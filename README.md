@@ -71,12 +71,25 @@ directories. The extracted JSONL files are not distributed in this release.
 
 ## Basic Statistics
 
+Total release size:
+
 - Papers: 22,177
 - Reviews: 52,369
 - Anonymized rationale items: 435,754
 - Covered subsets: `ICLR_2023`, `ICLR_2024`, `ICLR_2025`
 
-Per-year counts are also listed in `metadata/dataset_summary.json`.
+Yearly subsets:
+
+| Subset | Data directory | Papers | Reviews | Anonymized rationale items | Raw OpenReview papers |
+| --- | --- | ---: | ---: | ---: | ---: |
+| `ICLR_2023` | `data/ICLR_2023/` | 3,507 | 13,248 | 62,915 | 3,792 |
+| `ICLR_2024` | `data/ICLR_2024/` | 7,150 | 27,601 | 138,356 | 7,404 |
+| `ICLR_2025` | `data/ICLR_2025/` | 11,520 | 11,520 | 234,483 | 11,672 |
+
+`Papers` counts paper-level records, `Reviews` counts review-level records, and
+`Anonymized rationale items` counts structured pro/con rationale units extracted
+from the review data. The same per-year counts are also recorded in
+`metadata/dataset_summary.json`.
 
 ## Loading The Data
 
