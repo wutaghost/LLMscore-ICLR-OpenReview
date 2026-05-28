@@ -129,18 +129,6 @@ data curated for the LLMscore project. The released package contains normalized
 paper-level, review-level, and rationale-level records together with associated
 metadata required for peer review analysis and reproducibility.
 
-## Recommended Citation
-
-If you use this dataset, please cite the associated paper using the **official
-ICML bibliographic entry** for:
-
-- *Position: Peer Review Should Be Calibrated via LLM Scoring*
-- Zijin Chen, Lesui Yu, Xiaofei Liao, Hai Jin, and Qinbin Li
-
-To avoid introducing a non-official or incorrectly formatted reference, this
-repository does not provide a hand-written BibTeX entry. Users should adopt the
-final citation released with the official ICML proceedings record.
-
 ## Limitations
 
 - The release is intended for peer review analysis rather than general-purpose
