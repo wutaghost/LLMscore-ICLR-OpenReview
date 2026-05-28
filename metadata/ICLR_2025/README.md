@@ -1,12 +1,12 @@
-# ICLR 2025 Paper Full-Text Staging
+# ICLR 2025 Paper Text
 
-This is the ICLR 2025 partition of the LLMscore full-text staging dataset.
-It has not been merged into the released dataset.
+This directory stores metadata for the ICLR 2025 paper-text layer in the
+LLMscore-ICLR-OpenReview release.
 
 ## Files
 
 - `data/ICLR_2025/paper_text_index.jsonl.gz`: one row per paper, pointing to its txt file.
-- `texts/ICLR_2025/*.txt`: one UTF-8 text file per converted PDF for inspection.
+- `texts/ICLR_2025_1/*.txt` and `texts/ICLR_2025_2/*.txt`: UTF-8 text files for converted PDFs.
 - `metadata/ICLR_2025/paper_text_manifest.jsonl`: conversion metadata and quality flags.
 - `metadata/ICLR_2025/conversion_report.json`: aggregate quality report.
 
@@ -16,10 +16,6 @@ Command: `pdftotext -layout -enc UTF-8 -nopgbrk`.
 
 ## Current Counts
 
-- total: 11606
-- ok: 11561
-- warning: 44
-- error: 1
-
-Rows with warnings or errors should be inspected before this staging dataset is
-merged into the public release.
+- text index rows: 11606
+- text files: 11605
+- text directories: `texts/ICLR_2025_1/`, `texts/ICLR_2025_2/`

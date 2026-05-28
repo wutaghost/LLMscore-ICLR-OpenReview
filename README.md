@@ -71,8 +71,9 @@ understood as analysis artifacts rather than raw venue metadata:
   2023 paper PDF.
 - `texts/ICLR_2024/{paper_id}.txt`: one extracted UTF-8 text file per ICLR
   2024 paper PDF.
-- `texts/ICLR_2025/{paper_id}.txt`: one extracted UTF-8 text file per ICLR
-  2025 paper PDF.
+- `texts/ICLR_2025_1/{paper_id}.txt` and
+  `texts/ICLR_2025_2/{paper_id}.txt`: extracted UTF-8 text files for ICLR
+  2025 paper PDFs, split into two directories for repository hosting.
 - `metadata/schema.json`: field definitions.
 - `metadata/dataset_summary.json`: row counts, source roots, file sizes, and
   sha256 hashes.
@@ -84,7 +85,10 @@ understood as analysis artifacts rather than raw venue metadata:
 
 Only compressed `.jsonl.gz` files are kept in the yearly `data/ICLR_*`
 directories. The extracted JSONL files are not distributed in this release. Full
-paper text is distributed only as individual `.txt` files under `texts/ICLR_*`.
+paper text is distributed only as individual `.txt` files under `texts/ICLR_*`;
+the ICLR 2025 text layer is split across `texts/ICLR_2025_1/` and
+`texts/ICLR_2025_2/` to keep hosted directories within platform file-count
+limits.
 
 ## Basic Statistics
 
@@ -209,7 +213,8 @@ Paper PDF text is stored as UTF-8 `.txt` files partitioned by year:
 ```text
 texts/ICLR_2023/{paper_id}.txt
 texts/ICLR_2024/{paper_id}.txt
-texts/ICLR_2025/{paper_id}.txt
+texts/ICLR_2025_1/{paper_id}.txt
+texts/ICLR_2025_2/{paper_id}.txt
 ```
 
 Each year also contains a text index with paths and text metadata:

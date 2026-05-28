@@ -25,7 +25,7 @@ tags:
 
 The dataset is constructed for peer review analysis. It contains OpenReview-linked paper metadata, review records, anonymized rationale items, extracted paper text, LLM-derived anchor scores, and residual-based bias measurements for ICLR 2023, 2024, and 2025.
 
-The release does not redistribute paper PDFs. Paper-level records retain `openreview_url` and `pdf_url` fields so users can refer to the original public OpenReview source. Extracted paper text is distributed separately as UTF-8 `.txt` files under `texts/ICLR_2023`, `texts/ICLR_2024`, and `texts/ICLR_2025`; the JSONL index files store paths and conversion metadata rather than embedding full paper text.
+The release does not redistribute paper PDFs. Paper-level records retain `openreview_url` and `pdf_url` fields so users can refer to the original public OpenReview source. Extracted paper text is distributed separately as UTF-8 `.txt` files under `texts/ICLR_2023`, `texts/ICLR_2024`, `texts/ICLR_2025_1`, and `texts/ICLR_2025_2`; the JSONL index files store paths and conversion metadata rather than embedding full paper text.
 
 ## What The Dataset Captures
 
@@ -63,7 +63,7 @@ The release stores each conference year in a separate directory to keep the year
 - `data/ICLR_2025/`: the same four files for ICLR 2025;
 - `texts/ICLR_2023/{paper_id}.txt`: one extracted UTF-8 text file per converted ICLR 2023 paper PDF;
 - `texts/ICLR_2024/{paper_id}.txt`: one extracted UTF-8 text file per converted ICLR 2024 paper PDF;
-- `texts/ICLR_2025/{paper_id}.txt`: one extracted UTF-8 text file per converted ICLR 2025 paper PDF.
+- `texts/ICLR_2025_1/{paper_id}.txt` and `texts/ICLR_2025_2/{paper_id}.txt`: extracted UTF-8 text files for converted ICLR 2025 paper PDFs.
 
 The rows are deterministically sorted:
 
@@ -136,7 +136,7 @@ Yearly subsets:
 ### `paper_text_index.jsonl.gz`
 
 - `paper_id`: linked paper identifier.
-- `text_path`: relative path to the extracted UTF-8 `.txt` file.
+- `text_path`: relative path to the extracted UTF-8 `.txt` file when available.
 - `char_count`, `word_like_count`, and page-count fields: conversion metadata for the extracted text.
 - conversion status and quality flags when available.
 
