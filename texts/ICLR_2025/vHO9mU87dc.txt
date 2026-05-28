@@ -1,0 +1,2123 @@
+Under review as a conference paper at ICLR 2025
+
+
+000
+001       S HADOW KV: KV C ACHE IN S HADOWS FOR H IGH -
+002
+003   T HROUGHPUT L ONG -C ONTEXT LLM I NFERENCE
+004
+005
+       Anonymous authors
+006
+       Paper under double-blind review
+007
+008
+009
+010                                              A BSTRACT
+011
+012            With the widespread deployment of long-context large language models (LLMs),
+013            there has been a growing demand for efficient support of high-throughput infer-
+014            ence. However, as the key-value (KV) cache expands with the sequence length,
+015            the increasing memory footprint and the need to access it for each token generation
+016
+               both result in low throughput when serving long-context LLMs. While various dy-
+               namic sparse attention methods have been proposed to speed up inference while
+017
+               maintaining generation quality, they either fail to sufficiently reduce GPU mem-
+018
+               ory consumption or introduce significant decoding latency by offloading the KV
+019            cache to the CPU. We present S HADOW KV, a high-throughput long-context LLM
+020            inference system that stores the low-rank key cache and offloads the value cache to
+021            reduce the memory footprint for larger batch sizes and longer sequences. To min-
+022            imize decoding latency, S HADOW KV employs an accurate KV selection strategy
+023            that reconstructs minimal sparse KV pairs on-the-fly. By evaluating S HADOW KV
+024            on a broad range of benchmarks, including RULER, LongBench, and Needle In
+025            A Haystack, and models like Llama-3.1-8B, Llama-3-8B-1M, GLM-4-9B-1M,
+026            Yi-9B-200K, Phi-3-Mini-128K, and Qwen2-7B-128K, we demonstrate that it can
+027
+               support up to 6× larger batch sizes and boost throughput by up to 3.04× on an
+               A100 GPU without sacrificing accuracy, even surpassing the performance achiev-
+028
+               able with infinite batch size under the assumption of infinite GPU memory.
+029
+030
+031
+      1   I NTRODUCTION
+032
+033
+      Large language models (LLMs) have increasingly demonstrated their ability to scale and handle
+034
+      long contexts (Microsoft, 2024; Liu et al., 2024a; Achiam et al., 2023; Team et al., 2023), enabling
+035
+      them to tackle complex tasks like multi-document question answering and information retrieval from
+036   extensive contexts of up to 1M tokens (Achiam et al., 2023; Wang et al., 2024b). However, efficiently
+037   serving these long-context LLMs presents challenges related to the key-value (KV) cache (Liu et al.,
+038   2024b; Ge et al., 2023), which stores previous key-value activations to avoid re-computation. As the
+039   KV cache scales with sequence length, its growing memory footprint and the need to access it for
+040   each token generation lead to low throughput during long-context LLM inference. To address these
+041   issues, KV cache eviction or sparse attention methods have been widely explored.
+042   However, existing methods face three primary limitations: accuracy degradation, inadequate mem-
+043   ory reduction, and significant decoding latency overhead. KV cache eviction strategies (Zhang et al.,
+044   2024d;c) aim to reduce the memory footprint by discarding KV pairs based on specific policies, but
+045   they often result in information loss and accuracy degradation in tasks such as multi-turn conversa-
+046   tions (Yang et al., 2024b; Tang et al., 2024a). Dynamic sparse attention methods (Tang et al., 2024b)
+047   preserve all KV pairs on the GPU and accelerate inference by computing attention with selected KV
+048   pairs. However, this line of work does not mitigate the memory footprint, thereby limiting the batch
+049   size and preventing accommodation of extremely long contexts (e.g., 1M tokens). A naive solution
+050
+      based on sparse attention involves offloading the KV cache to the CPU to reduce memory usage
+      (Lee et al., 2024a; He & Zhai, 2024). Nonetheless, this approach incurs significant overhead due to
+051
+      the latency of fetching the selected sparse KV pairs from the CPU during decoding.
+052
+053   Consequently, an ideal effective system for long-context LLM inference with sparse attention
+      should: (i) reduce GPU memory usage, (ii) minimize inference latency, and (iii) maintain accuracy
+
+
+                                                       1
+      Under review as a conference paper at ICLR 2025
+
+
+054                             10
+                                     0
+                                                                                                      1.00                                                                 FFN
+                                                                                                                                                                  7000
+055                                                                                                                                                                        Attention
+                                                                                                                                                                  6000     SVD                             5
+                                                                                                      0.95                                                                 SVD percentage
+056   Relative Singular Value
+
+
+                                                                                Subspace Similarity
+                                     1
+                                10                                                                                                                                5000
+
+
+                                                                                                                                                                                                           SVD per cent (%)
+                                                                                                      0.90                                                                                                 4
+057
+
+
+                                                                                                                                                      Time (ms)
+                                                                                                                                                                  4000
+058                                  2                       Low-rank                                 0.85                                                                                                 3
+                                10                                                                                                                                3000
+059                                                                                                   0.80                                                        2000
+                                             X                    V                                              Context                                                                                   2
+060                                  3       K (pre-RoPE)         WK                                             Extended Context                                 1000
+                                10           K (post-RoPE)        WV                                  0.75       Inter-context
+061                                                                                                                                                                  0                                     1
+                                         0   200     400    600    800   1000                                0   5     10      15      20   25   30                      64K   128K 192k 256K       384K
+062                                                   Component                                                             Layer Index                                           Sequence Length
+063
+                                                      (a)                                                                   (b)                                                      (c)
+064
+065   Figure 1: (a) For a sample from PG-19 (Rae et al., 2019; Gao et al., 2020) fed into Llama-3.1-8B,
+066   the pre-RoPE keys are the most low-rank, as indicated by the sharpest decay in singular values. (b)
+067   Average similarities, defined in Section 3.1, between rank-256 truncated SVD projections of pre-
+068   RoPE keys from PG-19 sequences using Llama-3.1-8B. Similarity is measured between a length
+069   16K “Context” and either a 16K+2K continuation on “Context” (“Extended context”) or a new
+070   length 16K sequence (“Inter-context”). Pre-RoPE keys within sequences exhibit similar low-rank
+071
+      subspaces, while those between sequences show different patterns. (c) The relative overhead of
+      singular value decomposition (SVD) decreases as sequence length scales for the pre-filling stage.
+072
+073
+074   within limited sparse KV cache budgets. Fortunately, we can potentially overcome these challenges
+075   by leveraging our discovery that pre-Rotary Position Embedding (Su et al., 2024) (RoPE) keys are
+076   exceptionally low-rank compared to the layer inputs, post-RoPE keys, values, key weight matrix,
+077
+      and value weight matrix, as indicated in Figure 1a. Furthermore, our analysis in Figure 1b reveals
+      that pre-RoPE keys lack significant similarities in low-rank subspaces across different sequences,
+078
+      while a sequence and its continuation tend to strongly share low-rank subspaces, enabling high
+079
+      compression rates within each sequence. Motivated by these findings, we have developed two key
+080   insights that pave the way for the design of an applicable system, detailed in Section 3.
+081
+082   Low-rank Keys and Offloaded Values for Storage: In long-context LLM inference, the quadratic
+083
+      scaling of attention computation with sequence length makes the linear cost of low-rank decom-
+      position during pre-filling negligible, as illustrated in Figure 1c1 . To reduce memory footprint, we
+084
+      retain the low-rank pre-RoPE key cache on the GPU and offload the value cache to the CPU since
+085
+      the value cache does not exhibit low-rank properties, minimizing memory footprint without sacri-
+086   ficing accuracy. During decoding with sparse attention, we employ CUDA multi-streams to overlap
+087   the recovery of the selected key cache with the fetching of the corresponding value cache. This
+088   approach conceals key cache reconstruction and reduces data fetching overhead by 2× compared to
+089   the naive offloading strategy, thereby decreasing the latency of sparse attention during decoding.
+090
+      Accurate KV Selection for Fast Decoding: To further reduce decoding latency in sparse attention,
+091
+      we propose an accurate KV selection method that maintains accuracy with minimal number of se-
+092   lected tokens (i.e. the K of TopK), which we refer to as sparse budgets (1.56%). Our analysis reveals
+093   that most post-RoPE keys exhibit high cosine similarity with adjacent tokens, enabling chunk-level
+094   approximations for selecting important tokens. A minimal number of outlier chunks (0.3%), which
+095   are more challenging to approximate (Figure 3b), are stored as static cache on the GPU to preserve
+096   accuracy. As shown in Figure 2, our method outperforms the naive sparse attention approach (Tang
+097   et al., 2024b) and achieves higher sparsity, accelerating decoding.
+098   Building on these insights, we present S HADOW KV in Section 4, depicted in Figure 2, a high-
+099   throughput system for long-context LLM inference. Specifically, during pre-filling, we offload the
+100   value cache to the CPU, retaining only the low-rank pre-RoPE keys, along with compressed land-
+101   marks of the key cache and detected outliers for larger batch sizes. During decoding, landmarks are
+102   used to select chunk indices for key cache recovery and value cache fetching. We perform accurate
+103   sparse attention computation with selected KV pairs and static outliers to achieve high throughput.
+104   Empirically, we conduct extensive experiments and ablation studies to demonstrate the effectiveness
+105   and efficiency of S HADOW KV. In Section 5.1, we evaluate across various long-context LLMs, such
+106
+         1
+107        In practical scenarios, the key cache can be offloaded to the CPU to perform SVD asynchronously or
+      precomputed and stored as part of the prefix cache (Juravsky et al., 2024).
+
+
+                                                                                                                             2
+      Under review as a conference paper at ICLR 2025
+
+
+108   Pre-filling                                                                            Theoretical Equivalent Bandwidth for ShadowKV
+                                                  SVD
+109                                                        Low-rank Key Cache (Cached)         31.5 GB/s (PCIe)   2 TB/s (A100)   7 TB/s
+
+110                   Value         Pre-RoPE
+                      Cache         Key Cache     RoPE & Reduce
+111     GPU                                                        Landmarks (Cached)
+112                                               Find Outliers
+                                                                         Outliers (Cached)
+113
+114     CPU
+                                    Value Cache
+115                 Offload
+116
+117   Decoding
+118                               Landmarks        Low-rank Key Cache           Outliers
+119
+120                      KV        Cache          Low-rank Key Cache            Sparse
+121                      Sel.      Hit/Miss       Reconstruction + RoPE         Attention
+       GPU
+122
+123    CPU                    Selected Missed
+                                                  Value Cache Fetching
+124                           Chunk IDs
+125
+      Figure 2: Left: S HADOW KV enhances long-context LLM inference throughput by offloading the
+126
+      value cache to the CPU while maintaining a low-rank key cache, landmarks, and outliers on the
+127
+      GPU. During decoding, it employs landmarks for efficient sparse attention, reducing computation
+128   and data movement. Right: S HADOW KV effectively utilizes a limited KV budget to achieve high
+129   accuracy, theoretically reaching over 7 TB/s equivalent bandwidth on an A100, and empirically
+130   boosts generation throughput by 3.04× for Llama-3.1-8B with on a batch of 122K contexts.
+131
+132   as Llama-3-8B-1M (Gradient., 2024), Llama-3.1-8B (Meta AI, 2024), GLM-4-9B-1M (GLM et al.,
+133   2024), Yi-9B-200K (AI et al., 2024), Phi-3-Mini-128K (Abdin et al., 2024) and Qwen2-7B-128K
+134   (Yang et al., 2024a) using benchmarks including RULER (Hsieh et al., 2024), LongBench (Bai et al.,
+135   2023), and Needle In A Haystack (Kamradt, 2023) with contexts up to 1M.
+136   In Section 5.2, we demonstrate that S HADOW KV can support 6× larger batch sizes and boost
+137   throughput by 3.04× compared to small batches on an A100 using Llama-3.1-8B, with each sample
+138   having a context length of 122K. We also present results across different models and context lengths,
+139   increasing throughput up to 2.97× for Llama-3-8B-1M, 2.56× for GLM-4-9B-1M, and 2.66× for
+140   Yi-9B-200K, even surpassing infinite batch size under the assumption of infinite GPU memory.
+141
+142   2       R ELATED W ORKS
+143
+144   Token Eviction. To reduce memory footprint, eviction-based strategies keep a fixed size of KV
+145
+      cache to store the critical token KV pairs and discard unnecessary tokens. StreamingLLM (Xiao
+      et al., 2023b) addresses the limitations of window attention by retaining attention sinks and recent
+146
+      KV pairs. H2 O (Zhang et al., 2024d) introduces a low-cost eviction policy, updating the KV cache
+147
+      based on cumulative attention scores. LESS (Dong et al., 2024b) accumulates evicted token in-
+148   formation by a constant-sized low-rank cache, which allows partial access to previously evicted
+149   information, along with tokens maintained by a sparse policy. SnapKV (Li et al., 2024) uses the lo-
+150   cal window of prompts to select important tokens for future generations. However, they suffer from
+151   performance degradation and information loss since the evicted tokens will never be recovered.
+152
+153
+      Dynamic Sparse Attention. This line of work retains all KV cache but performs dynamic sparse
+      attention within selected KV pairs to reduce inference latency. SparQ (Ribar et al., 2023) uses the
+154
+      norm of the query to decide an important subset of the key cache’s channels to calculate a metric
+155
+      to select relevant tokens. Quest (Tang et al., 2024b) segments tokens into pages and selects pages
+156   by approximating the highest attention within each page. Loki (Singhania et al., 2024) performs
+157   principal component analysis on key caches using a calibration dataset, selecting tokens based on
+158   attention scores computed in low-dimensional space. TriForce (Sun et al., 2024) combines sparse
+159   attention with speculative decoding (Leviathan et al., 2023) for lossless acceleration. InfiniGen
+160   (Lee et al., 2024a) offloads the entire KV cache to the CPU and prefetches essential entries using
+161   an predefined projection matrix via SVD for KV selection. In contrast, S HADOW KV employs an
+      online, prompt-dependent SVD for key cache compression rather than for KV selection.
+
+
+                                                                            3
+       Under review as a conference paper at ICLR 2025
+
+
+162              1.0                                                                               1.0                                                          0.9
+
+
+                                                                 Minimum Similarity within Chunk
+163                                                                                                0.8                                                          0.8
+                 0.8
+164                                                                                                0.6                                                          0.7
+
+
+                                                                                                                                            KV Cache Hit Rate
+165              0.6
+      Accuracy
+                                                                                                   0.4                                                          0.6
+166              0.4                                                                                                                                            0.5
+                                                                                                   0.2
+167
+                 0.2                      Value Cache                                              0.0                   Layer-0, Head-1                        0.4       Layer-5, KV Head-0
+168                                       Post-RoPE Key Cache                                                            Layer-16, Head-7                                 Layer-15, KV Head-3
+                                          Pre-RoPE Key Cache                                       0.2                   Outlier Chunks                         0.3       Layer-25, KV Head-7
+169              0.0
+                       0      256     512        768      1024                                           0    4096     8192 12288 16384                               0    50       100 150 200         250
+170                                 SVD Rank                                                                 Chunk Index (Chunk Size=8)                                         Generated Token Index
+171
+                                    (a)                                                                           (b)                                                               (c)
+172
+173    Figure 3: (a) Accuracy on the needle retrieval task across various ranks shows that the pre-RoPE
+174    key cache can be compressed by over 6 times without a drop in accuracy. (b) The number of notable
+175    outlier chunks is small, taking only 0.2-0.3%. (c) The KV cache has a high hit rate, reducing
+176    computations and data movements by over 60% for each decoding step.
+177
+178
+179    Quantization. Several methods have been introduced to optimize KV cache quantization (Hooper
+180
+       et al., 2024; Yue et al., 2024; Xiao et al., 2023a), reducing memory consumption while retaining
+       accuracy. KIVI (Liu et al., 2024c) applies different quantization strategies for keys and values,
+181
+       quantizing the keys per-channel and the values per-token to 2-bit. Palu (Chang et al., 2024) decom-
+182
+       poses KV weight matrices offline, caching low-rank KV projections to achieve a higher compression
+183    rate. Quantization methods reduce the KV cache bit width, which is orthogonal to our approach.
+184
+185
+186    3               O BSERVATIONS
+187
+188
+       We present two key insights of long-context LLMs that inspire S HADOW KV’s design, as follows.
+189
+       3.1                 L OW-R ANK K EYS AND O FFLOADED VALUES FOR S TORAGE
+190
+191    To reduce memory footprint, the low-rank nature of the KV cache has been explored by recent
+192    studies (DeepSeek-AI, 2024; Xu et al., 2024; Chang et al., 2024). However, these methods focus on
+193    data-independent decomposition, either requiring training or achieving limited compression rates.
+194
+195    Observation. In our study, by conducting SVD on the model weights Wk , Wv , the input X, the
+196    pre-/post-RoPE key cache, and the value cache of Llama-3.1-8B, we visualize the relative singular
+197    value distributions in Figure 1a together with the accuracy in Figure 3a. As we observed, pre-RoPE
+198    keys have the lowest rank and can be compressed by 6× without performance degradation.
+199    We also identify striking dynamic and static behaviors in low-rank keys between and within se-
+200    quences, inspired by a related investigation in FFN layers (Dong et al., 2024a). Analogous to cosine
+201    similarity, we define D(H1 , H2 ) = ⟨H1 , H2 ⟩/r to be the similarity metric between low-rank sub-
+202    spaces of two rank-r projection matrices, H1 and H2 , where ⟨·, ·⟩ is the Frobenius inner product2 . In
+203    our case with truncated SVDs of pre-RoPE keys, let K1 , K2 ∈ Rn×d have rank-r truncated SVDs,
+204    Φ1 Σ1 Ψ⊤                ⊤
+                1 and Φ2 Σ2 Ψ2 , respectively, where Φ1 ∈ R
+                                                               n×r
+                                                                   , Σ1 ∈ Rr×r , Ψ1 ∈ Rd×r , and similarly
+                                              ⊤        ⊤
+205
+       for Φ2 , Σ2 , and Ψ2 . Then, D(Ψ1 Ψ1 , Ψ2 Ψ2 ) can measure the similarity between the low-rank
+       subspaces of the two right singular matrices. Depicted in Figure 1b, pre-RoPE keys between se-
+206
+       quences do not strongly share similar low-rank subspaces, but extensions of the same sequence do.
+207
+208
+       Insights. Our observation of the low-rank nature in the pre-RoPE keys indicates that storing the
+209
+       low-rank projections is sufficient for each sequence. By keeping the low-rank key cache on the GPU
+210    and offloading the value cache to the CPU since it is not low-rank, we can largely reduce the memory
+211    footprint. During decoding, selected KV pairs can be reconstructed on-the-fly for computation.
+212       2
+            Since H1 and H2 are projection matrices, their squared Frobenius norms are the sum of their singular
+213    values which consist of r 1’s and d − r 0’s, i.e., ∥H1 ∥2F = r. Thus, by Cauchy-Schwarz, |D(H1 , H2 )| ≤ 1.
+214    Additionally, D(H1 , H2 ) ≥ 0 by the cyclic property of trace and positive semidefiniteness of projection
+215    matrices. Together, this shows D(H1 , H2 ) ∈ [0, 1], maximized or minimized when the projection matrices
+       project onto identical or orthogonal subspaces, respectively.
+
+
+                                                                                                                 4
+      Under review as a conference paper at ICLR 2025
+
+
+216
+217   Algorithm 1: S HADOW KV Pre-filling                                                                     𝑩
+                                                                                              SVD
+218       Input: K, K RoPE , V ∈ Rb×hkv ×s×d , SVD rank r,               Pre-RoPE Key                𝑨
+                                                                                                          Low-Rank
+219       chunk size c, number of outlier chunks o                                                        (Cached)
+220       ▷ Store low-rank projection of pre-RoPE key cache
+221       A ∈ Rb×s×r , B ∈ Rb×hkv ×r×d ← SVD(K)
+                                                                                  0.2
+222       ▷ Segment post-RoPE key cache into chunks and                                             Outlier Chunks
+                                                                                        0.2
+223       compute the mean of each chunk                                          0.6
+                                                                                                      (Cached)
+
+224
+          C ∈ Rb×hkv ×s/c×d ← Reduce(K RoPE )
+          ▷ Compute cosine similarity within each chunk                           0.9
+225
+          S ∈ Rb×hkv ×s/c×c ← CosineSimilarity(C, K RoPE )                              0.8
+226
+          ▷ Find lowest cosine similarity as outliers                             0.8
+227       I ∈ Rb×hkv ×o ← ArgTopK(−Min(S, dim = −1), o)
+
+
+                                                                                                               ...
+                                                                                  ...
+                                                                         ...
+228       K outlier , V outlier ← Gather(K RoPE , V , I)
+229       ▷ Offload the rest of values to the CPU and store the        Value    Post-RoPE                 Landmarks
+                                                                       Cache    Key Cache                  (Cached)
+230       non-outlier chunks’ mean as landmarks
+231       V CPU ← V \ V outlier , L ← C \ Gather(C, I)                 Figure 4: S HADOW KV pre-filling.
+232
+233
+234   3.2    ACCURATE KV S ELECTION FOR FAST D ECODING
+235
+236   To further reduce the latency overhead in sparse attention, including fetching the selected value
+237   cache from the CPU and reconstructing the corresponding key cache, an accurate KV selection
+238   method is needed to minimize the sparse KV cache budget while maintaining the accuracy.
+239   Observation. We found most post-RoPE key cache exhibits spatial locality, with high cosine sim-
+240   ilarity to adjacent tokens, except for a few outliers. To quantify this, we conducted inference experi-
+241   ments on 128K contexts. We divided the post-RoPE keys into chunks of eight tokens and visualized
+242   the minimum cosine similarity between the chunk’s mean and its key cache, as shown in Figure 3b.
+243   The results indicate that, apart from a few outliers, there is generally high cosine similarity, suggest-
+244   ing the mean values can serve as landmarks to approximate attention well within normal chunks.
+245
+246   Analysis. This finding suggests that for the majority of chunks, we can maintain the mean value as
+247   compressed landmarks to select minimal important KV pairs (1.56%) accurately during decoding.
+248   Outlier chunks, which may contain dense or critical information and are difficult to approximate,
+249   are retained to ensure accuracy. Given their relatively small number (0.2–0.3%), storing them on the
+250   GPU is feasible without affecting memory capacity. Furthermore, as shown in Figure 3c, considering
+251   the temporal locality of the KV cache—meaning that the KV pairs selected by the queries of two
+252   adjacent decoding steps have a high repetition rate, a cache policy (Zhang et al., 2024a) can be
+253   leveraged to further reduce the latency overhead by 60% during decoding with optimized kernels.
+254
+255   4     S HADOW KV
+256
+257   In this section, we introduce S HADOW KV, a high-throughput long-context LLM inference system.
+258   We first elaborate our algorithm in Section 4.1, covering both the pre-filling and decoding phases.
+259   Subsequently, in Section 4.2, we discuss the concept of theoretical equivalent bandwidth to illustrate
+260   the benefits of our approach.
+261
+262   4.1    A LGORITHM
+263   The algorithm of S HADOW KV is divided into two main phases: pre-filling and decoding. The
+264   pre-filling phase involves low-rank decomposition of the post-RoPE key cache, offloading the value
+265   cache, and constructing landmarks to facilitate subsequent high-throughput decoding. The decoding
+266   phase includes accurate KV selection and efficient sparse KV cache reconstruction.
+267
+268   Pre-filling. During the pre-filling phase, we optimize GPU memory usage by performing low-
+269   rank compression on the key cache of each layer and offloading values to the CPU. Specifically, as
+      demonstrated in Algorithm 1 and Figure 4, we apply SVD on the pre-RoPE key cache and store only
+
+
+                                                         5
+      Under review as a conference paper at ICLR 2025
+
+
+270                                                                                Landmarks                 Selected
+271
+      Algorithm 2: S HADOW KV Decoding                                                                       Chunk IDs
+                                                                                       #1
+272     Input: A, B, L, V CPU , Q ∈ Rb×hq ×sq ×d , K outlier ,
+                                                                                                              #125
+273     V outlier , K, V ∈ Rb×hkv ×sq ×d , number of chunks nc ,                       #2
+                                                                                                 Top-K
+
+274     number of selected chunk budget k                                                                      #531
+
+
+                                                                                           ...
+                                                                          Query
+275
+        ▷ Compute chunk attention score
+                                                                                       #n
+        P ∈ Rb×hq ×sq ×nc ← MatMul(Q, L       ⊤
+                                             √ )
+                                                                                                     #531 Hit
+276              b×hq ×sq ×nc                                                                        #125 Miss
+277
+        S∈R                   ← Softmax(P / d)
+                                                                            Low-Rank Pre-RoPE
+        S1 ∈ Rb×hq ×nc ← sum(S, dim = −2)                                   Key Cache
+                                                                                                              #125
+278
+        S2 ∈ Rb×hkv ×nc ← maxkv group (S1 )
+279                                                                       Reconstruction
+        ▷ Select top-k chunks for each KV head                                   + RoPE
+280     I ∈ Rb×hkv ×k ← ArgTopK(S2 , k)
+281     ▷ Gather values from CPU
+                                                                                                     Fetch    Value
+282     V sparse ← Gather(V CPU , I)                                                                          Cache
+283     V ← [V outlier ; V sparse ; V ]
+284     ▷ Recover keys from low-rank projection
+                                                                              Current KV Cache
+285     K sparse ← MatMul(Gather(A, I), B)
+286     K ← [K outlier ; RoPE(K sparse ); K]
+                                                                     Figure 5: S HADOW KV decoding phase.
+287
+288
+289   the low-rank representations for each layer. Post-RoPE key cache is segmented into chunks, with
+290   the mean of each chunk computed as landmarks. By computing the cosine similarity within these
+291   chunks, we identify poorly approximated tokens as outliers. This small set of outliers is gathered
+292   and stored on the GPU as the static cache, while the remaining key cache is maintained as compact
+293   landmarks, with the corresponding values offloaded to the CPU memory.
+294
+      High-throughput Decoding. For incoming queries, we first compute the approximate attention
+295
+      scores using the landmarks. As detailed in Algorithm 2, by identifying the top-k scoring chunk
+296   indices, the corresponding values are retrieved from the CPU, and the key cache is simultaneously
+297   reconstructed from low-rank projections, effectively concealing the construction of the key cache.
+298   Based on the insight that the KV cache has temporal locality, we build cache-aware CUDA kernels,
+299   reducing computation and value fetching by 60%. As shown in Figure 5, we conduct an index scan
+300   to detect the missed chunks and only rebuild the necessary KV pairs on-the-fly.
+301
+      Based on our observations in Section 3.1, future pre-RoPE keys within a sequence reside in a shared
+302   low-rank subspace with the context. As a result, an extension of our algorithm would be to store
+303   generated tokens as low-rank states using the same projections obtained from pre-filling to reduce
+304   the memory usage for future generations3 . We evaluate it and include the results in Appendix A.1.
+305
+306   4.2   T HEORETICAL E QUIVALENT BANDWIDTH
+307
+308
+      The benefit of S HADOW KV in terms of increasing throughput can be analyzed through the concept
+      of equivalent bandwidth. Consider each K or V vector as being M bytes in size, with a sequence
+309
+      length of S, a chunk size of C, a selected chunk budget of K, O outliers, and hit rate α. During KV
+310
+      selection, S HADOW KV loads M × S/C bytes using the GPU memory bandwidth BGPU . For value
+311   cache fetching, it loads M ×K ×C bytes using the PCIe bandwidth BPCIe (Sheng et al., 2023). Since
+312   value movement and key cache reconstruction can be overlapped, we do not need to count key cache
+313   reconstruction here. Following this, S HADOW KV performs standard attention computation for the
+314   top-k chunks and predefined outliers, requiring 2M ×(K +O)×C bytes. The equivalent bandwidth
+315   of S HADOW KV is defined as below and the GPU memory savings is detailed in Appendix A.2.
+316                                                      2SBGPU
+317                       Bequivalent =
+                                          S/C + 2(K + O)C + (1 − α)KCBGPU /BPCIe
+318
+319   For example, assuming C=8, S=128K, K=256, O=48, BPCIe =31.5 GB/s, and BGPU =2 TB/s for A100,
+320   the equivalent bandwidth of S HADOW KV is calculated as 7.2 TB/s, which is 3.6× higher than A100
+321
+      memory bandwidth. This result indicates that S HADOW KV theoretically achieves a high equivalent
+      bandwidth to accelerate attention computation. System implementation is detailed in Appendix B.1.
+322
+323
+         3
+           If Ψ ∈ Rd×r is the right singular matrix calculated from the SVD of pre-RoPE context keys K ∈ Rs×d ,
+      new pre-RoPE keys K ′ ∈ Rsq ×d can be stored as K ′ Ψ and projected back up with Ψ⊤ when needed.
+
+
+                                                         6
+      Under review as a conference paper at ICLR 2025
+
+
+324   Table 1: Performance of different models and different methods on RULER (Hsieh et al., 2024)
+325   evaluated at length of 128K. S HADOW KV outperforms other methods with a 1.56% sparse budget.
+326
+327   Methods               N-S1    N-S2 N-MK1 N-MK2 N-MQ N-MV QA-1 QA-2                      VT FWE      Avg.
+328
+      Llama-3-8B-1M        100.00 100.00    98.96     98.96   98.96   95.57   75.00   48.96 78.54 71.85   86.68
+329   Loki                  18.75   1.04     2.08      0.00    1.56    0.78    4.17   13.54 26.04 25.35    9.33
+330   Loki (V only)         41.67   6.25    37.50      1.04    8.07   30.73   10.42   19.79 51.67 37.50   24.46
+331   InfiniGen            100.00 98.96     84.38     53.13   63.28   54.95   65.63   48.96 81.67 50.35   70.13
+332   InfiniGen (V only)   100.00 98.96     96.88     76.04   81.25   77.08   67.71   50.00 81.67 53.47   78.31
+      Quest                100.00 100.00    98.96     77.08   97.65   93.49   60.42   50.00 77.08 65.63   82.03
+333
+      Quest (V only)       100.00 100.00    98.96     85.42   97.92   95.49   70.83   46.88 78.75 65.63   83.99
+334   S HADOW KV           100.00 100.00    97.92     98.96   96.88   95.83   72.92   52.08 81.67 72.57   86.88
+335
+      GLM-4-9B-1M          100.00 100.00    94.79     87.50   99.74   93.75   67.71   55.21 97.29 72.22   86.82
+336   Loki                  71.88 27.08     22.92      2.08    9.90   11.46   28.13   27.08 31.04 54.17   28.57
+337   Loki (V only)         96.88 55.21     56.25     18.75   51.04   50.52   45.83   39.58 72.71 59.72   54.65
+338   InfiniGen            100.00 93.75     82.29      0.00   79.43   60.16   57.29   53.13 92.71 57.29   67.60
+339   InfiniGen (V only)   100.00 96.88     87.50      7.29   95.31   75.26   56.25   54.17 95.63 60.76   72.91
+      Quest                100.00 95.83     90.62     54.17   94.01   76.30   55.21   52.08 95.83 64.58   77.86
+340
+      Quest (V only)       100.00 96.88     93.75     72.92   95.83   83.07   56.25   53.13 96.88 65.97   81.47
+341   S HADOW KV           100.00 100.00    95.83     83.33   98.70   87.76   69.79   55.21 97.50 68.06   85.62
+342
+      Llama-3.1-8B         100.00 100.00    98.96     91.67   98.96   95.31   82.29   47.92 68.96 71.18   85.53
+343
+      Loki                  68.75 32.29     32.29     20.83   42.71   28.65   41.67   33.33 24.79 29.86   35.52
+344   Loki (V only)         95.83 36.46     57.29     62.50   77.86   70.83   69.79   39.58 35.21 37.50   58.29
+345   InfiniGen            100.00 77.08     78.13     13.54   58.07   47.40   65.63   41.67 60.83 50.35   59.27
+346   InfiniGen (V only)   100.00 88.54     87.50     26.04   79.43   77.08   72.92   43.75 57.08 55.21   68.76
+347   Quest                100.00 98.96     97.92     34.38   93.49   88.54   70.83   44.79 65.63 68.40   76.29
+      Quest (V only)       100.00 98.96     98.96     56.25   95.83   90.63   76.04   46.88 66.25 67.36   79.72
+348
+      S HADOW KV           100.00 100.00   100.00     83.33   97.92   92.19   81.25   48.96 67.08 64.93   83.57
+349
+350
+351
+      5     E MPIRICAL E VALUATION
+352
+353   In this section, we showcase the effectiveness and efficiency of S HADOW KV. Specifically,
+354
+      • In Section 5.1, we show that S HADOW KV can reduce the GPU memory footprint of the KV cache
+355
+        by over 6× without accuracy degradation on a wide range of models and evaluation benchmarks.
+356
+      • In Section 5.2, we demonstrate S HADOW KV can support up to 6× larger batch sizes and increase
+357
+        the inference throughput by up to 3.04× without compromising model quality.
+358
+      • In Section 5.3, we present extensive ablation studies that validate the effectiveness of each com-
+359
+        ponent of S HADOW KV in optimizing GPU memory usage and enhancing performance.
+360
+361   5.1   ACCURACY E VALUATION
+362
+363   We demonstrate that S HADOW KV can reduce the GPU memory usage of the KV cache by 6× while
+364
+      maintaining accuracy on a range of long-context tasks with a minimal sparse KV cache budget.
+365
+      Setup. We choose four widely used long-context models for our evaluation: Llama-3-8B-1M
+366   (Gradient., 2024), GLM-4-9B-1M (GLM et al., 2024), Llama-3.1-8B (Meta AI, 2024), and Yi-9B-
+367   200K (AI et al., 2024). We evaluate our approach on three challenging long-context benchmarks:
+368   RULER (Hsieh et al., 2024), LongBench (Bai et al., 2023), and Needle In A Haystack (Kamradt,
+369   2023), covering QA, multi-hop, reasoning, summarization, code completion4 . We set the chunk size
+370   to 8, the rank to 160, and the number of outliers to 48 for S HADOW KV.
+371
+372   Baselines. We include three dynamic sparse attention methods as baselines: Quest (Tang et al.,
+373
+      2024b), Loki (Singhania et al., 2024), and InfiniGen (Lee et al., 2024b). For all methods, we retain
+      exact pre-filling and perform dynamic sparse attention during decoding, where the computation cost
+374
+      is set to 1/16 of full attention for selecting sparse KV pairs. We include two variants for each base-
+375
+      line: one where all the KV cache is offloaded, and another where only the value cache is offloaded.
+376
+         4
+377        We include results for Yi-9B-200K and other models (e.g., Llama-3-70B-1M) in Appendix A. Needle In
+      A Haystack is also tested on Phi-3-Mini-128K (Abdin et al., 2024) and Qwen2-7B-128K (Yang et al., 2024a).
+
+
+                                                         7
+      Under review as a conference paper at ICLR 2025
+
+
+378   Table 2: Performance of various methods on different models with LongBench (Bai et al., 2023)
+379   samples exceeding 4K tokens. S HADOW KV outperforms other methods and maintains the accuracy.
+380
+381   Methods              NarrQA MultiFQA HotpotQA MuSiQue DuRead GovRep SAMSum PassRetr LCC Avg.
+382
+      Llama-3-8B-1M          18.98   41.84     36.79    21.47   31.93             34.18                    35.96           81.50 56.07 39.86
+383   Loki                    2.26   10.19      5.48     3.16   12.17             28.97                     7.84           40.52 31.44 15.78
+384   Loki (V only)           3.20   21.01     12.41     3.86   17.07             31.24                    16.23           52.57 38.10 21.74
+385   InfiniGen              14.39   31.46     33.63    17.94   26.65             27.38                    21.97           74.30 38.58 31.81
+386   InfiniGen (V only)     17.83   36.08     35.28    19.64   28.39             29.28                    28.12           74.85 45.53 35.00
+      Quest                  20.13   36.63     35.00    18.14   24.55             27.11                    35.63           79.00 53.64 36.65
+387
+      Quest (V only)         17.26   39.51     36.78    18.71   26.41             29.49                    35.80           79.50 60.05 38.17
+388   S HADOW KV             17.17   39.73     38.29    21.08   31.77             31.62                    35.87           80.00 63.93 39.94
+389
+      GLM-4-9B-1M            25.44   51.09     58.67    39.61   32.04             29.97                    40.31           99.00 58.02 48.24
+390   Loki                    5.82   30.60     22.73     9.20   30.09             30.35                    22.70           98.92 40.77 32.35
+391   Loki (V only)          10.89   44.97     45.44    23.51   32.07             30.56                    35.34           99.50 50.27 41.39
+392   InfiniGen              23.67   46.31     55.69    33.91   27.49             25.44                    33.48           91.83 36.96 41.64
+393   InfiniGen (V only)     25.63   48.44     57.23    36.94   29.77             26.67                    36.64           93.58 46.69 44.62
+      Quest                  23.81   44.53     56.41    35.49   23.54             21.73                    37.39           87.00 43.80 41.52
+394
+      Quest (V only)         26.00   46.32     57.54    36.42   24.58             24.52                    37.71           93.50 46.52 43.68
+395   S HADOW KV             26.50   51.31     59.09    38.87   32.92             28.54                    38.70           96.50 58.55 47.89
+396
+      Llama-3.1-8B           31.56   55.10     57.65    29.46   35.26             34.45                    29.84 100.00 67.31 48.96
+397
+      Loki                    2.31   18.89     10.64     5.47   19.30             31.16                    15.91 94.88 44.60 27.02
+398   Loki (V only)           3.93   38.59     22.85    12.96   27.43             32.22                    26.43 98.25 56.11 35.42
+399   InfiniGen              27.23   52.72     53.89    26.81   27.72             29.61                    24.42 98.93 56.89 44.25
+400   InfiniGen (V only)     29.73   53.47     55.11    28.72   28.55             31.42                    26.76 99.17 62.66 46.18
+401   Quest                  29.70   49.04     53.96    27.18   27.16             30.43                    29.85 98.50 57.35 44.80
+      Quest (V only)         30.02   53.97     56.39    27.06   29.06             31.65                    30.23 99.00 63.89 46.81
+402
+      S HADOW KV             30.93   55.20     57.32    29.13   31.85             32.79                    30.40 99.50 66.03 48.13
+403
+404
+405
+      The former has similar latency to S HADOW KV but a smaller sparse budget since S HADOW KV only
+406
+      needs to fetch the value cache from the CPU. The latter aligns with the same sparse KV cache budget
+407   but significantly increases GPU memory usage. The latter one is marked as “V only” in the table.
+408
+409   RULER. As shown in Table 1, S HADOW KV demonstrates excellent performance on 128K con-
+410   texts. With a fixed sparse budget of 1.56%, other methods experience performance degradation. In
+411   contrast, S HADOW KV is more robust and even outperforms original full attention on certain tasks,
+412   such as variable tracking. For complex tasks like multi-document QA or multi-key needle retrieval,
+413   other methods suffer from significant performance degradation while S HADOW KV does not.
+414
+                                                                                             Needle in A Haystack Llama-3-8B-Instruct-1M w/ ShadowKV   1.0
+415   LongBench. On LongBench, we evaluate our method with a                               0
+                                                                                          11
+                                                                                                                                                       0.8
+      range of realistic scenarios, including single-/multi-document                      22
+                                                                         Depth Percent (%)
+
+
+416                                                                                       33
+                                                                                                                                                       0.6
+417   question-answering, document summarization, code comple-                            44
+                                                                                          56
+                                                                                                                                                       0.4
+418   tion, information retrieval, etc. We only test on samples longer                    67
+                                                                                          78
+                                                                                                                                                       0.2
+419
+      than 4K and set the sparse KV cache budget to 256 for this                          89
+                                                                                         100
+                                                                                                                                                       0.0
+      benchmark since it has shorter inputs compared to RULER.
+                                                                                              16K
+                                                                                              87K
+                                                                                                 K
+                                                                                                 K
+                                                                                                 K
+                                                                                                 K
+                                                                                                 K
+                                                                                                 K
+                                                                                                 K
+                                                                                                 K
+                                                                                                 K
+                                                                                                 K
+                                                                                                 K
+                                                                                                 K
+                                                                                               1M
+
+
+420
+                                                                                             157
+                                                                                             227
+                                                                                             297
+                                                                                             368
+                                                                                             438
+                                                                                             508
+                                                                                             578
+                                                                                             649
+                                                                                             719
+                                                                                             789
+                                                                                             859
+                                                                                             930
+
+
+      As shown in Table 2, S HADOW KV outperforms other meth-                                                    Context Length
+421
+      ods consistently and maintains the performance.
+422                                                                                    Figure 6: Needle In A Haystack.
+423
+      Needle In A Haystack. On the Needle In A Haystack dataset, as shown in Figure 6, S HADOW KV
+424   shows the ability to process information at different positions across various context windows, rang-
+425   ing from 16K to 1M tokens. More experiments on a range of models can be found in Appendix B.3.
+426
+427   Integrate with Efficient Pre-filling Methods. We also combined S HADOW KV with a state-of-
+428   the-art efficient pre-filling method MInference (Jiang et al., 2024). As shown in Table 3, following
+429   the setting of MInference, we tested it on RULER with contexts scaling from 8K to 256K. This
+430   demonstrates that our method is compatible with pre-filling acceleration techniques. For some cer-
+431   tain context length settings, we even see a slight performance improvement.
+
+
+                                                        8
+      Under review as a conference paper at ICLR 2025
+
+
+432   Table 3: Performance of different methods on RULER (Hsieh et al., 2024) using MInference (Jiang
+433   et al., 2024) in the pre-filling stage. S HADOW KV is compatible with MInference.
+434
+435      Methods                                8K       16K      32K       64K                             128K            256K               Avg.
+436
+         Llama-3-8B-1M w/ MInference           89.92    88.02     82.81    78.45                            78.12           74.57             81.98
+437
+         S HADOW KV w/ MInference              90.47    88.12     83.28    77.71                            78.32           74.31             82.04
+438
+439
+440                                                                                                         1.0
+      Multi-turn Conversation Capability. To simulate multi-turn con-
+441                                                                                                         0.8
+      versations, we challenged S HADOW KV with a multi-turn needle
+
+
+                                                                                   Accuracy on Multi-NIAH
+442   retrieval task (Multi-turn NIAH). We also test two eviction-based                                     0.6                               Full Attention
+                                                                                                                                              SnapKV
+443   methods in Figure 7, including SnapKV (Li et al., 2024) and                                                                             StreamingLLM
+                                                                                                            0.4                               ShadowKV (Ours)
+444   StreamingLLM (Xiao et al., 2023b). The performance of SnapKV
+                                                                                                            0.2
+445   drops significantly from the second round due to the required con-
+      text information being different from the first round. Since SnapKV                                   0.0
+446
+                                                                                                                  #1   #2   #3      #4 #5 #6         #7    #8
+447   inevitably evicted tokens based on the first-turn conversation, it can-                                                    Conversation Turn
+
+448   not successfully retrieve related information for future queries. In
+      contrast, S HADOW KV can maintain accuracy in the multi-turn con-                  Figure 7: Multi-turn NIAH.
+449
+450
+      versation setting.
+451
+452   5.2   E FFICIENCY E VALUATION
+453
+      To demonstrate the efficiency of S HADOW KV, we deploy it into real-world large batch serving
+454
+      scenarios. By measuring the throughput during decoding across different models on A100, we show
+455
+      that S HADOW KV can support up to 6× larger batch sizes and boost throughput by up to 3.04×. The
+456   detailed latency breakdown can be found in Appendix A.6.
+457
+458   Baselines. The baseline selects the largest batch size that can fit entirely on the GPU with full
+459   attention. We also include results for the same batch size of S HADOW KV and the infinite batch size,
+460
+      assuming infinite GPU memory capabilities5 . We set the sparse budget to 1.56% for S HADOW KV.
+461   Results. As shown in Table 4, S HADOW KV demonstrates significant throughput improvements
+462   for various models on an A100, surpassing even those with infinite GPU memory. Notably, S HAD -
+463   OW KV supports batch sizes up to 6× larger and enhances throughput by up to 3.04× compared to
+464   full attention, even surpassing infinite batch size assuming infinite GPU memory. While the gains
+465   for GLM-4-9B-1M and Yi-9B-200K are slightly lower, the improvements still reach up to 2.56×
+466   and 2.66× respectively, highlighting S HADOW KV’s adaptability even with fewer KV heads.
+467
+468
+      Table 4: Generation throughput (tokens/s) on an A100. The gray text in brackets denotes batch size.
+469
+470    Model                Context    Full Attention    S HADOW KV        Gain                                         Full Attention (Inf)
+471    Llama-3-8B-1M           60K         160.62 (8)      455.14 (48)     2.83×                            168.72 (48) / 273.07 (Inf)
+472    (8 KV heads)           122K          80.77 (4)      239.51 (24)     2.97×                             83.05 (24) / 134.30 (Inf)
+473                           244K          40.37 (2)      119.01 (12)     2.95×                              52.00 (12) / 67.15 (Inf)
+474    Llama-3.1-8B            60K         160.93 (8)      472.77 (48)     2.94×                            168.72 (48) / 273.07 (Inf)
+475    (8 KV heads)           122K          80.78 (4)      245.90 (24)     3.04×                             83.05 (24) / 134.30 (Inf)
+476
+       GLM-4-9B-1M             60K        241.05 (12)      615.89 (50)     2.56×                            266.24 (50) / 436.91 (Inf)
+477
+       (4 KV heads)           122K         122.67 (6)      293.40 (25)     2.39×                            158.83 (25) / 214.87 (Inf)
+478                           244K          61.13 (3)      136.51 (12)     2.23×                             78.84 (12) / 107.44 (Inf)
+479
+480
+       Yi-9B-200K              60K        204.81 (10)      544.36 (42)     2.66×                            271.21 (42) / 364.09 (Inf)
+       (4 KV heads)           122K         101.44 (5)      260.03 (21)     2.56×                            133.53 (21) / 179.06 (Inf)
+481
+                              244K          46.74 (2)      118.55 (10)     2.54×                              65.79 (10) / 89.53 (Inf)
+482
+483
+484      5
+           For the equivalent S HADOW KV batch size, we evaluate a single Transformer block with FlashAttention
+485   and then project the number to the entire model. For the infinite batch size, we leverage A100’s theoretical
+      memory bandwidth (2 TB/s) for attention computations.
+
+
+                                                           9
+      Under review as a conference paper at ICLR 2025
+
+
+486                                           Multi-keys NIAH, Llama-3-8B-1M
+                                                                                                         0.9
+                                                                                                                                              Multi-keys NIAH, GLM-4-9B-1M                                              QA, Llama-3-8B-1M                                                                           QA, GLM-4-9B-1M
+                                   1.0                                                                                                                                                               0.75                                                                                       0.70
+487                                0.9
+                                                                                                         0.8
+                                                                                                                                                                                                     0.70                                                                                       0.65
+                                                                                                         0.7
+488         Accuracy
+                                   0.8                                                                                                                                                               0.65                                                                                       0.60
+
+
+                                                                                              Accuracy
+
+
+                                                                                                                                                                                          Accuracy
+
+
+                                                                                                                                                                                                                                                                                     Accuracy
+                                                                                                         0.6
+                                   0.7                                                                                                                                                               0.60                                                                                       0.55
+489                                                                                                      0.5
+                                   0.6                                                                                                                                                               0.55                                                                                       0.50
+                                                  Full (128K)                                            0.4                                    Full (128K)                                                          Full (128K)                                                                               Full (128K)
+490                                0.5            Quest                                                                                         Quest                                                0.50            Quest                                                                      0.45           Quest
+                                                  ShadowKV                                               0.3                                    ShadowKV                                                             ShadowKV                                                                                  ShadowKV
+491                                0.4                                                                                                                                                               0.45                                                                                       0.40
+                                         100 3.12 2.73 2.34 1.95 1.56 1.17 0.78 0.39 0.20                       100 3.12 2.73 2.34 1.95 1.56 1.17 0.78 0.39 0.20                                            100 3.12 2.73 2.34 1.95 1.56 1.17 0.78 0.39 0.20                                           100 3.12 2.73 2.34 1.95 1.56 1.17 0.78 0.39 0.20
+492                                            Sparse KV Cache Budget (%)                                                                      Sparse KV Cache Budget (%)                                         Sparse KV Cache Budget (%)                                                                Sparse KV Cache Budget (%)
+                                             Variable Tracking, Llama-3-8B-1M                                                                 Variable Tracking, GLM-4-9B-1M                                Frequent Words Extraction, Llama-3-8B-1M                                                   Frequent Words Extraction, GLM-4-9B-1M
+                                  0.86                                                                 0.98
+493                                                                                                                                                                                                0.750                                                                                        0.72
+                                  0.84                                                                 0.97
+494                                                                                                    0.96                                                                                        0.725                                                                                        0.70
+                                  0.82
+                                                                                                       0.95                                                                                        0.700
+                                  0.80
+      Accuracy
+
+
+                                                                                            Accuracy
+
+
+                                                                                                                                                                                        Accuracy
+
+
+                                                                                                                                                                                                                                                                                     Accuracy
+                                                                                                                                                                                                                                                                                                0.68
+495                               0.78                                                                 0.94                                                                                        0.675
+
+                                                                                                       0.93                                                                                        0.650                                                                                        0.66
+496                               0.76
+                                                  Full (128K)                                                                                   Full (128K)                                        0.625             Full (128K)                                                                               Full (128K)
+                                  0.74                                                                 0.92                                                                                                                                                                                     0.64
+                                                  Quest                                                                                         Quest                                              0.600             Quest                                                                                     Quest
+497                               0.72            ShadowKV                                             0.91
+                                                                                                                                                ShadowKV                                                             ShadowKV                                                                                  ShadowKV
+                                                                                                                                                                                                   0.575                                                                                        0.62
+                                                                                                       0.90
+498                                      100 3.12 2.73 2.34 1.95 1.56 1.17 0.78 0.39 0.20                       100 3.12 2.73 2.34 1.95 1.56 1.17 0.78 0.39 0.20                                            100 3.12 2.73 2.34 1.95 1.56 1.17 0.78 0.39 0.20                                           100 3.12 2.73 2.34 1.95 1.56 1.17 0.78 0.39 0.20
+                                                 Sparse KV Cache Budget (%)                                                                    Sparse KV Cache Budget (%)                                           Sparse KV Cache Budget (%)                                                                Sparse KV Cache Budget (%)
+499
+500                               Figure 8: Comparison results between the models with full cache, our S HADOW KV, and Quest.
+501
+502                                                                                                            1.0                                                                                                                                                         1.0
+                                                                                                                 Accuracy on RULER/NIAH-MK2
+
+
+                                                                                                                                                                   0.6
+                                  10                                                                                                                                                                                            10
+
+
+                                                                                                                                                                                                                                    Batch Size Scaling Factor
+      Batch Size Scaling Factor
+
+
+503                                                                                                            0.9                                                                                                                                                         0.8
+                                                                                                                                                                   0.5
+                                   8                                                                                                                                                                                            8
+                                                                                                                                                  Chunk Hit Rate
+
+
+                                                                                                               0.8
+504                                                                                                                                                                0.4                                                                                                     0.6
+
+
+                                                                                                                                                                                                                                                                Accuracy
+                                   6                                                                           0.7                                                                                                              6                                                                                             RULER/NIAH-S
+505                                                                                                                                                                0.3                                                                                                     0.4                                                RULER/NIAH-MK
+                                   4                                                                           0.6                                                 0.2                                                          4                                                                                             RULER/NIAH-MQ
+506                                                                                                                                                                                                                                                                        0.2                                                RULER/FWE
+                                   2                                                                           0.5                                                 0.1                                                          2
+                                                                                                                                                                                                                                                                                                                              RULER/QA
+507                                0                                                                           0.4                                                 0.0                                                          0                                          0.0
+                                             1      2       4    8 16             32        64                                                                           1   2   4       8 16                  32      64                                                        0          200             400      600            800        1000
+508                                                          Chunk Size                                                                                                              Chunk Size                                                                                                                   Rank
+509
+                                                                  (a)                                                                                                                  (b)                                                                                                                    (c)
+510
+511   Figure 9: (a) Impact of chunk size on batch size and accuracy. (b) Minimal effect of chunk size on
+512   hit rate. (c) Accuracy trends across different ranks with Llama-3-8B-1M on different tasks.
+513
+514    5.3                                   A BLATION R ESULTS
+515
+516
+      We present extensive ablation studies of S HADOW KV, focusing on three key points: (1) sparse
+      KV cache budget variations, (2) chunk size selections, and (3) pre-RoPE key cache rank choices.
+517
+      Additional ablations, including precision sensitivity analysis and the effectiveness of outliers, are
+518
+      provided in Appendix A.
+519
+520   Sparse KV Cache Budget. We examine S HADOW KV’s performance across various tasks with
+521   different sparse budgets, as illustrated in Figure 8. S HADOW KV consistently surpasses Quest under
+522   the same sparse budgets and achieves higher throughput. On most tasks, it maintains accuracy with
+523   just a 1.56% sparse budget compared to full attention and even improves slightly on some tasks.
+524
+      Chunk Size. As shown in Figure 9a, increasing the chunk size allows for larger batch sizes. How-
+525   ever, accuracy declines when the chunk size exceeds eight. Meanwhile, the chunk size choice has
+526   minimal impact on the chunk hit rate, which remains around 60%, as illustrated in Figure 9b.
+527
+528   Rank of Pre-RoPE Keys. We assess S HADOW KV’s performance across various tasks using dif-
+529
+      ferent ranks for pre-RoPE keys. As illustrated in Figure 9c, accuracy increases with the rank up
+      to approximately 160, after which it stabilizes near full-rank performance. Interestingly, the trends
+530
+      vary across tasks, and in some cases, low-rank approximations achieve better performance.
+531
+532
+       6                                  C ONCLUSION
+533
+534   We present S HADOW KV, a high-throughput inference system for long-context LLM inference.
+535   S HADOW KV optimizes GPU memory usage through the low-rank key cache and offloaded value
+536   cache, allowing for larger batch sizes. It reduces decoding overhead by accurate sparse attention,
+537   boosting throughput while maintaining accuracy. Our empirical experiments demonstrate S HAD -
+538   OW KV can support up to 6× larger batch sizes and enhance throughput by up to 3.04× on an A100
+539   across various long-context models, including Llama-3.1-8B, Llama-3-8B-1M, GLM-4-9B-1M, and
+      Yi-9B-200K. S HADOW KV holds great promise for improving long-context LLM inference.
+
+
+                                                                                                                                                                                       10
+      Under review as a conference paper at ICLR 2025
+
+
+540
+      R EFERENCES
+541
+542   Marah Abdin, Sam Ade Jacobs, Ammar Ahmad Awan, Jyoti Aneja, Ahmed Awadallah, Hany
+543    Awadalla, Nguyen Bach, Amit Bahree, Arash Bakhtiari, Harkirat Behl, et al. Phi-3 technical re-
+544    port: A highly capable language model locally on your phone. arXiv preprint arXiv:2404.14219,
+545
+       2024.
+546   Josh Achiam, Steven Adler, Sandhini Agarwal, Lama Ahmad, Ilge Akkaya, Florencia Leoni Ale-
+547     man, Diogo Almeida, Janko Altenschmidt, Sam Altman, Shyamal Anadkat, et al. Gpt-4 technical
+548     report. arXiv preprint arXiv:2303.08774, 2023.
+549
+550   01. AI, :, Alex Young, Bei Chen, Chao Li, Chengen Huang, Ge Zhang, Guanwei Zhang, Heng
+551     Li, Jiangcheng Zhu, Jianqun Chen, Jing Chang, Kaidong Yu, Peng Liu, Qiang Liu, Shawn Yue,
+552
+        Senbin Yang, Shiming Yang, Tao Yu, Wen Xie, Wenhao Huang, Xiaohui Hu, Xiaoyi Ren, Xinyao
+        Niu, Pengcheng Nie, Yuchi Xu, Yudong Liu, Yue Wang, Yuxuan Cai, Zhenyu Gu, Zhiyuan Liu,
+553
+        and Zonghong Dai. Yi: Open foundation models by 01.ai, 2024.
+554
+555   Yushi Bai, Xin Lv, Jiajie Zhang, Hongchang Lyu, Jiankai Tang, Zhidian Huang, Zhengxiao Du,
+556     Xiao Liu, Aohan Zeng, Lei Hou, Yuxiao Dong, Jie Tang, and Juanzi Li. Longbench: A bilingual,
+557     multitask benchmark for long context understanding. arXiv preprint arXiv:2308.14508, 2023.
+558
+559
+      Chi-Chih Chang, Wei-Cheng Lin, Chien-Yu Lin, Chong-Yan Chen, Yu-Fang Hu, Pei-Shuo Wang,
+        Ning-Chi Huang, Luis Ceze, and Kai-Chiang Wu. Palu: Compressing kv-cache with low-rank
+560
+        projection. arXiv preprint arXiv:2407.21118, 2024.
+561
+562   Tri Dao. Flashattention-2: Faster attention with better parallelism and work partitioning. arXiv
+563     preprint arXiv:2307.08691, 2023.
+564
+565   Tri Dao, Dan Fu, Stefano Ermon, Atri Rudra, and Christopher Ré. Flashattention: Fast and memory-
+566
+        efficient exact attention with io-awareness. Advances in Neural Information Processing Systems,
+        35:16344–16359, 2022.
+567
+568   DeepSeek-AI. Deepseek-v2: A strong, economical, and efficient mixture-of-experts language
+569     model, 2024.
+570
+571   Harry Dong, Beidi Chen, and Yuejie Chi. Prompt-prompted adaptive structured pruning for efficient
+572     llm generation. In First Conference on Language Modeling, 2024a.
+573
+      Harry Dong, Xinyu Yang, Zhenyu Zhang, Zhangyang Wang, Yuejie Chi, and Beidi Chen. Get more
+574     with less: Synthesizing recurrence with kv cache compression for efficient llm inference. arXiv
+575     preprint arXiv:2402.09398, 2024b.
+576
+577   Leo Gao, Stella Biderman, Sid Black, Laurence Golding, Travis Hoppe, Charles Foster, Jason
+578     Phang, Horace He, Anish Thite, Noa Nabeshima, et al. The pile: An 800gb dataset of diverse text
+579     for language modeling. arXiv preprint arXiv:2101.00027, 2020.
+580
+      Suyu Ge, Yunan Zhang, Liyuan Liu, Minjia Zhang, Jiawei Han, and Jianfeng Gao. Model tells
+581     you what to discard: Adaptive kv cache compression for llms. arXiv preprint arXiv:2310.01801,
+582     2023.
+583
+584   Team GLM, Aohan Zeng, Bin Xu, Bowen Wang, Chenhui Zhang, Da Yin, Diego Rojas, Guanyu
+585     Feng, Hanlin Zhao, Hanyu Lai, Hao Yu, Hongning Wang, Jiadai Sun, Jiajie Zhang, Jiale Cheng,
+586     Jiayi Gui, Jie Tang, Jing Zhang, Juanzi Li, Lei Zhao, Lindong Wu, Lucen Zhong, Mingdao Liu,
+587
+        Minlie Huang, Peng Zhang, Qinkai Zheng, Rui Lu, Shuaiqi Duan, Shudan Zhang, Shulin Cao,
+        Shuxun Yang, Weng Lam Tam, Wenyi Zhao, Xiao Liu, Xiao Xia, Xiaohan Zhang, Xiaotao Gu,
+588
+        Xin Lv, Xinghan Liu, Xinyi Liu, Xinyue Yang, Xixuan Song, Xunkai Zhang, Yifan An, Yifan
+589
+        Xu, Yilin Niu, Yuantao Yang, Yueyan Li, Yushi Bai, Yuxiao Dong, Zehan Qi, Zhaoyu Wang,
+590     Zhen Yang, Zhengxiao Du, Zhenyu Hou, and Zihan Wang. Chatglm: A family of large language
+591     models from glm-130b to glm-4 all tools, 2024.
+592
+593   Gradient. Llama-3-8b-instruct gradient 4194k (v0.1), 2024. URL https://huggingface.
+        co/gradientai/Llama-3-8B-Instruct-Gradient-1048k.
+
+
+                                                     11
+      Under review as a conference paper at ICLR 2025
+
+
+594
+      Jiaao He and Jidong Zhai. Fastdecode: High-throughput gpu-efficient llm serving using heteroge-
+595      neous pipelines. arXiv preprint arXiv:2403.11421, 2024.
+596
+597   Ke Hong, Guohao Dai, Jiaming Xu, Qiuli Mao, Xiuhong Li, Jun Liu, Kangdi Chen, Hanyu Dong,
+598     and Yu Wang. Flashdecoding++: Faster large language model inference on gpus. arXiv preprint
+599     arXiv:2311.01282, 2023.
+600   Coleman Hooper, Sehoon Kim, Hiva Mohammadzadeh, Michael W Mahoney, Yakun Sophia Shao,
+601     Kurt Keutzer, and Amir Gholami. Kvquant: Towards 10 million context length llm inference with
+602     kv cache quantization. arXiv preprint arXiv:2401.18079, 2024.
+603
+604   Cheng-Ping Hsieh, Simeng Sun, Samuel Kriman, Shantanu Acharya, Dima Rekesh, Fei Jia, Yang
+605
+        Zhang, and Boris Ginsburg. Ruler: What’s the real context size of your long-context language
+        models? arXiv preprint arXiv:2404.06654, 2024.
+606
+607   Huiqiang Jiang, Yucheng Li, Chengruidong Zhang, Qianhui Wu, Xufang Luo, Surin Ahn, Zhenhua
+608     Han, Amir H Abdi, Dongsheng Li, Chin-Yew Lin, et al. Minference 1.0: Accelerating pre-filling
+609     for long-context llms via dynamic sparse attention. arXiv preprint arXiv:2407.02490, 2024.
+610
+      Jordan Juravsky, Bradley Brown, Ryan Ehrlich, Daniel Y Fu, Christopher Ré, and Azalia
+611
+        Mirhoseini. Hydragen: High-throughput llm inference with shared prefixes. arXiv preprint
+612
+        arXiv:2402.05099, 2024.
+613
+614   Greg Kamradt. Needle in a haystack - pressure testing llms. 2023.
+615
+      Woosuk Kwon, Zhuohan Li, Siyuan Zhuang, Ying Sheng, Lianmin Zheng, Cody Hao Yu, Joseph
+616
+       Gonzalez, Hao Zhang, and Ion Stoica. Efficient memory management for large language model
+617    serving with pagedattention. In Proceedings of the 29th Symposium on Operating Systems Prin-
+618    ciples, pp. 611–626, 2023.
+619
+620   Wonbeom Lee, Jungi Lee, Junghwan Seo, and Jaewoong Sim. InfiniGen: Efficient generative infer-
+621    ence of large language models with dynamic kv cache management. In 18th USENIX Symposium
+622
+       on Operating Systems Design and Implementation (OSDI 24), 2024a.
+623   Wonbeom Lee, Jungi Lee, Junghwan Seo, and Jaewoong Sim. {InfiniGen}: Efficient generative
+624    inference of large language models with dynamic {KV} cache management. In 18th USENIX
+625    Symposium on Operating Systems Design and Implementation (OSDI 24), pp. 155–172, 2024b.
+626
+627
+      Yaniv Leviathan, Matan Kalman, and Yossi Matias. Fast inference from transformers via speculative
+        decoding. In International Conference on Machine Learning, pp. 19274–19286. PMLR, 2023.
+628
+629   Yucheng Li, Bo Dong, Chenghua Lin, and Frank Guerin. Compressing context to enhance inference
+630     efficiency of large language models. arXiv preprint arXiv:2310.06201, 2023.
+631
+632
+      Yuhong Li, Yingbing Huang, Bowen Yang, Bharat Venkitesh, Acyr Locatelli, Hanchen Ye, Tianle
+        Cai, Patrick Lewis, and Deming Chen. Snapkv: Llm knows what you are looking for before
+633
+        generation. arXiv preprint arXiv:2404.14469, 2024.
+634
+635   Hao Liu, Wilson Yan, Matei Zaharia, and Pieter Abbeel. World model on million-length video and
+636     language with ringattention. arXiv preprint arXiv:2402.08268, 2024a.
+637
+      Zichang Liu, Aditya Desai, Fangshuo Liao, Weitao Wang, Victor Xie, Zhaozhuo Xu, Anastasios
+638
+        Kyrillidis, and Anshumali Shrivastava. Scissorhands: Exploiting the persistence of importance
+639
+        hypothesis for llm kv cache compression at test time. Advances in Neural Information Processing
+640     Systems, 36, 2024b.
+641
+642   Zirui Liu, Jiayi Yuan, Hongye Jin, Shaochen Zhong, Zhaozhuo Xu, Vladimir Braverman, Beidi
+643     Chen, and Xia Hu. Kivi: A tuning-free asymmetric 2bit quantization for kv cache. arXiv preprint
+644     arXiv:2402.02750, 2024c.
+645   Meta AI.  Introducing Llama 3.1, 2024.               URL https://ai.meta.com/blog/
+646    meta-llama-3-1/. Accessed: 2024-08-21.
+647
+      Microsoft. Microsoft bingchat, 2024. URL https://www.bing.com/chat.
+
+
+                                                     12
+      Under review as a conference paper at ICLR 2025
+
+
+648
+      Adam Paszke, Sam Gross, Francisco Massa, Adam Lerer, James Bradbury, Gregory Chanan, Trevor
+649     Killeen, Zeming Lin, Natalia Gimelshein, Luca Antiga, et al. Pytorch: An imperative style, high-
+650     performance deep learning library. Advances in neural information processing systems, 32, 2019.
+651
+652   QwenTeam. Qwen2.5: A party of foundation models, September 2024. URL https://qwenlm.
+653    github.io/blog/qwen2.5/.
+654
+      Jack W Rae, Anna Potapenko, Siddhant M Jayakumar, and Timothy P Lillicrap. Compressive
+655     transformers for long-range sequence modelling. arXiv preprint arXiv:1911.05507, 2019.
+656
+657   Luka Ribar, Ivan Chelombiev, Luke Hudlass-Galley, Charlie Blake, Carlo Luschi, and Douglas Orr.
+658     Sparq attention: Bandwidth-efficient llm inference. arXiv preprint arXiv:2312.04985, 2023.
+659
+      Ying Sheng, Lianmin Zheng, Binhang Yuan, Zhuohan Li, Max Ryabinin, Beidi Chen, Percy Liang,
+660
+        Christopher Ré, Ion Stoica, and Ce Zhang. Flexgen: High-throughput generative inference of
+661     large language models with a single gpu. In International Conference on Machine Learning, pp.
+662     31094–31116. PMLR, 2023.
+663
+664   Prajwal Singhania, Siddharth Singh, Shwai He, Soheil Feizi, and Abhinav Bhatele. Loki: Low-rank
+665     keys for efficient sparse attention. arXiv preprint arXiv:2406.02542, 2024.
+666
+      Zezheng Song, Jiaxin Yuan, and Haizhao Yang. Fmint: Bridging human designed and data pre-
+667     trained models for differential equation foundation model. arXiv preprint arXiv:2404.14688,
+668     2024.
+669
+670   Jianlin Su, Murtadha Ahmed, Yu Lu, Shengfeng Pan, Wen Bo, and Yunfeng Liu. Roformer: En-
+671      hanced transformer with rotary position embedding. Neurocomputing, 568:127063, 2024.
+672   Hanshi Sun, Zhuoming Chen, Xinyu Yang, Yuandong Tian, and Beidi Chen. Triforce: Lossless
+673     acceleration of long sequence generation with hierarchical speculative decoding. arXiv preprint
+674     arXiv:2404.11912, 2024.
+675
+676   Hanlin Tang, Yang Lin, Jing Lin, Qingsen Han, Shikuan Hong, Yiwu Yao, and Gongyi Wang.
+677     Razorattention: Efficient kv cache compression through retrieval heads. arXiv preprint
+678
+        arXiv:2407.15891, 2024a.
+679   Jiaming Tang, Yilong Zhao, Kan Zhu, Guangxuan Xiao, Baris Kasikci, and Song Han. Quest:
+680      Query-aware sparsity for efficient long-context llm inference. arXiv preprint arXiv:2406.10774,
+681      2024b.
+682
+683   Gemini Team, Rohan Anil, Sebastian Borgeaud, Yonghui Wu, Jean-Baptiste Alayrac, Jiahui Yu,
+684
+        Radu Soricut, Johan Schalkwyk, Andrew M Dai, Anja Hauth, et al. Gemini: a family of highly
+        capable multimodal models. arXiv preprint arXiv:2312.11805, 2023.
+685
+686   Vijay Thakkar, Pradeep Ramani, Cris Cecka, Aniket Shivam, Honghao Lu, Ethan Yan, Jack Kosa-
+687     ian, Mark Hoemmen, Haicheng Wu, Andrew Kerr, Matt Nicely, Duane Merrill, Dustyn Blasig,
+688     Fengqi Qiao, Piotr Majcher, Paul Springer, Markus Hohnerbach, Jin Wang, and Manish Gupta.
+689     CUTLASS, January 2023. URL https://github.com/NVIDIA/cutlass.
+690
+      Haixin Wang, Xinlong Yang, Jianlong Chang, Dian Jin, Jinan Sun, Shikun Zhang, Xiao Luo, and
+691
+        Qi Tian. Parameter-efficient tuning of large-scale multimodal foundation model. Advances in
+692     Neural Information Processing Systems, 36, 2024a.
+693
+694   Minzheng Wang, Longze Chen, Cheng Fu, Shengyi Liao, Xinghua Zhang, Bingli Wu, Haiyang Yu,
+695    Nan Xu, Lei Zhang, Run Luo, et al. Leave no document behind: Benchmarking long-context llms
+696    with extended multi-doc qa. arXiv preprint arXiv:2406.17419, 2024b.
+697
+      T Wolf. Huggingface’s transformers: State-of-the-art natural language processing. arXiv preprint
+698     arXiv:1910.03771, 2019.
+699
+700   Guangxuan Xiao, Ji Lin, Mickael Seznec, Hao Wu, Julien Demouth, and Song Han. Smoothquant:
+701     Accurate and efficient post-training quantization for large language models. In International
+        Conference on Machine Learning, pp. 38087–38099. PMLR, 2023a.
+
+
+                                                     13
+      Under review as a conference paper at ICLR 2025
+
+
+702
+      Guangxuan Xiao, Yuandong Tian, Beidi Chen, Song Han, and Mike Lewis. Efficient streaming
+703     language models with attention sinks. In The Twelfth International Conference on Learning Rep-
+704     resentations, 2023b.
+705
+706   Yuhui Xu, Zhanming Jie, Hanze Dong, Lei Wang, Xudong Lu, Aojun Zhou, Amrita Saha, Caiming
+707     Xiong, and Doyen Sahoo. Think: Thinner key cache by query-driven pruning. arXiv preprint
+708
+        arXiv:2407.21018, 2024.
+709   An Yang, Baosong Yang, Binyuan Hui, Bo Zheng, Bowen Yu, Chang Zhou, Chengpeng Li,
+710     Chengyuan Li, Dayiheng Liu, Fei Huang, et al. Qwen2 technical report. arXiv preprint
+711     arXiv:2407.10671, 2024a.
+712
+713
+      June Yong Yang, Byeongwook Kim, Jeongin Bae, Beomseok Kwon, Gunho Park, Eunho Yang,
+        Se Jung Kwon, and Dongsoo Lee. No token left behind: Reliable kv cache compression via
+714
+        importance-aware mixed precision quantization. arXiv preprint arXiv:2402.18096, 2024b.
+715
+716   Zihao Ye, Ruihang Lai, Bo-Ru Lu, Lin Chien-Yu, Size Zheng, Lequn Chen, Tianqi Chen, and
+717     Luis Ceze. Cascade inference: Memory bandwidth efficient shared prefix batch decoding,
+718     2024. URL https://flashinfer.ai/2024/02/02/cascade-inference.html.
+719     Accessed: 2024-09-25.
+720
+      Yixiao Yuan, Yangchen Huang, Yu Ma, Xinjin Li, Zhenglin Li, Yiming Shi, and Huapeng Zhou.
+721     Rhyme-aware chinese lyric generator based on gpt. arXiv preprint arXiv:2408.10130, 2024.
+722
+723   Yuxuan Yue, Zhihang Yuan, Haojie Duanmu, Sifan Zhou, Jianlong Wu, and Liqiang Nie. Wkvquant:
+724     Quantizing weight and key/value cache for large language models gains more. arXiv preprint
+725     arXiv:2402.12065, 2024.
+726   Hailin Zhang, Xiaodong Ji, Yilin Chen, Fangcheng Fu, Xupeng Miao, Xiaonan Nie, Weipeng Chen,
+727     and Bin Cui. Pqcache: Product quantization-based kvcache for long context llm inference. arXiv
+728     preprint arXiv:2407.12820, 2024a.
+729
+730   Xinrong Zhang, Yingfa Chen, Shengding Hu, Zihang Xu, Junhao Chen, Moo Khai Hao, Xu Han,
+731
+        Zhen Leng Thai, Shuo Wang, Zhiyuan Liu, and Maosong Sun. ∞bench: Extending long context
+        evaluation beyond 100k tokens, 2024b.
+732
+733   Yichi Zhang, Bofei Gao, Tianyu Liu, Keming Lu, Wayne Xiong, Yue Dong, Baobao Chang, Junjie
+734     Hu, Wen Xiao, et al. Pyramidkv: Dynamic kv cache compression based on pyramidal information
+735     funneling. arXiv preprint arXiv:2406.02069, 2024c.
+736
+      Zhenyu Zhang, Ying Sheng, Tianyi Zhou, Tianlong Chen, Lianmin Zheng, Ruisi Cai, Zhao Song,
+737
+        Yuandong Tian, Christopher Ré, Clark Barrett, et al. H2o: Heavy-hitter oracle for efficient gen-
+738
+        erative inference of large language models. Advances in Neural Information Processing Systems,
+739     36, 2024d.
+740
+741
+742
+743
+744
+745
+746
+747
+748
+749
+750
+751
+752
+753
+754
+755
+
+
+
+                                                      14
+      Under review as a conference paper at ICLR 2025
+
+
+756
+      A     A DDITIONAL E XPERIMENT R ESULTS
+757
+758
+      In this section, we present additional experiments experiments not covered in the main text, includ-
+759   ing the handling of newly generated tokens (as discussed in Section 4.1), scalability analysis for
+760   larger models and longer sequences (mentioned in Section 5.1), latency breakdown (mentioned in
+761   Section 5.2), additional ablation studies (referenced in Section 5.3), and etc.
+762
+763   A.1   H ANDLING OF N EWLY G ENERATED T OKENS
+764
+765   To address the handling of newly generated tokens, we project these tokens’ key cache into a low-
+766   rank space using the same projections applied during the prefilling phase. This approach preserves
+767   the benefits of reduced GPU memory usage, particularly for long output sequences.
+768   As shown in Table 5 and Table 6, we refer to this extension as S HADOW KV +. Our evaluation across
+769   various models demonstrates that S HADOW KV + effectively maintains accuracy while optimizing
+770   memory usage.
+771
+772   Table 5: Performance of S HADOW KV and S HADOW KV + across different models on RULER
+773   (Hsieh et al., 2024) evaluated at length of 128K.
+774
+775   Methods           N-S1     N-S2 N-MK1 N-MK2 N-MQ N-MV QA-1 QA-2                        VT FWE      Avg.
+776   Llama-3-8B-1M 100.00 100.00          98.96    98.96    98.96     95.57 75.00 48.96 78.54 71.85 86.68
+777   S HADOW KV    100.00 100.00          97.92    98.96    96.88     95.83 72.92 52.08 81.67 72.57 86.88
+778
+      S HADOW KV + 100.00 100.00           98.96   100.00    95.83     93.49 71.88 50.00 80.21 71.88 86.23
+779   GLM-4-9B-1M      100.00 100.00       94.79    87.50    99.74     93.75 67.71 55.21 97.29 72.22 86.82
+780   S HADOW KV       100.00 100.00       95.83    83.33    98.70     87.76 69.79 55.21 97.50 68.06 85.62
+      S HADOW KV +     100.00 100.00       95.83    85.42    98.17     85.16 69.79 56.25 97.92 67.71 85.63
+781
+782   Llama-3.1-8B     100.00 100.00     98.96      91.67    98.96     95.31 82.29 47.92 68.96 71.18 85.53
+783
+      S HADOW KV       100.00 100.00    100.00      83.33    97.92     92.19 81.25 48.96 67.08 64.93 83.57
+      S HADOW KV +     100.00 100.00    100.00      84.38    96.88     91.67 81.25 52.08 65.63 62.85 83.47
+784
+785   Yi-9B-200K       100.00 100.00       86.46    62.50    64.58     32.55 44.79 39.58 36.87 89.93 65.73
+      S HADOW KV       100.00 100.00       82.29    67.71    63.28     31.51 43.75 38.54 56.04 72.22 65.53
+786
+      S HADOW KV +     100.00 100.00       81.25    67.71    61.72     31.51 46.88 38.54 53.54 72.92 65.41
+787
+788
+789   Table 6: Performance of S HADOW KV and S HADOW KV + on different models with LongBench
+790   (Bai et al., 2023) samples exceeding 4K tokens.
+791
+792   Methods         NarratQA MultiFQA HotpotQA MuSiQue DuRead GovRep SAMSum PassRetr LCC Avg.
+793   Llama-3-8B-1M      18.98     41.84       36.79    21.47        31.93   34.18   35.96    81.50 56.07 39.86
+794   S HADOW KV         17.17     39.73       38.29    21.08        31.77   31.62   35.87    80.00 63.93 39.94
+795   S HADOW KV +       20.42     41.16       37.22    21.03        31.77   31.98   35.80    80.00 63.89 40.36
+796   GLM-4-9B-1M        25.44     51.09       58.67    39.61        32.04   29.97   40.31    99.00 58.02 48.24
+797   S HADOW KV         26.50     51.31       59.09    38.87        32.92   28.54   38.70    96.50 58.55 47.89
+798   S HADOW KV +       27.59     51.31       59.17    38.34        33.55   31.25   39.46    96.50 55.86 48.11
+799   Llama-3.1-8B       31.56     55.10       57.65    29.46        35.26   34.45   29.84   100.00 67.31 48.96
+800   S HADOW KV         30.93     55.20       57.32    29.13        31.85   32.79   30.40    99.50 66.03 48.13
+801   S HADOW KV +       32.25     54.29       57.75    28.37        31.07   32.89   28.73    98.75 67.59 47.97
+802   Yi-9B-200K         13.88     30.02       52.46    28.20        22.29   30.25   19.08    67.00 73.50 37.41
+803   S HADOW KV         12.44     30.82       52.43    27.73        20.79   29.83   20.73    64.00 72.89 36.85
+804   S HADOW KV +       14.08     30.94       51.16    27.00        19.50   29.34   21.16    66.00 73.47 36.96
+805
+806
+807
+808
+809
+
+
+
+                                                        15
+      Under review as a conference paper at ICLR 2025
+
+
+810
+      A.2   Q UANTITATIVE A NALYSIS OF GPU M EMORY S AVINGS
+811
+812   The GPU memory savings provided by S HADOW KV can be quantitatively analyzed as follows. Let
+813   each K or V vector have a size of M bytes, with a sequence length S, a chunk size C, a selected
+814   chunk budget K, O outliers, and a pre-RoPE key cache rank r. The GPU memory savings of
+815   S HADOW KV can then be expressed as:
+816                                                           2SM
+817
+                            Memory Savings =
+                                             SM/C + 2(K + O)C + Sr + rM
+818
+      For example, assuming M = 1024, C = 8, S = 128K, K = 256, O = 48, r = 160, the memory
+819   savings of S HADOW KV is calculated as 7.08×. This result demonstrates that S HADOW KV can
+820   theoretically reduce the KV cache memory footprint on the GPU by 7.08× for longer sequences and
+821   larger batch sizes.
+822
+823   A.3   ACCURACY R ESULTS FOR Y I -9B-200K
+824
+825   We present accuracy results for Yi-9B-200K (AI et al., 2024) on RULER (Hsieh et al., 2024) and
+826   LongBench (Bai et al., 2023), highlighting S HADOW KV’s superior performance across diverse tasks
+827   compared to other methods.
+828
+      Table 7: Performance of Yi-9B-200K with different methods on RULER (Hsieh et al., 2024) evalu-
+829
+      ated at length of 128K. S HADOW KV outperforms other methods with a 1.56% sparse budget.
+830
+831   Methods                N-S1    N-S2 N-MK1 N-MK2 N-MQ N-MV QA-1 QA-2                        VT FWE      Avg.
+832
+      Yi-9B-200K            100.00 100.00     86.46      62.50   64.58   32.55   44.79   39.58 36.87 89.93   65.73
+833
+      Loki                   34.38   2.08      2.08       0.00    0.00    0.52   22.92   21.88 0.00 25.00    10.89
+834   Loki (V only)          59.38 11.46      18.75       5.21    4.43    2.08   22.92   31.25 0.00 35.07    19.06
+835   InfiniGen             100.00 94.79      77.08       1.04   40.10   20.57   37.50   34.38 41.46 46.18   49.31
+836   InfiniGen (V only)    100.00 98.96      78.13       2.08   58.33   24.48   40.63   35.42 52.92 55.90   54.69
+837   Quest                 100.00 98.96      79.17      26.04   56.51   31.77   32.29   31.25 51.04 71.88   57.89
+      Quest (V only)        100.00 100.00     80.21      45.83   59.37   31.90   36.45   34.37 53.54 71.88   61.36
+838
+      S HADOW KV            100.00 100.00     82.29      67.71   63.28   31.51   43.75   38.54 56.04 72.22   65.53
+839
+840
+841
+      Table 8: Performance of Yi-9B-200K with LongBench (Bai et al., 2023) samples exceeding 4K
+842   tokens. S HADOW KV outperforms other methods and maintains the accuracy.
+843
+844   Methods              NarrQA MultiFQA HotpotQA MuSiQue DuRead GovRep SAMSum PassRetr LCC Avg.
+845
+      Yi-9B-200K             13.88    30.02      52.46      28.20    22.29   30.25       19.08   67.00 73.50 37.41
+846
+      Loki                    1.63     2.73      16.21       4.87     4.75    2.13        4.95    0.00 38.72 8.44
+847   Loki (V only)           1.96    10.39      21.31       7.36     6.78    9.15       10.02    4.00 58.75 14.41
+848   InfiniGen              10.01    23.61      50.47      25.91    15.11   27.96       18.97   30.00 56.46 28.72
+849   InfiniGen (V only)     11.31    26.46      51.13      26.77    16.09   28.67       19.33   34.00 62.07 30.65
+850   Quest                  10.57    25.83      46.06      23.04    17.09   17.11       20.59   50.50 67.70 30.94
+      Quest (V only)         14.56    25.73      48.73      24.73    18.44   20.83       20.08   57.50 71.13 33.53
+851
+      S HADOW KV             12.44    30.82      52.43      27.73    20.79   29.83       20.73   64.00 72.89 36.85
+852
+853
+854   A.4   P RECISION S ENSITIVITY
+855
+856   In the main experiments, we used BF16 for both model weights and KV cache. To further investi-
+857   gate the impact of precision on S HADOW KV’s performance, we conducted additional experiments
+858   using FP8 precision (torch.float8 e5m2). These tests aim to determine whether S HADOW KV
+859   can retain its accuracy at this lower precision, addressing concerns about precision sensitivity, par-
+860
+      ticularly in SVD computations.
+861   As detailed in Table 9 and Table 10, S HADOW KV and baseline methods were evaluated using FP8.
+862   Results show that S HADOW KV maintains accuracy and achieves consistently high performance
+863   even with FP8 precision. This robustness, despite FP8’s reduced numerical range, confirms that
+      S HADOW KV can continue to deliver efficiency gains without compromising accuracy.
+
+
+                                                           16
+      Under review as a conference paper at ICLR 2025
+
+
+864   Table 9: Performance comparison of S HADOW KV and baseline methods on the RULER (Hsieh
+865   et al., 2024) using FP8 precision, evaluated at a sequence length of 128K.
+866
+867   Methods            N-S1     N-S2 N-MK1 N-MK2 N-MQ N-MV QA-1 QA-2                                                           VT FWE            Avg.
+868
+      Llama-3-8B-1M     100.00 100.00       98.96    95.83      97.40                       95.57    63.54      48.96       75.83      73.26      84.94
+869   Loki                5.21   1.04        0.00     0.00       0.78                        0.26     5.21      13.54       28.33      28.82       8.32
+870   Loki (V only)      36.46   9.38       31.25     0.00       6.25                       21.09    11.46      15.63       57.08      35.76      22.44
+871   Quest             100.00 98.96        98.96    71.88      96.61                       93.49    63.54      45.83       78.13      67.01      81.44
+872   Quest (V only)    100.00 100.00       98.96    85.42      97.40                       93.49    70.83      48.96       78.13      65.63      83.88
+      S HADOW KV        100.00 100.00       97.92    94.79      95.31                       93.49    75.00      48.96       80.42      73.61      85.95
+873
+874
+875   Table 10: Evaluation of S HADOW KV and baseline methods on LongBench (Bai et al., 2023) with
+876   sequence lengths exceeding 4K tokens, using FP8 precision.
+877
+878   Methods          NarratQA MultiFQA HotpotQA MuSiQue DuRead GovRep SAMSum PassRetr LCC Avg.
+879   Llama-3-8B-1M       18.69     41.21       35.76      21.59        31.81                       33.77          35.29         80.50 56.77 39.49
+880   Loki                 2.21     11.12        5.70       1.84        15.42                       28.59          11.41         41.91 33.99 16.91
+881   Loki (V only)        2.68     22.33       12.69       3.35        21.43                       30.57          16.32         47.68 36.64 21.52
+      Quest               19.41     38.92       34.02      19.64        23.13                       26.40          28.04         78.50 49.81 35.32
+882
+      Quest (V only)      16.19     36.73       36.64      19.59        25.57                       29.46          27.14         79.50 60.05 36.76
+883   S HADOW KV          18.29     39.39       36.06      21.04        30.47                       31.87          35.56         78.50 62.11 39.25
+884
+885
+886
+      A.5   S CALABILITY A NALYSIS FOR L ARGER M ODELS AND L ONGER S EQUENCES
+887
+888                                                                                         Needle in A Haystack Llama-3-70B-Instruct-1M w/ ShadowKV     1.0
+      To demonstrate the scalability of S HADOW KV, we                                   10
+889                                                                                      20
+      present experiments with Llama-3-8B-1M on 1M con-                                  30
+                                                                                                                                                         0.8
+                                                                        Depth Percent (%)
+
+
+890   texts and Llama-3-70B-1M on 512K contexts, using                                   40
+                                                                                                                                                         0.6
+                                                                                         50
+891   the RULER benchmark (Hsieh et al., 2024). Addition-                                60
+                                                                                                                                                         0.4
+                                                                                         70
+892   ally, we evaluate Llama-3-70B-1M on the Needle In A                                80
+                                                                                                                                                         0.2
+893   Haystack dataset, testing context lengths ranging from                             90
+                                                                                        100
+      16K to 1M tokens.                                                                                                                                  0.0
+894
+                                                                                              16K
+                                                                                              87K
+                                                                                                 K
+                                                                                                 K
+                                                                                                 K
+                                                                                                 K
+                                                                                                 K
+                                                                                                 K
+                                                                                                 K
+                                                                                                 K
+                                                                                                 K
+                                                                                                 K
+                                                                                                 K
+                                                                                                 K
+                                                                                               1M
+                                                                                             157
+                                                                                             227
+                                                                                             297
+                                                                                             368
+                                                                                             438
+                                                                                             508
+                                                                                             578
+                                                                                             649
+                                                                                             719
+                                                                                             789
+                                                                                             859
+                                                                                             930
+895                                                                                                             Context Length
+      As shown in Figure 10 and Table 11, S HADOW KV
+896   maintains robust performance across increasing context       Figure 10: Needle In A Haystack.
+897   lengths and model sizes, demonstrating its scalability
+898   in handling large-scale inputs. This scalability allows S HADOW KV to process extensive contexts
+899   with high accuracy, making it a valuable solution for real-world applications requiring extensive
+900   sequences.
+901
+902   Table 11: Performance of different methods on RULER (Hsieh et al., 2024) evaluated at length of
+903   1M. The Llama-3-8B-1M is evaluated on 1M contexts while the Llama-3-70B-1M is evaluated on
+904   512K contexts.
+905
+906
+      Methods             N-S1    N-S2 N-MK1 N-MK2 N-MQ N-MV QA-1 QA-2                                                           VT FWE                Avg.
+907   Llama-3-70B-1M     100.00   82.29      90.63      54.17    85.16                       96.61     69.79      35.42      68.75      69.44          75.23
+908   Loki               100.00    1.04       0.00       0.00     0.00                        0.00     13.54      11.46      34.30      22.92          18.33
+      Loki (V only)      100.00   15.63      26.04       0.00     0.00                        0.00     25.00      19.79      40.00      31.94          25.84
+909
+      Quest              100.00   76.04      78.13      35.42    85.47                       92.19     53.21      34.38      38.33      58.33          65.15
+910   Quest (V only)     100.00   77.08      79.17      36.49    86.19                       95.31     54.17      36.58      47.70      58.68          67.14
+911   S HADOW KV         100.00   82.29      88.54      53.04    88.02                       94.79     67.71      37.50      68.54      68.25          74.87
+912
+      Llama-3-8B-1M       96.88 100.00       96.88      69.79    91.15                       85.68     64.58      42.71      25.00      56.25          72.89
+913   Loki                 9.38   1.04       10.42       0.00     2.60                        4.43     38.54      11.46       1.67       0.69           8.02
+914   Loki (V only)       68.75 29.17        60.42       1.04    26.56                       43.23     59.38      15.63       6.46       0.69          31.13
+915   Quest               94.79 92.71        80.21       4.17    76.30                       69.27     57.29      28.13      25.67      30.56          55.91
+916   Quest (V only)      94.79 93.75        81.25       4.17    79.69                       69.27     62.50      31.25      26.00      32.99          57.57
+      S HADOW KV          96.88 100.00       96.88      65.63    89.38                       83.16     69.79      42.71      26.04      59.38          72.98
+917
+
+
+
+                                                           17
+      Under review as a conference paper at ICLR 2025
+
+
+918
+      A.6    L ATENCY B REAKDOWN
+919
+920   We present a detailed latency breakdown in Table 12 and Table 13 to illustrate the efficiency of each
+921   operation under various context lengths for both the prefilling and decoding stages.
+922
+923   Scalability for Longer Sequences. As shown in Table 12, the overhead of SVD, reduce, cosine
+924   similarity, topK, and gather computing is very low and tends to decrease as the sequence scales,
+925   proving that S HADOW KV’s scalability to longer sequences.
+926
+927
+       Table 12: Latency breakdown (ms) of a Transformer block of Llama-3-8B-1M during prefilling.
+928
+929
+         Context     Attention      FFN      SVD       Reduce       CosineSimilarity    TopK       Gather    Cost
+930          64K       186.23     96.47     17.19         0.10                 1.41      0.08        0.01   6.65%
+931         128K       721.13    193.32     26.62         0.20                 2.77      0.14        0.02   3.25%
+            256K      2880.21    392.77     50.56         0.42                 6.11      0.11        0.03   1.75%
+932
+            512K     11720.30    789.23    108.38         0.84                12.19      0.15        0.06   0.97%
+933
+934
+935
+936
+      Overlapping Operations for Latency Reduction. In Table 13, we demonstrate how overlapping
+      the recomputation of the key cache with value cache fetching from the CPU significantly reduces de-
+937
+      coding latency. This concurrent processing approach ensures that S HADOW KV minimizes overhead
+938
+      when handling long-context models.
+939
+940    Table 13: Latency breakdown (ms) of a Transformer block of Llama-3-8B-1M during decoding.
+941
+942                    GEMM+                            Recompute K
+943
+          Context      Softmax     Max      TopK                           Fetch V     Attention     FFN     QKV
+                                                        (Overlapped)
+944       48×64K        0.56       0.07      0.14           1.25             1.84        0.23        0.33    0.05
+945      24×128K        0.58       0.07      0.15           1.36             1.66        0.21        0.29    0.05
+946      12×256K        0.65       0.07      0.16           1.49             1.75        0.19        0.25    0.05
+947       6×512K        0.71       0.07      0.17           1.51             1.69        0.18        0.23    0.05
+948
+949
+950   A.7    E FFICIENCY C OMPARISON WITH Q UEST
+951
+952   We present an efficiency comparison with Quest, particularly under long contexts or high batch
+953   sizes where the GPU memory alone cannot accommodate the KV cache. In such cases, both Full
+954   Attention and Quest must offload the KV cache to the CPU. As shown in Table 14, S HADOW KV
+955
+      significantly outperforms both Full Attention and Quest under the same sparse budget.
+956   The efficiency advantage of S HADOW KV over Quest is due to two key factors: (1) S HADOW KV
+957   only fetches the value cache from the CPU, rather than the entire KV pair, minimizing data transfer
+958   and reducing latency, and (2) S HADOW KV integrates a cache mechanism that leverages the temporal
+959   locality of the KV cache.
+960
+961
+                                   Table 14: Efficiency comparsion with Quest.
+962
+963
+             Context     Full Attention   Full Attention (CPU)       Quest    Quest (CPU)          S HADOW KV
+964           3×1M               OOM                0.21 tokens/s    OOM      9.34 tokens/s     45.32 tokens/s
+965
+966
+967
+968
+969
+970
+971
+
+
+
+                                                            18
+       Under review as a conference paper at ICLR 2025
+
+
+972
+       A.8   ACCURACY C ONTRIBUTION OF O UTLIER KV C ACHE
+973
+974    We conduct experiments using different numbers of outlier chunks for Llama-3-8B-1M on the
+975    RULER benchmark with 128K context length. As presented in Table 15, our findings indicate that
+976    outliers play a crucial role. For instance, the first chunk, a significant outlier, has previously been
+977    shown to act as an attention sink (Xiao et al., 2023b), underscoring its importance in maintaining
+978    model accuracy.
+979    The results demonstrate that increasing the number of outlier chunks has a positive impact on ac-
+980    curacy, especially in complex tasks. This indicates that even a small number of outliers can effec-
+981    tively capture essential information, reducing the need for full attention. Remarkably, with just 8
+982    outliers (0.049%), S HADOW KV outperforms the Quest baseline and nearly matches the accuracy
+983    achieved by full attention. However, when outliers are not adequately managed, the performance of
+984    the mean-based landmarks in S HADOW KV may fall below the min-max approach used by Quest,
+985    underscoring the importance of handling outliers properly.
+986
+       Table 15: Performance across different number of outlier chunks on RULER (Hsieh et al., 2024)
+987
+       evaluated at length of 128K.
+988
+989
+             # Outliers    N-S1     N-S2 N-MK1 N-MK2 N-MQ N-MV QA-1 QA-2                        VT FWE        Avg.
+990
+991        0 (0.000 %)    100.00   100.00   96.88   85.42     73.18   70.83   43.75   39.58   73.54   57.29   74.05
+           1 (0.006 %)    100.00   100.00   97.92   98.96     95.83   94.79   70.83   51.04   70.63   70.14   85.01
+992
+           2 (0.012 %)    100.00   100.00   97.92   98.96     95.57   95.57   70.83   51.04   72.08   70.49   85.25
+993        4 (0.024 %)    100.00   100.00   97.92   98.96     95.83   95.57   71.88   51.04   74.38   71.18   85.68
+994        8 (0.049 %)    100.00   100.00   97.92   98.96     95.57   95.05   72.92   51.04   78.13   72.57   86.22
+995       16 (0.098 %)    100.00   100.00   97.92   98.96     96.09   95.31   72.92   51.04   80.42   71.53   86.42
+996       32 (0.195 %)    100.00   100.00   97.92   98.96     96.35   95.57   72.92   52.08   81.25   72.22   86.73
+          48 (0.293 %)    100.00   100.00   97.92   98.96     96.88   95.83   72.92   52.08   81.67   72.57   86.88
+997
+998        Quest (Ref.) 100.00 100.00       98.96   77.08     97.65   93.49 60.42 50.00 77.08 65.63 82.03
+        Full Attn (Ref.) 100.00 100.00      98.96   98.96     98.96   95.57 75.00 48.96 78.54 71.85 86.68
+999
+1000
+1001
+       A.9   D ETAILED C OMPARISON WITH I NFINI G EN
+1002
+1003   We provide further clarification on the key distinctions and conduct additional experiments between
+1004   S HADOW KV and InfiniGen. These experiments show that S HADOW KV significantly outperforms
+1005   InfiniGen across a wide range of downstream tasks.
+1006
+1007   Differences in SVD Usage. Infinigen performs an offline SVD to get a projection matrix, which is
+1008   applied to post-RoPE key and query states for KV selection, while S HADOW KV applies an online,
+1009   prompt-dependent SVD directly to the pre-RoPE key cache for compression, not for KV selection.
+1010
+1011   Methodological Differences. While InfiniGen uses SVD for KV selection, it requires fetching
+1012   selected, exact KV pairs from the CPU. In contrast, S HADOW KV only fetches the value cache from
+1013   the CPU, reconstructing the key cache from its low-rank storage on the GPU. By overlapping these
+1014
+       processes, S HADOW KV reduces data-fetch overhead and achieves improved efficiency in KV cache
+       management.
+1015
+1016
+       Accuracy Comparison. To empirically validate S HADOW KV’s advantages, we conducted accu-
+1017
+       racy evaluations. Results confirm S HADOW KV’s effectiveness in maintaining accuracy while op-
+1018
+       timizing memory usage. Although InfiniGen performs well on simpler tasks like RULER-N-S1, it
+1019   shows significant accuracy drops on more complex tasks, such as RULER-N-MK2, RULER-FWE,
+1020   LongBench-LCC, and others, where S HADOW KV maintains consistently high accuracy.
+1021
+1022
+1023
+1024
+1025
+
+
+
+                                                         19
+       Under review as a conference paper at ICLR 2025
+
+
+1026
+       B     E XPERIMENT D ETAILS
+1027
+1028
+       In this section, our goal is to provide the details of the system implementation (mentioned in Sec-
+1029   tion 4.2), experiment settings, and additional experiments (mentioned in Section 5).
+1030
+1031
+       B.1   S YSTEM I MPLEMENTATION .
+1032
+1033   We implement the framework based on PyTorch (Paszke et al., 2019; Wolf, 2019) and dedicated
+1034   kernels (Thakkar et al., 2023). FlashAttention (Dao et al., 2022; Dao, 2023; Hong et al., 2023) is
+1035   used for attention computation and some efficient fused kernels in Flashinfer (Ye et al., 2024) and
+1036   vLLM (Kwon et al., 2023) are used, including layer norm. To reduce memory movement and kernel
+1037   launch overhead, we fuse some operations into CUDA kernels, including attention approximation,
+1038   key cache low-rank reconstruction, value cache fetching, cache mechanism, etc. We leverage multi-
+1039
+       streams to overlap the reconstruction of key cache and value cache fetching. We set the rank of
+       pre-RoPE key cache to 160, chunk size to 8, and sparse KV cache budget to 1.56% for most cases.
+1040
+1041
+1042
+       B.2   DATASET D ETAILS
+1043   LLMs are widely used in various fields (Li et al., 2023; Yuan et al., 2024; QwenTeam, 2024; Wang
+1044   et al., 2024a; Song et al., 2024), and we select three long-context benchmarks, detailed below.
+1045
+1046
+       • RULER (Hsieh et al., 2024) consists of 13 complex tasks and supports adjustable context lengths,
+         including retrieval, multi-hop tracking, aggregation, and QA tasks. For the test with MInference
+1047
+         (Jiang et al., 2024), we set up test sets scaling from 8K to 256K for evaluation.
+1048
+       • LongBench (Bai et al., 2023) is a challenging long-context benchmark that assesses the perfor-
+1049
+         mance of LLMs in extended contexts. Featuring Chinese and English languages, LongBench
+1050
+         encompasses 6 main categories and 21 diverse tasks, evaluating LLM capabilities across crucial
+1051     long-text applications like single-/multi-document QA, summarization, code completion, etc.
+1052
+       • Needle In A Haystack (Kamradt, 2023) is a long-context retrieval benchmark testing LLM’s per-
+1053     formance with context window scales up to 1M tokens where information placed at various posi-
+1054     tions. We tested the retrieval capabilities of six long-context LLMs based on their context length.
+1055
+1056   B.3   N EEDLE I N A H AYSTACK
+1057
+1058   In addition to the Needle In A Haystack results for Llama-3-8B-1M shown in Figure 6, we also
+1059   present results for GLM-4-9B-1M, Llama-3.1-8B, Yi-9B-200K, Phi-3-Mini-128K, and Qwen2-7B-
+1060   128K, shown in Figure 11. Compared to full attention, using S HADOW KV has minimal impact on
+1061   the ability to understand semantic information across different context windows and needle depths.
+1062   There is even a slight performance improvement for Yi-9B-200K.
+1063
+1064   B.4   I NFINITE B ENCH
+1065
+       InfiniteBench (Zhang et al., 2024b) is a challenging long-context benchmark that consists of 10
+1066
+       tasks, including QA, coding, dialogue, summarization, and retrieval, with an average length of 214K.
+1067
+1068             Table 16: Accuracy of different methods on InfiniteBench (Zhang et al., 2024b).
+1069
+1070   Methods         En.Sum En.QA En.MC En.Dia Zh.QA Code.Debug Math.Find Retr.PassKey Retr.Num
+1071
+       Llama-3-8B-1M 23.05      18.14   65.06   10.50 12.47     24.36       37.14      100.00      100.00
+1072   S HADOW KV    21.50      17.73   64.63   10.50 12.45     23.86       37.43      100.00      100.00
+1073
+       GLM-4-9B-1M      28.61    9.25   68.12   39.50 11.77     30.20       40.00      100.00      100.00
+1074
+       S HADOW KV       23.22    8.48   68.56   32.50 11.27     30.46       40.00      100.00      100.00
+1075
+1076   Llama-3.1-8B     26.42   14.48   66.38   16.00 12.92     21.07       34.00      100.00      99.66
+       S HADOW KV       24.23   13.83   66.38   16.50 12.76     21.07       34.00      100.00      94.41
+1077
+1078   Yi-9B-200K        8.88   10.61   61.57   5.50   13.88    21.57       23.71      100.00      99.66
+       S HADOW KV        8.92   10.06   59.39   6.00   13.89    20.56       24.29      100.00      99.83
+1079
+
+
+
+                                                        20
+       Under review as a conference paper at ICLR 2025
+
+
+1080
+1081
+1082                                 Needle in A Haystack GLM-4-9B-1M           1.0                            Needle in A Haystack GLM-4-9B-1M w/ ShadowKV           1.0
+                            0                                                                           0
+1083                       11                                                                          11
+                                                                                0.8                                                                                   0.8
+                           22                                                                          22
+          Depth Percent (%)
+
+
+                                                                                      Depth Percent (%)
+1084                       33                                                                          33
+                                                                                0.6                                                                                   0.6
+                           44                                                                          44
+1085                       56                                                                          56
+                                                                                0.4                                                                                   0.4
+1086                       67                                                                          67
+                           78                                                                          78
+                                                                                0.2                                                                                   0.2
+1087                       89                                                                          89
+                          100                                                                         100
+1088                                                                            0.0                                                                                   0.0
+                               16K
+                               87K
+                                  K
+                                  K
+                                  K
+                                  K
+                                  K
+                                  K
+                                  K
+                                  K
+                                  K
+                                  K
+                                  K
+                                  K
+                                1M
+
+
+                                                                                                           16K
+                                                                                                           87K
+                                                                                                              K
+                                                                                                              K
+                                                                                                              K
+                                                                                                              K
+                                                                                                              K
+                                                                                                              K
+                                                                                                              K
+                                                                                                              K
+                                                                                                              K
+                                                                                                              K
+                                                                                                              K
+                                                                                                              K
+                                                                                                            1M
+                              157
+                              227
+                              297
+                              368
+                              438
+                              508
+                              578
+                              649
+                              719
+                              789
+                              859
+                              930
+
+
+                                                                                                          157
+                                                                                                          227
+                                                                                                          297
+                                                                                                          368
+                                                                                                          438
+                                                                                                          508
+                                                                                                          578
+                                                                                                          649
+                                                                                                          719
+                                                                                                          789
+                                                                                                          859
+                                                                                                          930
+1089                                          Context Length                                                                   Context Length
+1090
+                                         (a) GLM-4-9B-1M                                                      (b) GLM-4-9B-1M w/ S HADOW KV
+1091                             Needle in A Haystack Llama-3.1-8B-Instruct                                 Needle in A Haystack Llama-3.1-8B-Instruct w/ ShadowKV
+                                                                                1.0                                                                                   1.0
+                            0                                                                           0
+1092                       11                                                                          11
+                                                                                0.8                                                                                   0.8
+                           22                                                                          22
+          Depth Percent (%)
+
+
+                                                                                      Depth Percent (%)
+1093
+                           33                                                                          33
+1094                                                                            0.6                                                                                   0.6
+                           44                                                                          44
+                           56                                                                          56
+1095                                                                            0.4                                                                                   0.4
+                           67                                                                          67
+1096                       78                                                                          78
+                                                                                0.2                                                                                   0.2
+                           89                                                                          89
+1097                      100                                                                         100
+                                                                                0.0                                                                                   0.0
+                               16K
+                               24K
+                               32K
+                               40K
+                               48K
+                               56K
+                               64K
+                               72K
+                               80K
+                               88K
+                               96K
+                                  K
+                                  K
+                                  K
+                                  K
+
+
+                                                                                                           16K
+                                                                                                           24K
+                                                                                                           32K
+                                                                                                           40K
+                                                                                                           48K
+                                                                                                           56K
+                                                                                                           64K
+                                                                                                           72K
+                                                                                                           80K
+                                                                                                           88K
+                                                                                                           96K
+                                                                                                              K
+                                                                                                              K
+                                                                                                              K
+                                                                                                              K
+1098
+                              104
+                              112
+                              120
+                              128
+
+
+                                                                                                          104
+                                                                                                          112
+                                                                                                          120
+                                                                                                          128
+                                              Context Length                                                                   Context Length
+1099
+1100                                (c) Llama-3.1-8B-Instruct                                             (d) Llama-3.1-8B-Instruct w/ S HADOW KV
+                                      Needle in A Haystack Yi-9B-200K           1.0                              Needle in A Haystack Yi-9B-200K w/ ShadowKV          1.0
+1101                        0                                                                           0
+                           11                                                                          11
+1102                       22
+                                                                                0.8
+                                                                                                       22
+                                                                                                                                                                      0.8
+          Depth Percent (%)
+
+
+                                                                                      Depth Percent (%)
+
+
+1103                       33                                                                          33
+                                                                                0.6                                                                                   0.6
+                           44                                                                          44
+1104                       56                                                                          56
+                                                                                0.4                                                                                   0.4
+                           67                                                                          67
+1105                       78                                                                          78
+                                                                                0.2                                                                                   0.2
+1106                       89                                                                          89
+                          100                                                                         100
+1107                                                                            0.0                                                                                   0.0
+                               16K
+                               29K
+                               43K
+                               56K
+                               69K
+                               82K
+                               95K
+                                  K
+                                  K
+                                  K
+                                  K
+                                  K
+                                  K
+                                  K
+                                  K
+
+
+                                                                                                           16K
+                                                                                                           29K
+                                                                                                           43K
+                                                                                                           56K
+                                                                                                           69K
+                                                                                                           82K
+                                                                                                           95K
+                                                                                                              K
+                                                                                                              K
+                                                                                                              K
+                                                                                                              K
+                                                                                                              K
+                                                                                                              K
+                                                                                                              K
+                                                                                                              K
+                              108
+                              121
+                              134
+                              148
+                              161
+                              174
+                              187
+                              200
+
+
+                                                                                                          108
+                                                                                                          121
+                                                                                                          134
+                                                                                                          148
+                                                                                                          161
+                                                                                                          174
+                                                                                                          187
+                                                                                                          200
+1108                                          Context Length                                                                   Context Length
+1109                                        (e) Yi-9B-200K                                                       (f) Yi-9B-200K w/ S HADOW KV
+1110                            Needle in A Haystack Phi-3-Mini-128K-Instruct   1.0                       Needle in A Haystack Phi-3-Mini-128K-Instruct w/ ShadowKV   1.0
+                            0                                                                           0
+1111                       11                                                                          11
+                                                                                0.8                                                                                   0.8
+                           22                                                                          22
+          Depth Percent (%)
+
+
+                                                                                      Depth Percent (%)
+
+
+1112                       33                                                                          33
+                                                                                0.6                                                                                   0.6
+1113                       44                                                                          44
+                           56                                                                          56
+1114                                                                            0.4                                                                                   0.4
+                           67                                                                          67
+                           78                                                                          78
+1115                       89
+                                                                                0.2
+                                                                                                       89
+                                                                                                                                                                      0.2
+1116                      100                                                                         100
+                                                                                0.0                                                                                   0.0
+                               16K
+                               24K
+                               32K
+                               40K
+                               48K
+                               56K
+                               64K
+                               72K
+                               80K
+                               88K
+                               96K
+                                  K
+                                  K
+                                  K
+                                  K
+
+
+                                                                                                           16K
+                                                                                                           24K
+                                                                                                           32K
+                                                                                                           40K
+                                                                                                           48K
+                                                                                                           56K
+                                                                                                           64K
+                                                                                                           72K
+                                                                                                           80K
+                                                                                                           88K
+                                                                                                           96K
+                                                                                                              K
+                                                                                                              K
+                                                                                                              K
+                                                                                                              K
+                              104
+                              112
+                              120
+                              128
+
+
+                                                                                                          104
+                                                                                                          112
+                                                                                                          120
+                                                                                                          128
+
+
+1117
+                                              Context Length                                                                   Context Length
+1118
+1119                                    (g) Phi-3-Mini-128K                                                  (h) Phi-3-Mini-128K w/ S HADOW KV
+                                  Needle in A Haystack Qwen2-7B-Instruct        1.0                          Needle in A Haystack Qwen2-7B-Instruct w/ ShadowKV       1.0
+1120                        0                                                                           0
+                           11                                                                          11
+1121                                                                            0.8                                                                                   0.8
+                           22                                                                          22
+          Depth Percent (%)
+
+
+                                                                                      Depth Percent (%)
+
+
+1122                       33                                                                          33
+                                                                                0.6                                                                                   0.6
+                           44                                                                          44
+1123                       56                                                                          56
+                                                                                0.4                                                                                   0.4
+                           67                                                                          67
+1124                       78                                                                          78
+                                                                                0.2                                                                                   0.2
+                           89                                                                          89
+1125                      100                                                                         100
+                                                                                0.0                                                                                   0.0
+1126
+                               16K
+                               24K
+                               32K
+                               40K
+                               48K
+                               56K
+                               64K
+                               72K
+                               80K
+                               88K
+                               96K
+                                  K
+                                  K
+                                  K
+                                  K
+
+
+                                                                                                           16K
+                                                                                                           24K
+                                                                                                           32K
+                                                                                                           40K
+                                                                                                           48K
+                                                                                                           56K
+                                                                                                           64K
+                                                                                                           72K
+                                                                                                           80K
+                                                                                                           88K
+                                                                                                           96K
+                                                                                                              K
+                                                                                                              K
+                                                                                                              K
+                                                                                                              K
+                              104
+                              112
+                              120
+                              128
+
+
+                                                                                                          104
+                                                                                                          112
+                                                                                                          120
+                                                                                                          128
+
+
+1127                                          Context Length                                                                   Context Length
+1128                                    (i) Qwen2-7B-128K                                                     (j) Qwen2-7B-128K w/ S HADOW KV
+1129
+1130   Figure 11: Needle In A Haystack (Kamradt, 2023) results using GLM-4-9B-1M (GLM et al., 2024),
+1131   Llama-3.1-8B-Instruct (Meta AI, 2024), Yi-9B-200K (AI et al., 2024), Phi-3-Mini-128K (Abdin
+1132   et al., 2024), and Qwen2-7B-128K (Yang et al., 2024a).
+1133
+
+
+
+                                                                                 21

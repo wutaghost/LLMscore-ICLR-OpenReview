@@ -1,0 +1,1417 @@
+Under review as a conference paper at ICLR 2025
+
+
+000
+001
+      R EVISITING P OSITIONAL I NFORMATION IN T RANS -
+002   FORMERS IN THE ERA OF F USED ATTENTION
+003
+004
+005    Anonymous authors
+006    Paper under double-blind review
+007
+008
+009                                                A BSTRACT
+010
+011            Imparting positional information has been a crucial component in Transformers
+012            due to attention’s invariance to permutation. Methods that bias attention weights,
+013            like Relative Positional Bias (RPB), have been preferred choice in more recent
+014            transformer-based architectures for vision. In parallel, fused attention has become
+015            the standard implementation for attention, largely thanks to open source solutions
+016            such as Flash Attention and FMHA. However, it is not trivial to fuse explicit biasing
+017            or masking of attention weights into a fused attention kernel without affecting its
+018
+               performance. In this scenario, position embeddings present themselves as a viable
+               replacement for attention weight biases. Position embeddings are applied to the
+019
+               tokens directly, decoupled from the attention mechanism, thereby sidestepping the
+020
+               problems that arise with attention weight biases in fused kernels. In this work,
+021            inspired by the booming LLM landscape, we analyze the applicability of Rotary
+022            Position Embeddings (RoPE) as a replacement for RPBs in vision models. Unlike
+023            RPB which explicitly biases attention weights, RoPE biases the dot product inputs
+024            (query and key) directly and ahead of the attention operation. We empirically show
+025            the prowess of RoPE over RPBs in terms of accuracy and speed. We study multiple
+026            implementations of RoPE and show that it is sufficient to use only a fraction
+027            of hidden dimensions for RoPE to achieve competitive performance. We also
+028            develop a fast implementation for Axial RoPE. Together with the most performant
+029
+               fused attention implementations, and our fast RoPE implementation, we observe
+               inference speedups compared to RPB with improved or similar accuracy. We
+030
+               foresee RoPE as a replacement for RPBs, paving the way for the widespread
+031
+               adoption of fused attention in transformer-based vision models.
+032
+033
+034   1    I NTRODUCTION
+035
+036   Self attention and transformers Vaswani et al. (2017) have proven to be powerful tools for learning
+037   from large amounts of unstructured data. The inception of Vision Transformers Dosovitskiy et al.
+038   (2021), or ViTs, further propelled the use of transformers for image and video modalities. ViT follows
+039   the isotropic architecture design of the Transformer, with a single downsampling step and identically
+040   shaped encoder layers. On the other hand, hierarchical vision transformers started to incorporate the
+041   CNN-like design Liu et al. (2021); Hassani et al. (2023); Hassani & Shi (2022); Ryali et al. (2023);
+042   Fan et al. (2021); Li et al. (2022), downsampling the token space gradually and increasing the number
+043   of attention heads. They also typically restrict their earlier attention layers to local or sparse patterns
+044
+      in order to avoid scaling issues resulting from performing global self attention.
+045   The widespread usage of attention in language and vision inspired the creation of fused attention
+046   implementations like Flash Attention Dao et al. (2022); Dao (2023) and FMHA Lefaudeux et al.
+047   (2022). These implementations are functionally equivalent to a BMM-style implementation in a
+048   deep learning framework like PyTorch Paszke et al. (2019), but provide significant improvements in
+049   performance and activation memory footprint by keeping attention weights in fast local memory and
+050
+      fusing the second half of the operation, instead of storing attention weights as an additional activation
+      to the relatively slower global memory, thereby reducing the number of expensive global memory
+051
+      accesses.
+052
+053   In all transformers, tokens are the smallest unit of representation. Since the attention mechanism is
+      invariant to the permutation of these tokens, additional positional biases are added to inject spatial
+
+
+                                                          1
+      Under review as a conference paper at ICLR 2025
+
+
+054
+055
+                                          2017 - 2022                                          2022 - Today
+056
+057                                                   Outputs
+
+058
+                                                       BMM
+059
+                                         Attn.                                                     Outputs
+060                                     weights
+
+                                                                                                                                         Bias
+061                                 Softmax
+                                                                               >6x            Fused Attention
+062                                                                                                                              ❌
+                                                                             FASTER   (FlashAttention, Triton, cuDNN, FusedNA)
+                                                                                                                                  Poor support
+
+063                                     QKT+B
+                SLOW
+                                                                                          Position
+064
+                                        Elem.                                            Embeddings
+                                         Add
+065                                                                                             (RoPE)
+
+                                                                                                                                 fast-rope
+066                         Bias
+                                        QKT
+                                                                                                                                   (ours)
+                            (RPB)                                                          Q             K           V
+067                                                                BMM
+                                                                 Attention
+                                        BMM
+068
+069
+070                                 Q             K          V
+071
+072   Figure 1: Attention weight biases in BMM-style and fused attention: Attention weight biases (like
+073   RPB) are added directly to the attention map. This bottlenecks the backward pass in fused attention
+074   kernels since the update for bias tensor is a reduction operation. Due to this, many implementations
+075   of fused attention implementations do not support explicit biases or attention masks. Using position
+076   embeddings like RoPE will enable less restricted usage of fused attention implementations. We note
+077   that xFormers’ FMHA and some others support explicit attention weights and masking, but they
+078
+      rarely succeed in hiding the additional and sometimes considerable latency from the bias.
+079
+080
+081
+082
+      information into the transformer. The original ViT used Absolute Position Embeddings (APE) to
+      solve this problem. In the years that followed, encoding positional information in the form of attention
+083
+      weight biases became a popular choice in transformer-based models in vision, among which, Relative
+084
+      Positional Bias (RPB) Shaw et al. (2018) has been one of the most popular. However, RPB, and
+085   attention weight biases in general, can somewhat greatly hinder the performance of fused attention
+086   implementations. While they are a barely noticeable elementwise operation in forward pass, the
+087   backward pass for attention weight biases is a reduction operation. This makes it non-trivial to fuse the
+088   already complex fused attention backward kernel together with that of position biases. Additionally,
+089   incorporating such biases in newer implementations of fused attention requires an unjustifiably
+090   significant engineering effort. The recently released Flash Attention V2 and V3 Dao (2023); Shah
+091   et al. (2024) never supported explicit masking or biasing. To date, very few implementations, namely
+092   the xFormers’ FMHA, offer such features. In addition to the effort required to implement, hiding
+093
+      the latency of the softmax operation in pipelined attention kernels such as FAv3 Shah et al. (2024) is
+      already very challenging, and supporting explicit attention weight biasing or masking will add to that
+094
+      latency and easily expose it. We illustrate this in Figure 1.
+095
+096   On the other hand, position embeddings are usually decoupled from the attention mechanism and are
+097   applied to the input tokens instead, ahead of the attention operation. Originally these embeddings
+098   were applied to the tokens only once at the very beginning of the model. This approach is commonly
+099
+      referred to as Absolute Positional Embedding (APE). However, Rotary Position Embeddings (RoPE)
+      Su et al. (2021) have become the de-facto choice in large language models Touvron et al. (2023a;b);
+100
+      Chiang et al. (2023), and are slowly making their way into vision models as well Crowson et al.
+101
+      (2024); Karras et al. (2022). We compare these three methods for introducing positional information
+102   (RPB, APE, and RoPE) in Figure 2. Compared to APE, RoPE can be seen as much more flexible
+103   generalization. Compared to RPB, the advantages of RoPE are threefold: 1. RoPE is a static position
+104   embedding mechanism; RoPE can be interpolated for varying input resolutions without retraining or
+105   finetuning. 2. the forward and backward pass of RoPE are both element-wise operations, for which
+106   developing highly parallelized SIMT implementations and kernel fusions are much easier. Lastly,
+107   since RoPE is agnostic to the dot-product attention operation, one can use the best available fused
+      attention implementation for their use case, and to its full potential.
+
+
+                                                                             2
+      Under review as a conference paper at ICLR 2025
+
+
+108
+      Inspired by this, we thoroughly study the applicability of RoPE in transformer-based models for
+109   vision. Our main contributions are as follows:
+110
+111         1. We present the scaling and implementation-related challenges in using RPB, or any explicit
+112            attention bias, in the context of fused attention. Positional biases, while very simple
+113            elementwise operations in their forward pass, are a reduction in their backward pass, making
+114            their fusion into complex fused attention kernels very challenging.
+115         2. We empirically show the improvement from using Rotary Position Embeddings over RPB.
+116            We show consistent improvements across three model families: ViT, Swin, and NAT, with
+117            varying model sizes (19 million to 89 million parameters). These models also cover three
+118            different attention patterns: self attention, windowed attention and neighborhood attention.
+119            We achieve noteworthy gains across all models.
+120         3. We develop an efficient CUDA implementation for RoPE with an easy-to-use Python
+121            wrapper. We carefully benchmark it and show its speedup against using RPB.
+122         4. We carefully study multiple implementations of Rotary Position Embeddings and present
+123            an analysis of using RoPE in transformer-based vision models. We empirically show that
+124            one can use only a fraction of hidden dimensions for RoPE and still achieve competitive
+125            performance. We introduce a hyperparameter krope and analyze its effect on multi-resolution
+126            performance.
+127
+128   2     R ELATED WORK
+129
+130   In this section, we review some prominent transformer-based architectures for vision, as well as
+131   current methods for introducing spatial biases, and the effect of using positional biases with fused
+132   attention implementations.
+133
+134   2.1   V ISION T RANSFORMERS AND H IERARCHICAL V ISION T RANSFORMERS
+135
+136   After the inception of the original Vision Transformer (ViT)Dosovitskiy et al. (2021), a considerable
+137   research effort has been towards understanding Ghiasi et al. (2022); Raghu et al. (2021) and improving
+138   ViTs. Most notably, many works are inspired by the efficient design of CNNs and have transformer
+139   the isotropic ViT into a multi-level hierarchical vision transformer Liu et al. (2021); Fan et al. (2021);
+140
+      Li et al. (2022). The networks reduce the spatial dimensions of the feature map at every level with
+      increasing channels (attention heads). Similar to CNNs, many found that tokens in the earlier layers
+141
+      and levels of these models attend more locally, and those in later layers and levels attend more
+142
+      globally Raghu et al. (2021). This has propelled the development of hierarchical vision transformers
+143   with restricted local attention Hassani et al. (2023); Hassani & Shi (2022); Ryali et al. (2023).
+144
+145
+      2.2   A DDING POSITIONAL BIASES TO VISION TRANSFORMERS
+146
+147   Transformers are primarily comprised of linear layers and attention, both of which are invariant to
+148   token permutation, which naturally led to researchers introducing positional information into their
+149   models. After the inception of the original transformer architecture Vaswani et al. (2017), many
+150   new methods were introduced to add position information to transformers Ke et al. (2020); Huang
+151   et al. (2020). ViT Dosovitskiy et al. (2021) used absolute sinusoidal position embeddings used
+152   in the original Transformer Vaswani et al. (2017). Relative Positional Biases (RPBs) Shaw et al.
+153
+      (2018) quickly became the de facto method used in a plethora of hierarchical vision transformers.
+      More recently, Rotary Position Embeddings Su et al. (2021) became the norm in billion-parameter
+154
+      models like LLaMA Touvron et al. (2023a) and its derivatives Touvron et al. (2023b); Chiang et al.
+155
+      (2023). RoPE enjoys several benefits, like usability in long contexts, better training stability, and
+156   decaying influence with increasing relative distance, to name a few. This makes RoPE a more scalable
+157   alternative to RPBs. However, RoPE has not yet been as widely adopted in vision models, and we
+158   aim to shed light in this direction through this work. We find that 2D RoPE Heo et al. (2024); Jeevan
+159   & Sethi (2022) and AS2DRoPE Chu et al. (2024) are suboptimal extensions of original RoPE in the
+160   context of vision transformers. We illustrate the difference between APE, RPB and RoPE in Figure 2.
+161   We observe a clear trend; newer and larger models often prefer position embeddings over attention
+      weight biases.
+
+
+                                                          3
+      Under review as a conference paper at ICLR 2025
+
+
+162
+163
+                                        o                                                                                     o
+164
+165                                                                                         o
+
+166                             Attention
+                                  map                                                                              Attention
+167                                                                                                                  map
+                                                                Relative    Attention
+168                                                            Positional
+                                                                 Bias         map
+
+169
+                                q       k            v
+                                                                                                                       RoPE
+170
+171                                                                         q           k         v                q          k      v
+                    Added only once
+172                  after patching
+
+
+173
+                                 Visual Tokens                              Visual Tokens                          Visual Tokens
+174
+                             (a) Absolute Position                    (b) Relative Positional                      (c) Rotary Position
+175                           Embeddings (APE)                             Biases (RPB)                           Embeddings (RoPE)
+176
+177                                         MViT v1,      Swin,
+                                                                 CoAtNet        LeViT           NAT     DiNAT   EVA-02    EVA-CLIP       HDiT
+                            ViT             MViT v2      Swin v2
+178
+179                         2020              2021                2021                                2022       2023               2024
+
+
+180
+                           Absolute Positional                           Relative Position                            Rotary Position
+181                        Embeddings (APE)                                Bias (RPB)                               Embeddings (RoPE)
+
+182
+183
+      Figure 2: Comparison between types of position embeddings. Absolute Position Embeddings are
+      applied once to the tokens after patchifying, but RPB and RoPE are both applied in every attention
+184
+      block. RPBs are added to the attention map itself, whereas RoPE is applied to queries and keys. We
+185
+      observe that prominent models used APE and RPB in the early years of vision transformers. However,
+186   newer models like HDiT and EVA-CLIP, which have been scaled to up to 18 billion parameters, opt
+187   for the more scalable Rotary Position Embeddings. We see a growing trend towards the applying
+188   position embeddings to the tokens themselves in contrast to biasing attention weights.
+189
+190
+191
+192
+193
+      2.3   F USED ATTENTION IN VISION TRANSFORMERS
+194
+195   For most of its history, dot-product attention, one of the primary operations in the Transformer,
+196   has been implemented as back-to-back batched matrix multiplications (BMMs), now commonly
+197   referred to as BMM-style attention. The first BMM computes the dot products between query and
+198   key tokens, the softmax of which produces attention weights. Attention weights are then “applied”
+199   to the values by taking their weighted average using the corresponding scores in the weight matrix
+200   through the second BMM. At scale, this implementation can quickly become bounded by memory
+201
+      bandwidth and capacity. In the case of self attention, in addition to a quadratic time complexity,
+      the memory footprint is also quadratic. This inspired “fused” attention implementations, the first
+202
+      practical example of which is Flash Attention Dao et al. (2022), which was later followed by Flash
+203
+      Attention V2 Dao (2023), FMHA Lefaudeux et al. (2022), and many more implementations. These
+204   methods successfully fuse the two BMMs and the softmax into one kernel by using partial softmax
+205   aggregation (since softmax involves a reduction), allowing them to scale to large sequence lengths.
+206   Through doing so, they improve performance by significantly reducing accesses to global memory,
+207   and instead keeping attention weights on much higher throughput local memory (shared memory).
+208   In addition, the global memory footprint is also reduced significantly. As a consequence, fused
+209   implementations are naturally less flexible in terms of allowing manipulation of attention weights.
+210   This presents a challenge to positional biases, which, even when implemented, can noticeably impact
+211   the performance of fused attention kernels.
+212   In light of this, Rotary Position Embeddings are much better suited for fused attention because
+213   they do not operate on attention weights directly. Instead, RoPE is applied to to the query and
+214   key tensors prior to attention. This decoupling of positional biases and attention computation can
+215   significantly improve model performance. This work exploits this fact further by developing a fast
+      RoPE implementation suited specifically for vision models.
+
+
+                                                                                 4
+      Under review as a conference paper at ICLR 2025
+
+
+216
+      3     M ETHOD
+217
+218   In this section, we will outline the usage of position embeddings in vision transformers. First, we
+219   will go over attention weight biases in Section 3.1 and then go on to formalize RoPE in Section 3.2.
+220   We comprehensively explain the existing 2D variants of RoPE in Section 3.3. Lastly, in Section 3.4,
+221   we will discuss some practical implications of using RoPE and present our fused implementation.
+222
+223   3.1   ATTENTION WEIGHT BIASES
+224
+225   Attention weight biases have become a common choice to add spatial biases in vision transformers.
+226   Attention weight biases assign a bias value for every query-key pair in the attention map. Techniques
+227
+      like Relative Positional Biases (RPB) use the relative position of query and key tokens to add a
+      specific bias term to them. Attention weight bias is added directly to the raw attention weights
+228
+      calculated by taking the dot product between queries and keys. Formally, in a feature map of the size
+229
+      (H, W ) we will have queries Q ∈ RHW ×d and keys K ∈ RHW ×d where d is the channel dimension.
+230   A bias B ∈ RHW ×HW will be added to the attention weights as follows:
+231
+232
+233
+                                                A = (QK T ) + B                                            (1)
+234   In the case of RPB, the bias B is parameterized as a smaller tensor but “viewed" as a tensor with
+235   the same shape as the attention weights. Generally, attention weight biases in vision transformers
+236   are learnable and thus need to be interpolated if the spatial resolution of the input image changes.
+237   Moreover, they cause a bottleneck in the backward pass of any fused attention kernel. We delve into
+238   practical implications of attention weight biases in Section 3.4.
+239
+240   3.2   ROTARY P OSITION E MBEDDINGS
+241
+      Rotary Position Embeddings (RoPE) Su et al. (2021) were proposed to equip tokens in language
+242
+      models with stronger positional information. RoPE applies position embeddings based on the global
+243
+      position of the token in the sequence, but the actual embedding function is derived to keep the relative
+244   distances amongst two tokens intact irrespective of their global positions.
+245
+246   Rotary Position Embeddings impart spatial bias by chunking the feature vector of dimension d into
+247
+      d/2 chunks of two elements each, and rotating each chunk in the Argand plane. The angle of rotation
+      is decided based on the token’s position in the sequence. Formally, considering a token x at index t
+248
+      in a sequence of length N , its resulting embedding xt will be given by
+249
+250                                                           t
+251                                            xtj,k = xj,k eiθj ∀ j
+                                                                                                     (2)
+252                                            θjt = t ∗ fθ (j, d)
+253   where j, k are the dimension indices and j ∈ {0, ..., d/2 − 1} and k = j + d/2. Here fθ (j, d)
+254   is the rotation angle generator – it produces an angle for each dimension index, given j and d.
+255   Conventionally, the angle generator is given by fθ (j, d) = 10000−2j/d in LLMs like Llama Touvron
+256   et al. (2023a). Now, consider a query and key qm , kn at the positions m and n respectively with
+257   RoPE applied according to their positions. Their corresponding entry Am,n in the attention matrix
+258   will be given by
+259
+260                                     Am,n = qm · kn
+261                                            X                  m   n
+                                                                                                           (3)
+                                        Am,n =    qj,k k′ j,k ei(θj −θj )
+262
+                                                   j
+263
+      where qj,k is the unmodified j, k chunk of the query vector and k′ j,k is the unmodified complex
+264
+      conjugate of the j, k chunk of the key vector. "·" represents dot product of two vectors.
+265
+266   We make some key observations from Equation 3. First, the relativity of      Ptwo tokens  is captured
+                                                                                           m  n
+267   by each chunk in the exponent θjm − θjn . Second, as m − n increases, | j ei(θj −θj ) | decreases,
+268   implying decay of influence when the relative distance between the tokens increases. This makes
+269   RoPE a preferred choice for injecting positional bias in both self and local attention mechanisms, as
+      the property of relativity holds in both cases. We discuss practical benefits of RoPE in Section 3.4.
+
+
+                                                         5
+      Under review as a conference paper at ICLR 2025
+
+
+270
+                                                                              Feature vector of a patch
+271
+272
+                                                                                           C
+273
+274
+                                                             R        iR       R    iR
+275
+276   H                                                     Apply θx          Apply θy
+277
+                              C
+278               W                                 iR                                     iR
+279           Image tensor
+280
+                                                            θ1x
+281                                                                                  θ1y
+282
+283                                                                       R                           R
+                                                  θ2x                                           θ2y
+284
+285
+286
+287                            Rotation of chunks w.r.t. positions in X and Y axis in the image.
+288
+289   Figure 3: Illustration of RoPE for images. In this figure, two elements of the same color denote
+290   a single point on the Argand plane. We interleave the elements to denote that half of the elements
+291   constitute the real part and the other half constitute the complex part of the points. Here krope = 2,
+292   thus, we use only the first half of the feature to encode positional information.
+293
+294
+295
+      3.3     A XIAL ROTARY P OSITION E MBEDDINGS
+296
+      We introduced RoPE for a one-dimensional sequence of tokens in Section 3.2. We will now extend it
+297   for images, which have a two-dimensional array of tokens. We will elucidate the intricate changes
+298   made to RoPE to make it suitable for multi-resolution 2D settings.
+299
+300   3.3.1     E XTENDING RO PE FOR 2-D TOKEN ARRAYS
+301
+302   Consider a 2-D feature map of the spatial dimensions (H, W ). To extend the current approach of
+303   RoPE from the 1-D setting, we will simply decompose the two-dimensional position index into
+304   two one-dimensional positional indices. Naturally, this means that each position will have an index
+305   corresponding to the X-axis and one corresponding to the Y-axis. We will then assign a rotation angle
+306
+      for each position index in both axes.
+307   Secondly, we will divide the number of dimensions in two parts – one part for one axis each. We
+308   will then proceed to further divide each part into two to represent the real and complex parts each,
+309   creating a total of four parts of the entire feature vector. The first and third chunks are treated as the
+310   real and complex parts for the position in Y-axis, and the second and fourth chunks are treated as the
+311   real and complex parts for the token’s position in X-axis. This is illustrated in Figure 3. Formally, this
+312
+      can be expressed as follows. Given an unmodified query vector q at the position (y, x), its resulting
+      embedding qy,x will be given by
+313
+314                                               (               x
+315                                     y,x             qj,k eiθj ∀ j ∈ {0, ..., d/4}
+                                    q         =                 y
+316                                                     qj,k eiθj ∀ j ∈ {d/4, ..., d/2}
+317                                                                                                         (4)
+318
+                                    θjx = x ∗ fθ (j, d)
+319                                 θjy = y ∗ fθ (j − d/4, d)
+320
+321   and k = j + d/2. An important thing to note is the angle generator is the same for both axes, however,
+322   we subtract the dimension index by d/4 so that both axes are treated in identical manner. In other
+323   words, the first d/4 indices hold the positional information in Y-axis and the second d/4 indices
+      do the same for X-axis. The third and fourth d/4 chunks follow the same ordering, and carry the
+
+
+                                                                      6
+      Under review as a conference paper at ICLR 2025
+
+
+324                                          2D RoPE                      Axial RoPE
+325
+                  Position co-ordinates    Absolute indices      Interpolated between (-1, 1)
+326               Angles of rotation          100−4j/d         exp (j ∗ (log(10π) − log(π))/d)
+327               Default krope                   1                            2
+328               Shared θ for all heads        Yes                           No
+329
+330
+      Table 1: Comparing the design decisions in 2D RoPE and Axial RoPE. We note these design
+331
+      decisions are inspired by different applications – 2D RoPE has been inspired by works in the LLM
+332   community whereas Axial RoPE has been inspired by works in the image generation space.
+333
+334
+335
+      complex parts of the first and second chunks respectively. This way, we can encode a 2-D position in
+336   a single feature vector. Additionally, this approach can be extended to an arbitrary number of spatial
+337   dimensions, n, with the only constraint d (mod 2n) ≡ 0. Since this implementation expands on 1D
+338   RoPE for the 2D case, we henceforth refer to this as 2D RoPE. Scalable vision models use this flavor
+339   of 2D RoPE, and is directly inspired from LLMs like LLaMA.
+340
+341
+      3.3.2   I MPROVING 2D ROTARY P OSITION E MBEDDINGS
+342
+343   Image modality is vastly different from language requires a separate treatment compared to language.
+344   Modern generative models Karras et al. (2022); Nawrot et al. (2021); Crowson et al. (2024) use a
+345   specific variant of 2D RoPE implementation which makes it more suitable for the vision domain. The
+346   following changes are made to 2D RoPE, and we call the resulting variant as Axial RoPE.
+347    Sampling y, x between -1 and 1: Conventionally, the token index is the multiplicative factor that
+348    changes the rotation angle to signify different positions in the sequence. Language is inherently
+349    causal, and thus this approach makes sense in the language domain. However, an image does not
+350    follow the same notion. Thus, we sample the multiplicative factor by linearly interpolating between
+351   -1 and 1 for the spatial dimensions. We later empirically show that this is indeed equivalent than using
+352    the plain token indices as the multiplicative factor.
+353   Bounded log sampling of rotation angles: The original RoPE implementation generates rotation
+354   angles through the function fθ (j, d) = 10000−2j/d (j is the dimension index). We note that using an
+355   bounded log-sampling for the base rotation angle causes the index-specific rotation angle to fluctuate
+356   gracefully. We log-sample our angle between π and 10π. Our angle generator function is given by
+357
+358                                fθ (j, d) = exp (j ∗ (log(10π) − log(π))/d)                             (5)
+359
+360   Applying RoPE to only a fraction of the hidden dimensions: We empirically observe that applying
+361   RoPE to a fraction of hidden dimensions retains, or in some cases exceeds the performance of
+362   applying RoPE to the full feature vector. We hypothesize that this is because applying RoPE to all
+363   dimensions greatly mutilates the actual semantic information in the tokens. Additionally, applying
+364   RoPE to a fraction of hidden dimensions is sufficient to impart the necessary positional information.
+365   We divide the total dimensions by a positive integer divisor and apply RoPE to the resultant number
+366   of dimensions. We will henceforth refer to this divisor as krope . In the following section, we will
+367   present empirical results analyzing krope ∈ {1, 2, 4, 8, 16}. We will also draw correlations between
+368
+      multi-resolution performance and the fraction of hidden dimensions used.
+369   Shared angles of rotation for all heads: One of the differences between 2D RoPe and Axial RoPE
+370   is the usage of same rotation angles for all heads. Axial RoPE uses different angles for all heads,
+371   and on the other hand, 2D RoPE uses the same rotation angles for all heads. We empirically study
+372   the effects of using shared or non-shared angles of rotation for 2D and Axial RoPE. Note that for
+373   non-shared rotation angles, RoPE is applied to the first d/(heads ∗ krope ) dimensions for each head.
+374   We summarize the differences between 2D and Axial RoPE in Table 1. In order to use RoPE to its best,
+375   we encourage practitioners to perform sweeps over krope and using shared or non-shared angles with
+376   Axial and 2D RoPE for their specific use case. In this paper, we will empirically study the effect of
+377   these design choices on the ImageNet-1k dataset. We study the multi-resolution performance of each
+      variant and draw connections with the implementation specifics and the choice of hyperparameters.
+
+
+                                                         7
+      Under review as a conference paper at ICLR 2025
+
+
+378
+      3.4   H ARDWARE EFFICIENCY AND SCALABILITY OF RO PE VS RPB
+379
+380   As mentioned, Rotary Position Embeddings are applied to the query and key tensors, as opposed to
+381   attention weights in the case of RPBs. Moreover, RoPE is a more complex operation: for each of
+382   the two tensors, two elements are read from the feature vector, to which rotation is applied through
+383   reading one more element from the θ tensor, before the elements are stored back into the original
+384   tensor. This operation consists of multiple elementwise operations, all of which can grow quickly
+385   into a memory-bandwidth-bound bottleneck in eager mode. On the other hand, RPB is typically only
+386
+      a single elementwise operation, leading one to think that in theory RPB is more efficient.
+387   However, there are two key issues with RPB in terms of performance: 1. though it is a single
+388   elementwise operation, we do not always have access to attention weights, a clear example of which
+389   is fused implementations. For example, Flash Attention V2 Dao et al. (2022) does not support
+390   attention biases at all, while FMHA Lefaudeux et al. (2022) only supports when they are fully
+391   materialized in global memory, and padded to meet memory alignment requirements, which can
+392
+      undo some of the performance improvements, as the positional biases will consume the same amount
+      of memory that attention weights would. 2. Loading fully materialized attention biases or masks
+393
+      in fused attention kernels burdens their scalability. Fused attention kernels are typically compute
+394
+      bound, whereas unfused implementations of attention are heavily bound by memory bandwidth.
+395   Adding O(n2 ) loads into fused attention kernels can make them memory bandwidth bound again
+396   at scale. FNA Hassani et al. (2024) on the other hand only supports RPB in the forward pass. 3.
+397   RPB’s backward pass is typically not an elementwise operation. Local / sparse attention will turn
+398   the RPB gradient into a reduction operation, which is considerably more difficult to performance
+399   optimize compared to elementwise operations. While fusing an elementwise operation into complex
+400   fused attention kernels such as Flash Attention V2 Dao (2023) is relatively trivial, fusing reduction
+401   operations into any kernel, especially fused attention kernels, is typically non-trivial. RoPE however
+402   is an elementwise operation both in the forward and in the backward pass. In fact, the only difference
+403
+      between the forward and backward pass is the sign of one element, which means:
+404
+             • RoPE can be applied efficiently in both the forward pass and backward pass,
+405
+406          • RoPE’s forward and backward pass implementations are almost identical,
+407          • RoPE is completely agnostic to the attention operator, making it compatible with all imple-
+408            mentations out of the box.
+409
+410
+      Having said that, a vanilla PyTorch implementation made RoPE slower than RPB, even when using
+      powerful fused attention implementations. This is primarily because multiple elementwise oper-
+411
+      ations used in RoPE are not automatically fused into a single one, and while using tools such as
+412
+      torch.compile() does exactly that, they simply do not improve performance enough to justify
+413   switching from RPB. This motivated us to develop fast-rope, a fused CUDA implementation
+414   performing Axial RoPE on feature tensors. The implementation follows HDiT’s specifications Crow-
+415   son et al. (2024): it can read operands of mixed precision levels, but computation is done strictly in
+416   higher precision. This allows us to perform the operation in place on the original tensor, without any
+417   extra type cast operations or kernel calls. We plan to open-source our library and release a Python
+418   package which will make using our library as easy as performing one function call.
+419
+420
+      4     E XPERIMENTS
+421
+422
+      We demonstrate the capabilities of Axial RoPE on four model families – ViT Dosovitskiy et al. (2021),
+423   Swin Liu et al. (2021), NAT Hassani et al. (2023) and DiNAT Hassani & Shi (2022) on the ImageNet-
+424   1k dataset Russakovsky et al. (2015). Furthermore, we present the throughput gains obtained by using
+425   fused implementation of Axial RoPE combined with fused attention implementations. Lastly, we
+426   present our analysis on different existing RoPE methods, and discuss why we picked Axial RoPE.
+427
+428   4.1   C LASSIFICATION ON I MAGE N ET-1 K
+429
+430   We evaluate Axial RoPE on the ImageNet-1k dataset and report the validation set accuracy in Table 2.
+431   Specifically, we report the scores for three cases – without using any positional information, with
+      RPB, and with Axial RoPE (krope = 2). We also report acheived throughput for all these cases. We
+
+
+                                                        8
+      Under review as a conference paper at ICLR 2025
+
+
+432
+                                                                                RPB         No bias        Axial RoPE
+433                        Attention mechanism             Model                (%)           (%)              (%)
+434                                                            Mini             81.8       81.3 (-0.5)      82.1 (+0.3)
+435                                                             Tiny            83.1       82.5 (-0.6)      83.2 (+0.1)
+                                                         NAT
+                                                               Small            83.6       83.3 (-0.3)      83.8 (+0.2)
+436
+                                                               Base             84.3       84.0 (-0.3)      84.5 (+0.2)
+437                       Neighborhood Attention
+                                                                     Mini       81.7       81.5 (-0.2)      81.9 (+0.2)
+438                                                                   Tiny      82.7       82.6 (-0.1)      83.0 (+0.3)
+                                                        DiNAT
+439                                                                  Small      83.8       83.6 (-0.2)      83.9 (+0.2)
+440                                                                  Base       84.4       84.1 (-0.3)      84.5 (+0.1)
+441                                                                   Tiny      81.2       80.2 (-1.0)      81.5 (+0.3)
+                             Window Attention            Swin        Small      83.0       81.9 (-1.1)      83.1 (+0.1)
+442
+                                                                     Base       83.5       82.7 (-0.8)      83.7 (+0.2)
+443
+                                                                     Small      81.2       79.0 (-2.2)      81.4 (+0.2)
+444                            Self Attention             ViT
+                                                                     Base       82.6       81.2 (-1.4)      82.8 (+0.2)
+445
+446   Table 2: ImageNet-1k top-1 accuracies: We present the top-1 accuracy on the ImageNet-1k
+447   validation split. We observe a accuracy over RPB across all model architectures and sizes.
+448
+449                                   RPB                               No bias                                       Axial RoPE
+              Model
+450                       BMM-style         Fused        BMM-style                 Fused                  BMM-style              Fused
+451               Mini      2664            3774        2871 (+7.8%)           3870 (+2.5%)          2769 (+3.9%)            3772 (-0.1%)
+452                Tiny     1948            2806        2095 (+7.5%)           2898 (+3.3%)          2025 (+4.0%)            2810 (+0.1%)
+        NAT
+                  Small     1335            1935        1436 (+7.6%)           2000 (+3.4%)          1387 (+3.9%)            1931 (-0.2%)
+453               Base      1029            1511        1113 (+8.2%)           1564 (+3.5%)          1070 (+4.0%)            1517 (+0.4%)
+454               Mini      2558            3948        2802 (+9.5%)           4053 (+2.7%)          2704 (+5.7%)            3922 (-0.7%)
+455                Tiny     1857            2943        2043 (+10.0%)          3028 (+2.9%)          1965 (+5.8%)            2932 (-0.4%)
+       DiNAT
+                  Small     1342            2223        1485 (+10.7%)          2292 (+3.1%)          1429 (+6.5%)            2200 (-1.0%)
+456               Base      979             1592        1081 (+10.4%)          1638 (+2.9%)          1041 (+6.3%)            1587 (-0.3%)
+457                       BMM-style    FMHA     FAv2     BMM-style             FMHA          FAv2         BMM-style          FMHA        FAv2
+458                Tiny     3018       3444         -   3114 (+3.2%)        3535 (+2.6%)     3472        2982 (-1.2%)     3394 (-1.5%)   3329
+459     Swin      Small     1902       2173         -   1966 (+3.4%)        2237 (+2.9%)     2196        1875 (-1.4%)     2146 (-1.2%)   2106
+                  Base      1450       1658         -   1501 (+3.5%)        1705 (+2.8%)     1676        1431 (-1.3%)     1639 (-1.1%)   1611
+460
+                  Small     4665       7864         -   5256 (+12.7%)       8207 (+4.4%)     8593    5144 (+10.3%)        7964 (+1.3%)   8337
+461     ViT
+                  Base      2178       3343         -   2423 (+11.2%)       3468 (+3.7%)     3598    2367 (+8.7%)         3387 (+1.3%)   3519
+462
+463
+      Table 3: Inference throughput: We present the inference throughput for all models, using different
+464
+      attention mechanisms. Here “BMM-style” represents attention implemented with native PyTorch,
+465   without any optimizations. “Fused” represents Fused Neighborhood Attention (FNA) Hassani et al.
+466   (2024) in the case of NA-based models. “FMHA” represents xFormers’s implementation Lefaudeux
+467   et al. (2022), and “FAv2” represents Flash Attention V2 Dao (2023). All numbers represent the
+468   throughput in images per second. We report the improvements over RPB in green.
+469
+470
+471   observe consistent accuracy improvements across all model families spanning across a wide range of
+472   parameter counts and FLOPs. Interestingly, we see that larger models with high parameter counts,
+473   like the "Base" variants also enjoy the same performance boosts as the smaller models. We provide
+474
+      additional evaluations on ImageNet A Djolonga et al. (2021), ImageNet RHendrycks et al. (2021),
+      ImageNet ReaLBeyer et al. (2020) and ImageNet V2 Recht et al. (2019) in Appendix F. We clearly
+475
+      observe that RoPE outperforms RPB on all models, irrespective of their size or attention mechanism.
+476
+477
+478
+      4.2      B ENCHMARKING F A S T - R O P E
+479
+      In Table 3, we present throughputs of models with Axial RoPE using our fused implementation
+480
+      against models with RPB. We report inference throughput (i.e. forward pass throughput) using both
+481   BMM-style and fused attention implementations 1 . For Neighborhood Attention, those would be the
+482   GEMM-based and fused kernels from NATTEN. For Swin and ViT, that would be xFormers’ FMHA
+483   and Flash Attention V2. We use Automatic Mixed Precision (AMP) in all tests to do FP16 inference.
+484   We observe considerable gains in almost all models, while being roughly equal in the case of Swin.
+485
+         1
+             All performance measurements were benchmarked on the A100-SXM4.
+
+
+                                                                        9
+      Under review as a conference paper at ICLR 2025
+
+
+486                128 px          192 px          224 px          256 px          320 px          384 px          480 px          512 px
+       krope
+487              2D     Axial    2D     Axial    2D     Axial    2D     Axial    2D     Axial    2D     Axial    2D     Axial    2D     Axial
+          RPB      34.19           78.62           81.22           81.21           79.77           77.97           75.19            73.9
+488
+           1    70.53   62.85   80.09   78.47   81.42   80.85   81.69   80.32   81.31   79.85   80.08   78.57   76.37   75.84   74.73   74.69
+489        2    69.81   65.43   79.89   80.11   81.37   81.43   81.84   81.77   81.29   81.28   79.02   79.90   72.78   77.41   69.78   76.47
+490        4    70.02   65.76   80.18   80.19   81.46   81.47   81.96   81.78   81.20   80.80   77.54   79.45   68.13   76.37   63.80   75.16
+           8    69.37   41.59   79.81   79.61   81.14   81.51   81.73   81.78   81.68   80.78   80.34   78.77   76.77   76.05   75.48   75.01
+491       16    63.6    56.13   79.19   79.76   80.77   81.34   81.16   81.70   80.32   81.12   78.17   79.78   74.00   76.68   72.36   75.82
+492
+493
+      Table 4: Multi-resolution performance for different values of krope with shared angles for all
+494   heads. We highlight the best performing entry in every resolution group.
+495
+496                128 px          192 px          224 px          256 px          320 px          384 px          480 px          512 px
+       krope
+497              2D     Axial    2D     Axial    2D     Axial    2D     Axial    2D     Axial    2D     Axial    2D     Axial    2D     Axial
+
+498       RPB       34.19           78.62           81.22           81.21           79.77           77.97           75.19           73.9
+           1    67.02   62.25   79.17   78.36   80.75   80.91   81.17   80.44   80.28   80.17   78.49   78.95   74.40   76.53   73.10    75.6
+499        2    68.10   67.18   79.45   80.03   81.00   81.41   81.44   81.67   80.44   81.05   77.86   79.64   71.31   77.12   68.86   75.89
+500        4    67.56   65.26   79.41   79.55   80.93   81.41   81.38   81.13   80.62   80.54   78.36   79.14   73.60   75.96   71.32   74.61
+           8    66.31   51.09   79.41   77.64   81.11   81.42   81.47   79.81   80.79   77.64   79.20   76.23   75.16   74.17   73.37   71.76
+501       16    68.02   53.97   79.73   78.34   81.18   81.16   81.43   80.08   80.55   79.62   78.30   77.81   73.73   73.95   71.64   72.45
+502
+503
+      Table 5: Multi-resolution performance for different values of krope with non-shared angles for
+504   all heads. We highlight the best performing entry in every resolution group.
+505
+506
+507   We attribute the slowdown in Swin to the nature of θ tensor, as it is larger in Swin due to the presence
+508   of the batch dimension. Even with this disadvantage, RoPE is able to catch up to RPB’s throughput.
+509   Additional benchmarks of fast-rope are included in Appendix A.
+510
+511   4.3       A NALYZING DESIGN DECISIONS IN RO PE
+512
+513   We will now analyze the differences between the two implementations mentioned above – 2D RoPE
+514   and Axial RoPE. We will consider the choices of krope and whether all heads use the same rotation
+515
+      angles. Through this analysis, we aim to empirically study the effect of these hyperparameters on
+      RoPE and its multi-resolution performance on a wide range of testing resolutions. We perform all our
+516
+      ablations on ViT-Small trained with 224 px resolution.
+517
+518   Table 4 presents the performance when all heads share the same rotation angles. We make a striking
+519   observation – 2D RoPE with a high value of krope often performs best. In the case where training
+520   and testing resolution are the same (224 px), we observe Axial RoPE has its best performance at
+521
+      krope = 8 and is roughly the same for other values of krope . We observe similar effects for resolutions
+      relatively closer to training resolution, specifically 192 and 256 px. Moving to Table 5, we report
+522
+      the numbers in the case where all heads have different rotation angles. In most cases, we observe
+523
+      Axial RoPE to outperform 2D RoPE. We speculate that this is due to the nature of the angle generator
+524   function, and we delve into its specifics in Appendix C. Both of these ablations suggest that only
+525   a fraction of hidden dimensions are enough to impart positional information using RoPE. In both
+526   shared and non-shared angles, we observe that Axial RoPE with a high value of krope is superior to
+527   2D RoPE for most inference resolutions, including the training resolution itself.
+528
+529
+530
+      5        C ONCLUSION
+531
+      In this work, we propose using Rotary Position Embeddings (RoPE) instead of Relative Positional
+532
+      Biases (RPB), in order to achieve better performance and better accuracy. We presented empirical
+533
+      evidence and analysis to support this proposition. Further, to accelerate RoPE compared to RPB,
+534   we developed fast-rope, a fast, CUDA-based implementation of RoPE, and showed its speedup
+535   through careful model-level benchmarking. We conducted empirical analysis on two RoPE methods:
+536   Axial RoPE and 2D RoPE. We introduced a new hyperparameter, krope , to control the fraction of
+537   hidden dimensions used in RoPE for both implementations, and observed that applying RoPE to
+538   only half, 1/4th, or even 1/8th of the hidden dimensions is enough to reasonably introduce positional
+539   information and achieve competitive accuracy. As a result of these findings, we foresee widespread
+      adoption of RoPE in isotropic and hierarchical vision transformers in the near future.
+
+
+                                                                        10
+      Under review as a conference paper at ICLR 2025
+
+
+540
+      E THICS S TATEMENT
+541
+542
+      This work discusses methods to potential improve and speed up transformer-based vision models.
+543   While such models can be further trained to generate malicious content like deepfakes, we foresee no
+544   direct negative implications of this work.
+545
+546
+547
+      R EPRODUCIBILITY S TATEMENT
+548
+      We provide all relevant implementation details of experiments in this paper in Appendix E. We use
+549
+      open-sourced libraries for our experiments (timm, xFormers, CUTLASS) and use the official model
+550
+      implementations (NAT and Swin), while only making changes to accommodate RoPE. Our models
+551   can be easily trained through timm by modifying the relevant configuration files. For evaluations on
+552   ImageNet-A, R, V2 and ReaL, we use timm’s validation script with relevant TensorFlow Datasets
+553   dataloaders.
+554
+555
+      R EFERENCES
+556
+557   Lucas Beyer, Olivier J. Hénaff, Alexander Kolesnikov, Xiaohua Zhai, and Aäron van den Oord. Are
+558     we done with imagenet? arXiv preprint arXiv: 2006.07159, 2020.
+559
+      Wei-Lin Chiang, Zhuohan Li, Zi Lin, Ying Sheng, Zhanghao Wu, Hao Zhang, Lianmin Zheng,
+560    Siyuan Zhuang, Yonghao Zhuang, Joseph E. Gonzalez, Ion Stoica, and Eric P. Xing. Vicuna: An
+561    open-source chatbot impressing gpt-4 with 90%* chatgpt quality, March 2023. URL https:
+562    //lmsys.org/blog/2023-03-30-vicuna/.
+563
+564
+      Xiangxiang Chu, Jianlin Su, Bo Zhang, and Chunhua Shen. Visionllama: A unified llama interface
+        for vision tasks. arXiv preprint arXiv:2403.00522, 2024.
+565
+566   Katherine Crowson, Stefan Andreas Baumann, Alex Birch, Tanishq Mathew Abraham, Daniel Z.
+567     Kaplan, and Enrico Shippole. Scalable high-resolution pixel-space image synthesis with hourglass
+568     diffusion transformers. arXiv preprint arXiv: 2401.11605, 2024.
+569
+      Tri Dao. FlashAttention-2: Faster attention with better parallelism and work partitioning. arXiv,
+570     2023.
+571
+572   Tri Dao, Daniel Y. Fu, Stefano Ermon, Atri Rudra, and Christopher Ré. FlashAttention: Fast and
+573     memory-efficient exact attention with IO-awareness. In Advances in Neural Information Processing
+574
+        Systems, 2022.
+575   Josip Djolonga, Jessica Yung, Michael Tschannen, Rob Romijnders, Lucas Beyer, Alexander
+576     Kolesnikov, Joan Puigcerver, Matthias Minderer, Alexander D’Amour, Dan Moldovan, Syl-
+577     vain Gelly, Neil Houlsby, Xiaohua Zhai, and Mario Lucic. On robustness and transferability
+578     of convolutional neural networks. CVPR, 2021.
+579
+      Alexey Dosovitskiy, Lucas Beyer, Alexander Kolesnikov, Dirk Weissenborn, Xiaohua Zhai, Thomas
+580
+        Unterthiner, Mostafa Dehghani, Matthias Minderer, Georg Heigold, Sylvain Gelly, Jakob Uszkoreit,
+581     and Neil Houlsby. An image is worth 16x16 words: Transformers for image recognition at scale.
+582     ICLR, 2021.
+583
+584   Haoqi Fan, Bo Xiong, Karttikeya Mangalam, Yanghao Li, Zhicheng Yan, Jitendra Malik, and
+585
+        Christoph Feichtenhofer. Multiscale vision transformers. In ICCV, 2021.
+586   Amin Ghiasi, Hamid Kazemi, Eitan Borgnia, Steven Reich, Manli Shu, Micah Goldblum, An-
+587    drew Gordon Wilson, and Tom Goldstein. What do vision transformers learn? a visual exploration.
+588    arXiv preprint arXiv: 2212.06727, 2022.
+589
+      Ali Hassani and Humphrey Shi. Dilated neighborhood attention transformer. arXiv, 2022. URL
+590
+        https://arxiv.org/abs/2209.15001.
+591
+592   Ali Hassani, Steven Walton, Jiachen Li, Shen Li, and Humphrey Shi. Neighborhood attention
+593     transformer. In Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern
+        Recognition (CVPR), pp. 6185–6194, June 2023.
+
+
+                                                      11
+      Under review as a conference paper at ICLR 2025
+
+
+594
+      Ali Hassani, Wen-Mei Hwu, and Humphrey Shi. Faster neighborhood attention: Reducing the O(n2 )
+595     cost of self attention at the threadblock level. arXiv preprint arXiv: 2403.04690, 2024.
+596
+597   Dan Hendrycks, Steven Basart, Norman Mu, Saurav Kadavath, Frank Wang, Evan Dorundo, Rahul
+598     Desai, Tyler Zhu, Samyak Parajuli, Mike Guo, Dawn Song, Jacob Steinhardt, and Justin Gilmer.
+599     The many faces of robustness: A critical analysis of out-of-distribution generalization. ICCV,
+600
+        2021.
+601   Byeongho Heo, Song Park, Dongyoon Han, and Sangdoo Yun. Rotary position embedding for vision
+602     transformer. arXiv preprint arXiv:2403.13298, 2024.
+603
+604
+      Zhiheng Huang, Davis Liang, Peng Xu, and Bing Xiang. Improve transformer models with better
+        relative position embeddings. FINDINGS, 2020. doi: 10.18653/v1/2020.findings-emnlp.298.
+605
+606   Pranav Jeevan and Amit Sethi. Resource-efficient hybrid x-formers for vision. In 2022 IEEE/CVF
+607     Winter Conference on Applications of Computer Vision (WACV), pp. 3555–3563, 2022. doi:
+608     10.1109/WACV51458.2022.00361.
+609
+      Tero Karras, M. Aittala, Timo Aila, and S. Laine. Elucidating the design space of diffusion-based
+610
+        generative models. Neural Information Processing Systems, 2022. doi: 10.48550/arXiv.2206.
+611     00364.
+612
+613   Guolin Ke, Di He, and Tie-Yan Liu. Rethinking positional encoding in language pre-training.
+614    International Conference on Learning Representations, 2020.
+615   Benjamin Lefaudeux, Francisco Massa, Diana Liskovich, Wenhan Xiong, Vittorio Caggiano, Sean
+616     Naren, Min Xu, Jieru Hu, Marta Tintore, Susan Zhang, Patrick Labatut, Daniel Haziza, Luca
+617     Wehrstedt, Jeremy Reizenstein, and Grigory Sizov. xformers: A modular and hackable transformer
+618     modelling library. https://github.com/facebookresearch/xformers, 2022.
+619
+      Yanghao Li, Chao-Yuan Wu, Haoqi Fan, Karttikeya Mangalam, Bo Xiong, Jitendra Malik, and
+620
+        Christoph Feichtenhofer. Mvitv2: Improved multiscale vision transformers for classification and
+621
+        detection. In CVPR, 2022.
+622
+623   Ze Liu, Yutong Lin, Yue Cao, Han Hu, Yixuan Wei, Zheng Zhang, Stephen Lin, and Baining Guo.
+624     Swin transformer: Hierarchical vision transformer using shifted windows. In Proceedings of the
+625     IEEE/CVF International Conference on Computer Vision (ICCV), 2021.
+626   Piotr Nawrot, Szymon Tworkowski, Michał Tyrolski, Lukasz Kaiser, Yuhuai Wu, Christian Szegedy,
+627     and H. Michalewski. Hierarchical transformers are more efficient language models. NAACL-HLT,
+628     2021. doi: 10.18653/v1/2022.findings-naacl.117.
+629
+630   Adam Paszke, Sam Gross, Francisco Massa, Adam Lerer, James Bradbury, Gregory Chanan, Trevor
+631
+        Killeen, Zeming Lin, Natalia Gimelshein, Luca Antiga, Alban Desmaison, Andreas Köpf, Edward
+       Yang, Zach DeVito, Martin Raison, Alykhan Tejani, Sasank Chilamkurthy, Benoit Steiner, Lu Fang,
+632
+        Junjie Bai, and Soumith Chintala. Pytorch: An imperative style, high-performance deep learning
+633
+        library. arXiv preprint arXiv: 1912.01703, 2019.
+634
+635   Maithra Raghu, Thomas Unterthiner, Simon Kornblith, Chiyuan Zhang, and Alexey Dosovitskiy.
+636    Do vision transformers see like convolutional neural networks? Advances in neural information
+637    processing systems, 34:12116–12128, 2021.
+638   B. Recht, R. Roelofs, Ludwig Schmidt, and Vaishaal Shankar. Do imagenet classifiers generalize to
+639     imagenet? International Conference on Machine Learning, 2019.
+640
+641   Olga Russakovsky, Jia Deng, Hao Su, Jonathan Krause, Sanjeev Satheesh, Sean Ma, Zhiheng Huang,
+642
+        Andrej Karpathy, Aditya Khosla, Michael Bernstein, Alexander C. Berg, and Li Fei-Fei. ImageNet
+        Large Scale Visual Recognition Challenge. International Journal of Computer Vision (IJCV), 115
+643
+        (3):211–252, 2015. doi: 10.1007/s11263-015-0816-y.
+644
+645   Chaitanya Ryali, Yuan-Ting Hu, Daniel Bolya, Chen Wei, Haoqi Fan, Po-Yao Huang, Vaibhav
+646     Aggarwal, Arkabandhu Chowdhury, Omid Poursaeed, Judy Hoffman, Jitendra Malik, Yanghao
+647     Li, and Christoph Feichtenhofer. Hiera: A hierarchical vision transformer without the bells-and-
+        whistles. ICML, 2023.
+
+
+                                                     12
+      Under review as a conference paper at ICLR 2025
+
+
+648
+      Jay Shah, Ganesh Bikshandi, Ying Zhang, Vijay Thakkar, Pradeep Ramani, and Tri Dao.
+649     Flashattention-3: Fast and accurate attention with asynchrony and low-precision, 2024. URL
+650     https://arxiv.org/abs/2407.08608.
+651
+652   Peter Shaw, Jakob Uszkoreit, and Ashish Vaswani. Self-attention with relative position repre-
+653     sentations. In Marilyn Walker, Heng Ji, and Amanda Stent (eds.), Proceedings of the 2018
+654
+        Conference of the North American Chapter of the Association for Computational Linguistics:
+        Human Language Technologies, Volume 2 (Short Papers), pp. 464–468, New Orleans, Louisiana,
+655
+        June 2018. Association for Computational Linguistics. doi: 10.18653/v1/N18-2074. URL
+656
+        https://aclanthology.org/N18-2074.
+657
+658   Jianlin Su, Yu Lu, Shengfeng Pan, Bo Wen, and Yunfeng Liu. Roformer: Enhanced transformer with
+659      rotary position embedding, 2021.
+660
+      Vijay Thakkar, Pradeep Ramani, Cris Cecka, Aniket Shivam, Honghao Lu, Ethan Yan, Jack Kosaian,
+661     Mark Hoemmen, Haicheng Wu, Andrew Kerr, et al. Cutlass, 2023. URL https://github.
+662     com/NVIDIA/cutlass/tree/v3.0.0.
+663
+664   Hugo Touvron, Thibaut Lavril, Gautier Izacard, Xavier Martinet, Marie-Anne Lachaux, Timothée
+665
+        Lacroix, Baptiste Rozière, Naman Goyal, Eric Hambro, Faisal Azhar, Aurelien Rodriguez, Armand
+       Joulin, Edouard Grave, and Guillaume Lample. Llama: Open and efficient foundation language
+666
+        models. ARXIV, 2023a.
+667
+668   Hugo Touvron, Louis Martin, Kevin Stone, Peter Albert, Amjad Almahairi, Yasmine Babaei, Nikolay
+669     Bashlykov, Soumya Batra, Prajjwal Bhargava, Shruti Bhosale, Dan Bikel, Lukas Blecher, Cris-
+670     tian Canton Ferrer, Moya Chen, Guillem Cucurull, David Esiobu, Jude Fernandes, Jeremy Fu,
+671     Wenyin Fu, Brian Fuller, Cynthia Gao, Vedanuj Goswami, Naman Goyal, Anthony Hartshorn,
+672
+        Saghar Hosseini, Rui Hou, Hakan Inan, Marcin Kardas, Viktor Kerkez, Madian Khabsa, Isabel
+        Kloumann, Artem Korenev, Punit Singh Koura, Marie-Anne Lachaux, Thibaut Lavril, Jenya Lee,
+673
+        Diana Liskovich, Yinghai Lu, Yuning Mao, Xavier Martinet, Todor Mihaylov, Pushkar Mishra,
+674
+        Igor Molybog, Yixin Nie, Andrew Poulton, Jeremy Reizenstein, Rashi Rungta, Kalyan Saladi,
+675     Alan Schelten, Ruan Silva, Eric Michael Smith, Ranjan Subramanian, Xiaoqing Ellen Tan, Binh
+676     Tang, Ross Taylor, Adina Williams, Jian Xiang Kuan, Puxin Xu, Zheng Yan, Iliyan Zarov, Yuchen
+677     Zhang, Angela Fan, Melanie Kambadur, Sharan Narang, Aurelien Rodriguez, Robert Stojnic,
+678     Sergey Edunov, and Thomas Scialom. Llama 2: Open foundation and fine-tuned chat models.
+679     arXiv preprint arXiv: 2307.09288, 2023b.
+680
+      Ashish Vaswani, Noam Shazeer, Niki Parmar, Jakob Uszkoreit, Llion Jones, Aidan N Gomez,
+681
+        Ł ukasz Kaiser, and Illia Polosukhin. Attention is all you need. In I. Guyon, U. Von
+682
+        Luxburg, S. Bengio, H. Wallach, R. Fergus, S. Vishwanathan, and R. Garnett (eds.), Ad-
+683     vances in Neural Information Processing Systems, volume 30. Curran Associates, Inc.,
+684     2017.   URL https://proceedings.neurips.cc/paper_files/paper/2017/
+685     file/3f5ee243547dee91fbd053c1c4a845aa-Paper.pdf.
+686
+687
+688   A     I MPLEMENTATION AND EVALUATION DETAILS FOR F A S T - R O P E
+689
+690   A.1   P ROBLEM SIZES FOR EVALUATION
+691
+      Here we note the problem size space used for benchmarking all kernels. We assume our input feature
+692
+      tensor to have the shape [B, Nh, H * W, C] and our θ tensor to have the shape [Nh, H *
+693
+      W, C/4], where B represents batch size, Nh represents number of heads, H, W represent the height
+694   and width respectively and C is the hidden dimension. Our implementation does not expect inputs to
+695   be contiguous except in the last (i.e. channel) dimension. We list down the problem size space in
+696   Table 7. Note that our ablations are for the case where krope = 2. We will achieve better speedups
+697   with a higher krope value.
+698
+699   A.2   A DDITIONAL INFORMATION ABOUT F A S T - R O P E
+700
+701   In Table 6, we present the average improvement in latency of performing RoPE with the generated
+      fused kernel using torch.compile() and our fused implementation over eager PyTorch. The
+
+
+                                                     13
+      Under review as a conference paper at ICLR 2025
+
+
+702                      Compiled over eager                  Fused over eager                       Fused over compiled
+       Prec.
+703               Avg.        Min.         Max.      Avg.          Min.            Max.       Avg.          Min.         Max.
+704    16-16     ↑2%         ↓ -6 %     ↑ 975 %    ↑ 1121 %      ↑ 709 %         ↑ 1905 %   ↑ 1117 %      ↑ 33 %     ↑ 1900 %
+       16-32     ↑2%         ↓ -5 %     ↑ 850 %    ↑ 1091 %      ↑ 727 %         ↑ 1700 %   ↑ 1088 %      ↑ 33 %     ↑ 1700 %
+705    32-32     ↑1%         ↓ -8 %     ↑ 650 %    ↑ 598 %       ↑ 333 %         ↑ 1033 %   ↑ 596 %       ↑ 33 %     ↑ 1033 %
+706
+707
+      Table 6: Gains using our fused kernel. We present minimum, maximum and average gains in speed
+708
+      over a wide range of problem sizes. The first column signifies the precision of the feature vector
+709
+      and rotation angle tensor respectively. For example, 16-32 implies that the feature vector is in
+710   float16 and the rotation angle tensor is in float32. Measured on A100-SXM4-80G.
+711
+712
+713   full range of problem sizes is presented in Appendix A.1. Our implementation enjoys a speedup of 10
+714   to 11× in the case where the input features are in float16, and a speedup of almost 6× when the
+715   features are in float32. Note that the math precision is still in float32 in our implementation.
+716   Our implementations provide an average speedup of 9.34× over torch.compile().
+717   Akin to xFormers, we do not need our inputs to be contiguous in memory, we just expect the stride
+718   of the last dimension to be 1. Our implementation supports float16, bfloat16, float32,
+719   float64 data-types for the feature vector and rotation angles tensor. We use CUTLASS Thakkar
+720   et al. (2023) constructs to perform vectorized memory reads and to perform math on the accumulated
+721   arrays. For the purposes of our testing, we set the number of dimensions for RoPE to be half the
+722   dimensions in the feature vector. Intuitively, the speed benefits will increase as the fraction of
+723   dimensions decreases.
+724
+725                                           Dimension          Possible values
+726                                                 B          [1, 16, 32, 64, 128]
+727                                                Nh              [1, 3, 4, 6, 8]
+728                                               H, W            [56, 28, 14, 7]
+729                                                 C              [32, 64, 128]
+730
+731   Table 7: Problem sizes used for evaluation. We test over a wide range of problem sizes. We take
+732   the outer product of all these parameters to generate our problem size space. The speedup reported in
+733   the main section are average, minimum and maximum speedups of all problem sizes.
+734
+735
+736
+      B     A DDITONAL ABLATIONS ON DESIGN DECISIONS IN RO PE VARIANTS
+737
+738
+      B.1      A BLATION ON ANGLE GENERATOR AND POSITION CO - ORDINATES
+739
+740   We perform additional ablations on the angle generator function and position co-ordinates in RoPE.
+741   Since it is computationally prohibitive to experiment with all possible combinations, we choose two
+742   settings – one with shared angles and krope = 1 and another with non-shared angles and krope = 2,
+743   akin to 2D and Axial RoPE respectively. With these settings, we experiment with the two angle
+744   generators, and the two position co-ordinate systems. We present the results in Tables 8 and 9.
+745
+746   B.2      A BLATION WITH THE BEST PERFORMING SETTING IN TABLES 4 AND 5
+747
+748
+      We observe that non-shared angles with krope = 8 performs the best across all combinations in Tables
+      4 and 5, on the resolution of 224 px. Motivated by this, we experiment with this configuration on all
+749
+      models. We present the results in Table 10
+750
+751
+752   C     A NALYSIS OF ROTATION ANGLES IN 2D RO PE AND A XIAL RO PE
+753
+754   In Sec 3.3, we outline the differences between 2D RoPE and Axial RoPE. Through our ablations in
+755   Table 4 and 5, we eliminate the practical differences in the two variants. We now turn our attention
+      towards the two fundamental and theoretical differences – namely the angle generators. In Figure
+
+
+                                                                 14
+      Under review as a conference paper at ICLR 2025
+
+
+756                                                                 Position co-ordinates
+757                                                          Absolute indices Between -1 and 1
+758                                    Exponential decay          81.0                80.7
+759
+                   Angle generator
+                                     Bounded log-sampling          81.2               81.4
+760
+761
+      Table 8: Ablation on angle generator and position co-ordinates with non-shared angles and krope = 2.
+762
+763
+                                                                    Position co-ordinates
+764                                                          Absolute indices Between -1 and 1
+765                                    Exponential decay          81.4                81.0
+766                Angle generator
+                                     Bounded log-sampling          81.0               80.9
+767
+768
+769    Table 9: Ablation on angle generator and position co-ordinates with shared angles and krope = 1.
+770
+771
+772
+      4, we plot the dimension-wise angles of rotation for d = 256 and d = 512. The plots give us some
+      intuitive explanation about the disparity in multi-resolution performance of the two variants. We
+773
+      make the following observations:
+774
+775           1. Angles in Axial RoPE are higher in magnitude throughout all dimensions than 2D RoPE.
+776
+777           2. Angles in Axial RoPE occur in chunks, and are repeated multiple times to cover the entire
+778
+                 feature vector.
+779           3. Angles for 2D RoPE are monotonically decreasing in magnitude.
+780
+              4. For the latter dimensions in 2D RoPE, the angles of rotation are orders of magnitude lower
+781
+                 than for the former dimensions.
+782
+783   From these observations, we make two hypotheses: first, higher rotation angles imply a stronger
+784   injection of information. This explains the consistent performance of Axial RoPE, even when krope
+785   is reduced to 8 or 16, but where the angles of rotation are still large in magnitude. Second, in the
+786   cases where testing resolution is higher than training resolution, we observe that Axial RoPE is
+787   roughly equal or surpasses 2D RoPE. We attribute this to the position co-ordinates assigned in Axial
+788   RoPE. Specifically, we speculate that interpolating indices to be between (−1, 1), coupled with the
+789   repeating, high-magnitude angles of rotation results in a better encoding of positions in the tokens for
+790
+      higher test-time resolutions.
+791
+792   D       NAT- S AND D I NAT- S WITH A XIAL RO PE
+793
+794
+      Here, we report the accuracies for NAT-s and DiNAT-s in Table 11. We observe that both these model
+795   families enjoy the same accuracy and throughput improvements as the other models.
+796
+797
+798   E       OTHER IMPLEMENTATION DETAILS
+799
+800   In this section, we will report the implementation details for all models trained in the paper.
+801
+      We use the official NAT2 and Swin3 implementations, with the only changes being to the attention
+802
+      module to accommodate RoPE. For the Mini, Tiny and Small variants, we follow the hyperparameters
+803   in Table 12. For the Base variants, we follow the hyperparameters in Table 13. One can easily plug
+804   these values into the corresponding fields in timm’s .yml files and obtain the same results. We use
+805   timm 4 training and evaluation scripts. We use a single node with 8 A100-SXM4 GPUs for our
+806   experiments.
+807
+          2
+808         NAT
+          3
+809         Swin
+          4
+            timm
+
+
+                                                        15
+      Under review as a conference paper at ICLR 2025
+
+
+810
+                                                                                                               Original                   Shared PE, krope = 8
+811
+812                                                                               NAT-small                          83.8                                                 83.8
+813                                                                              DiNAT-small                         83.9                                                 83.9
+814                                                                              Swin-small                          83.1                                                 82.8
+815
+                                                                                  ViT-small                          81.4                                                 81.5
+816
+                                                                                   Table 10: Ablation with shared PE and krope = 8.
+817
+818
+819                                                           Dimension­wise angle of rotation in Axial RoPE                                                                 Dimension­wise angle of rotation in 2D RoPE
+                                                                                                                                                                1.0                                                        dim = 128
+820                                      6                                                                                                                                                                                 dim = 512
+
+821                                                                                                                                                             0.8
+                                         5
+822
+          Angle of rotation in radians
+
+
+                                                                                                                                 Angle of rotation in radians
+                                         4
+823                                                                                                                                                             0.6
+
+824                                      3
+                                                                                                                                                                0.4
+825                                      2
+
+826                                                                                                                                                             0.2
+                                         1
+827                                              dim = 256
+                                         0       dim = 512                                                                                                      0.0
+828
+                                             0               100           200           300            400    500                                                    0    100           200           300           400      500
+829                                                                          Dimension index                                                                                               Dimension index
+
+830
+831   Figure 4: Comparing rotation angles for Axial and 2D RoPE. We illustrate the dimension-wise
+832
+      rotation angles for Axial and 2D RoPE for d = 256 and d = 512.
+833
+834
+      F                                  A DDITIONAL EVALUATIONS ON I MAGE N ET VARIANTS
+835
+836
+      We have included additional evaluations on ImageNet-A, ImageNet-R, ImageNet-V2 and ImageNet-
+837   ReaL in this section.
+838
+839
+840
+841
+842
+843
+844
+845
+846
+847
+848
+849
+850
+851
+852
+853
+854
+855
+856
+857
+858
+859
+860
+861
+862
+863
+
+
+
+                                                                                                                            16
+      Under review as a conference paper at ICLR 2025
+
+
+864
+865
+866
+867                                 RPB                                 No bias                                   Axial RoPE
+           Model         Accuracy        Thru.        Accuracy                Thru.                Accuracy                Thru.
+868                        (%)         (imgs/sec.)      (%)                 (imgs/sec.)              (%)                 (imgs/sec.)
+869                                  GEMM     Fused                    GEMM               Fused                     GEMM               Fused
+870               Tiny     81.7       2687    3773    80.6 (-0.9)   2884 (+7.3%)    3894 (+3.2%)   82.1 (+0.4)   2779 (+3.4%)   3759 (-0.4%)
+        NAT-s    Small     83.3       1700    2430    82.0 (-1.3)   1830 (+7.6%)    2516 (+3.5%)   83.4 (+0.1)   1764 (+3.8%)   2429 (0.0%)
+871              Base      83.6       1295    1851    82.7 (-0.9)   1395 (+7.7%)    1914 (+3.4%)   83.7 (+0.1)   1343 (+3.7%)   1861 (0.5%)
+872               Tiny     81.8       2553    3992    80.7 (-1.1)   2801 (+9.7%)    4088 (+2.4%)   81.9 (+0.1)   2705 (+6.0%)   3941 (-1.3%)
+873    DiNAT-s   Small     83.4       1611    2572    82.8 (-0.6)   1774 (+10.1%)   2641 (+2.7%)   83.7 (+0.3)   1711 (+6.2%)   2552 (-0.8%)
+                 Base      83.8       1226    1962    83.0 (-0.8)   1350 (+10.1%)   2010 (+2.4%)   84.0 (+0.2)   1303 (+6.3%)   1951 (-0.6%)
+874
+875
+      Table 11: ImageNet-1k classification top-1 accuracy with inference throughput. We present
+876
+      the top-1 accuracy of NAT-s and DiNAT-s model families on the ImageNet-1k validation split. We
+877
+      observe a accuracy boost and comparable throughput with respect to RPB across both model families.
+878
+879
+880
+881
+882
+883
+884
+                              Hyperparameter                                        Value
+885
+886                             Total epochs                                 310
+887                            Warmup epochs                                  20
+888
+                              Cooldown epochs                                 10
+                             Per GPU batch size                              128
+889
+                                Warmup LR                                  1e − 6
+890
+                                Minimum LR                                 5e − 6
+891                               Base LR                                  1e − 3
+892                             LR schedule                  Cosine annealing with linear warmup
+893                             Weight decay                               5e − 2
+894                                EMA                                      False
+895
+896                         Table 12: Hyperparameters for Mini, Tiny and Small variants.
+897
+898
+899
+900
+901
+902
+903                                 Hyperparameter                                  Value
+904
+                                       Total epochs                             310
+905
+                                      Warmup epochs                              50
+906
+                                     Cooldown epochs                             10
+907                                 Per GPU batch size                          128
+908                                    Warmup LR                               1e − 6
+909                                    Minimum LR                              5e − 6
+910                                      Base LR                               1e − 3
+911                                    LR schedule                  Cosine annealing with warmup
+912                                    Weight decay                            5e − 2
+913                                       EMA                                   True
+914
+915                                       Table 13: Hyperparameters for Base variant.
+916
+917
+
+
+
+                                                                       17
+      Under review as a conference paper at ICLR 2025
+
+
+918
+919
+920
+921
+922
+923
+                                           ImageNet ReaL                   ImageNet V2
+924                   Model
+                                   RPB      No bias   Axial RoPE   RPB     No bias   Axial RoPE
+925
+                           Mini    87.20     86.90       87.51     70.82    70.31       71.55
+926                        Tiny    87.70     87.41       87.96     72.00    72.24       73.27
+927
+                    NAT
+                           Small   88.03     87.91       88.14     73.23    72.62       73.76
+928                        Base    88.58     88.34       88.70     74.11    73.72       74.34
+929                        Mini    87.02    86.74        87.22     71.23   70.47        71.07
+930                        Tiny    87.51    87.45        87.66     71.95   71.65        72.43
+                   DiNAT
+                           Small   87.91    87.74        88.17     73.57   72.95        73.70
+931                        Base    88.58    88.24        88.55     74.05   73.65        74.51
+932
+                           Tiny    86.55    85.95        86.89     69.40   68.45        70.29
+933                Swin    Small   87.64    86.86        87.77     71.93   70.68        72.52
+934                        Base    87.94    87.32        88.02     72.52   71.89        72.98
+935                        Small   86.64    84.91        86.77     70.25   67.56        70.64
+                    ViT
+936                        Base    86.94    85.77        87.15     70.89   69.51        71.33
+937
+938   Table 14: Top-1 accuracies on ImageNet ReaLBeyer et al. (2020) and ImageNet V2 Recht et al.
+939   (2019).
+940
+941
+942
+943
+944
+945
+946
+947
+948
+949
+950
+951                                         ImageNet A                     ImageNet R
+                      Model
+952                                RPB      No bias   Axial RoPE   RPB     No bias   Axial RoPE
+953                        Mini    12.77     10.89       13.27     29.60    28.71       31.36
+954                        Tiny    17.12     14.95       18.81     31.59    30.65       32.35
+                    NAT
+                           Small   19.27     18.07       20.51     33.41    32.36       33.73
+955                        Base    22.03     20.35       23.68     35.11    34.52       35.76
+956
+                           Mini    13.20    11.32        13.36     30.77   29.21        30.81
+957                        Tiny    16.12    16.24        17.48     31.40   30.94        32.26
+                   DiNAT
+958                        Small   20.35    19.97        22.04     32.97   32.26        34.16
+959                        Base    22.41    21.35        23.93     36.04   34.48        36.96
+960                        Tiny    10.03    7.73         10.00     27.29   24.58        28.06
+                   Swin    Small   16.43    12.57        17.09     31.13   27.80        32.25
+961
+                           Base    18.77    15.81        19.32     31.96   29.20        32.84
+962
+                           Small   11.27     7.93        11.99     28.87   22.24        31.24
+963                 ViT
+                           Base    14.00     9.96        13.92     31.70   24.87        33.40
+964
+965
+      Table 15: Top-1 accuracies on ImageNet A Djolonga et al. (2021) and ImageNet RHendrycks et al.
+966
+      (2021).
+967
+968
+969
+970
+971
+
+
+
+                                                        18

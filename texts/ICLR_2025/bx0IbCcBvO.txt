@@ -1,0 +1,1085 @@
+Under review as a conference paper at ICLR 2025
+
+
+000
+001
+      Z IP VL: E FFICIENT L ARGE V ISION -L ANGUAGE M OD -
+002   ELS WITH DYNAMIC T OKEN S PARSIFICATION AND KV
+003
+004   C ACHE C OMPRESSION
+005
+006
+       Anonymous authors
+007
+       Paper under double-blind review
+008
+009
+010
+011                                               A BSTRACT
+012
+013            The efficiency of large vision-language models (LVLMs) is constrained by the
+014            computational bottleneck of the attention mechanism during the prefill phase and
+015
+               the memory bottleneck of fetching the key-value (KV) cache in the decoding phase,
+               particularly in scenarios involving high-resolution images or videos. Visual content
+016
+               often exhibits substantial redundancy, resulting in highly sparse attention maps
+017
+               within LVLMs. This sparsity can be leveraged to accelerate attention computation
+018            or compress the KV cache through various approaches. However, most studies
+019            focus on addressing only one of these bottlenecks and do not adequately support
+020            dynamic adjustment of sparsity concerning distinct layers or tasks. In this paper, we
+021            present ZipVL, an efficient inference framework designed for LVLMs that resolves
+022            both computation and memory bottlenecks through a dynamic ratio of important
+023            tokens. This ratio is adaptively determined based on the layer-specific distribution
+024            of attention scores, rather than fixed hyper-parameters, thereby improving efficiency
+025            for less complex tasks while maintaining high performance for more challenging
+026
+               ones. Then we select important tokens based on their normalized attention scores
+               and perform attention mechanism solely on those important tokens to accelerate
+027
+               the prefill phase. To mitigate the memory bottleneck in the decoding phase, we
+028
+               employ mixed-precision quantization to the KV cache, where high-bit quantization
+029            is used for caches of important tokens, while low-bit quantization is applied to
+030            those of less importance. Our experiments demonstrate that ZipVL can accelerate
+031            the prefill phase by 2.6× and reduce GPU memory usage by 50.0%, with a minimal
+032            accuracy reduction of only 0.2% on Video-MME benchmark over LongVA-7B
+033            model, effectively enhancing the generation efficiency of LVLMs.
+034
+035
+036   1   I NTRODUCTION
+037
+038   With the recent advancement of large language models (LLMs) (Achiam et al., 2023; Team et al.,
+039
+      2023; Vavekanand & Sam, 2024), many studies have extended their capabilities to comprehend and
+      generate visual content. These models, commonly known as large vision-language models (LVLMs),
+040
+      have demonstrated remarkable performance in tasks such as image captioning and visual question
+041
+      answering (Ge et al., 2024b; Liu et al., 2024b; Team, 2024; Ge et al., 2024c; Lin et al., 2023).
+042   Typically, to remain compatible with the next-token-prediction generation scheme of LLMs, images
+043   or videos are encoded into visual tokens through a pre-trained visual encoder, and concatenated with
+044   text tokens for input into the model. For instance, LLaVA (Liu et al., 2024b) employs a pre-trained
+045   CLIP-ViT-L-336px model (Radford et al., 2021), which encodes an image of size 336×336 pixels
+046   to 576 visual tokens. However, for high-resolution images or videos, the visual encoder generates
+047   excessive sequences of visual tokens, significantly limiting the generative efficiency of LVLMs.
+048   Specifically, the prefill phase suffers from the quadratic complexity of the attention mechanism,
+049   resulting in computational bottleneck and prolonged time-to-first-token (TTFT). In the decoding
+050
+      phase, each new token interacts with all preceding tokens, requiring to fetch the full key-value (KV)
+      cache from memory. This process slows down decoding due to memory bottleneck. Improving
+051
+      generative efficiency in both phases is essential for the practical deployment of LVLMs.
+052
+053   To address computational complexity in the prefill phase, sparse attention (Pagliardini et al., 2023;
+      Jiang et al., 2024; Zhu et al., 2024) has emerged as an effective strategy, particularly suitable for
+
+
+                                                        1
+      Under review as a conference paper at ICLR 2025
+
+
+054
+055
+056
+057
+058
+059
+060
+061
+062
+063
+064
+065
+066                    (a) Layer 0, ChartQA           (b) Layer 10, ChartQA            (c) Layer 10, VQAv2
+067
+068
+069   Figure 1: The attention maps exhibit distinct sparse patterns across different layers (subfigures (a)
+070   and (b)) and vary significantly between tasks (subfigures (b) and (c)). Data was collected from the
+071   LLaVA-Next-7B model using input samples from the VQAv2 and ChartQA datasets.
+072
+073
+074   LVLMs where visual information exhibits considerable redundancy, leading to highly sparse attention
+075   maps (Wan et al., 2024; Chen et al., 2024). This sparsity can be implemented at various levels of
+076   granularity. Some studies pre-define several sparse patterns and assign them to the attention mask
+077   during inference (Jiang et al., 2024; Zhu et al., 2024). However, these predefined patterns are not
+078   compatible with efficient attention implementations such as FlashAttention (Dao et al., 2022) and
+079   require custom GPU kernels for each pattern. Alternatively, other approaches adopt token-level
+080   sparsity by identifying and discarding less important tokens (Chen et al., 2024; Arif et al., 2024),
+081
+      allowing seamless integration with off-the-shelf efficient attention implementations. However, the
+      optimal retention ratio of important tokens may vary across different layers or tasks due to distinct
+082
+      attention patterns, as illustrated in Figure 1. These methods rely on a fixed token retention ratio and
+083
+      do not dynamically adjust based on task difficulty, leading to suboptimal performance on complex
+084   tasks.
+085
+086   To alleviate memory bottleneck, various efforts have been made to reduce KV cache size, including
+087
+      token dropping (Wan et al., 2024), token merging (Yang et al., 2024a), and quantization (Hooper
+      et al., 2024; He et al., 2024b). However, these methods often rely on fixed compression ratios that
+088
+      are uniformly applied across all layers, failing to account for the distinct characteristics of attention
+089
+      maps in different layers. Moreover, despite the necessity of identifying important tokens for both
+090   sparse attention and KV cache compression, a unified inference optimization framework has yet to be
+091   developed.
+092
+093
+      In this paper, we present ZipVL, an efficient inference framework tailored for LVLMs that jointly
+      optimizes the prefill and decoding phases with a unified ratio of important tokens, as shown in Figure 2.
+094
+      To start with, we introduce a layer-wise adaptive ratio assignment scheme for important tokens. This
+095
+      ratio is adaptively determined based on the distribution of attention scores in each layer, rather than
+096   relying on predefined hyper-parameters (Chen et al., 2024; Arif et al., 2024; He et al., 2024b; Zhang
+097   et al., 2023). This adaptive approach allows the ratio to be adjusted according to task complexity,
+098   enhancing efficiency for simpler tasks while preserving performance for more complex ones. After
+099   determining the ratio, we then select important tokens with the highest normalized attention scores,
+100   following prior work (He et al., 2024b; Ren & Zhu, 2024). To alleviate the computational bottleneck
+101   in the prefill phase, sparse attention is performed at the token level by computing attention only
+102   for the selected important tokens. Notably, this approach seamlessly integrates with existing fast
+103   attention implementations without requiring custom GPU kernels. To tackle the memory bottleneck,
+104
+      the same set of important tokens is applied to compress the KV cache, where we employ high-bit
+      quantization for caches of important tokens and low-bit quantization for those of less importance.
+105
+      Extensive experiments on multimodal benchmarks demonstrate that our method achieves nearly
+106
+      lossless performance while reducing prefill phase latency by 2.6× and GPU memory usage by 50%.
+107
+      In summary, our contributions are as follows:
+
+
+                                                         2
+      Under review as a conference paper at ICLR 2025
+
+
+108         ① Dynamic Ratio of Important Tokens           ③ Token-level Sparse Attention
+109
+                                                                                 FlashAttention
+110
+111
+112
+113                                                                            Padding
+114
+115
+116
+117                             sum                       ④ KV cache compression
+118
+119                                                                                      : high-bit   : low-bit
+                              p out of n tokens
+          normalize
+
+
+120                                                                    mixed-precision
+121                          s.t. sum(   ) ≥ τ*n                        quantization
+122                    ② Important token identification
+123
+124
+125
+      Figure 2: Overview of the proposed ZipVL framework during the prefill phase. Here, τ represents
+126   the threshold for retaining attention scores, n and p are the total number of tokens and the number of
+127   important tokens, respectively. After determining the ratio of important tokens and identifying them,
+128   we optimize the prefill phase by exclusively computing attention for important tokens. Additionally,
+129   we apply mixed-precision quantization to the KV cache, where the KV cache of less important tokens
+130   is quantized to a lower bit-width.
+131
+132
+133   • We propose an adaptive layer-wise ratio assignment scheme for important tokens. The ratio is
+134     dynamically determined based on the distribution of attention scores and varies across different
+135
+        layers and tasks, thereby enhancing performance and efficiency compared to a fixed ratio scheme.
+136   • We introduce a unified approach to jointly optimize the prefill and decoding stages through the
+137     assigned ratio of important tokens. Tokens considered less important are excluded from attention
+138     computation during the prefill phase, and their KV cache is quantized to a lower bit-width to
+139
+        alleviate the memory bottleneck in the decoding phase.
+140   • By integrating these techniques, we present ZipVL, an efficient inference framework tailored
+141     for LVLMs. Comprehensive experiments across diverse benchmarks validate the efficacy of
+142     ZipVL, demonstrating that it achieves state-of-the-art performance in both accuracy and generation
+143     efficiency for LVLMs.
+144
+145   2           R ELATED W ORK
+146
+147   2.1             S PARSE ATTENTION FOR LLM S
+148
+149   Attention scores have been widely observed to exhibit high sparsity in both LLMs and LVLMs (Xiao
+150   et al., 2024; Wan et al., 2024; Zhu et al., 2024; Zaheer et al., 2020; Beltagy et al., 2020). This
+151   sparsity allows sparse attention to overcome the quadratic computational complexity of the standard
+152   attention mechanism by restricting each token to focus on only a subset of tokens within the input
+153
+      sequence (Zhu et al., 2024; Jiang et al., 2024; Pagliardini et al., 2023; Ribar et al., 2024). Depending
+      on the granularity of sparsity, sparse attention can be categorized into unstructured, semi-structured,
+154
+      and structured schemes. The unstructured scheme (Lefaudeux et al., 2022; He et al., 2024a) employs
+155
+      sparse attention masks without a fixed structure, making it hardware-unfriendly and challenging to
+156   achieve practical inference acceleration. The semi-structured sparse attention uses attention masks
+157   with predefined sparse patterns (Jiang et al., 2024; Pagliardini et al., 2023; Zhu et al., 2024) or
+158   introduces N:M sparsity to attention weights (Chen et al., 2023). However, it requires customized
+159   computational kernels for each sparse pattern or specific hardware to achieve acceleration. Structured
+160   sparse attention (Chen et al., 2024; Arif et al., 2024) directly prunes tokens before the attention
+161   computation, enabling acceleration without the need for custom kernels. However, due to its coarse
+      granularity, the pruning sparsity and the selection of tokens to prune significantly impact model
+
+
+                                                              3
+      Under review as a conference paper at ICLR 2025
+
+
+162
+      performance. For instance, HiRED (Arif et al., 2024) selects patches with the highest responses
+163   based on the feature maps of the visual encoder without considering the input text prompt, leading to
+164   suboptimal performance. FastV (Chen et al., 2024) empirically retains all tokens in the first two layers
+165   and prunes 50% of the visual tokens in all subsequent layers, resulting in performance degradation in
+166   challenging tasks such as ChartQA (Masry et al., 2022). In contrast, our approach achieves superior
+167   performance through an adaptive layer-wise ratio assignment scheme for important tokens.
+168
+169   2.2   KV C ACHE C OMPRESSION
+170
+171   KV cache prevents re-computation in the decoding phase by storing the key and value states of
+172   previous tokens, but with a significant memory bottleneck in long-context scenarios. Previous efforts
+173   to compress the KV cache can be broadly categorized into three types: token dropping-based (Ge et al.,
+174   2024a; Ren & Zhu, 2024; Zhang et al., 2023), token merging-based (Wang et al., 2024; Wan et al.,
+175
+      2024; Liu et al., 2024d), and quantization-based approaches (Hooper et al., 2024; He et al., 2024b;
+      Yang et al., 2024b; Kang et al., 2024; Liu et al., 2024c). Both token dropping-based and merging-
+176
+      based methods aim to reduce the number of tokens stored in the KV cache by evicting or merging
+177
+      less important tokens. However, the information that is evicted or merged cannot be recovered,
+178   potentially leading to risks such as contextual incoherency or hallucination (Yang et al., 2024b),
+179   especially in multi-round dialogue scenarios. Conversely, quantization-based approaches retain all
+180   tokens in the KV cache and apply quantization to the cached values. To preserve performance,
+181   mixed-precision quantization further assigns higher bit-width to recent tokens (Liu et al., 2024c)
+182   or important tokens (Yang et al., 2024b) in the KV cache. In this paper, we apply mixed-precision
+183   quantization to compress the KV cache, leveraging the proposed layer-wise adaptive ratio assignment
+184   scheme to achieve a higher compression ratio.
+185
+186   3     P RELIMINARY
+187
+188   Attention block is the key module of Transformer-based LLMs. Each attention block contains three
+189   weight matrices WQ , WK , WV ∈ Rd×d , where d is the dimension of the input data. Here, we use a
+190   single attention head and omit the output projection for clarity. In the prefill phase, the input data
+191   X ∈ Rn×d with a sequence length of n is first multiplied with three weight matrices to obtain the
+192   query, key and value states:
+193
+194
+                                  Q = XWQ ,        K = XWK ,       V = XWV .                               (1)
+195
+196   Then the attention output is calculated as follows:
+197
+                                                     QKT + M
+
+198                                A = Softmax           √     , O = AV.                                   (2)
+                                                           d
+199
+200   Here, computing the product of QKT has a quadratic complexity O(n2 ), which makes the prefill
+201   phase compute-bound. M ∈ Rn×n is a lower triangular causal mask to ensure that each token can
+202   only attend to itself and previous tokens. Unstructured and semi-structured sparse attention introduce
+203   sparsity in the attention mask M with dynamic or fixed sparse pattern. With custom computing
+204   kernels, tokens in certain positions can be skipped when computing QKT , thus accelerating the
+205   computation. On the other hand, structured sparse attention only computes attention scores for
+                                      ′                                                  2
+206   a subset of tokens X′ ∈ Rn ×d , reducing computational complexity to O(n′ ) and seamlessly
+207   integrating with existing fast attention implementations.
+208   For the decoding phase, the input data is the embedding of the current token x ∈ R1×d . To enable
+209   the interaction between the current token and all previous tokens, the KV cache of previous tokens
+210   needs to be fetched from memory, making the decoding phase memory-bound:
+211
+                      q = xWQ ,      K = Concat(K, xWK ),          V = Concat(V, xWV ).                    (3)
+212
+213   The attention outputs are then computed as follows with a computational complexity of O(n):
+214
+                                                     qKT
+
+215
+                                      a = Softmax √         , o = aV.                                      (4)
+                                                        d
+
+                                                         4
+      Under review as a conference paper at ICLR 2025
+
+
+216
+      4     M ETHOD
+217
+218
+      4.1   L AYER - WISE A DAPTIVE R ATIO A SSIGNMENT FOR I MPORTANT TOKENS
+219
+220   Prior studies (Arif et al., 2024; Zhang et al., 2023; He et al., 2024b; Liu et al., 2024c; Wan et al.,
+221   2024) typically adopt a fixed ratio of important tokens across all layers. However, as analyzed by the
+222   preceding study (Chen et al., 2024) and demonstrated in Figure 1(a) and (b), there are substantial
+223   variations in the attention map patterns across different layers. Moreover, Figure 1(b) and (c) illustrate
+224   that, even within the same layer, attention maps can differ depending on the task and input. In
+225   scenarios involving complex tasks, a limited, static ratio for important tokens can impair model
+226   performance. This raises the question:
+227
+              can the model dynamically determine the number of tokens required to solve a task?
+228
+229   Intuitively, for simpler tasks, the model needs to concentrate on fewer tokens, leading to a more
+230   focused distribution of attention scores. Conversely, more demanding tasks require the model to
+231   engage with a broader array of tokens, resulting in a more uniform distribution of attention scores.
+232   Prior work (Xiao et al., 2024) also highlights the criticality of preserving significant attention scores
+233   during inference within a constrained attention window. Building on these insights, we introduce
+234   a layer-wise adaptive scheme for assigning ratio of important tokens, ensuring the majority of
+235   significant attention scores are maintained within each layer.
+236   Consider an attention layer with n input tokens, where the full attention score matrix is denoted
+237   as A ∈ Rn×n . The accumulated attention score for each token j is calculated by summing the
+238   corresponding column:
+239                                                        n
+240
+                                                           X
+                                                    aj =           Ac,j .                                                                              (5)
+241
+                                                             c=1
+242
+243   These accumulated attention scores are subsequently                                            100          ZipVL on VQAv2, overall ratio: 50.30%
+244   sorted in descending order, such that asorted(j) repre-                                                     ZipVL on ChartQA, overall ratio: 52.43%
+                                                                         Ratio of Important Tokens (%)
+
+
+                                                                                                                  FastV, overall ratio: 53.12%
+245   sents the j-th highest attention score. The number of                                              80
+246   important tokens p is determined by preserving the
+247   majority of attention scores with minimal number of                                                60
+248   tokens, which can be expressed as:
+249                             p
+                                X                                                                        40
+250         p = min{p ∈ Z |           asorted(j) ≥ τ × n}.         (6)
+251                             j=1                                                                      20
+252                                                                                                           0       10             20              30
+      Here, τ is the threshold dictating the retention of atten-                                                           Layer Index
+253
+254
+      tion scores and the sum of the attention scores in A is
+      equal to n due to the row-wise Softmax operation. As                        Figure 3: The ratio of important tokens dis-
+255                                                                               tributed across layers. Data was collected
+      shown in Figure 3, our method can dynamically adjust
+256
+      the ratio of important tokens across distinct layers and                    from the LLaVA-Next-7B model using in-
+257   tasks, thereby enhancing performance in complex tasks                       put samples from the VQAv2 and ChartQA
+258   while improving efficiency in simpler tasks. Additional                     datasets.
+259   experimental results can be found in Section 5.2.1 and
+260   Figure 4.
+261
+262   4.2   I NFERENCE O PTIMIZATION WITH U NIFIED T OKEN R ATIO
+263
+264   After determining the number of important tokens p for each layer, we partition all tokens into two
+265   sets: set T of important tokens with a size of p and the set U for less important tokens with a size
+266   of n − p. Following prior work (Ren & Zhu, 2024; He et al., 2024b), we use normalized attention
+267   scores to assess token importance, calculated as follows:
+268                                                  Pn
+                                                            Ac,j
+269                                            ãj = c=1         .                                     (7)
+                                                      nnz(A:,j )
+
+
+                                                              5
+      Under review as a conference paper at ICLR 2025
+
+
+270
+      Here, nnz(A:,j ) denotes the number of non-zero elements in the j-th column. Important tokens are
+271   then selected using the top-k indexing method, while the remainder are considered less important:
+272
+273                                         T = topk index(ãj , p),                                      (8)
+274                                    U = {j ∈ {1, 2, . . . , n} | j ∈
+                                                                      / T}.                               (9)
+275
+      The inference optimization is then performed based on the split of tokens. Specifically, to address the
+276
+      computational bottleneck in the prefill phase, the attention mechanism is performed solely on these
+277   important tokens, thereby enhancing efficiency through token-level sparsity. Tokens excluded from
+278   this computation have their outputs padded to maintain the number of tokens consistent for subsequent
+279   layers. By leveraging token-level sparsity, our approach seamlessly integrates with off-the-shelf, fast
+280   attention implementations (Dao et al., 2022) to expedite the prefill process.
+281
+      To tackle the memory bottleneck, we implement mixed-precision quantization for the KV cache
+282
+      based on the same token split in Eqs. (8) and (9). The KV cache for important tokens is quantized
+283   at a higher bit-width to retain information, whereas the cache for less critical tokens is quantized at
+284   a lower bit-width to significantly reduce KV cache size. In comparison to prior method (He et al.,
+285   2024b), quantizing KV cache with our adaptive layer-wise token ratio leads to a higher compression
+286   ratio with even stronger performance. Further details will be provided in Section 5.3.1.
+287
+      Efficient approximation of full attention scores. To integrate our method with fast attention
+288
+      implementation (Dao et al., 2022) and circumvent the computation of full attention scores in Eqs. (5)
+289   and (7), we selectively compute and accumulate the attention scores for a subset of tokens, following
+290   previous literature (He et al., 2024b; Jiang et al., 2024). The size of this subset is small and fixed,
+291   ensuring that the computational burden for these tokens remains minimal in long-context scenarios.
+292   The accumulated and normalized attention scores for each token can then be approximated with
+293   partial attention scores. Details can be found in Appendix A.
+294
+      Computation in the decoding phase. It should be noted that sparse attention is exclusively utilized in
+295   the prefill phase to mitigate its computational bottleneck. During the decoding phase, the computation
+296   follows the standard attention mechanism as described in Eq. (3). Nonetheless, the KV cache for
+297   newly generated tokens will also be quantized with mixed precision. Specifically, every time 100 new
+298   tokens are generated, their importance is assessed based on the attention scores of the last token, and
+299   they are subsequently quantized accordingly.
+300
+      Overall, the attention mechanism after optimization is summarized in Algorithm 1.
+301
+302
+303   5     E XPERIMENTS
+304
+305   5.1     I MPLEMENTATION D ETAILS
+306
+      To assess the effectiveness of our proposed method, we conduct experiments on both image and video
+307
+      understanding tasks. For image understanding, we utilize three widely adopted LVLMs: LLaVA (Lin
+308   et al., 2023), LLaVA-Next (Liu et al., 2024a), and QWen-VL (Bai et al., 2023). These models are
+309   evaluated against five rigorous benchmarks: VQAv2 (Goyal et al., 2017), TextVQA (Singh et al.,
+310   2019), GQA (Hudson & Manning, 2019), MME (Fu et al., 2023), and ChartQA (Masry et al., 2022).
+311   For video understanding, evaluations are conducted using the LongVA (Zhang et al., 2024) model
+312   on the Video-MME (Fu et al., 2024) benchmark. To ensure reproducibility, all reported results
+313   are obtained using the Evaluation Suite of Large Multimodal Models (Li et al., 2024). For mixed-
+314   precision quantization, the KV cache of important tokens was quantized to 4-bit, while the KV cache
+315   of other tokens was quantized to 2-bit.
+316
+317   5.2     M AIN R ESULTS
+318
+      5.2.1    E VALUATION ON I MAGE B ENCHMARKS
+319
+320   We begin our evaluation on five image comprehension benchmarks and compare our results against
+321   well-established methods with token-level sparsity: FastV (Chen et al., 2024) and HiRED (Arif et al.,
+322   2024). The results are presented in Table 1. Notably, HiRED determines the importance of patches
+323   through the feature map of the visual encoder, without considering the semantic information of the
+      input prompt, resulting in a significant accuracy drop. In contrast, both FastV and our approach assess
+
+
+                                                        6
+      Under review as a conference paper at ICLR 2025
+
+
+324
+325
+      Algorithm 1: The attention mechanism of ZipVL
+326   procedure ZipVL Prefill:
+327      Input: Input embedding X, bit-width for important tokens bh , bit-width for other tokens bl
+328
+         Output: Attention output O, KV cache (K, V)
+         Calculate query, key and value states (Q,K,V) as per Eq. (1)
+329
+         Select a subset of tokens Q′ from query states and compute attention scores
+330
+           A′ = Softmax Q′ KT
+331      Determine the number of important tokens as per Eq. (6)
+332      Calculate the normalized attention scores for each token as per Eq. (7)
+333      Select set T for important tokens as per Eq. (8) and set U for other tokens as per Eq. (9)
+334      // Token-level Sparse Attention with FlashAttention
+335      O = FlashAttention(Q[T], K[T], V[T])
+336      // Compressing KV Cache
+337      K̂ = Concat(Quant(K[T], bh ), Quant(K[U], bl ))
+338      V̂ = Concat(Quant(V[T], bh ), Quant(V[U], bl ))
+339      return O, (K̂, V̂)
+340   procedure ZipVL Decoding:
+341      Input: Input embedding x, stored KV cache (Kin , Vin ), bit-width for important tokens bh ,
+342              bit-width for other tokens bl , the number of token generated m
+343      Output: Attention output o, updated KV cache (Kout , Vout )
+344      Calculate query, key and value states (q,k,v) as per Eq. (1)
+345      Fetch KV cache from memory: K = Concat(Kin , k), V = Concat(Vin , v)
+346      Compute attention output o = FlashAttention(q, K, V)
+347
+         // Compress new KV cache every 100 tokens generated
+         if m%100 == 0 then
+348
+             Compute attention scores: a = Softmax qKT [−100 :]
+349
+             Determine the number of important tokens as per Eq. (6)
+350
+             Calculate the normalized attention scores as per Eq. (7)
+351          Select set T as per Eq. (8) and set U as per Eq. (9)
+               ′                   ′
+352
+             K = K[−100 :], V = V[−100 :]
+353                                   ′                  ′
+             K̂′ = Concat(Quant(K [T], bh ), Quant(K [U], bl ))
+354                                   ′                  ′
+
+355
+             V̂′ = Concat(Quant(V [T], bh ), Quant(V [U], bl ))
+356          Kout = Concat(K[: −100], K̂′ ), Vout = Concat(V[: −100], V̂′ )
+357      else
+             Kout = K, Vout = V
+358
+         return o, (Kout , Vout )
+359
+360
+361
+362   token importance via attention maps in the LVLMs. However, FastV employs a fixed token ratio
+363   and exhibits severe performance degradation on challenging tasks such as ChartQA (Masry et al.,
+364   2022). By implementing layer-wise adaptive ratio assignment, our proposed ZipVL consistently
+365   surpasses FastV across all five benchmarks and three model architectures, while maintaining a smaller
+366   overall ratio of important tokens. As illustrated in Figure 4, our method dynamically adjusts the
+367
+      ratio across various tasks and models, slightly increasing the ratio of important tokens for difficult
+      tasks to preserve performance and enhancing efficiency on simpler tasks. Moreover, the performance
+368
+      gap between our method and FastV becomes more pronounced over the LLaVA-Next-13B model.
+369
+      This discrepancy can be attributed to the varying attention maps across different models and that
+370   FastV’s predefined hyperparameters are not universally applicable, whereas our dynamic approach
+371   demonstrates high robustness.
+372
+373
+      5.2.2   E VALUATION ON V IDEO B ENCHMARKS
+374
+375   We also assess the performance of our method on the Video-MME benchmark (Fu et al., 2024) over
+376   the LongVA model (Zhang et al., 2024), which supports a maximum multimodal input length of 224K
+377   tokens. We compare our approach with semi-structured sparse attention methods such as MInference
+      (Jiang et al., 2024) and QK-sparse (Pagliardini et al., 2023), as well as the structured sparse attention
+
+
+                                                         7
+                Under review as a conference paper at ICLR 2025
+
+
+378            Table 1: Performance comparisons of image LVLMs on various benchmarks. Here, “Ratio” denotes
+379            the proportion of tokens participating in attention computation. “†” denotes token-level sparsity is
+380            only employed in attention modules.
+381
+382                                       Model             Method                                     Ratio    VQAv2      ChartQA                                      TextVQA    GQA     MME
+383                                                           Full                                     100%      76.6        18.2                                         46.1     61.9    1507
+                                                            FastV†                                     53.1%     75.8        17.7                                         45.5     60.2    1511
+384
+                                                            HiRED                                       20%      73.0        17.3                                         45.6     56.8    1368
+385                                   LLaVA-v1.5-7B
+                                                            HiRED                                       40%      75.5        17.6                                         45.6     59.5    1433
+386                                                      Ours (τ =0.96)                                44.1%     76.1        17.9                                         45.0     61.3    1515
+387                                                      Ours (τ =0.975)                               52.8%     76.4        18.0                                         45.7     61.7    1524
+388                                                           Full                                     100%      80.3        54.8                                         64.8     64.1    1519
+389                                                         FastV†                                     53.1%     79.5        51.2                                         63.7     63.7    1490
+390                                                         HiRED                                       20%      77.5        42.0                                         61.4     61.4    1483
+                                      LLaVA-Next-7B
+391
+                                                            HiRED                                       40%      78.8        46.5                                         61.8     59.4    1474
+                                                         Ours (τ =0.96)                                40.4%     79.4        51.0                                         62.6     63.8    1489
+392
+                                                         Ours (τ =0.975)                               49.7%     79.8        52.4                                         63.9     64.1    1495
+393                                                           Full                                     100%      80.9        66.2                                         66.9     65.7    1570
+394                                                         FastV†                                     53.1%     76.8        51.6                                         59.7     62.9    1555
+395                                                         HiRED                                       20%      77.9        48.9                                         63.6     63.1    1545
+                                      LLaVA-Next-13B
+396                                                         HiRED                                       40%      79.3        53.7                                         65.2     64.1    1570
+397                                                      Ours (τ =0.96)                                30.6%     79.7        56.2                                         63.8     64.4    1549
+398                                                      Ours (τ =0.975)                               36.7%     80.3        58.2                                         65.0     65.0    1551
+399
+400                                      (a) LLaVA-v1.5-7B                                                                                                               (c) LLaVA-Next-13B
+                                                                                                       (b) LLaVA-Next-7B
+401                               54
+                                                                                                                                       Ratio of Important Tokens (%)
+      Ratio of Important Tokens (%)
+
+
+                                                                    Ratio of Important Tokens (%)
+
+
+                                                                                                52.5
+402                               52                                                                                                                               50
+403                                                                                             50.0
+                                  50                                                                                                                               45
+404                                                        ZipVL-0.96                           47.5                     ZipVL-0.96                                                       ZipVL-0.96
+                                  48                       ZipVL-0.975                                                   ZipVL-0.975                                                      ZipVL-0.975
+405                                                        FastV                                45.0                     FastV                                     40                     FastV
+                                  46
+406                                                                                             42.5                                                               35
+407                               44
+                                                                                                40.0                                                               30
+408                               42VQAv2 ChartQA TextVQA GQA MME                                  VQAv2 ChartQA TextVQA GQA     MME                                VQAv2 ChartQA TextVQA GQA     MME
+409
+                                                Task Names                                                     Task Names                                                       Task Names
+410
+411             Figure 4: The ratio of important tokens across different methods on different tasks. The proposed
+412             ZipVL can adaptively determine this ratio based on the attention scores, assigning more ratio to
+413             important tokens on complex tasks.
+414
+415
+416             method FastV (Chen et al., 2024). The results are summarized in Table 2. Among these sparse
+417             attention methods, FastV (Chen et al., 2024) consistently retains a fixed proportion of tokens while
+418             MInference (Jiang et al., 2024) retains a fixed number of sparse blocks. Notably, our approach not
+419
+                only achieves the highest overall performance but also exhibits superior reductions in FLOPs within
+                the attention module compared to other sparse attention methods. This demonstrates the effectiveness
+420
+                of employing dynamic token-level sparsity to accelerate the attention module in LVLMs. Furthermore,
+421
+                long videos inherently contain significant redundancy, and our method dynamically allocates the ratio
+422             of important tokens by analyzing the sparse attention maps, resulting in a higher FLOPs reduction
+423             ratio when processing 128-frame videos compared to 64-frame videos.
+424
+425
+                5.3                      A BLATION S TUDY
+426
+427             5.3.1                     E FFECT OF THE L AYER - WISE ADAPTIVE RATIO
+428
+429             In this subsection, we evaluate the efficacy of the proposed adaptive ratio assignment scheme by
+430             integrating it with sparse attention and KV cache compression, as detailed in Table 3. Initially, we
+431             implement a fixed sparse attention scheme on LongVA-7B model over Video-MME benchmark. In
+                this scheme, the ratio for important tokens remains constant across all attention layers and is fixed.
+
+
+                                                                                                               8
+      Under review as a conference paper at ICLR 2025
+
+
+432   Table 2: Performance comparisons of video LVLMs on Video-MME benchmark. Here, “Attn FLOPs
+433   Reduction” denotes the reduction in floating-point operations (FLOPs) of the attention mechanism.
+434   “†” denotes token-level sparsity is only employed in attention modules.
+435
+436                                                   Attn FLOPs
+              Model        Frames        Method                     Short    Medium      Long   Overall
+437
+                                                       Reduction
+                                          Full            0%         61.4      50.9      45.0     52.4
+438
+                                      QK-sparse          47.0%       60.9      51.4      45.1     52.4
+439
+                             64       MInference         54.2%       60.7      51.2      44.6     52.1
+440                                     FastV†           71.7%       61.0      50.6      45.0     52.2
+441                                  Ours(τ =0.975)      77.0%       61.1      51.6      45.0     52.5
+            LongVA-7B
+442                                       Full            0%         61.1      50.4      46.2     52.6
+443                                   QK-sparse          46.9%       61.3      49.7      46.3     52.4
+444                         128       MInference         77.1%       61.0      50.5      45.3     52.3
+445
+                                        FastV†           71.7%       60.2      50.2      46.2     52.2
+                                     Ours(τ =0.975)      82.3%       60.7      51.3      45.2     52.4
+446
+447
+448   Although this approach shares the same overall important token ratio and FLOPs reduction ratio
+449   as our method, it suffers from significant performance degradation (51.1% vs. 52.6%) due to its
+450   failure to account for the varying attention maps across layers. In contrast, our method achieves
+451   nearly lossless performance (52.4% vs. 52.6%) while reducing the FLOPs of attention mechanism by
+452   82.3%.
+453
+      To assess the efficacy of our method specifically for KV cache compression, we apply it to compress
+454   the KV cache of LLaMA3-8B (Meta, 2024) and evaluate its performance on the GSM8k dataset.
+455   The baseline method (He et al., 2024b) also utilizes mixed-precision quantization for KV cache but
+456   employs a fixed ratio for important tokens. For both the baseline and our method, important tokens
+457   are quantized to 4-bit, while other tokens are quantized to 2-bit. Notably, by adaptively determining
+458   the ratio of important tokens, our method achieves a significantly higher compression ratio (6.18 ×
+459   vs. 4.69×) while maintaining superior accuracy (54.06% vs. 53.75%). This demonstrates that our
+460   method also sets a new state-of-the-art for KV cache compression of LLMs.
+461
+462
+      Table 3: The effect of the proposed adaptive ratio assignment scheme on sparse attention and KV
+      cache compression. Here, “Ratio” denotes the proportion of important tokens. For Video-MME
+463
+      benchmark, the input videos consist of 128 frames.
+464
+465                                              Sparse Attention
+466                  Method              Ratio (%) Attn FLOPs Reduction (%)           Video-MME (%)
+467                LongVA-7B               100                    0                         52.6
+468                  Fixed                 42.1                 82.3                        51.1
+469                   Ours                 42.1                 82.3                        52.4
+470                                          KV Cache Compression
+471                   Method             Ratio (%)       Compression Ratio            GSM8k Acc. (%)
+472                LLaMA3-8B               100                   1×                       55.88
+473
+              Fixed (He et al., 2024b)     70.0                4.69×                      53.75
+                       Ours                28.6                6.18×                      54.06
+474
+475
+476   5.3.2    E FFECT OF THE THRESHOLD τ
+477
+478   We further investigate the impact of the attention retention threshold τ on both the ratio of important
+479   tokens and model performance. The results are illustrated in Figure 5. Intuitively, a lower retention
+480
+      threshold leads to a reduced ratio for important tokens, thereby enhancing generation efficiency at
+      the cost of performance degradation. Notably, the ratio decreases significantly as τ decreases but
+481
+      remains above 0.97, with minimal performance deterioration. Conversely, when τ falls below 0.97,
+482
+      substantial performance loss is observed, despite a gradual reduction in the ratio of important tokens.
+483   This indicates that the optimal range for τ lies around 0.97.
+484
+485
+      5.4     D EPLOYMENT E FFICIENCY
+
+
+                                                        9
+      Under review as a conference paper at ICLR 2025
+
+
+486
+      In this subsection, we present the prefill phase la-
+                                                                  70       Ratio
+
+
+                                                                                              Ratio of Important Tokens (%)
+487   tency and GPU memory usage in Figure 6 to illus-
+488   trate the real efficiency improvements achieved by                   Accuracy              61.5
+
+
+                                                                                                                                                                 Accuracy on GQA
+489   ZipVL. Specifically, we first compare the prefill phase
+                                                                  60
+      latency of ZipVL with that of the well-established semi-
+                                                                                                 61.0
+490
+491   structured sparse attention method, MInference (Jiang
+      et al., 2024), as shown in Figure 6a. Notably, MIn-
+492
+493   ference exhibits significant additional overhead when       50                             60.5
+494   the sequence length is short and is notably slower than
+      FlashAttention (Dao et al., 2022) for sequence lengths
+495
+      below 32K. In contrast, ZipVL achieves comparable           40                             60.0
+496
+      latency to FlashAttention with short input sequences,
+497
+                                                                       0.94 0.96 0.98 59.5
+      while significantly reducing the prefill phase latency
+498   as the sequence length exceeds 32K. This can be at-
+499   tributed to the fact that the attention module’s latency
+500   becomes the dominant factor in the total latency with
+501   long sequences. With an input sequence length of 200K, Figure 5: The effect of attention scores re-
+502   ZipVL achieves a 2.6× reduction in prefill-phase la- tention threshold τ on the ratio of important
+      tency.                                                   tokens and the model performance. Data
+503
+                                                               was collected on GQA benchmark over
+504   Moreover, MInference is not designed to reduce the KV LLaVA-v1.5-7B model.
+505   cache size, while the proposed ZipVL jointly optimizes
+506   the attention computation in the prefill phase and the
+507   KV cache through the dynamic token ratio. Consequently, ZipVL presents a 50.0% reduction in GPU
+508   memory usage with an input sequence length of 64K (26,230MB vs. 52,514MB), as illustrated in
+509   Figure 6b.
+510
+511                                             (a)                                                                                 (b)
+512
+                            50           FlashAttention                               50000                                   FlashAttention
+513
+                                         MInference                                                                           Ours
+                                                                        GPU Memory (MB)
+          Prefill Latency (s)
+
+
+                                                                                      40000
+514                         40           Ours
+515
+                            30                                                        30000
+516
+517                                                                                   20000
+                            20
+518
+519                         10                                                        10000
+520
+521                             0   1K 2K 4K 8K 16K 32K 64K 128K 200K                     0                        1K         2K   4K     8K   16K   32K   64K
+522                                      Sequence Length (K)                                                                  Sequence Length (K)
+523
+524   Figure 6: Comparisons of prefill phase latency and GPU memory across different sequence lengths.
+525   Data is collected from LongVA-7B model.
+526   6           C ONCLUSION AND F UTURE W ORK
+527
+528   In this paper, we have proposed ZipVL, an efficient inference framework tailored for LVLMs. ZipVL
+529   jointly optimizes both the prefill and decoding phases by assigning an adaptive ratio of important
+530   tokens. This ratio is dynamically adjusted based on the distribution of attention scores across each
+531
+      layer, ensuring that the majority of attention scores are preserved. After identifying important
+      tokens through normalized attention scores, less significant tokens are excluded from attention
+532
+      computation during the prefill phase to alleviate the computational bottleneck. Additionally, their
+533
+      KV cache is quantized to a lower bit-width, mitigating the memory bottleneck in the decoding phase.
+534   Extensive experiments have demonstrated that ZipVL significantly enhances the generation efficiency
+535   of LVLMs, achieving up to a 2.6× reduction in prefill phase latency and a 50% reduction in GPU
+536   memory usage. However, a limitation of our approach is its focus on sparse attention during the
+537   prefill phase only, while attention during the decoding phase and the multi-layer perceptron (MLP)
+538   modules in both phases remain dense. Future efforts may explore extending sparse computations
+539   to MLP modules or the attention mechanism in the decoding phase to further reduce computational
+      complexity.
+
+
+                                                                              10
+      Under review as a conference paper at ICLR 2025
+
+
+540
+      R EFERENCES
+541
+542   Josh Achiam, Steven Adler, Sandhini Agarwal, Lama Ahmad, Ilge Akkaya, Florencia Leoni Aleman,
+543     Diogo Almeida, Janko Altenschmidt, Sam Altman, Shyamal Anadkat, et al. Gpt-4 technical report.
+544     arXiv preprint arXiv:2303.08774, 2023.
+545
+      Kazi Hasan Ibn Arif, JinYi Yoon, Dimitrios S Nikolopoulos, Hans Vandierendonck, Deepu John,
+546     and Bo Ji. Hired: Attention-guided token dropping for efficient inference of high-resolution
+547     vision-language models in resource-constrained environments. arXiv preprint arXiv:2408.10945,
+548     2024.
+549
+550   Jinze Bai, Shuai Bai, Shusheng Yang, Shijie Wang, Sinan Tan, Peng Wang, Junyang Lin, Chang Zhou,
+551
+         and Jingren Zhou. Qwen-vl: A versatile vision-language model for understanding, localization,
+         text reading, and beyond. arXiv preprint arXiv:2308.12966, 2023.
+552
+553   Iz Beltagy, Matthew E Peters, and Arman Cohan. Longformer: The long-document transformer.
+554      arXiv preprint arXiv:2004.05150, 2020.
+555
+556   Liang Chen, Haozhe Zhao, Tianyu Liu, Shuai Bai, Junyang Lin, Chang Zhou, and Baobao Chang.
+557     An image is worth 1/2 tokens after layer 2: Plug-and-play inference acceleration for large vision-
+558
+        language models. arXiv preprint arXiv:2403.06764, 2024.
+559   Zhaodong Chen, Zheng Qu, Yuying Quan, Liu Liu, Yufei Ding, and Yuan Xie. Dynamic n: M
+560     fine-grained structured sparse attention mechanism. In PPoPP, pp. 369–379, 2023.
+561
+562   Tri Dao, Dan Fu, Stefano Ermon, Atri Rudra, and Christopher Ré. Flashattention: Fast and memory-
+563     efficient exact attention with io-awareness. In NeurIPS, 2022.
+564
+      Chaoyou Fu, Peixian Chen, Yunhang Shen, Yulei Qin, Mengdan Zhang, Xu Lin, Jinrui Yang, Xiawu
+565     Zheng, Ke Li, Xing Sun, Yunsheng Wu, and Rongrong Ji. Mme: A comprehensive evaluation
+566     benchmark for multimodal large language models. arXiv preprint arXiv:2306.13394, 2023.
+567
+568   Chaoyou Fu, Yuhan Dai, Yondong Luo, Lei Li, Shuhuai Ren, Renrui Zhang, Zihan Wang, Chenyu
+569     Zhou, Yunhang Shen, Mengdan Zhang, et al. Video-mme: The first-ever comprehensive evaluation
+570
+        benchmark of multi-modal llms in video analysis. arXiv preprint arXiv:2405.21075, 2024.
+571   Suyu Ge, Yunan Zhang, Liyuan Liu, Minjia Zhang, Jiawei Han, and Jianfeng Gao. Model tells you
+572     what to discard: Adaptive kv cache compression for llms. In ICLR, 2024a.
+573
+574   Yuying Ge, Sijie Zhao, Ziyun Zeng, Yixiao Ge, Chen Li, Xintao Wang, and Ying Shan. Making
+575     llama see and draw with seed tokenizer. In ICLR, 2024b.
+576
+      Yuying Ge, Sijie Zhao, Jinguo Zhu, Yixiao Ge, Kun Yi, Lin Song, Chen Li, Xiaohan Ding, and Ying
+577     Shan. Seed-x: Multimodal models with unified multi-granularity comprehension and generation.
+578     arXiv preprint arXiv:2404.14396, 2024c.
+579
+580   Yash Goyal, Tejas Khot, Douglas Summers-Stay, Dhruv Batra, and Devi Parikh. Making the v in vqa
+581     matter: Elevating the role of image understanding in visual question answering. In CVPR, 2017.
+582
+      Team PyTorch: Horace He, Driss Guessous, Yanbo Liang, and Joy Dong. Flexattention: The
+583
+        flexibility of pytorch with the performance of flashattention. https://pytorch.org/blog/
+584     flexattention/, 2024a.
+585
+586   Yefei He, Luoming Zhang, Weijia Wu, Jing Liu, Hong Zhou, and Bohan Zhuang. Zipcache:
+587     Accurate and efficient kv cache quantization with salient token identification. arXiv preprint
+588     arXiv:2405.14256, 2024b.
+589
+      Coleman Hooper, Sehoon Kim, Hiva Mohammadzadeh, Michael W Mahoney, Yakun Sophia Shao,
+590     Kurt Keutzer, and Amir Gholami. Kvquant: Towards 10 million context length llm inference with
+591     kv cache quantization. arXiv preprint arXiv:2401.18079, 2024.
+592
+593   Drew A Hudson and Christopher D Manning. Gqa: A new dataset for real-world visual reasoning
+        and compositional question answering. In CVPR, 2019.
+
+
+                                                      11
+      Under review as a conference paper at ICLR 2025
+
+
+594
+      Huiqiang Jiang, YUCHENG LI, Chengruidong Zhang, Qianhui Wu, Xufang Luo, Surin Ahn, Zhenhua
+595     Han, Amir H Abdi, Dongsheng Li, Chin-Yew Lin, et al. Minference: Accelerating pre-filling for
+596     long-context llms via dynamic sparse attention. In Workshop on Efficient Systems for Foundation
+597     Models II@ ICML, 2024.
+598
+599   Hao Kang, Qingru Zhang, Souvik Kundu, Geonhwa Jeong, Zaoxing Liu, Tushar Krishna, and Tuo
+600     Zhao. Gear: An efficient kv cache compression recipefor near-lossless generative inference of llm.
+601
+        arXiv preprint arXiv:2403.05527, 2024.
+602   Benjamin Lefaudeux, Francisco Massa, Diana Liskovich, Wenhan Xiong, Vittorio Caggiano, Sean
+603     Naren, Min Xu, Jieru Hu, Marta Tintore, Susan Zhang, Patrick Labatut, Daniel Haziza, Luca
+604     Wehrstedt, Jeremy Reizenstein, and Grigory Sizov. xformers: A modular and hackable transformer
+605     modelling library. https://github.com/facebookresearch/xformers, 2022.
+606
+607   Bo Li, Peiyuan Zhang, Kaichen Zhang, Fanyi Pu, Xinrun Du, Yuhao Dong, Haotian Liu, Yuanhan
+608
+        Zhang, Ge Zhang, Chunyuan Li, and Ziwei Liu. Lmms-eval: Accelerating the development of
+        large multimoal models, March 2024. URL https://github.com/EvolvingLMMs-Lab/
+609
+        lmms-eval.
+610
+611   Bin Lin, Bin Zhu, Yang Ye, Munan Ning, Peng Jin, and Li Yuan. Video-llava: Learning united visual
+612     representation by alignment before projection. arXiv preprint arXiv:2311.10122, 2023.
+613
+614   Haotian Liu, Chunyuan Li, Yuheng Li, Bo Li, Yuanhan Zhang, Sheng Shen, and Yong Jae Lee.
+615     Llava-next: Improved reasoning, ocr, and world knowledge, January 2024a. URL https:
+616
+       //llava-vl.github.io/blog/2024-01-30-llava-next/.
+617   Haotian Liu, Chunyuan Li, Qingyang Wu, and Yong Jae Lee. Visual instruction tuning. In NeurIPS,
+618     2024b.
+619
+620   Zirui Liu, Jiayi Yuan, Hongye Jin, Shaochen Zhong, Zhaozhuo Xu, Vladimir Braverman, Beidi
+621     Chen, and Xia Hu. Kivi: A tuning-free asymmetric 2bit quantization for kv cache. arXiv preprint
+622     arXiv:2402.02750, 2024c.
+623
+      Zuyan Liu, Benlin Liu, Jiahui Wang, Yuhao Dong, Guangyi Chen, Yongming Rao, Ranjay Krishna,
+624     and Jiwen Lu. Efficient inference of vision instruction-following models with elastic cache. arXiv
+625     preprint arXiv:2407.18121, 2024d.
+626
+627   Ahmed Masry, Do Xuan Long, Jia Qing Tan, Shafiq Joty, and Enamul Hoque. Chartqa: A bench-
+628     mark for question answering about charts with visual and logical reasoning. arXiv preprint
+629     arXiv:2203.10244, 2022.
+630
+      Meta. Introducing meta llama 3: The most capable openly available llm to date. https://ai.
+631    meta.com/blog/meta-llama-3/, 2024.
+632
+633   Matteo Pagliardini, Daniele Paliotta, Martin Jaggi, and François Fleuret. Fast attention over long
+634    sequences with dynamic sparse flash attention. In NeurIPS, 2023.
+635
+      Alec Radford, Jong Wook Kim, Chris Hallacy, Aditya Ramesh, Gabriel Goh, Sandhini Agarwal,
+636
+        Girish Sastry, Amanda Askell, Pamela Mishkin, Jack Clark, et al. Learning transferable visual
+637
+        models from natural language supervision. In ICLR, 2021.
+638
+639   Siyu Ren and Kenny Q Zhu. On the efficacy of eviction policy for key-value constrained generative
+640     language model inference. arXiv preprint arXiv:2402.06262, 2024.
+641
+642
+      Luka Ribar, Ivan Chelombiev, Luke Hudlass-Galley, Charlie Blake, Carlo Luschi, and Douglas Orr.
+        Sparq attention: Bandwidth-efficient llm inference. In ICML, 2024.
+643
+644   Amanpreet Singh, Vivek Natarajan, Meet Shah, Yu Jiang, Xinlei Chen, Dhruv Batra, Devi Parikh,
+645    and Marcus Rohrbach. Towards vqa models that can read. In CVPR, 2019.
+646
+647   Chameleon Team. Chameleon: Mixed-modal early-fusion foundation models. arXiv preprint
+        arXiv:2405.09818, 2024.
+
+
+                                                      12
+      Under review as a conference paper at ICLR 2025
+
+
+648
+      Gemini Team, Rohan Anil, Sebastian Borgeaud, Yonghui Wu, Jean-Baptiste Alayrac, Jiahui Yu, Radu
+649     Soricut, Johan Schalkwyk, Andrew M Dai, Anja Hauth, et al. Gemini: a family of highly capable
+650     multimodal models. arXiv preprint arXiv:2312.11805, 2023.
+651
+652   Raja Vavekanand and Kira Sam. Llama 3.1: An in-depth analysis of the next-generation large
+653     language model, 2024.
+654   Zhongwei Wan, Ziang Wu, Che Liu, Jinfa Huang, Zhihong Zhu, Peng Jin, Longyue Wang, and
+655     Li Yuan. Look-m: Look-once optimization in kv cache for efficient multimodal long-context
+656     inference. arXiv preprint arXiv:2406.18139, 2024.
+657
+658   Zheng Wang, Boxiao Jin, Zhongzhi Yu, and Minjia Zhang. Model tells you where to merge: Adaptive
+659
+        kv cache merging for llms on long-context tasks. arXiv preprint arXiv:2407.08454, 2024.
+660   Guangxuan Xiao, Yuandong Tian, Beidi Chen, Song Han, and Mike Lewis. Efficient streaming
+661     language models with attention sinks. In ICLR, 2024.
+662
+663   Dongjie Yang, XiaoDong Han, Yan Gao, Yao Hu, Shilin Zhang, and Hai Zhao. Pyramidinfer: Pyramid
+664
+        kv cache compression for high-throughput llm inference. arXiv preprint arXiv:2405.12532, 2024a.
+665   June Yong Yang, Byeongwook Kim, Jeongin Bae, Beomseok Kwon, Gunho Park, Eunho Yang,
+666     Se Jung Kwon, and Dongsoo Lee. No token left behind: Reliable kv cache compression via
+667     importance-aware mixed precision quantization. arXiv preprint arXiv:2402.18096, 2024b.
+668
+669
+      Manzil Zaheer, Guru Guruganesh, Kumar Avinava Dubey, Joshua Ainslie, Chris Alberti, Santiago
+       Ontanon, Philip Pham, Anirudh Ravula, Qifan Wang, Li Yang, et al. Big bird: Transformers for
+670
+       longer sequences. In NeurIPS, 2020.
+671
+672   Peiyuan Zhang, Kaichen Zhang, Bo Li, Guangtao Zeng, Jingkang Yang, Yuanhan Zhang, Ziyue
+673     Wang, Haoran Tan, Chunyuan Li, and Ziwei Liu. Long context transfer from language to vision.
+674     arXiv preprint arXiv:2406.16852, 2024.
+675
+      Zhenyu Zhang, Ying Sheng, Tianyi Zhou, Tianlong Chen, Lianmin Zheng, Ruisi Cai, Zhao Song,
+676
+        Yuandong Tian, Christopher Ré, Clark Barrett, et al. H2o: Heavy-hitter oracle for efficient
+677     generative inference of large language models. In NeurIPS, 2023.
+678
+679   Qianchao Zhu, Jiangfei Duan, Chang Chen, Siran Liu, Xiuhong Li, Guanyu Feng, Xin Lv, Huanqi
+680     Cao, Xiao Chuanfu, Xingcheng Zhang, et al. Near-lossless acceleration of long context llm
+681     inference with adaptive structured sparse attention. arXiv preprint arXiv:2406.15486, 2024.
+682
+683
+684
+685
+686
+687
+688
+689
+690
+691
+692
+693
+694
+695
+696
+697
+698
+699
+700
+701
+
+
+
+                                                    13
+      Under review as a conference paper at ICLR 2025
+
+
+702
+                                                  Appendix
+703
+704
+705   A    E FFICIENT A PPROXIMATION OF F ULL ATTENTION S CORES
+706
+707   ZipVL requires accumulated attention scores to adaptively assign the ratio of important tokens and
+708   normalized attention scores to identify token importance. However, attention scores are not accessible
+709
+      in fast attention implementations such as FlashAttention (Dao et al., 2022). To integrate our method
+      with FlashAttention, we follow prior literature (He et al., 2024b; Jiang et al., 2024) and select a subset
+710
+      of tokens, referred to as “probe tokens” (He et al., 2024b), and explicitly compute their attention
+711
+      scores:
+                                                              Qprobe KT
+
+712
+713                                    Aprobe = Softmax            √         .                              (10)
+                                                                     dk
+714
+      The approximate accumulated and normalized attention scores for each token can then be obtained
+715
+      accordingly based on Aprobe . Prior work (He et al., 2024b) selects 10% of the tokens as probe tokens,
+716
+      which still yields quadratic complexity in Eq. 10. In contrast, we select only 64 recent tokens and 64
+717   randomly positioned tokens, which incurs negligible computation overhead in long-context scenarios.
+718
+719
+720
+721
+722
+723
+724
+725
+726
+727
+728
+729
+730
+731
+732
+733
+734
+735
+736
+737
+738
+739
+740
+741
+742
+743
+744
+745
+746
+747
+748
+749
+750
+751
+752
+753
+754
+755
+
+
+
+                                                         14

@@ -1,0 +1,1823 @@
+Under review as a conference paper at ICLR 2025
+
+
+000
+001
+      S WIFT KV: FAST P REFILL -O PTIMIZED I NFERENCE WITH
+002   K NOWLEDGE -P RESERVING M ODEL T RANSFORMATION
+003
+004
+005    Anonymous authors
+006    Paper under double-blind review
+007
+008
+009                                                       A BSTRACT
+010
+011                LLM inference for popular enterprise use cases, such as summarization, RAG, and
+012                code-generation, typically observes orders of magnitude longer prompt lengths than
+013                generation lengths. This characteristic leads to high cost of prefill and increased re-
+014                sponse latency. In this paper, we present SwiftKV, a novel model transformation and
+015                distillation procedure specifically designed to reduce the time and cost of processing
+016                prompt tokens while preserving high quality of generated tokens. SwiftKV combines
+017
+                   three key mechanisms: i) SingleInputKV, which prefills later layers’ KV cache using
+                   a much earlier layer’s output, allowing prompt tokens to skip much of the model
+018
+                   computation, ii) AcrossKV, which merges the KV caches of neighboring layers to
+019
+                   reduce the memory footprint and support larger batch size for higher throughput, and
+020                iii) a knowledge-preserving distillation procedure that can adapt existing LLMs for
+021                SwiftKV with minimal accuracy impact and low compute and data requirement. For
+022                Llama-3.1-8B and 70B, SwiftKV reduces the compute requirement of prefill by 50%
+023                and the memory requirement of the KV cache by 62.5% while incurring minimum
+024                quality degradation across a wide range of tasks. In the end-to-end inference serving
+025                using an optimized vLLM implementation, SwiftKV realizes up to 2× higher aggre-
+026                gate throughput and 60% lower time per output token. It can achieve a staggering 560
+027                TFlops/GPU of normalized inference throughput, which translates to 16K tokens/s
+028
+                   for Llama-3.1-70B in 16-bit precision on 4× H100 GPUs. Our training, inference,
+                   and model implementations are open-sourced at https://anonymized.link.
+029
+030
+031   1       I NTRODUCTION
+032
+033   Large Language Models (LLMs) are quickly becoming an integral enabler of enterprise applications and
+034   offerings, including code and data co-pilots (Chen et al., 2021; Pourreza & Rafiei, 2024), retrieval aug-
+035   mented generation (RAG) (Lewis et al., 2020; Lin et al., 2024), summarization (Pu et al., 2023; Zhang
+036   et al., 2024), and agentic workflows (Wang et al., 2024; Schick et al., 2023). While it is clear that LLMs
+037   can add value to these applications, the cost and speed of inference determine their practicality. There-
+038   fore, improving the aggregate throughput and reducing latency of LLM inference has become an increas-
+039   ingly important topic of interest, with various efforts (Sec. 2) tackling the problem from multiple angles.
+040   In this paper, we take a unique approach to improving LLM inference for enterprise applications based
+041   on the key observation that typical enterprise workloads process many more input tokens than output
+042   tokens. For example, tasks like code completion, text-to-SQL, summarization and RAG each submit
+043   long prompts but produce a small number of generated tokens, and a majority of enterprise LLM use
+044   cases incur a 10:1 ratio between prompt and generated tokens.1
+045   Based on this observation, we designed SwiftKV, which improves throughput and latency by: i)
+046   reducing the computation required to pre-fill the KV cache for input tokens, and ii) enabling memory
+047   savings to support larger batch sizes needed to serve LLMs more cost effectively (Sheng et al., 2023;
+048   Pope et al., 2022; Yu et al., 2022). SwiftKV (Fig. 1) consists of four key components:
+049
+      SingleInputKV. SingleInputKV rewires an existing model so that the pre-fill stage during inference can
+050
+      skip a number of later layers in the network, and their KV cache are computed by a single earlier layer.
+051   SingleInputKV is motivated by the observation that the output hidden states of the later transformer lay-
+052   ers do not change significantly (see Sec. 3.2, also independently discovered by Liu et al. (2024c)). With
+053
+          1
+              Exact use cases hidden to preserve anonymity but will be included in final paper.
+
+
+                                                                 1
+      Under review as a conference paper at ICLR 2025
+
+
+054
+       Layer 1       Layer 2      Layer 3      Layer 4      Prefill   Layer 5      Layer 6        Layer 7      Layer 8
+055                                                         tokens                                                           LM
+                                                              exit                                                           Head
+056                                                                                                                                      Distill from
+        Wq            Wq           Wq           Wq                     Wq           Wq             Wq           Wq                        Original
+057
+058           Attn         Attn         Attn         Attn                   Attn           Attn         Attn          Attn
+              out          out          out          out                    out            out          out           out
+        Wk            Wk           Wk           Wk                     Wk                          Wk
+059            &
+              MLP
+                            &
+                           MLP
+                                         &
+                                        MLP
+                                                      &
+                                                     MLP
+                                                                             &
+                                                                            MLP
+                                                                                            &
+                                                                                           MLP
+                                                                                                         &
+                                                                                                        MLP
+                                                                                                                       &
+                                                                                                                      MLP
+
+060
+061     Wv            Wv           Wv           Wv                     Wv                          Wv
+
+
+062
+063                                                                                                                                 KV Cache
+
+064                                                                                                                                 Computed in prefill
+
+065                                                                                                                                 Skipped in prefill
+
+066                                                                                                                                 Trained in distillation
+                                                                       50% SingleInputKV             2-way AcrossKV
+067
+068   Figure 1: Illustration of SwiftKV with 50% SingleInputKV and 2-way AcrossKV. After distillation,
+069   the KV cache of layers 5–8 can all be populated using the hidden state outputs of layer 4. For prefill
+070   tokens, the query, attention, and MLP operations of layers 5–8 may be skipped altogether, while decode
+071   tokens complete all layers. Existing models may be efficiently adapted for SwiftKV by distilling from
+072   the original unmodified model using a small dataset. Model knowledge is preserved by keeping the
+073   trainable parameters limited to the Q, K, and V projections of the layers affected by SingleInputKV.
+074
+075
+076   SingleInputKV, the computation required for pre-fill is reduced by approximately the number of layers
+077   skipped. We found that it is possible to skip at least 50% of the layers without significantly impacting the
+078
+      model quality (Sec. 4.2), which translates to a 50% reduction of the pre-fill computation in inference.
+079   AcrossKV. While SingleInputKV reduces the pre-fill computation, it does not reduce the KV cache
+080   memory requirement. AcrossKV combines the KV projections from multiple adjacent layers into
+081   a single one, and share the KV cache across these layers to reduce its size in memory. AcrossKV
+082   allows significant memory savings, which unlocks higher throughput by enabling larger batches during
+083   inference. In Sec. 3, we show that AcrossKV can reduce the KV cache size by 25% with less than
+084
+      a 1% quality gap. We also show in ablation studies (Sec. 5) that AcrossKV is compatible with existing
+      KV cache quantization methods, which combine to unlock 62.5% reduction in KV cache size.
+085
+086   Knowledge Recovery. Although SingleInputKV and AcrossKV can be applied to existing LLMs
+087   with minimal changes to their architectures, we found that the resulting model parameters should
+088   still be adapted to the new architecture to recover their original prediction quality. This can be done
+089   via distillation from the original model. With SwiftKV, we found that a lightweight distillation is
+090
+      sufficient, with only a fraction of the model (Q, K, and V projections of the affected layers) trained
+      on 680M tokens, which takes less than 3 hours on a single 8× H100 node for Llama-3.1-8B.
+091
+092   SwiftKV Optimized Inference. To realize the computation and memory reductions of SingleInputKV
+093   and AcrossKV into end-to-end throughput and latency improvements, we implemented SwiftKV in
+094   vLLM (Kwon et al., 2023). Our implementation includes several additional optimizations, including
+095   fusing all KV-projections beyond layer l into a single GEMM operation, and integrated memory
+096
+      management needed to lower the KV cache memory footprint achievable via AcrossKV.
+097   SwiftKV increases the aggregate throughput of enterprise workloads by up to 2×, while reducing time-
+098   to-first-token (TTFT) and time-per-output-token (TPOT) by up to 50% and 60%, respectively. In fact,
+099   for Llama-3.1-70B, SwiftKV can achieve a normalized throughput of 560 TFLops/GPU2 . This is an
+100   unprecedented 56.6% MFU utilization for inference (Sec. 4.3). We show that SwiftKV incurs minimal
+101   quality degradation averaged across a wide range of tasks (Sec. 4.2), including ARC-Challenge (Clark
+102
+      et al., 2018), Winogrande (Sakaguchi et al., 2019), HellaSwag (Zellers et al., 2019), TruthfulQA (Lin
+      et al., 2022), MMLU (Hendrycks et al., 2021), and GSM8K (Cobbe et al., 2021).
+103
+104   In addition to these main results, in Sec. 5 we discuss the impact of distillation, datasets, choice
+105   of trainable parameters for training SwiftKV. We also present our analysis of the hidden state
+106   similarities, and how AcrossKV can be extended and combined with other KV cache compression
+107
+         2
+             Normalized throughput and MFU is based on number of floating point operations in the baseline model.
+
+
+                                                                            2
+      Under review as a conference paper at ICLR 2025
+
+
+108
+      works. Additionally, we also discuss how SingleInputKV can enable compute savings not just during
+109   pre-fill but also during decoding phase.
+110
+111   Lastly, we open-sourced the training and inference code for SwiftKV that can be used to fully
+112
+      reproduce our results at https://anonymized.link, as well as several SwiftKV models that
+      can be used directly by the community at https://anonymized.link.
+113
+114
+115
+      2     R ELATED W ORK
+116
+117
+118
+      Hardware and System Optimizations. Lower-precision quantization like FP8 (Kuzmin et al., 2024)
+      can enable the use of tensor-cores to accelerate inference (Luo et al., 2024). System approaches like
+119
+      PagedAttention (Kwon et al., 2023), Tensor-Parallelism(Shoeybi et al., 2020), Split-Fuse (Holmes et al.,
+120
+      2024; Agrawal et al., 2024), FlashAttention (Dao et al., 2024), and their optimized implementations
+121   in TensorRT (NVIDIA, 2019), FasterTransformer (NVIDIA, 2021), vLLM (Kwon et al., 2023), and
+122   DeepSpeed-Inference (Aminabadi et al., 2022) enable better parallelization, batching, and scheduling to
+123   eliminate performance overheads and achieve better hardware peak utilization without impacting model
+124   quality. In contrast, SwiftKV is a model architecture optimization and is complementary to these works.
+125
+      Sparse attention optimizations. Systems such as ALISA (Zhao et al., 2024) and MInference (Jiang
+126
+      et al., 2024) leverage naturally-occurring sparsity patterns in transformer models to reduce the computa-
+127   tion of the quadratic attention operation. Particularly, like SwiftKV, MInference also targets the prefill
+128   phase of inference. Sparse attention can be particularly effective for very long sequence lengths (e.g.
+129   100K - 1M tokens) when attention is the dominant operation. In comparison, SwiftKV reduces prefill
+130   computation by skipping not just the attention operation, but also the query/output projections and
+131   MLP of certain layers. This means that (1) SwiftKV can be more suited for inputs with more moderate
+132   lengths when MLP is the dominant operation, and (2) SwiftKV, which either runs attention as-is or
+133   skips attention entirely, is complementary to sparse attention methods which are more concerned with
+134   the implementation of attention itself.
+135   Memory Compression. A wide range of techniques have been developed to reduce the memory need
+136   of inference. Lower-precision quantization techniques like FP8/FP4 can reduce the memory for both
+137   KV cache and parameters (Hooper et al., 2024). Attention optimization techniques like MQA (Shazeer,
+138   2019), GQA (Ainslie et al., 2023b), low-rank attention (Chang et al., 2024) also reduce the KV Cache.
+139   These approaches are complementary to SwiftKV, which we demonstrate in Sec. 4.2 and Sec. 5.3.
+140   Like AcrossKV, MiniCache (Liu et al., 2024b) also considers merging the KV cache of consecutive
+141
+      layers. However, AcrossKV enables consolidating more than just two layers, allowing for higher level
+      of compression, and does not require any token retention strategy where distinct KV caches are stored
+142
+      for special tokens, allowing for simpler implementation.
+143
+144   Furthermore, while many of these approaches only focus on reducing the memory, SwiftKV can reduce
+145   both the prefill computation (via SingleInputKV) along with memory. As we show in Sec. 5.1, compute
+146   reduction rather than memory reduction is crucial for accelerating inference in compute-bound
+147
+      scenarios with sufficient memory, which is common in production with modern GPUs (H100, A100).
+148
+149
+      3     S WIFT KV: D ESIGN AND I MPLEMENTATION
+150
+151
+152   3.1   P RELIMINARIES
+153
+154
+      In transformer models (Vaswani et al., 2017), attention enables each token to focus on other
+      tokens by comparing queries (Q) with keys (K) and using values (V ) to compute the final
+155
+      representation. For a sequence of input tokens x(1) ,...,x(n) , the projections are defined as follows:
+156
+      Q = XWQ , K = XWK , V = XWV , where X ∈ Rn×d are the input embeddings, and
+157
+      WQ ∈ Rd×dk and WK ,WV ∈ Rd×dg are trained model parameters with dg |dk . Hereafter, we may also
+158
+      refer to WK and WV as a single matrix WKV ∈ Rd×2dk .
+159
+160   During the prefill phase of inference, the model processes the entire input sequence at once, computing
+161   K and V for all tokens in parallel (or in chunks in the case of Split-Fuse (Holmes et al., 2024; Agrawal
+      et al., 2024)). This typically occurs when the model handles an initial prompt or context.
+
+
+                                                          3
+      Under review as a conference paper at ICLR 2025
+
+
+162
+163                                    LLaMa-3.1-8B-Instruct                                                 SingleInputKV (l = L/4)   SingleInputKV (l = 3L/4)
+                                       Mistral-7B-Instruct-v0.1                                              SingleInputKV (l = L/2)   Baseline
+164                          0.8       Qwen2.5-7B-Instruct
+                                                                                                              350
+165
+                                                                                                              300
+166           SimScore(xl)   0.6
+
+
+                                                                                         Forward time (ms)
+                                                                                                              250
+167
+                                                                                                              200
+168
+                             0.4                                                                              150
+169
+                                                                                                              100
+170
+171                          0.2                                                                               50
+                                                                                                                0
+172
+                                                                                                                      128      256     512     1024     2048
+173                                0      5        10         15      20    25    30
+174                                                           Layer                                                            Batch size (tokens)
+
+175
+176   Figure 2: LEFT: the input similarity of several smaller scale models (Fig. A.1 in the Appendix
+177
+      shows a similar observation for larger models). RIGHT: The time per forward pass of Llama-3.1-8B.
+      SingleInputKV effectively reduces the forward pass processing time across a range of batch sizes.
+178
+179
+180   During the decoding phase of inference, new tokens are generated one at a time. When predicting
+181   the next token, only the query (Q(t+1) ) for the new token needs to be computed, while the model must
+182   attend to the keys and values (K (1) ,...,K (t) , V (1) ,...,V (t) ) of all previously processed tokens.
+183
+184   To optimize efficiency in the decoding phase, KV caching is employed. After processing each token
+185   t, the newly computed K (t) and V (t) are stored in a cache. For the next token t+1, only the new query
+186   Q(t+1) , key K (t+1) , and value V (t+1) are computed. The attention computation will then utilize the
+187
+      cached K and V from all prior tokens, allowing for reduced computational overhead during inference.
+188
+189   3.2         S INGLE I NPUT KV: P ROJECT KV CACHE FROM A SINGLE LAYER
+190                                                                                     (i)
+      Assume the input of l-th layer is xl , and its i-th token is xl . Prior studies (Liu et al., 2024c; Gromov
+191
+      et al., 2024) showed that xl becomes more similar as the depth grows. Here, we conduct a similar study.
+192
+193   We compute the average input similarity between l-th layer’s input and all remaining layers’ input, i.e.,
+194                                               PL
+                                                    j=l+1 Similarity(xl ,xj )
+195                             SimScore(xl ) =                                 ,                          (1)
+196
+                                                              L−l
+197   where L is the number of layers in the model and Similarity(xl ,xj ) is the average cosine similarity
+198                (i)    (i)
+      between all xl and xj tokens.
+199
+200
+      We use 50 random training examples from HuggingFaceH4/ultrachat_200k to estimate
+      SimScore(xl ), and the results of Llama-3.1-8B-Instruct, Mistral-7B-Instruct-v0.1, and Qwen2.5-7B-
+201
+      Instruct are shown in the left of Fig. 2. As the layers get deeper, SimScore(xl ) gets higher. Particularly,
+202
+      around half of the depth, the average similarity of xl with x>l is above 0.5 for all models, which shows
+203   that the difference of input hidden states are small in deeper layers.
+204
+205   Based on this observation, the first key component of SwiftKV is to use l-th layer’s output xl+1 to
+206
+      compute the KV cache for all remaining layers. More specifically, SwiftKV retains the standard
+      transformer architecture up to and including the l-th layer, but the KV cache for all remaining layers
+207
+      are computed immediately using xl+1 , i.e.
+208
+                                                                          j
+209                                                                KVj = WKV xl+1 , for all j > l,                                                                (2)
+210                                                 j
+211   where KVj is the KV cache for j-th layer and WKV is its KV projection weight matrix.
+212   Prefill Compute Reduction. SingleInputKV can enable significant reduction in prefill compute
+213   during LLM inference. Originally, all input tokens must be processed by all transformer layers. With
+                                                             j
+214   SingleInputKV, input tokens3 only need to compute WKV      xl+1 for layers j > l to generate layer j’s
+215
+         3
+             The very last input token still needs to compute all layers to generate the first output token.
+
+
+                                                                                 4
+      Under review as a conference paper at ICLR 2025
+
+
+216
+      KV cache, and all other operations (i.e., QO projections, Attention, and MLP) of layers j > l can
+217   be skipped entirely. When prefill computation dominates generated token computation, this reduces
+218   the total inference computation to approximately l/L. Fig. 1 illustrates the operations skipped by
+219   SingleInputKV, and Table 1 shows a more detailed example compute breakdown for Llama-3.1-70B.
+220
+221   3.3   ACROSS KV: S HARING KV CACHE FOR CONSECUTIVE LAYERS
+222
+223   GQA (Ainslie et al., 2023a), one of the
+224   most widely adopted KV cache compres- Table 1: Breakdown of transformer operations for Llama-
+225   sion methods, showed that the KV cache 3.1-70B with SwiftKV (in GFlops per prefill token).
+226
+      can be easily shared within a transformer
+      layer. Later, Liu et al. (2024a) showed that Model             Vocab K,V Q,O MLP Attn. Total  Rel.
+227
+      the KV cache can be merged for certain pairs Baseline           4.3  2.6 22  113 160   302   100%
+228
+      of adjacent layers. AcrossKV extends the 25% SingleInputKV 4.3 2.6 16 85 120 228 75.5%
+229   ideas to cross-layer KV cache sharing.       50% SingleInputKV  4.3  2.6 11   56  80   154   51.0%
+230                                                    50% SingleInputKV
+                                                                           4.3   1.7   11   56   80   153   50.7%
+231   Particularly, instead of computing KV + 4× AcrossKV
+232
+      cache for all of the remaining layers as
+      shown in equation 2, AcrossKV selectively
+233
+      chooses one layer to compute the KV cache for several consecutive layers and share it within the small
+234
+      group. The key idea is shown in Fig. 1. As AcrossKV can combine multiple layers’ KV caches into a
+235   single one rather than just two adjacent layers, it offers higher potential reduction ratio compared to Liu
+236   et al. (2024a) while simplifying the implementation to realize the benefits of the KV cache reduction.
+237   (See Sec. 2 for more detailed comparison with Liu et al. (2024a)).
+238
+239   3.4   K NOWLEDGE R ECOVERY
+240
+241   While SingleInputKV preserves all the original parameters, it re-wires the architecture so that the
+242   KV cache projections may receive different inputs. We found that this re-wiring (and AcrossKV)
+243   requires fine-tuning to recover the original capabilities from the modified model. As we only change the
+244
+      computation of the attention part for layer > l, this can be achieved by fine-tune just the WQKV weight
+      matrices from the (l+1)-th layer onwards. However, instead of directly fine-tuning these parameters
+245
+      using standard LM loss, we find that distilling using the output logits of the original model allows for
+246
+      better knowledge recovery (see Sec. 5 for more details).
+247
+248   Implementing the Distillation. Since only a few WQKV parameters need fine-tuning, we are able to
+249   do a memory efficient parameter-sharing based distillation. More specifically, we keep a single copy of
+250
+      the original model weights in memory that are frozen during training, and add an extra trainable copy
+      of the WQKV parameters for layers > l initialized using the original model (See Fig. 1).
+251
+252   During the training, we create two forward modes for the later layers > l, one with original frozen
+253   parameters using original architecture, and another with the SwiftKV re-wiring using new QKV
+254   projections i.e.,
+255             yteacher = M(x,Swif tKV = F alse), and ystudent = M(x,Swif tKV = T rue),               (3)
+256   where y· is the final logits, M is the model, and x is the input. Afterwards, we apply the standard
+257   distillation loss (L) upon the outputs with temperature (τ ) using (Hinton et al., 2015). After the
+258   distillation, the original KV projection layers > l are discarded during inference.
+259
+      This method allows us to perform the distillation for Llama-3.1-8B-Instruct on 680M tokens of data in
+260
+      3 hours using 8 H100 GPUs, and Llama-3.1-70B-Instruct in 5 hours using 32 H100 GPUs across 4
+261
+      nodes.
+262
+263
+      3.5   O PTIMIZED I MPLEMENTATION FOR I NFERENCE
+264
+265   LLM serving systems can be complex and incorporate many simultaneous optimizations at multiple
+266   layers of the stack, such as PagedAttention (Kwon et al., 2023), Speculative Decoding (Leviathan et al.,
+267   2023), SplitFuse (Holmes et al., 2024; Agrawal et al., 2024), and more. One benefit of SwiftKV is that
+268   it makes minimal changes to the model architecture, limited to only a few linear projection layers. This
+269   means that SwiftKV can easily be integrated into existing serving systems without implementing new
+      kernels (e.g. for custom attention operations or sparse computation) or novel inference procedures.
+
+
+                                                           5
+      Under review as a conference paper at ICLR 2025
+
+
+270
+      Implementation in vLLM. To realize the performance benefits of SwiftKV, we integrated it with
+271   vLLM . Our implementation is compatible with vLLM’s chunked prefill, which processes prefill
+272   tokens in chunks and may mix prefills and decodes in each minibatch. During each forward pass, after
+273   completing layer l, the KV-cache for the remaining layers (> l) are immediately computed, and only
+274   the decode tokens are propagated through the rest of the model layers.
+275
+      GEMM and Memory Optimizations. Upon this basic implementation, we implemented two ad-
+276
+      ditional optimizations. First, SingleInputKV fusion: instead of computing the KV cache KVj for
+277                                                 j                                j>l
+      each layer j > l one at a time, we fused all WKV into one large weight matrix WKV  so that their KV
+278
+      cache can be computed with a single efficient GEMM operation. Second, AcrossKV reduction: we
+279
+      modified vLLM to only allocate one layer’s KV-cache for each group of merged layers, which realizes
+280   the memory gains of AcrossKV.
+281
+282
+283   4       M AIN R ESULTS
+284
+285   4.1      S ETUP
+286
+      Training and Evaluation. We use Llama-3.1-8B-Instruct and Llama-3.1-70B-Instruct as our base
+287
+      models for SwiftKV. Our training datasets include a mixture of the full supervised training data from
+288   HuggingFaceH4/ultrachat_200k (Ding et al., 2023) and teknium/OpenHermes-2.5
+289   (Teknium, 2023). We evaluated model quality using a modified LM-Eval-Harness (Gao et al., 2024)4
+290   due to its support for the custom prompt format of Llama-3.1, particularly for MMLU and MMLU-
+291   CoT (Hendrycks et al., 2021), GSM8K (Cobbe et al., 2021), and Arc-Challenge (Clark et al., 2018).
+292   For more details, please see Appendix B.
+293
+      Compression Metrics. For prefill computation, we report the approximate reduction as (L−l)/L
+294   due to SingleInputKV, and for KV cache, we report the exact memory reduction due to AcrossKV.
+295   For example, SwiftKV with SingleInputKV (l = L/2) and 4-way AcrossKV is reported as 50% prefill
+296   compute reduction and 37.5% KV cache memory reduction. We further study how these theoretical
+297   compute and memory reductions translate into end-to-end inference improvements in Sec. 4.3.
+298
+      Inference Performance. In our inference evaluation, we focus on two common scenarios: batch-
+299
+      inference for cost sensitive scenarios and interactive-inference for latency sensitive scenario.
+300
+301   Batch-Inference When processing text in bulk or when serving a model under high usage demand,
+302   it is important to achieve high combined throughput in terms of input + output tokens processed per
+303
+      second. For bulk processing, the combined throughput determines the time it takes to finish the job. For
+      interactive use, it determines the volume of concurrent users and requests that can be supported per unit
+304
+      of hardware. In both scenarios, the combined throughput is a key determinant of the cost of serving the
+305
+      model.
+306
+307   Interactive-Inference In interactive scenarios (e.g., chatbots, copilots), not only the combined through-
+308   put is important, but also metrics that define the end-user experience. Chief upon them are the
+309
+      time-to-first-token (TTFT) and time-per-output-token (TPOT). TTFT is the time between the user
+      sending a message and receiving the first token in the response. TPOT is the time between each
+310
+      output token after the first token has been received. Low TTFT and TPOT are desirable by interactive
+311
+      applications to deliver smooth usage experiences.
+312
+313   For all experiments on Llama-3.1-8B-Instruct, we use 1 NVIDIA H100 GPU with 80GB of memory,
+314   and for all experiments on Llama-3.1-70B-Instruct, we use 4 NVIDIA H100 GPUs running the model
+315
+      with 4-way tensor parallelism. We provide the full hardware and vLLM configurations in Appendix B.2
+316
+317   4.2      M ODEL Q UALITY WITH P REFILL C OMPUTE R EDUCTION
+318
+      Llama-3.1-8B-Instruct. The top rows of Table 2 show that SwiftKV can preserve model quality well
+319
+      until 50% prefill reduction using SingleInputKV. For 25% prefill reduction, the accuracy degradation
+320
+      is only about 0.12 points and for 50% reduction, the gap is about 1 point 5 . When we push to 62.5%
+321
+          4
+322           https://github.com/neuralmagic/lm-evaluation-harness/tree/llama_3.1_instruct
+          5
+323        Note that we did not try to find the best training recipe, regarding to either training data (e.g., we did not
+      include any math or coding datasets) or training pipeline (e.g., we did not include reinforce-learning rated steps,
+
+
+                                                              6
+      Under review as a conference paper at ICLR 2025
+
+
+324                                                            Table 2: Llama-3.1-8B-Instruct
+325
+326                      SingleInputKV          AcrossKV          Arc-Challenge    Winogrande     HelloSwag        truthfulqa   MMLU      MMLU-CoT            GSM-8K
+            Model                                                                                                                                                        Avg.
+                       (Prefill Reduction)   (Cache Reduction)        0-shot        5-shots        10-shots          0-shot     5-shots     0-shot             8-shots
+327         Baseline          N/A                   N/A                 82.00         77.90         80.40            54.56       67.90        70.63            82.56     73.71
+
+328         SwiftKV        ✓(25%)                       ✗               82.08         77.98         80.63            54.59       67.95        70.45            81.43     73.59
+            SwiftKV        ✓(50%)                       ✗               80.38         78.22         79.30            54.54       67.30        69.73            79.45     72.70
+329         SwiftKV        ✓(62.5%)                     ✗               71.76         75.77         78.21            52.73       61.55        53.68            68.92     66.09
+            SwiftKV         ✓(50%)            2-way (25%)               80.29         77.82         79.03            54.66       66.96        68.39            75.59     71.82
+330         SwiftKV         ✓(50%)            4-way (37.5%)             79.35         77.51         78.44            54.96       65.71        67.75            76.72     71.49
+            SwiftKV         ✓(50%)            8-way (43.75%)            79.18         77.19         77.38            54.79       65.73        66.88            72.33     70.50
+331         SwiftKV         ✓(50%)           16-way (46.875%)           78.24         76.80         76.87            56.86       64.65        65.86            72.25     70.22
+
+332
+333                                                            Table 3: Llama-3.1-70B-Instruct
+334
+335         Model
+                        SingleInputKV          AcrossKV          Arc-Challenge    Winogrande     HelloSwag        truthfulqa    MMLU      MMLU-CoT            GSM-8K
+                                                                                                                                                                         Avg.
+                       Prefill Reduction     Cache Reduction         0-shot        5-shots        10-shots          0-shot      5-shots     0-shot             8-shots
+336         Baseline         N/A                   N/A               93.34          85.16          86.42            59.95       83.97         86.21            95.15     84.31
+337         SwiftKV        ✓(25%)                   ✗                93.00          84.69          85.98            59.43       82.82         85.81            95.07     83.83
+            SwiftKV        ✓(50%)                   ✗                93.09          83.82          84.45            58.40       82.51         85.00            93.56     82.98
+338         SwiftKV        ✓(50%)             2-way (25%)            92.92          82.95          84.10            57.79       82.66         84.55            93.48     82.63
+            SwiftKV        ✓(50%)            4-way (37.5%)           92.92          83.74          84.72            58.28       82.60         84.79            93.71     82.96
+339
+340
+341                 Table 4: Summary of all other models we evaluated, only average scores shown.
+342
+                                       SingleInputKV          AcrossKV           Llama-3.2-3B-    Llama-3.1-405B-            Mistral-Small-   Deepseek-V2-
+343                     Model
+                                      Prefill Reduction     Cache Reduction         Instruct       Instruct (FP8)            Instruct-2409      Lite-Chat
+344                     Baseline             N/A                  N/A                66.47                 86.6                   78.2                64.12
+                        SwiftKV          ✓(~25%)                   ✗                 66.55                  –                      –                  64.19
+345                     SwiftKV         ✓(40–50%)                  ✗                 65.55                 85.9                   77.2                63.51
+346                     SwiftKV         ✓(40–50%)             2-way (25%)            65.13                  –                      –                  63.07
+                        SwiftKV         ✓(40–50%)            4-way (37.5%)           65.19                  –                     76.7                59.32
+347
+348
+349
+      reduction (i.e. SingleInputKV with l = 12 and L = 32), the accuracy drops to 66.09 points, which is
+350
+      significantly lower than the baseline. This can be explained by the drop in activation similarity from
+351
+      0.61 to 0.51 between layer 16 to layer 12 (Fig. 2).
+352
+353   The bottom rows of Table 2 show the model quality when adding AcrossKV to 50% SingleInputKV.
+354   From pure SingleInputKV to 2-way AcrossKV, the accuracy drops about 0.9 points with 25% KV
+355
+      cache reduction. The accuracy drops by another 0.32, going from 2-way to 8-way sharing, and 0.62
+      when going all the way to 16-way sharing. Particularly, for the extreme case, i.e., using a single KV
+356
+      cache for all remaining layers, the accuracy is only about 2.5 points lower than pure SingleInputKV,
+357
+      and could be useful for more memory constrained cases, e.g., embedding and/or mobile devices.
+358
+359   Furthermore, the design of AcrossKV is complementary to many existing KV cache compression
+360   methods. In Sec. 5.3, we show that AcrossKV can be combined with quantization to achieve 62.5%
+361
+      reduction in KV cache memory with only a 1-point accuracy gap compared to SingleInputKV only.
+362   Llama-3.1-70B-Instruct. Table 3 shows that with 50% prefill reduction using SingleInputKV,
+363   Llama-3.1-70B-Instruct incurs a 1.3 point drop in accuracy which is slightly higher than the results of
+364   Llama-3.1-8B-Instruct. However, Llama-3.1-70B-Instruct is more resilient to AcrossKV, incurring
+365   less than a 0.35 point drop in accuracy even for 4-way sharing across layers.
+366   Other models and diverse architectures. In addition to Llama-3.1-Instruct 8B and 70B, we integrated
+367   and evaluated four other models with SwiftKV, which span a more diverse spectrum of model architec-
+368   tures. Of particular note, Llama-3.1-405B-Instruct is run at 8-bit precision using W8A8 quantization,
+369   and Deepseek-V2-Lite-Chat is an mixture-of-experts model that also implements a novel attention
+370   mechanism that compresses its keys and values using a latent vector (DeepSeek-AI et al., 2024).
+371   Table 4 summarizes the results, and the full per-task evaluation scores can be found in Appendix B.3.
+372   Overall, we find that SwiftKV generalizes well to all these models, with few minor exceptions. First,
+373   Llama-3.2-3B-Instruct experiences a steeper quality degradation at 50% SingleInputKV, but performs
+374   well at 40% SingleInputKV (detailed comparison in Appendix B.3). Second, Deepseek-V2-Lite-Chat
+375   experiences a steeper quality degradation at 4-way AcrossKV, but performs well at 2-way AcrossKV.
+376
+377   like DPO/RLHF). Yet, the quality of SwiftKV is close to the original base Llama-3.1-8/70B-Instruct models.
+      In Sec. D, we show that better data recipe could boost the model performance and close the quality gap further.
+
+
+                                                                                        7
+      Under review as a conference paper at ICLR 2025
+
+
+378                                     50% SingleInputKV    50% SingleInputKV + 2x AcrossKV          50% SingleInputKV + 4x AcrossKV     Baseline
+379
+380                            30,000                                              480       18,000                                              630
+
+
+                                                                                                                                                       Normalized TFLOPS/GPU
+       Throughput (tokens/s)
+381
+382                            20,000                                              320       12,000                                              420
+383
+384
+                               10,000                                              160        6,000                                              210
+385
+386                                0                                               0             0                                               0
+387
+                                           2000       8000      32000     128000                        2000      8000      32000       128000
+388
+389   Figure 3: Combined input and output throughput for Llama-3.1-8B (left) and Llama-3.1-70B (right)
+390   across a range of input lengths (bottom). For each experiment, a number of requests are sent to vLLM
+391   at once such that the total number of tokens is roughly 15M. Each request generates 256 output tokens.
+392
+393
+394   4.3                       I NFERENCE P ERFORMANCE
+395
+      Batch Inference Performance. Fig. 3 shows the results of Llama-3.1-8B and Llama-3.1-70B across
+396
+      several workloads with a range of input lengths. SwiftKV achieves higher combined throughput than
+397
+      the baseline model across all the workloads we evaluated.
+398
+399   For Llama-3.1-8B-Instruct, with 2K input tokens per prompt, SwiftKV achieves 1.2−1.3× higher
+400   combined throughput than the baseline model, and our benefits increase further to 1.8−1.9× higher
+401
+      combined throughput with 128K inputs. Note that for an input length of 8K tokens, SwiftKV achieves
+      a staggering 30K tokens/sec/GPU (480 TFLOPS/GPU). For Llama-3.1-70B with 2K input tokens per
+402
+      prompt, SwiftKV achieves 1.4−1.5× higher combined throughput than the baseline model, which
+403
+      improves to 1.8−2.0× better combined throughput for 128K inputs.6 As expected, SwiftKV provides
+404   greater improvements when the inputs are long.
+405
+406   We also observe AcrossKV can further improve the combined throughput due to its ability to reduce
+407
+      the memory usage for the KV-cache and supporting larger batch sizes. For sequence length of 8K,
+      Llama-3.1-70B-Instruct with SwiftKV achieves a combined throughput of over 16K toks/sec over
+408
+      4xH100 GPUs which corresponds to 560 TFLOPS/GPU of bf16 performance when normalized to
+409
+      baseline. This is an unprecedented throughput for BF16 inference workloads.
+410
+411   Interactive-Inference Performance. Fig. 4 shows the TTFT and TPOT of Llama-3.1-70B-Instruct
+412   across a range of request arrival rates and input lengths. When the arrival rate is too high, the
+413
+      TTFT explodes due to the request queue accumulating faster than they can be processed by the
+      system. However, SwiftKV can sustain 1.5−2.0× higher arrival rates before experiencing such TTFT
+414
+      explosion. When the arrival rate is low, SwiftKV can reduce the TTFT by up to 50% for workloads
+415
+      with longer input lengths. In terms of TPOT, SwiftKV achieves significant reductions for all but the
+416   lowest arrival rates, up to 60% for certain settings. A similar story unfolds for Llama-3.1-8B, which
+417   can be found in Fig. B.1 in the Appendix.
+418
+419
+420   5                        A BLATION AND D ISCUSSION
+421
+422   5.1                       C OMPUTE R EDUCTION VS M EMORY C OMPRESSION
+423
+424   A key aspect of SwiftKV is combining prefill compute reduction (SingleInputKV) and KV cache
+425
+      compression (AcrossKV). While many prior works address KV cache compression alone, they are
+      only effective in scenarios with limited GPU memory, and can have limited impact on recent datacenter
+426
+      GPUs (e.g., A100 and H100) with sufficient memory and inference is compute-bound.
+427
+428       6
+            While the total compute savings is roughly 2×, the end-to-end speedup is lower due to two main reasons: i)
+429   the performance improvement is limited to the decoding computation which needs the output activation of all
+430   the layers. Fig. 2 (right) shows the max possible speedup for Llama-3.1-8B-Instruct during model forward pass
+431   despite the decoding overhead, and ii) due to additional vLLM overheads outside of the model forward pass, such
+      as sampling, optimizing which is beyond the scope of the paper.
+
+
+                                                                                         8
+      Under review as a conference paper at ICLR 2025
+
+
+432
+433                           50% SingleInputKV              50% SingleInputKV + 2x AcrossKV                       50% SingleInputKV + 4x AcrossKV                         Baseline
+
+434
+                   800                                               2,000                                                         8,000
+435
+                   600                                               1,500                                                         6,000
+       TTFT (ms)
+
+436
+                   400                                               1,000                                                         4,000
+437
+                   200                                                 500                                                         2,000
+438                  0                                                      0                                                         0
+439
+                         1    2   3    4     5      6    7     8                  0.5           1.0     1.5        2.0                        0.1      0.2     0.3   0.4     0.5   0.6
+440
+441                200                                                 200                                                          200
+       TPOT (ms)
+
+
+                   150                                                 150                                                          150
+442
+                   100                                                 100                                                          100
+443
+444                 50                                                     50                                                        50
+                     0                                                      0                                                         0
+445
+                         1    2   3    4     5      6    7     8                  0.5           1.0     1.5        2.0                        0.1      0.2     0.3   0.4     0.5   0.6
+446
+447                           Arrival Rate (requests/s)                                  Arrival Rate (requests/s)                                  Arrival Rate (requests/s)
+448
+449   Figure 4: Time to first token (TTFT, top) and time per output token (TPOT, bottom) for input lengths
+450   2000 (left), 8000 (middle), and 32000 (right) for Llama-3.1-70B. For each experiment, a range of
+451
+      different request arrival rates is simulated. Each request generates 256 output tokens.
+452
+453
+      Table 5: Throughput of Llama-3.1-8B-Instruct compared between Baseline, Merge-all-Layers, and
+454
+      SwiftKV variants. Run on a H100 GPU with varying memory limits.
+455
+456                                                                           Throughput (tokens/s)
+457                           Memory       Baseline
+                                                        Merge-all-
+                                                                           50% SingleInputKV
+                                                                                               50% SingleInputKV                       50% SingleInputKV
+                                                         Layers                                   + 4× AcrossKV                       + 4× AcrossKV (FP8)
+458
+                              80GB          22.9K         25.1K                      31.0K                       31.2K                             32.0K
+459                           40GB          20.6K         25.2K                      27.3K                       28.4K                             28.9K
+460                           20GB          10.8K         25.2K                      12.2K                       18.0K                             23.2K
+                              16GB          OOM           24.8K                      OOM                         4.22K                             7.28K
+461
+462
+463
+                   Table 6: Impact of Distillation and Full/Partial Model Finetuning on Llama-3.1-8B-Instruct
+464
+465                                    Arc-Challenge          Winogrande           Hellaswag          TruthfulQA         MMLU       MMLU-CoT             GSM-8K
+                    Setting                                                                                                                                            Avg.
+466                                        0-shot              5-shots              10-shots            0-shot           5-shots      0-shot              8-shots
+
+467                                                                             (a) The effect of distillation
+                    W/o Distillation         79.44                 77.27              78.71          51.14               65.55             65.60             72.71    70.06
+468                 W Distillation           80.38                 78.22              79.30          54.54               67.30             69.73             79.45    72.70
+469                                                           (b) Full model finetuning vs. part model finetuning
+470                 Full Model               76.79                 74.82                76.42           53.08            62.94             64.20             69.37    68.23
+                    Part Model               80.38                 78.22                79.30           54.54            67.30             69.73             79.45    72.70
+471
+472
+473
+474   To illustrate, we consider an “ideal” KV compression scheme, where every layer’s KV cache is merged
+475                                                                                                    T
+      into a single layer (Merge-all-Layers). We retain the computation for all KV operations (i.e., Wkv X)
+476   but eliminate the memory for all layers > 1, leading to a single layer of KV cache. Merge-all-Layers
+477   represents a “best case compression scenario” with (1) extreme compression ratio beyond any published
+478   technique, e.g. 32× and 80× for Llama-3.1 8B and 70B, respectively, and (2) zero overhead, while most
+479   techniques (e.g., quantization, low-rank decomposition) add extra computations or data conversions.
+480   Table 5 shows the throughput attained by Merge-all-Layers compared with the baseline model and its
+481   SwiftKV variants under various memory constraints. As shown, Merge-all-Layers outperforms only
+482   in very low memory scenarios (e.g. 16GB and 20GB) when there is barely enough memory for just
+483   the model weights, and is only marginally (10%) better than the baseline model when using all 80GB
+484   memory. On the other hand, SingleInputKV attains 35% higher throughput than the baseline at 80GB
+485   even without any AcrossKV. When combined with 4× AcrossKV using FP8-quantized KV cache,
+      SwiftKV can approach the throughput of Merge-all-Layers even at a more limited 20GB of memory.
+
+
+                                                                                                 9
+      Under review as a conference paper at ICLR 2025
+
+
+486                             Table 7: Llama-3.1-8B-Instruct KV cache quantization results.
+487
+488                      AcrossKV                           Arc-Challenge   Winogrande   Hellaswag   TruthfulQA   MMLU      MMLU-CoT   GSM-8K
+            Model                         KV Quantization                                                                                         Avg.
+                      (Cache Reduction)                         0-shot       5-shots      10-shots     0-shot     5-shots     0-shot    8-shots
+489         SwiftKV           ✗                 ✗               80.38         78.22        79.30       54.54      67.30       69.73     79.45     72.70
+            SwiftKV           ✗                 ✓               80.29         77.66        79.23       54.40      67.10       69.51     77.94     72.30
+490         SwiftKV    2-way (25%)              ✗               80.29         77.82        79.03       54.66      66.96       68.39     75.59     71.82
+            SwiftKV   2-way (62.5%)             ✓               80.03         77.35        78.86       54.44      66.89       68.27     75.97     71.69
+491         SwiftKV    4-way (37.5%)            ✗               79.35         77.51        78.44       54.96      65.71       67.75     76.72     71.49
+            SwiftKV   4-way (68.75%)            ✓               79.27         77.43        78.38       54.76      65.62       68.00     75.97     71.35
+492
+493
+494   5.2   T HE IMPACT OF DISTILLATION
+495
+496   To demonstrate the effectiveness of our distillation, we train Llama-3.1-8B-Instruct with 50% SingleIn-
+497   putKV and no AcrossKV using the standard language model loss, and compare it with our distillation
+498   based approach discussed in Sec. 3.4. The results are shown in Table 6 (a). As we can see, the
+499   model trained with distillation has a 2.64 point higher average. Particularly, for generative tasks, i.e.,
+500
+      MMLU-Cot and GSM-8K, the performance improvement is 4.13 and 6.74, respectively.
+501
+      Full model training vs. partial model training. Our distillation method only fine-tuned the WQKV
+502
+      parameters, as discussed in Sec. 3.4, with the hypothesis that it preserves the knowledge from the
+503
+      original models compared to fine-tuning the entire model. This hypothesis aligns with Meng et al.
+504   (2024), Geva et al. (2021), and Elhage et al. (2021), which suggest that MLP layers player a more
+505   prominent role in storing knowledge.
+506
+507
+      To validate this, we fine-tuned a model with 50% SingleInputKV on Llama-3.1-8B-Instruct where all
+      parameters in the latter 50% of layers are trained. The results are shown in Table 6 (b). The model
+508
+      quality of full model distillation is about 4.5 points lower than our proposed partial model distillation.
+509
+510
+      5.3   C OMBINING WITH OTHER KV CACHE COMPRESSION METHODS
+511
+512   SwiftKV explores an orthogonal design space from many KV cache compression methods, which
+513   means that it can be easily combined with them, e.g., sliding window (Jiang et al., 2023), token-level
+514   pruning (Liu et al., 2024d), quantization (Hooper et al., 2024) etc. In this section, we show the combined
+515   effect of SwiftKV with per-token KV cache FP8 quantization (Yao et al., 2022) using PyTorch’s
+516   natively supported float8_e4m3fn. Table 7 shows the accuracy degradation is within 0.4 points
+517   for all cases, even though we applied post-training quantization with no quantization-aware finetuning.
+518   Appendix C explores a second, potentially interesting, trade-off between AcrossKV (inter-layer) vs
+519   GQA (intra-layer) KV cache sharing.
+520
+521
+522
+      6     C ONCLUSIONS
+523
+      In this paper, we presented SwiftKV, a novel model transformation for reducing inference cost for
+524
+      prompt-dominant workloads, combined with a KV cache reduction strategy to reduce memory footprint,
+525
+      and a light-weight distillation procedure to preserve model accuracy. While we presented strong results
+526   on the effectiveness of SwiftKV, exploration of parameter-preserving model transformations for
+527   inference optimization is still in its early stages. We have identified both limitations as well as areas of
+528   improvement. Given the simplicity and effectiveness of SwiftKV, we hope that this will spark further
+529   exploration which we hope will continue to lower the latency and cost of inference.
+530
+531
+      L IMITATIONS AND F UTURE W ORK
+532
+533
+      It is important for every work to acknowledge its limitations and suggest future directions, particularly
+534   for LLM-related works. In our work, we did not aim to optimize the training data selection though
+535   we provide potential ways in Sec. D. Additionally, we did not include a detailed benchmark analysis
+536   for our method. However, as shown in Sec. D, we ensured that our datasets were not cherry-picked to
+537   overfit the reported tasks. Furthermore, we did not finetune our model with advanced post-training
+538   approaches, like DPO and RLHF, which we leave for future work. Finally, we hypothesize that our
+539   method can work even better when combined with pretraining or continued-pretraining, but due to
+      resources constraints, we did not explore this direction. We hope to revisit these ideas in the future.
+
+
+                                                                                10
+      Under review as a conference paper at ICLR 2025
+
+
+540
+      R EFERENCES
+541
+542   Amey Agrawal, Nitin Kedia, Ashish Panwar, Jayashree Mohan, Nipun Kwatra, Bhargav Gulavani,
+543    Alexey Tumanov, and Ramachandran Ramjee. Taming Throughput-Latency tradeoff in LLM
+544    inference with Sarathi-Serve. In 18th USENIX Symposium on Operating Systems Design and
+545
+       Implementation (OSDI 24), pp. 117–134, Santa Clara, CA, July 2024. USENIX Association. ISBN
+       978-1-939133-40-3. URL https://www.usenix.org/conference/osdi24/prese
+546
+       ntation/agrawal.
+547
+548   Joshua Ainslie, James Lee-Thorp, Michiel de Jong, Yury Zemlyanskiy, Federico Lebron, and Sumit
+549     Sanghai. GQA: Training generalized multi-query transformer models from multi-head checkpoints.
+550     In Houda Bouamor, Juan Pino, and Kalika Bali (eds.), Proceedings of the 2023 Conference on
+551     Empirical Methods in Natural Language Processing, pp. 4895–4901, Singapore, December 2023a.
+552     Association for Computational Linguistics. doi: 10.18653/v1/2023.emnlp-main.298. URL
+553
+        https://aclanthology.org/2023.emnlp-main.298.
+554   Joshua Ainslie, James Lee-Thorp, Michiel de Jong, Yury Zemlyanskiy, Federico Lebrón, and Sumit
+555     Sanghai. Gqa: Training generalized multi-query transformer models from multi-head checkpoints,
+556     2023b. URL https://arxiv.org/abs/2305.13245.
+557
+558
+      Reza Yazdani Aminabadi, Samyam Rajbhandari, Minjia Zhang, Ammar Ahmad Awan, Cheng Li,
+        Du Li, Elton Zheng, Jeff Rasley, Shaden Smith, Olatunji Ruwase, and Yuxiong He. Deepspeed
+559
+        inference: Enabling efficient inference of transformer models at unprecedented scale, 2022. URL
+560
+        https://arxiv.org/abs/2207.00032.
+561
+562   Chi-Chih Chang, Wei-Cheng Lin, Chien-Yu Lin, Chong-Yan Chen, Yu-Fang Hu, Pei-Shuo Wang,
+563     Ning-Chi Huang, Luis Ceze, and Kai-Chiang Wu. Palu: Compressing kv-cache with low-rank
+564     projection, 2024. URL https://arxiv.org/abs/2407.21118.
+565
+      Mark Chen, Jerry Tworek, Heewoo Jun, Qiming Yuan, Henrique Ponde de Oliveira Pinto, Jared Kaplan,
+566    Harri Edwards, Yuri Burda, Nicholas Joseph, Greg Brockman, Alex Ray, Raul Puri, Gretchen
+567    Krueger, Michael Petrov, Heidy Khlaaf, Girish Sastry, Pamela Mishkin, Brooke Chan, Scott Gray,
+568    Nick Ryder, Mikhail Pavlov, Alethea Power, Lukasz Kaiser, Mohammad Bavarian, Clemens Winter,
+569    Philippe Tillet, Felipe Petroski Such, Dave Cummings, Matthias Plappert, Fotios Chantzis, Elizabeth
+570    Barnes, Ariel Herbert-Voss, William Hebgen Guss, Alex Nichol, Alex Paino, Nikolas Tezak, Jie Tang,
+571    Igor Babuschkin, Suchir Balaji, Shantanu Jain, William Saunders, Christopher Hesse, Andrew N.
+572    Carr, Jan Leike, Josh Achiam, Vedant Misra, Evan Morikawa, Alec Radford, Matthew Knight,
+573    Miles Brundage, Mira Murati, Katie Mayer, Peter Welinder, Bob McGrew, Dario Amodei, Sam
+574
+       McCandlish, Ilya Sutskever, and Wojciech Zaremba. Evaluating large language models trained on
+       code, 2021. URL https://arxiv.org/abs/2107.03374.
+575
+576   Peter Clark, Isaac Cowhey, Oren Etzioni, Tushar Khot, Ashish Sabharwal, Carissa Schoenick, and
+577     Oyvind Tafjord. Think you have solved question answering? try arc, the ai2 reasoning challenge.
+578     ArXiv, abs/1803.05457, 2018.
+579
+      Karl Cobbe, Vineet Kosaraju, Mohammad Bavarian, Jacob Hilton, Reiichiro Nakano, Christopher
+580
+        Hesse, and John Schulman. Training verifiers to solve math word problems, 2021.
+581
+582   Tri Dao, Daniel Y. Fu, Stefano Ermon, Atri Rudra, and Christopher Ré. Flashattention: fast and
+583     memory-efficient exact attention with io-awareness. In Proceedings of the 36th International
+584     Conference on Neural Information Processing Systems, NIPS ’22, Red Hook, NY, USA, 2024.
+585     Curran Associates Inc. ISBN 9781713871088.
+586
+      DeepSeek-AI, Aixin Liu, Bei Feng, Bin Wang, Bingxuan Wang, Bo Liu, Chenggang Zhao, Chengqi
+587
+        Dengr, Chong Ruan, Damai Dai, Daya Guo, Dejian Yang, Deli Chen, Dongjie Ji, Erhang Li, Fangyun
+588     Lin, Fuli Luo, Guangbo Hao, Guanting Chen, Guowei Li, H. Zhang, Hanwei Xu, Hao Yang, Haowei
+589     Zhang, Honghui Ding, Huajian Xin, Huazuo Gao, Hui Li, Hui Qu, J. L. Cai, Jian Liang, Jianzhong
+590     Guo, Jiaqi Ni, Jiashi Li, Jin Chen, Jingyang Yuan, Junjie Qiu, Junxiao Song, Kai Dong, Kaige
+591     Gao, Kang Guan, Lean Wang, Lecong Zhang, Lei Xu, Leyi Xia, Liang Zhao, Liyue Zhang, Meng
+592     Li, Miaojun Wang, Mingchuan Zhang, Minghua Zhang, Minghui Tang, Mingming Li, Ning Tian,
+593     Panpan Huang, Peiyi Wang, Peng Zhang, Qihao Zhu, Qinyu Chen, Qiushi Du, R. J. Chen, R. L. Jin,
+        Ruiqi Ge, Ruizhe Pan, Runxin Xu, Ruyi Chen, S. S. Li, Shanghao Lu, Shangyan Zhou, Shanhuang
+
+
+                                                      11
+      Under review as a conference paper at ICLR 2025
+
+
+594
+        Chen, Shaoqing Wu, Shengfeng Ye, Shirong Ma, Shiyu Wang, Shuang Zhou, Shuiping Yu, Shunfeng
+595     Zhou, Size Zheng, T. Wang, Tian Pei, Tian Yuan, Tianyu Sun, W. L. Xiao, Wangding Zeng, Wei
+596     An, Wen Liu, Wenfeng Liang, Wenjun Gao, Wentao Zhang, X. Q. Li, Xiangyue Jin, Xianzu Wang,
+597     Xiao Bi, Xiaodong Liu, Xiaohan Wang, Xiaojin Shen, Xiaokang Chen, Xiaosha Chen, Xiaotao Nie,
+598     Xiaowen Sun, Xiaoxiang Wang, Xin Liu, Xin Xie, Xingkai Yu, Xinnan Song, Xinyi Zhou, Xinyu
+599     Yang, Xuan Lu, Xuecheng Su, Y. Wu, Y. K. Li, Y. X. Wei, Y. X. Zhu, Yanhong Xu, Yanping Huang,
+600     Yao Li, Yao Zhao, Yaofeng Sun, Yaohui Li, Yaohui Wang, Yi Zheng, Yichao Zhang, Yiliang Xiong,
+601     Yilong Zhao, Ying He, Ying Tang, Yishi Piao, Yixin Dong, Yixuan Tan, Yiyuan Liu, Yongji Wang,
+602     Yongqiang Guo, Yuchen Zhu, Yuduan Wang, Yuheng Zou, Yukun Zha, Yunxian Ma, Yuting Yan,
+603
+        Yuxiang You, Yuxuan Liu, Z. Z. Ren, Zehui Ren, Zhangli Sha, Zhe Fu, Zhen Huang, Zhen Zhang,
+        Zhenda Xie, Zhewen Hao, Zhihong Shao, Zhiniu Wen, Zhipeng Xu, Zhongyu Zhang, Zhuoshu Li,
+604
+        Zihan Wang, Zihui Gu, Zilin Li, and Ziwei Xie. Deepseek-v2: A strong, economical, and efficient
+605
+        mixture-of-experts language model, 2024. URL https://arxiv.org/abs/2405.04434.
+606
+607   Ning Ding, Yulin Chen, Bokai Xu, Yujia Qin, Zhi Zheng, Shengding Hu, Zhiyuan Liu, Maosong
+608     Sun, and Bowen Zhou. Enhancing chat language models by scaling high-quality instructional
+609     conversations, 2023.
+610
+      Nelson Elhage, Neel Nanda, Catherine Olsson, Tom Henighan, Nicholas Joseph, Ben Mann, Amanda
+611     Askell, Yuntao Bai, Anna Chen, Tom Conerly, Nova DasSarma, Dawn Drain, Deep Ganguli, Zac
+612     Hatfield-Dodds, Danny Hernandez, Andy Jones, Jackson Kernion, Liane Lovitt, Kamal Ndousse,
+613     Dario Amodei, Tom Brown, Jack Clark, Jared Kaplan, Sam McCandlish, and Chris Olah. A mathe-
+614     matical framework for transformer circuits. Transformer Circuits Thread, 2021. https://transformer-
+615     circuits.pub/2021/framework/index.html.
+616
+      Leo Gao, Jonathan Tow, Baber Abbasi, Stella Biderman, Sid Black, Anthony DiPofi, Charles Foster,
+617
+        Laurence Golding, Jeffrey Hsu, Alain Le Noac’h, Haonan Li, Kyle McDonell, Niklas Muennighoff,
+618
+        Chris Ociepa, Jason Phang, Laria Reynolds, Hailey Schoelkopf, Aviya Skowron, Lintang Sutawika,
+619     Eric Tang, Anish Thite, Ben Wang, Kevin Wang, and Andy Zou. A framework for few-shot language
+620     model evaluation, 07 2024. URL https://zenodo.org/records/12608602.
+621
+622   Mor Geva, Roei Schuster, Jonathan Berant, and Omer Levy. Transformer feed-forward layers are key-
+623    value memories. In Marie-Francine Moens, Xuanjing Huang, Lucia Specia, and Scott Wen-tau Yih
+624
+       (eds.), Proceedings of the 2021 Conference on Empirical Methods in Natural Language Processing,
+       pp. 5484–5495, Online and Punta Cana, Dominican Republic, November 2021. Association for
+625
+       Computational Linguistics. doi: 10.18653/v1/2021.emnlp-main.446. URL https://aclant
+626
+       hology.org/2021.emnlp-main.446.
+627
+628   GretelAI. Synthetically generated reasoning dataset (gsm8k-inspired) with enhanced diversity using
+629     gretel navigator and meta-llama/meta-llama-3.1-405b. https://huggingface.co/gretelai/synthetic-
+630     gsm8k-reflection-405b, 9 2024.
+631
+      Andrey Gromov, Kushal Tirumala, Hassan Shapourian, Paolo Glorioso, and Daniel A. Roberts. The
+632     unreasonable ineffectiveness of the deeper layers, 2024. URL https://arxiv.org/abs/24
+633     03.17887.
+634
+635   Dan Hendrycks, Collin Burns, Steven Basart, Andy Zou, Mantas Mazeika, Dawn Song, and Jacob
+636     Steinhardt. Measuring massive multitask language understanding. Proceedings of the International
+637
+        Conference on Learning Representations (ICLR), 2021.
+638   Geoffrey E. Hinton, Oriol Vinyals, and Jeffrey Dean. Distilling the knowledge in a neural network.
+639     CoRR, abs/1503.02531, 2015. URL http://dblp.uni-trier.de/db/journals/corr
+640    /corr1503.html#HintonVD15.
+641
+642
+      Connor Holmes, Masahiro Tanaka, Michael Wyatt, Ammar Ahmad Awan, Jeff Rasley, Samyam
+        Rajbhandari, Reza Yazdani Aminabadi, Heyang Qin, Arash Bakhtiari, Lev Kurilenko, and Yuxiong
+643
+        He. Deepspeed-fastgen: High-throughput text generation for llms via mii and deepspeed-inference,
+644
+        2024. URL https://arxiv.org/abs/2401.08671.
+645
+646   Coleman Hooper, Sehoon Kim, Hiva Mohammadzadeh, Michael W. Mahoney, Yakun Sophia Shao,
+647     Kurt Keutzer, and Amir Gholami. Kvquant: Towards 10 million context length llm inference with
+        kv cache quantization, 2024. URL https://arxiv.org/abs/2401.18079.
+
+
+                                                      12
+      Under review as a conference paper at ICLR 2025
+
+
+648
+      Albert Q. Jiang, Alexandre Sablayrolles, Arthur Mensch, Chris Bamford, Devendra Singh Chap-
+649     lot, Diego de las Casas, Florian Bressand, Gianna Lengyel, Guillaume Lample, Lucile Saulnier,
+650     Lélio Renard Lavaud, Marie-Anne Lachaux, Pierre Stock, Teven Le Scao, Thibaut Lavril,
+651     Thomas Wang, Timothée Lacroix, and William El Sayed. Mistral 7b, 2023. URL https:
+652     //arxiv.org/abs/2310.06825.
+653
+654   Huiqiang Jiang, Yucheng Li, Chengruidong Zhang, Qianhui Wu, Xufang Luo, Surin Ahn, Zhenhua
+655
+        Han, Amir H. Abdi, Dongsheng Li, Chin-Yew Lin, Yuqing Yang, and Lili Qiu. Minference
+       1.0: Accelerating pre-filling for long-context llms via dynamic sparse attention, 2024. URL
+656
+        https://arxiv.org/abs/2407.02490.
+657
+658   Andrey Kuzmin, Mart Van Baalen, Yuwei Ren, Markus Nagel, Jorn Peters, and Tijmen Blankevoort.
+659     Fp8 quantization: the power of the exponent. In Proceedings of the 36th International Conference on
+660    Neural Information Processing Systems, NIPS ’22, Red Hook, NY, USA, 2024. Curran Associates
+661     Inc. ISBN 9781713871088.
+662
+663
+      Woosuk Kwon, Zhuohan Li, Siyuan Zhuang, Ying Sheng, Lianmin Zheng, Cody Hao Yu, Joseph
+       Gonzalez, Hao Zhang, and Ion Stoica. Efficient memory management for large language model
+664
+       serving with pagedattention. In Proceedings of the 29th Symposium on Operating Systems Principles,
+665
+       SOSP ’23, pp. 611–626, New York, NY, USA, 2023. Association for Computing Machinery. ISBN
+666    9798400702297. doi: 10.1145/3600006.3613165. URL https://doi.org/10.1145/3600
+667    006.3613165.
+668
+669   Yaniv Leviathan, Matan Kalman, and Yossi Matias. Fast inference from transformers via speculative
+670     decoding. In Proceedings of the 40th International Conference on Machine Learning, ICML’23.
+671     JMLR.org, 2023.
+672
+      Patrick Lewis, Ethan Perez, Aleksandra Piktus, Fabio Petroni, Vladimir Karpukhin, Naman Goyal,
+673     Heinrich Küttler, Mike Lewis, Wen-tau Yih, Tim Rocktäschel, Sebastian Riedel, and Douwe Kiela.
+674     Retrieval-augmented generation for knowledge-intensive nlp tasks. In Proceedings of the 34th
+675     International Conference on Neural Information Processing Systems, NIPS ’20, Red Hook, NY,
+676     USA, 2020. Curran Associates Inc. ISBN 9781713829546.
+677
+678   Stephanie Lin, Jacob Hilton, and Owain Evans. TruthfulQA: Measuring how models mimic human
+679
+        falsehoods. In Proceedings of the 60th Annual Meeting of the Association for Computational
+        Linguistics (Volume 1: Long Papers), pp. 3214–3252, Dublin, Ireland, May 2022. Association for
+680
+        Computational Linguistics. doi: 10.18653/v1/2022.acl-long.229. URL https://aclantholo
+681
+        gy.org/2022.acl-long.229.
+682
+683   Xi Victoria Lin, Xilun Chen, Mingda Chen, Weijia Shi, Maria Lomeli, Richard James, Pedro Ro-
+684     driguez, Jacob Kahn, Gergely Szilvasy, Mike Lewis, Luke Zettlemoyer, and Wen tau Yih. RA-DIT:
+685     Retrieval-augmented dual instruction tuning. In The Twelfth International Conference on Learning
+686     Representations, 2024. URL https://openreview.net/forum?id=22OTbutug9.
+687
+      Akide Liu, Jing Liu, Zizheng Pan, Yefei He, Gholamreza Haffari, and Bohan Zhuang. Minicache: Kv
+688
+        cache compression in depth dimension for large language models. arXiv preprint arXiv:2405.14366,
+689
+        2024a.
+690
+691   Akide Liu, Jing Liu, Zizheng Pan, Yefei He, Gholamreza Haffari, and Bohan Zhuang. Minicache:
+692     Kv cache compression in depth dimension for large language models, 2024b. URL https:
+693    //arxiv.org/abs/2405.14366.
+694
+      Songwei Liu, Chao Zeng, Lianqiang Li, Chenqian Yan, Lean Fu, Xing Mei, and Fangmin Chen.
+695
+        Foldgpt: Simple and effective large language model compression scheme, 2024c. URL https:
+696
+        //arxiv.org/abs/2407.00928.
+697
+698   Zichang Liu, Aditya Desai, Fangshuo Liao, Weitao Wang, Victor Xie, Zhaozhuo Xu, Anastasios
+699     Kyrillidis, and Anshumali Shrivastava. Scissorhands: exploiting the persistence of importance
+700     hypothesis for llm kv cache compression at test time. In Proceedings of the 37th International
+701     Conference on Neural Information Processing Systems, NIPS ’23, Red Hook, NY, USA, 2024d.
+        Curran Associates Inc.
+
+
+                                                      13
+      Under review as a conference paper at ICLR 2025
+
+
+702
+      Weile Luo, Ruibo Fan, Zeyu Li, Dayou Du, Qiang Wang, and Xiaowen Chu. Benchmarking and
+703    dissecting the nvidia hopper gpu architecture, 2024. URL https://arxiv.org/abs/2402
+704    .13499.
+705
+706   Kevin Meng, David Bau, Alex Andonian, and Yonatan Belinkov. Locating and editing factual associa-
+707     tions in gpt. In Proceedings of the 36th International Conference on Neural Information Processing
+708
+        Systems, NIPS ’22, Red Hook, NY, USA, 2024. Curran Associates Inc. ISBN 9781713871088.
+709   NVIDIA. Tensorrt. https://github.com/NVIDIA/TensorRT, 2019.
+710
+711   NVIDIA. Fastertransformer. https://github.com/NVIDIA/FasterTransformer,
+712    2021.
+713   Reiner Pope, Sholto Douglas, Aakanksha Chowdhery, Jacob Devlin, James Bradbury, Anselm Lev-
+714     skaya, Jonathan Heek, Kefan Xiao, Shivani Agrawal, and Jeff Dean. Efficiently scaling transformer
+715     inference, 2022. URL https://arxiv.org/abs/2211.05102.
+716
+717   Mohammadreza Pourreza and Davood Rafiei. Din-sql: decomposed in-context learning of text-to-sql
+718
+       with self-correction. In Proceedings of the 37th International Conference on Neural Information
+       Processing Systems, NIPS ’23, Red Hook, NY, USA, 2024. Curran Associates Inc.
+719
+720   Xiao Pu, Mingqi Gao, and Xiaojun Wan. Summarization is (almost) dead, 2023. URL https:
+721     //arxiv.org/abs/2309.09558.
+722
+      Keisuke Sakaguchi, Ronan Le Bras, Chandra Bhagavatula, and Yejin Choi. Winogrande: An adversarial
+723
+        winograd schema challenge at scale. arXiv preprint arXiv:1907.10641, 2019.
+724
+725   Timo Schick, Jane Dwivedi-Yu, Roberto Dessì, Roberta Raileanu, Maria Lomeli, Luke Zettlemoyer,
+726     Nicola Cancedda, and Thomas Scialom. Toolformer: Language models can teach themselves to use
+727     tools, 2023. URL https://arxiv.org/abs/2302.04761.
+728
+      Noam Shazeer. Fast transformer decoding: One write-head is all you need, 2019. URL https:
+729
+       //arxiv.org/abs/1911.02150.
+730
+731   Ying Sheng, Lianmin Zheng, Binhang Yuan, Zhuohan Li, Max Ryabinin, Beidi Chen, Percy Liang,
+732     Christopher Ré, Ion Stoica, and Ce Zhang. Flexgen: high-throughput generative inference of large
+733     language models with a single gpu. In Proceedings of the 40th International Conference on Machine
+734     Learning, ICML’23. JMLR.org, 2023.
+735   Mohammad Shoeybi, Mostofa Patwary, Raul Puri, Patrick LeGresley, Jared Casper, and Bryan
+736    Catanzaro. Megatron-lm: Training multi-billion parameter language models using model parallelism,
+737    2020. URL https://arxiv.org/abs/1909.08053.
+738
+739   Rohan Taori, Ishaan Gulrajani, Tianyi Zhang, Yann Dubois, Xuechen Li, Carlos Guestrin, Percy
+740
+        Liang, and Tatsunori B. Hashimoto. Stanford alpaca: An instruction-following llama model.
+        https://github.com/tatsu-lab/stanford_alpaca, 2023.
+741
+742   Teknium. Openhermes 2.5: An open dataset of synthetic data for generalist llm assistants, 2023. URL
+743     https://huggingface.co/datasets/teknium/OpenHermes-2.5.
+744
+745
+      Ashish Vaswani, Noam Shazeer, Niki Parmar, Jakob Uszkoreit, Llion Jones, Aidan N. Gomez, Łukasz
+        Kaiser, and Illia Polosukhin. Attention is all you need. In Proceedings of the 31st International
+746
+        Conference on Neural Information Processing Systems, NIPS’17, pp. 6000–6010, Red Hook, NY,
+747
+        USA, 2017. Curran Associates Inc. ISBN 9781510860964.
+748
+749   Junlin Wang, Jue Wang, Ben Athiwaratkun, Ce Zhang, and James Zou. Mixture-of-agents enhances
+750     large language model capabilities, 2024. URL https://arxiv.org/abs/2406.04692.
+751
+      Yuxiang Wei, Zhe Wang, Jiawei Liu, Yifeng Ding, and Lingming Zhang. Magicoder: Source code is
+752
+        all you need. arXiv preprint arXiv:2312.02120, 2023.
+753
+754   Zhewei Yao, Reza Yazdani Aminabadi, Minjia Zhang, Xiaoxia Wu, Conglong Li, and Yuxiong He.
+755     Zeroquant: Efficient and affordable post-training quantization for large-scale transformers, 2022.
+        URL https://arxiv.org/abs/2206.01861.
+
+
+                                                      14
+      Under review as a conference paper at ICLR 2025
+
+
+756
+      Gyeong-In Yu, Joo Seong Jeong, Geon-Woo Kim, Soojeong Kim, and Byung-Gon Chun. Orca: A
+757     distributed serving system for Transformer-Based generative models. In 16th USENIX Symposium
+758     on Operating Systems Design and Implementation (OSDI 22), pp. 521–538, Carlsbad, CA, July
+759     2022. USENIX Association. ISBN 978-1-939133-28-1. URL https://www.usenix.org/c
+760     onference/osdi22/presentation/yu.
+761
+762
+      Rowan Zellers, Ari Holtzman, Yonatan Bisk, Ali Farhadi, and Yejin Choi. Hellaswag: Can a machine
+        really finish your sentence? In Proceedings of the 57th Annual Meeting of the Association for
+763
+        Computational Linguistics, 2019.
+764
+765   Tianyi Zhang, Faisal Ladhak, Esin Durmus, Percy Liang, Kathleen McKeown, and Tatsunori B.
+766     Hashimoto. Benchmarking large language models for news summarization. Transactions of the
+767     Association for Computational Linguistics, 12:39–57, 2024. doi: 10.1162/tacl_a_00632. URL
+768     https://aclanthology.org/2024.tacl-1.3.
+769
+      Youpeng Zhao, Di Wu, and Jun Wang. Alisa: Accelerating large language model inference via
+770     sparsity-aware kv caching, 2024. URL https://arxiv.org/abs/2403.17312.
+771
+772
+773
+774
+775
+776
+777
+778
+779
+780
+781
+782
+783
+784
+785
+786
+787
+788
+789
+790
+791
+792
+793
+794
+795
+796
+797
+798
+799
+800
+801
+802
+803
+804
+805
+806
+807
+808
+809
+
+
+
+                                                    15
+      Under review as a conference paper at ICLR 2025
+
+
+810                                                                 Table B.1: The setting for different tasks
+811
+812                              Arc-Challenge       Winogrande     HelloSwag           truthfulqa                            MMLU                MMLU-CoT                     GSM-8K
+                                     0-shot             5-shots        10-shots          0-shot                               5-shots                 0-shot                    8-shots
+813                    exact_match,multi_choice          acc           acc_norm   truthfulqa_mc2 (acc)   exact_match,multi_choice            exact_match,strict-match   exact_match,strict-match
+814
+815
+816   A      A DDITIONAL M OTIVATION
+817
+818
+                                       LLaMa-3.1-8B-Instruct
+819                                    Mistral-7B-Instruct-v0.1
+                           0.8         Qwen2.5-7B-Instruct                                                              0.8
+820
+821
+                           0.6                                                                                          0.6
+            SimScore(xl)
+
+
+                                                                                                         SimScore(xl)
+822
+823
+                           0.4                                                                                          0.4
+824
+825
+                           0.2                                                                                          0.2                                      LLaMa-3.1-70B-Instruct
+826                                                                                                                                                              Mistral-Large-Instruct-2407
+827                                                                                                                                                              Qwen2.5-72B-Instruct
+                                 0            5    10          15         20       25          30                              0        20              40              60            80
+828                                                            Layer                                                                                     Layer
+829
+830         Figure A.1: The input similarity of small scale models (left) and large scale models (right).
+831
+832
+833   B     E XPERIMENTAL D ETAILS
+834
+835   B.1          T RAINING AND EVALUATION DETAILS
+836
+837   We directly use the Huggingface LLama-3.1 checkpoints, particularly, “meta-llama/Meta-Llama-3.1-
+838   8B-Instruct” and “meta-llama/Meta-Llama-3.1-70B-Instruct”. For datasets, we use the supervised
+839   finetuning datasets from “HuggingFaceH4/ultrachat_200k” and “teknium/OpenHermes-2.5”, which in
+840
+      total is about 1.2M samples, and about 160M tokens. We set training epochs to be 2, learning rate to
+      be 3e-4, weight decay to be 0.05, warm up ratio to be 5%, maximum sequence length to be 8192 with
+841
+      attention separated sequence packing, the distillation temperature to be 2.0, and the training batch size
+842
+      to be 32 for both Llama-3.1-8B-Instruct and Llama-3.1-70B-Instruct.
+843
+844   Our evaluation follows https://huggingface.co/neuralmagic/Meta-Llama-3.1
+845   -8B-Instruct-FP8 using the github repository https://github.com/neuralmagic/l
+846
+      m-evaluation-harness/tree/llama_3.1_instruct. The main reason behind this is
+      that the implemention from the repository aligns with original Llama-3.1 evaluation, which has superme
+847
+      scores over the original Lm-eval-harness repository. One issue we found in the provided commands is
+848
+      the one used to run MMLU-5-shots. Directly using the command does not give us desired accuracy.
+849   Therefore, we added both --apply_chat_template and --fewshot_as_multiturn, and
+850   the accuracy is even slightly higher than what they reported.
+851
+852
+      For all tasks, we follow the same number of few shots and/or chain of thoughts as the provided
+      commands. We present the number of shots and metrics used in the paper in Table B.1.
+853
+854
+      B.2          I NFERENCE S PEEDUP E VALUATION D ETAILS
+855
+856   Hardware Details. We ran all inference speedup experiments on a AWS p5.48xlarge instance, with
+857   8 NVIDIA H100 GPUs, 192 vCPUs, and 2TB memory. Llama-3.1-8B-Instruct experiments are run
+858   using 1 of the 8 GPUs, and Llama-3.1-70B-Instruct experiments are run using 4 of the 8 GPUs.
+859
+860   vLLM Configuration. We ran all experiments with enforce_eager and chunked prefill enabled
+861   with max_num_batched_tokens set to 2048. To run each benchmark, we instantiated vLLM’s
+862   AsyncLLMEngine and submitted requests using its generate method according to each bench-
+863   mark setting. For each request, the inputs are tokenized before being submitted, and the outputs are
+      forced to a fixed length of 256.
+
+
+                                                                                                     16
+      Under review as a conference paper at ICLR 2025
+
+
+864
+865                            50% SingleInputKV                    50% SingleInputKV + 2x AcrossKV                       50% SingleInputKV + 4x AcrossKV                        Baseline
+
+866
+                   300                                                      800                                                        4,000
+867
+                                                                            600                                                        3,000
+       TTFT (ms)
+                   200
+868
+                                                                            400                                                        2,000
+869                100
+                                                                            200                                                        1,000
+870                  0                                                         0                                                          0
+871
+                           2    4      6      8      10        12    14               0.5 1.0   1.5     2.0   2.5   3.0   3.5 4.0                 0.2          0.4      0.6      0.8    1.0
+872
+873                100                                                      100
+                                                                                                                                        100
+       TPOT (ms)
+
+
+874
+875                 50                                                        50
+                                                                                                                                         50
+876
+                     0                                                         0                                                          0
+877
+                           2    4      6      8      10        12    14               0.5 1.0   1.5     2.0   2.5   3.0   3.5 4.0                 0.2          0.4      0.6      0.8    1.0
+878
+879                            Arrival Rate (requests/s)                                   Arrival Rate (requests/s)                                Arrival Rate (requests/s)
+880
+881   Figure B.1: Time to first token (TTFT, top) and time per output token (TPOT, bottom) for input lengths
+882   2000 (left), 8000 (middle), and 32000 (right) for Llama-3.1-8B. For each experiment, a range of
+883
+      different request arrival rates is simulated. Each request generates 256 output tokens.
+884
+885   Llama-3.1-8B Latency Evaluation. See Fig. B.1.
+886
+887   B.3           A DDITIONAL M ODEL E VALUATIONS
+888
+889   Full per-task evaluation scores for Llama-3.2-3B-Instruct, Llama-3.1-405B-Instruct (FP8), Mistral-
+890   Small-Instruct-2409, and Deepseek-V2-Lite-Chat can be found in Table B.2, Table B.3, Table B.4, and
+891   Table B.5, respectively.
+892
+                                                                      Table B.2: Llama-3.2-3B-Instruct
+893
+894                             SingleInputKV        AcrossKV             Arc-Challenge     Winogrande        HelloSwag   truthfulqa   MMLU       MMLU-CoT           GSM-8K
+                   Model                                                                                                                                                        Avg.
+                               Prefill Reduction   Cache Reduction            0-shot         5-shots           10-shots     0-shot     5-shots      0-shot            8-shots
+895
+                   Baseline          N/A                  N/A                 75.17             68.59           73.32       51.45       62.01       62.48             72.32     66.47
+896                SwiftKV          ✓(25%)                 ✗                  75.59             69.77           72.34       52.80       61.89       62.39             71.11     66.55
+                   SwiftKV          ✓(40%)                 ✗                  75.34             68.98           71.37       51.10       61.80       61.62             68.68     65.55
+897                SwiftKV          ✓(50%)                 ✗                  71.25             68.75           70.77       51.29       59.63       59.94             67.02     64.09
+898                SwiftKV          ✓(40%)           2-way (25%)              74.82             68.66           71.41       50.67       61.55       61.03             67.77     65.13
+                   SwiftKV          ✓(40%)          4-way (37.5%)             75.59             69.21           70.79       50.89       61.35       60.82             67.70     65.19
+899
+900
+901                                                        Table B.3: Llama-3.1-405B-Instruct (FP8)
+902
+                                SingleInputKV        AcrossKV             Arc-Challenge    Winogrande         Hellaswag   TruthfulQA    MMLU      MMLU-CoT           GSM-8K
+                   Model                                                                                                                                                        Avg.
+903                            Prefill Reduction   Cache Reduction            0-shot        5-shots            10-shots     0-shot      5-shots     0-shot            8-shots
+                   Baseline          N/A                  N/A                 94.7              87.0            88.3         64.7         87.5          88.1           96.1     86.6
+904
+                   SwiftKV          ✓(50%)                 ✗                  94.0              86.3            88.1         64.2         85.7          87.5           95.2     85.9
+905
+906
+907
+                                                                Table B.4: Mistral-Small-Instruct-2409
+908                             SingleInputKV        AcrossKV             Arc-Challenge     Winogrande        HelloSwag   truthfulqa   MMLU       MMLU-CoT           GSM-8K
+                   Model                                                                                                                                                        Avg.
+                               Prefill Reduction   Cache Reduction            0-shot         5-shots           10-shots     0-shot     5-shots      0-shot            8-shots
+909
+                   Baseline          N/A                  N/A                 84.12             84.68           87.27       56.85       73.33       74.86             86.50     78.23
+910                SwiftKV          ✓(25%)                 ✗                  84.04             84.84           87.03       55.97       72.88       74.69             85.21     77.80
+                   SwiftKV          ✓(50%)                 ✗                  83.53             83.97           86.30       55.63       72.91       74.04             84.30     77.24
+911
+                   SwiftKV          ✓(50%)           2-way (25%)              83.36             84.05           86.22       56.20       72.30       73.70             84.68     77.21
+912                SwiftKV          ✓(50%)          4-way (37.5%)             82.93             83.82           86.17       56.00       72.29       73.00             82.48     76.66
+
+913
+914
+915   C            I NTER - LAYER ACROSS KV VS I NTRA -L AYER KV CACHE R EDUCTION
+916
+917   In this section, we share different design choices of AcrossKV, which considers the tradeoff between
+      GQA (Ainslie et al., 2023a) and the acorss layer sharing into the design. Particularly, when AcrossKV ≥
+
+
+                                                                                                  17
+      Under review as a conference paper at ICLR 2025
+
+
+918                                                      Table B.5: Deepseek-V2-Lite-Chat
+919
+920         Model
+                        SingleInputKV        AcrossKV        Arc-Challenge   Winogrande    HelloSwag   truthfulqa   MMLU      MMLU-CoT        GSM-8K
+                                                                                                                                                          Avg.
+                       Prefill Reduction   Cache Reduction       0-shot       5-shots       10-shots     0-shot     5-shots     0-shot         8-shots
+921         Baseline         N/A                   N/A           65.53         74.66         81.56       50.98      56.86           50.61       68.69    64.12
+922         SwiftKV        ✓(25%)                   ✗            65.44         75.05         81.52       50.53      56.91           50.92       68.99    64.19
+            SwiftKV        ✓(45%)                   ✗            65.61         73.95         80.82       50.20      56.33           51.56       66.11    63.51
+923         SwiftKV        ✓(45%)            2-way (25%)         65.52         74.26         80.23       49.85      55.59           50.51       65.57    63.07
+            SwiftKV        ✓(45%)           4-way (37.5%)        61.34         75.21         79.80       48.39      54.82           30.80       64.89    59.32
+924
+925
+926
+      2, we can either use GQA and AcrossKV together or we can simply use AcrossKV to get all savings.
+927   For instance, when AcrossKV = 4 (a.k.a., the second row of the final session in Table 2), we have KV
+928   cache reduction from both GQA and AcrossKV. However, we can either do multi-query attention
+929   (MQA) for all 16 layers or do multi-head attention (MHA) but share the KV cache for all 16 layers.
+930
+931                                        Table C.1: Llama-3.1-8B-Instruct AcrossKV design
+932
+933                                 Arc-Challenge        Winogrande      Hellaswag        TruthfulQA     MMLU         MMLU-CoT              GSM-8K
+            Method                                                                                                                                       Avg.
+                                        0-shot            5-shots         10-shots          0-shot       5-shots        0-shot               8-shots
+934         MQA                            66.89             72.22           67.33          55.00         55.96             39.12            22.37       54.13
+935         AcrossKV-MHA                   77.99             75.85           77.37          55.50         63.55             65.48            72.63       69.76
+            AcrossKV-GQA                   79.35             77.51           78.44          54.96         65.71             67.75            76.72       71.49
+936
+937
+938   We present the 50% SingleInputKV reduction with MQA, GQA plus AcrossKV, and GQA plus MHA
+939   in Table C.1, that all have the same KV cache reduction, 37.5%. AcrossKV-GQA actually provides
+940   the best performance. One thing to notice is that the AcrossKV-MHA is actually worse than the
+941   result of AcrossKV-16x from from Table 2 even though AcrossKV-MHA has larger KV cache than
+942   AcrossKV-16x. We hypothesis that this might be related to hyper-paramter tuning but did not invest
+943   deeper. Also, note that pure MQA leads to worst performance, which is about 17 points lower than
+944   AcrossKV-GQA
+945   How to effectively balance inter/intra-layer KV cache sharing is an interesting direction to explore. We
+946   hope that our initial experiments here shed some light for future research.
+947
+948
+949
+      D    T HE IMPACT OF FINE - TUNING DATASETS
+950
+      Note that in Sec. 4, we did not try to maximize the performance of SwiftKV from the data recipe
+951
+      perspective since the search space is very large and outside the scope of our paper. However, we want
+952
+      to share some initial findings about the dataset recipe.
+953
+954   How good is the data used to train SwiftKV? We chose the datasets to train SwiftKV due to their
+955   popular adoption and broad domain and task coverage. However, as compared to other high-quality
+956
+      domain specific fine-tuning datasets, they may have weaknesses. To measure the quality of these two
+      datasets, we directly fine-tuned a model using the Llama-3.1-8B base model, and compared this trained
+957
+      model with the Llama-3.1-8B-Instruct model released by Meta.
+958
+959   The results are shown in Table D.1 (a). The original Llama-3.1-8B-Instruct has a average score of 73.71
+960   but the model trained using our two datasets only achieved 65.77. This indicates the training data used
+961   for SwiftKV is not optimal and there may be opportunities to further improve the results we reported
+962
+      in Sec. 4 as discussed next.
+963   Does more math/coding data help GSM-8K? From Table 2, the main degradation among 7 tasks for
+964   50% SingleInputKV is GSM-8K. This may be due to the lack of math and coding examples in the two
+965   datasets we picked to train the model. To verify this, we distilled SwiftKV using one extra math-related
+966   dataset, gretelai/synthetic-gsm8k-reflection-405b (GretelAI, 2024), and one extra
+967   coding dataset, ise-uiuc/Magicoder-OSS-Instruct-75K (Wei et al., 2023), in total about
+968
+      8K+75K = 83K samples, and about 16M tokens.
+969   The results are reported in Table D.1 (b). The performance of all tasks except Winogrande are slightly
+970   improved, with the average score being 0.23 higher. Particularly, GSM-8K improves the most, with a
+971   0.53% improvement. This is expected since we added extra math and coding datasets. Considering the
+      small amount of new data (83k vs. 1.2M), the improvement is remarkable.
+
+
+                                                                                  18
+       Under review as a conference paper at ICLR 2025
+
+
+972                                                                             Table D.1: The impact of datasets on Llama-3.1-8B-Instruct.
+973
+974                           Setting
+                                                                                          Arc-Challenge    Winogrande                              Hellaswag       TruthfulQA        MMLU         MMLU-CoT           GSM-8K
+                                                                                                                                                                                                                                    Avg.
+                                                                                              0-shot        5-shots                                 10-shots         0-shot          5-shots        0-shot            8-shots
+975
+                                                                (a) Quality of Llama-3.1-8B-Instruct vs model fine-tuned using “ultrachat_200k” and “OpenHermes-2.5”.
+976
+                              Llama-3.1-8B-Instruct                                              82.00            77.90                               80.40            54.56          67.90           70.63            82.56        73.71
+977                           Our fine-tuned model                                               71.42            76.56                               80.29            55.37          59.14           54.03            63.61        65.77
+978                                                                                                        (b) Adding more data improves model quality.
+
+979                           Original SwiftKV data                                              80.38            78.22                               79.30            54.54          67.30           69.73            79.45        72.70
+                              Plus math & code data                                              80.89            77.98                               79.54            54.70          67.41           70.00            79.98        72.93
+980
+981                                                                                                               1.0
+                 0.35
+                        Distribution of max prob. of early exit logits                                                                        Q u e s t i o n : What a r e t h e t h r e e p r i m a r y c o l o r s ?
+982              0.30
+                        Prob. of aligned early exit logits and final logits
+                                                                                                                  0.8
+                                                                                                                                              Answer : The t h r e e p r i m a r y c o l o r s a r e :
+
+
+                                                                                                                    Prob. of aligned logits
+                 0.25                                                                                             0.6                         1 . Red
+983
+       Density
+
+
+                 0.20
+                 0.15                                                                                             0.4                         2 . Blue
+984              0.10
+                                                                                                                  0.2
+                                                                                                                                              3 . Yellow
+                 0.05                                                                                                                         These c o l o r s a r e c a l l e d primary because t h e y a r e t h e
+985              0.00
+                        0.0                    0.2                     0.4
+                                                                         Max softmax score
+                                                                                           0.6       0.8    1.0
+                                                                                                                  0.0
+                                                                                                                                              b a s i c b u i l d i n g b l o c k s o f a l l o t h e r c o l o r s . They c a n n o t be
+                                                                                                                                              c r e a t e d by m i x i n g o t h e r c o l o r s t o g e t h e r , and t h e y a r e t h e
+986                                                                                                                                           o n l y c o l o r s t h a t c a n be u s e d t o c r e a t e a l l o t h e r c o l o r s
+987    Figure D.1: Density of early exit probabili-                                                                                           through mixing .
+
+988    ties and alignment of early exit vs final logits.                                                                                                    Table D.2: A Q&A example of early exit.
+989
+990
+991    This study indicates that improvements in distillation data is potentially an important direction for
+992    future work, particularly domain-specific datasets to reduce the quality gap compared to the original
+993
+       model when using SwiftKV.
+994
+995    D.1                     S IMPLE E ARLY E XIT FOR D ECODING T OKENS
+996
+       SingleInputKV allows all the KV cache needed for generating future tokens to be computed without
+997
+       having to forward-pass though the entire LLM. This means that even the decoding phase could exit
+998    earlier without worrying about missing KV cache for subsequent tokens.
+999
+1000   To test the feasibility, we added an early exit language modeling head. We then used the input to
+1001
+       SingleInputKV layer to calculate output logits, and incorporated them as part of the distillation training.
+       Our results are preliminary and requires further evaluation, but we found that the alignment between
+1002
+       early exit logits and the final output logits to be over 66% when the largest probability from the early
+1003
+       exit logits is over 95% (Fig. D.1). We used this as our early exit criteria (i.e., decoding tokens exit
+1004   early if it predicts an output token with 95%+ probability), and Table D.2 shows a sample result. See
+1005   Appendix E for more details.
+1006
+1007
+1008
+       E                 E ARLY E XIT D ETAILS
+1009
+1010
+       Thanks to SingleInputKV, there is no need to go through the entire network to compute all KV cache
+       for later tokens generation. This also brings another unique opportunity as compared to standard
+1011
+       transformer architecture design: it allows the model to perform early exit to speedup both the prefill
+1012
+       and generation phases without worrying about missing KV cache.
+1013
+1014   To add early exit upon SwiftKV, we add an extra language modeling head and use the input to calculate
+1015   SingleInputKV to directly compute the output logits. We apply the same distillation loss of this early
+1016
+       exit logits with the original teacher’s logits and directly sum the two distillation losses together as our
+       final optimizing loss.
+1017
+1018   After training, we first look the alignment between the early exit logits and the final logits. The figure
+1019   is shown in Fig. D.1. The left axis plot the density of early exit largest probabilities. And the right
+1020   axis shows the probabilities when the maximum of early exit logits aligns with the final logits for each
+1021   bin. As can be seen, when the maximum logits is larger than 0.95, the alignment likelihood is larger
+1022
+       than 66%. Note that this is achieved within 160M token training and longer training should help the
+       alignment.
+1023
+1024   How to use early exit is always an interesting directly and research topic. Fully exploring this is out of
+1025   the scope of this paper. Here we adopt a simple heuristic approach. When the largest probability is
+       larger than 0.95, we directly use the early exit prediction. Otherwise, we still process the remaining
+
+
+                                                                                                                                                         19
+       Under review as a conference paper at ICLR 2025
+
+
+1026
+       layers to get the final prediction. We apply this logic to some questions we selected from Alpaca (Taori
+1027
+       et al., 2023) and the results are shown in Table D.2 and Appendix E.1.
+1028
+1029
+       E.1   E ARLY E XIT E XAMPLES
+1030
+1031   Here we provide more examples of early exit from Alpaca dataset.
+1032     Question:
+1033
+1034     Describe a time when you had to make a difficult decision.
+1035
+1036
+         Answer:
+1037     I’m an AI, I don’t have personal experiences or emotions, but I
+1038     can provide a hypothetical scenario to illustrate a difficult decision-
+1039     making process.
+1040
+1041
+         Imagine a scenario where I’m a manager at a company that specializes in
+         developing artificial intelligence solutions. One of the key clients, a
+1042     large corporation, has been a significant contributor to the company’s
+1043     revenue. However, the client has been consistently pushing for the
+1044     development of a new AI system that would require significant resources
+1045     and resources, including the expertise of several key team members.
+1046
+         However, the company has also been approached by a new client that
+1047     offers a more sustainable and long-term partnership, but with a lower
+1048     initial revenue potential. The new client is willing to invest in the
+1049     company’s research and development, which could lead to breakthroughs
+1050     in AI technology.
+1051
+         The decision I would have to make is whether to prioritize the existing
+1052     client’s needs and risk over the long-term potential of the new
+1053     client’s partnership. This decision would require weighing the short-
+1054     term financial benefits against the potential long-term benefits of the
+1055     new partnership.
+1056
+         To make this decision, I would consider the following factors:
+1057
+1058     1. **Financial implications:**
+1059        - The immediate revenue from the existing client would be
+1060          significant, but it would also come with the risk of
+1061
+              overcommitting resources and potentially straining the team’s
+              capacity.
+1062        - The new client’s partnership would offer a more sustainable
+1063          revenue stream, but it would require a significant investment of
+1064          resources upfront.
+1065
+1066
+         2. **Strategic alignment:**
+            - The existing client’s project aligns with the company’s current
+1067          business model, but it may not be the best use of resources in the
+1068          long term.
+1069        - The new client’s partnership would allow the company to explore
+1070          new areas of research and development, which could lead to
+1071
+              breakthroughs in AI technology.
+1072     3. **Team dynamics:**
+1073         - The existing client’s project would require the involvement of
+1074           several key team members, which could lead to burnout and
+1075           decreased morale.
+1076
+             - The new client’s partnership would allow the company to attract
+               and retain top talent, which would be beneficial for the company’s
+1077           long-term success.
+1078     ...
+1079     ======================================================================
+         Question:
+
+
+                                                         20
+       Under review as a conference paper at ICLR 2025
+
+
+1080
+1081     What is the capital of France?
+1082
+1083     Answer:
+1084
+         The capital of France is Paris.
+1085
+         ======================================================================
+1086     Question:
+1087
+1088     Explain the use of word embeddings in Natural Language Processing
+1089
+         Answer:
+1090
+1091
+         **Word Embeddings in Natural Language Processing**
+1092
+1093     Word embeddings are a fundamental concept in Natural Language
+1094     Processing (NLP) that enables computers to understand the meaning of
+         words in a more meaningful way. They are a way to represent words as
+1095
+         numerical vectors, allowing machines to capture the semantic
+1096     relationships between words.
+1097
+1098     **What are Word embeddings?**
+1099
+         Word embeddings are a type of word representation that captures the
+1100
+         semantic meaning of words. They are typically learned from large
+1101     amounts of text data using techniques such as word2vec, GloVe, and
+1102     Word2Vec.
+1103
+1104     **How do Word embeddings work?**
+1105
+         Word embeddings work by learning a vector space where words are
+1106     represented as points. Each word is mapped to a vector in this space,
+1107     where the vector represents the meaning of the word. The closer two
+1108     words are in the vector space, the more similar they are semantically.
+1109
+1110     **Types of Word embeddings**
+1111     There are several types of word embeddings, including:
+1112
+1113     1. **Word2Vec**: This is a popular word embedding technique that learns
+1114        word representations by predicting the context in which a word is
+            used. Word2Vec uses two main architectures: CBOW (Continuous Bag-of-
+1115
+            Words) and skip-gram.
+1116     2. **GloVe**: This is another popular word embedding technique that
+1117        learns word representations by analyzing the co-occurrence of words
+1118        in a sentence.
+1119     3. **Word2Vec with Negative Sampling**: This is a variant of the
+            word2vec algorithm that uses negative sampling to reduce the
+1120
+            dimensionality of the word embeddings.
+1121
+1122     **How are Word embeddings used in NLP tasks?**
+1123
+1124     Word embeddings are used in a variety of NLP tasks, including:
+1125
+         1. **Text Classification:**
+1126        - **Sentiment Analysis:**
+1127        - **Spam Detection:**
+1128        - **Topic Modeling:**
+1129        - **Named Entity Recognition (NER):**
+1130
+         2. **Text Generation:**
+1131        - **Text Summarization:**
+1132        - **Text Generation:**
+1133
+         3. **Information Retrieval:**
+
+
+                                                     21
+       Under review as a conference paper at ICLR 2025
+
+
+1134
+             - **Information Retrieval:**
+1135
+1136     4. **Machine Translation:**
+1137
+1138     5. **Question Answering:**
+         ...
+1139
+         ======================================================================
+1140     Question:
+1141
+1142     What is the product of 6 and 2?
+1143
+         Answer:
+1144
+1145     The product of 6 and 2 is 12.
+1146     ======================================================================
+1147     Question:
+1148
+         Give three tips for staying healthy.
+1149
+1150     Answer:
+1151
+1152     Here are three tips for staying healthy:
+1153
+         1. **Maintain a Balanced Diet:**
+1154
+1155     Eating a well-balanced diet is essential for maintaining overall
+1156     health. This includes consuming a variety of fruits, vegetables, whole
+1157     grains, lean proteins, and healthy fats. Aim to include a rainbow of
+1158     colors on your plate to ensure you’re getting a range of essential
+         vitamins and minerals. Limit your intake of processed and sugary foods,
+1159
+         and stay hydrated by drinking plenty of water throughout the day.
+1160
+1161     2. **Stay Physically Active:**
+1162
+1163     Regular physical activity is crucial for maintaining physical and
+         mental health. Aim to engage in at least 150 minutes of moderate-
+1164
+         intensity exercise or 75 minutes of vigorous-intensity exercise per
+1165     week. This can include activities such as walking, running, swimming,
+1166     cycling, or any other physical activity that you enjoy. You can also
+1167     incorporate strength training exercises into your routine to build
+1168     muscle and improve bone density.
+1169
+         3. **Get Enough Sleep and Manage Stress:**
+1170
+1171     Getting enough sleep and managing stress are essential for maintaining
+1172     overall health. Aim to get 7-9 hours of sleep per night to help your
+1173     body repair and recharge. Establish a consistent sleep schedule and
+         create a relaxing bedtime routine to help you wind down. Additionally,
+1174
+         engage in stress-reducing activities such as meditation, yoga, or deep
+1175     breathing exercises to help manage stress and anxiety.
+1176
+1177     Remember, maintaining a healthy lifestyle is a long-term commitment,
+1178     and it’s essential to find activities and habits that work for you and
+         your lifestyle.
+1179
+1180
+1181
+1182
+1183
+1184
+1185
+1186
+1187
+
+
+
+                                                     22

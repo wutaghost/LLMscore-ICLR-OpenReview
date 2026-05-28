@@ -1,0 +1,1477 @@
+Under review as a conference paper at ICLR 2025
+
+
+000
+001
+      Z ERO REDUNDANCY DISTRIBUTED LEARNING
+002   WITH DIFFERENTIAL PRIVACY
+003
+004
+005    Anonymous authors
+006    Paper under double-blind review
+007
+008
+                                                  A BSTRACT
+009
+010
+               Deep learning using large models have achieved great success in a wide range
+011
+               of domains. However, training these models on billions of parameters is very
+012            challenging in terms of the training speed, memory cost, and communication ef-
+013            ficiency, especially under the privacy-preserving regime with differential privacy
+014            (DP). On the one hand, DP optimization has comparable efficiency to the standard
+015            non-private optimization on a single GPU, but existing DP distributed learning
+016            (such as pipeline parallelism) has suffered from significantly worse efficiency on
+017            multiple GPUs. On the other hand, the Zero Redundancy Optimizer (ZeRO) is a
+018            state-of-the-art solution to the standard distributed learning, exhibiting excellent
+019            training efficiency on large models, but to work compatibly with DP is technically
+020
+               complicated. In this work, we develop a new systematic solution, DP-ZeRO, (I)
+               to scale up the trainable DP model size, e.g. to GPT-100B, (II) to obtain the same
+021
+               computation and communication efficiency as the standard ZeRO, and (III) to en-
+022
+               able mixed-precision DP training. Our DP-ZeRO, like the standard ZeRO, has the
+023            potential to train models with arbitrary size and is evaluated on the world’s largest
+024            DP models in terms of the number of trainable parameters. 1
+025
+026
+027   1   I NTRODUCTION
+028
+029   Recent advances in differentially private (DP) deep learning have witnessed the power of large pre-
+030   trained models, achieving comparable accuracy to state-of-the-art (SOTA) non-private models across
+031   computer vision De et al. (2022); Bu et al. (2022a); Mehta et al. (2022); Xie et al. (2018), natural
+032   language processing Yu et al. (2021a); Li et al. (2021); Bu et al. (2023a), and many other tasks.
+033   Similar to their non-DP counter-parts, it has been observed that larger DP models tend to have
+034   better performance. For example, the DP accuracy increases from 83% using RoBERTa-base (123M
+035
+      parameters) to 86% using RoBERTa-large (354M parameters) on GLUE datasets Li et al. (2021);
+      Bu et al. (2023a); Yu et al. (2021a); the DP BLEU score increases from 61 using GPT2-small (124M
+036
+      parameters) to 64 using GPT2-large (800M parameters) on E2E dataset Li et al. (2021); Bu et al.
+037
+      (2023a); a similar trend is also observed using ViT (Base/Large/Huge) up to 600M parameters to
+038   achieve state-of-the-art DP accuracy on ImageNet, around 81% at ϵ = 8 Mehta et al. (2022).
+039
+040   Driven by this success and the surge of computational power, it is high time to enable DP deep
+041
+      learning at the same scale of the standard non-DP one, e.g., GPT3-175B (Brown et al., 2020) and
+      LLaMA-63B (Touvron et al., 2023a;b). Specifically, such a DP training system must have high
+042
+      speed and memory efficiency, low communication cost, and the compatibility with general model
+043
+      architectures.
+044
+045   For small to moderately large models (e.g. with less than a billion parameters) that fit within the
+046   memory of a single GPU, a range of DP algorithms are feasible, producing the same result at differ-
+047
+      ent efficiency. Examples include TensorFlow-privacy Subramani et al. (2021), Opacus Yousefpour
+      et al. (2021); Bu et al. (2022b), ghost clipping (GhostClip) Goodfellow (2015); Li et al. (2021);
+048
+      Bu et al. (2022a), and Book-Keeping (BK) Bu et al. (2023b), among which the BK algorithm has
+049
+      allowed DP optimization to be almost as efficient as the standard one. To be specific, the time/space
+050   complexity of BK algorithm is 1.08 × /1.05× of the standard optimization on ViT-Large (300M
+051   parameters, 147 layers) and 1.03 × /1.01× on GPT2-large (800M parameters, 220 layers).
+052
+         1
+053        Code at https://anonymous.4open.science/r/DP-ZERO-2821 (this is built on fastDP and
+      no identifiers are related to our work).
+
+
+                                                        1
+      Under review as a conference paper at ICLR 2025
+
+
+054                                 Table 1: Summary of selected DP distributed learning.
+055    Distributed
+                      Parallelism
+                                     Model            Standard                      DP
+                                                                                                                          Remark
+        solution                    sharding           version                    version
+056       DDP            Data         No               Li et al.           Yousefpour et al. (2021)   unable to fit large model and DP is memory costly
+          DDP            Data         No         Frostig et al. (2018)        De et al. (2022)            unable to fit large model and DP is slow
+057      GPipe          Pipeline      Yes        Huang et al. (2019)          He et al. (2022)                pipeline bubble wastes GPU time
+058      ZeRO        Data(&Model)     Yes      Rajbhandari et al. (2020)           Ours                 speed & memory & communication efficient
+
+059
+060
+061   To enable the DP distributed learning of these not-too-large models, one can directly use DDP
+062
+      (distributed data parallelism) (Li et al.), where each mini-batch of data is partitioned to smaller
+      micro-batches and each GPU computes one micro-batch with a full copy of the DP model. A line
+063
+      of researches (Yousefpour et al., 2021; De et al., 2022; Kurakin et al., 2022) have reported that
+064
+      DDP with DP usually either incurs huge memory cost due to caching the per-sample gradients, or
+065   suffers from 2 − 9× slower training speed than non-DP optimization De et al. (2022); Bu et al.
+066   (2021). While the efficiency issues can be addressed through a better DP algorithm, such as BK, the
+067   feasibility issue remains insurmountable because DDP cannot train models that exceed the capacity
+068   of one GPU. Notably, the efficiency of BK algorithm is enhanced by two key techniques: mixed
+069   ghost norm (computing per-sample gradient norms almost for free) and book-keeping trick (only
+070   using one round of full back-propagation, not two rounds as in Li et al. (2021); Bu et al. (2022a)),
+071   which are detailed in Appendix A and will also be leveraged in our DP-ZeRO solution.
+072   As the model size further increases beyond a reasonable bound for one GPU (e.g. 32GB memory,
+073   which roughly translates to 2B model training with Adam), the model must be partitioned in addition
+074   to the data, e.g. using pipeline parallelism and model parallelism, so that each GPU only holds
+075   a partial shard of the model (see Figure 2). In He et al. (2022), DP is combined with pipeline
+076   parallelism to fine-tune about 0.1% of GPT3-175B. Yet, the pipeline parallelism can be inefficient
+077   due to a non-DP-related issue – the pipeline bubble, where GPUs are idle while waiting for data to
+078   process.
+079   Generally speaking, more advanced distributed methods such as Zero Redundancy Optimizer Rajb-
+080   handari et al. (2020) (ZeRO) and mixed-precision training have not be paired with DP due to the
+081   lack of algorithmic advances. In this work, we develop DP-ZeRO, equipping state-of-the-art dis-
+082   tributed learning solution with DP (see comparison in Table 1), without altering the mathematics of
+083   DP optimization. We summarize our contributions as follows2 .
+084
+085
+             1. We propose the zero redundancy distributed learning with differential privacy (DP-ZeRO),
+                demonstrating the same level of communication efficiency, computation efficiency
+086
+                (speed and memory), and scalability (to GPT3 level and hundreds of GPUs) as the stan-
+087
+                dard ZeRO.
+088
+089
+             2. We enable the mixed-precision training with DP by addressing the issue of loss scaling.
+                This solution allows us to reduce the memory cost by roughly 50% and allow significantly
+090
+                faster communication that was previously not enjoyed by DP distributed learning.
+091
+092          3. We enable DP deep learning with more than 1B trainable parameters for the first time. E.g.
+093
+                we are the first to train the full GPT2-XL, ViT-Gigantic, ViT-10B and GPT-100B with DP.
+094          4. We will open-source our codebase as the first DP distributed learning library, that automat-
+095             ically applies DP-ZeRO for general tasks (e.g. classification and language understanding),
+096             general network architectures (e.g. ResNet, ViT, GPT), and general distributed solutions
+097
+                (including DeepSpeed and FSDP).
+098
+099   2     P RELIMINARY
+100
+101   2.1     D IFFERENTIAL PRIVACY
+102
+103
+      DP provides a formal privacy guarantee, making it difficult to extract any information from training
+      data. The privacy guarantee is characterized by (ϵ, δ)-DP in Definition 2.1, with smaller (ϵ, δ)
+104
+      representing lower privacy risk.
+105
+106      2
+           We do not report any accuracy results since this is a system design paper, following the norm in the original
+107   ZeRO Rajbhandari et al. (2020) and FSDP Zhao et al.. We verify that DP-ZeRO is implemented correctly by
+      comparing to single-GPU DP libraries in Appendix E.
+
+
+                                                                            2
+      Under review as a conference paper at ICLR 2025
+
+
+108                                       105                                                          GPT-100B                                         104                                                           ViT-10B
+109                                                                                           GPT-26B
+                                          104                                             GPT-13B
+110                                                                                     GPT-7B                                                                                                         ViT-Gigantic
+                                                                                                                                                        103
+111
+
+
+                                                                                                                      Trainable parameters (million)
+        Trainable parameters (million)
+                                          103                                  GPT2-XL                                                                                                     ViT-Large
+112                                                                        GPT2-large
+                                                                        RoBERTa-large                                                                   102
+113                                                                                                                                                                             ViT-Base
+                                                                                                         GPT3(LoRA)                                                           ResNet152
+                                          102                       GPT2-small/RoBERTa-base
+114                                                                                                                                                                     ResNet50
+115                                                                                                                                                     101         ResNet18
+                                          101
+116
+                                                                          RoBERTa-large(LoRA)                                                                                 ResNet152(LP)
+117                                                                             GPT2-XL(LoRA)                                                           100                                   ViT-Huge(LP)
+                                                                                                                                                                                         ViT-Large(LP)                     ViT-22B
+                                          100                        RoBERTa-base(LoRA)                                                                                         ViT-Base(LP)
+118                                                                           GPT2-large(BiTFiT)
+                                                                          RoBERTa-large(BiTFiT)                                                                                            ViT-Large(BiTFiT)
+119
+                                         10 1                        RoBERTa-base(BiTFiT)                                                              10 1                     ViT-Base(BiTFiT)
+120                                             10 1   100     101        102        103         104        105                                               100    101            102             103                 104
+121                                                          Total model parameters (million)                                                                            Total model parameters (million)
+
+122      Figure 1: Total/trainable parameters of existing DP models (blue) and ours by DP-ZeRO (red).
+123
+124   Definition 2.1 (Dwork et al. (2006)). A randomized algorithm M is (ε, δ)-DP if, for any two neigh-
+125   boring datasets S, S ′ that differ by one sample and for any event E, we have P[M (S) ∈ E] ⩽
+126   eε P [M (S ′ ) ∈ E] + δ.
+127
+128   In DP deep learning, the gradients are made private by post-processing through per-sample gradient
+129
+      clipping and random noising:
+130                                             X
+131     private gradient (m-th group): G[m] :=      Ci (Rm )g[m],i + σDP ∥[R1 , · · · , RM ]∥ · N (0, I). (1)
+                                                                                                           i
+132
+133   Here the gradient of all trainable parameters is partitioned into M groups, i.e. g[m],i is the i-th
+134   per-sample gradient of the m-th group’s parameters, where m ∈ {1 · · · M } is the group index. Ci is
+135   the per-sample gradient clipping factor so that ∥Ci g[m],i ∥ ≤ Rm and Rm is the clipping threshold.
+136   That is, DP optimization is enabled when the standard optimizers such as stochastic gradient descent
+137   (SGD) and Adam (Kingma & Ba,    P 2014) update the trainable parameters with the private gradient,
+138   instead of the standard gradient i gi .
+139
+140   Mathematical gradient partition In equation 1, the trainable parameters and their gradients are
+141   mathematically partitioned into M groups, e.g. in all-layer clipping, all parameters form one group
+142   (M = 1) Abadi et al. (2016); in layer-wise clipping McMahan et al. (2018); He et al. (2022),
+143   each layer’s parameters form a group (M = number of layers). Empirical evidence and theoretical
+144   analysis show that different partitions have the same training speed, though a finer partition (e.g.
+145   layer-wise) has lighter memory footprint3 .
+146
+147   Per-sample gradient clipping In equation 1, a number of clipping functions Ci = C(∥gi ∥; R) are
+148   available. Most works Abadi et al. (2016); Li et al. (2021); Yu et al. (2021a) use the vanilla clipping
+149   Ci = min(R/∥gi ∥, 1). Recently, Bu et al. (2023a); Yang et al. (2022) advocate the automatic
+150   clipping Ci = 1/(∥gi ∥ + 0.01) which is hyperparameter-free and comparably accurate. Note if
+151   Ci ≡ 1, then the clipped gradient reduces to the standard gradient. The main overhead of DP
+152   optimization is the computation of per-sample gradient norms. On a single GPU, the mixed ghost
+153   clipping Bu et al. (2023b) has reduced the time complexity to < 10% on large models like GPT2.
+154
+155   Privacy accounting In equation 1, adding Gaussian noise to the clipped gradient protects the
+156   privacy that is quantifiable by the privacy accounting theory Abadi et al. (2016); Bu et al. (2020);
+157   Dong et al. (2019); Zhu et al. (2022); Gopi et al. (2021); Koskela et al. (2020). The privacy guarantee
+158   is increasing in the noise level σDP , independent of Rm , learning rate, clipping function and model
+159   architectures, with σDP = 0 leading to ϵ = ∞ (non-private).
+160
+         3
+161        We note that DP optimization under different group-wise clippings can have the same computation and
+      communication efficiency (under the BK algorithm), with or without ZeRO.
+
+
+                                                                                                                      3
+      Under review as a conference paper at ICLR 2025
+
+
+162
+      2.2     Z ERO R EDUNDANCY O PTIMIZER (Z E RO)
+163
+164   2.2.1    PARALLEL COMPUTING
+165
+166   Parallel computing is necessary to train large-scale models and is critical to the optimization ef-
+167   ficiency. For models that fit in a single GPU, data parallelism (DataP) can be used to speed
+168   up the training by partition the mini-batch of samples into multiple micro-batches. Then, each
+169
+      GPU (holding a full copy of parameters) executes the forward and backward propagation of one
+      micro-batch, from which the parameter gradients are generated and averaged across GPUs to up-
+170
+      date the trainable parameters. However, for models that do not fit in a single GPU, the model
+171
+      parameters need to be sharded by alternative solutions such as ZeRO Rajbhandari et al. (2020),
+172   model parallelism (ModelP) and pipeline parallelism (PipeP).
+173
+174   ModelP partitions a model vertically, e.g. using 3 GPUs to store the parameters of one layer. As
+175
+      a consequence, ModelP does not scale efficiently beyond a single node due to fine-grained com-
+      putation and expensive communication between layers. Implementation-wise, ModelP frameworks
+176
+      usually require heavy code integration that may not be generalizable in model architectures. In con-
+177
+      trast, PipeP partitions a model horizontally across layers, e.g. storing 3 layers in each GPU. Each
+178   GPU deals with all micro-batches sequentially, though PipeP can be inefficient due to the pipeline
+179   bubble, which is overcome by ZeRO Rajbhandari et al. (2020). ZeRO is an advanced data parallel
+180   method that eliminates memory redundancies during the training, and improves the training speed
+181   and communication volume proportionally to the number of GPUs. Unlike basic DataP, ZeRO par-
+182   titions a model’s states across GPUs and gather/reduce in a just-in-time manner, thus sustaining the
+183   high efficiency of very large model training. Notice that ZeRO can work compatibly with ModelP
+184   and optionally offload the model states to CPUs Ren et al. (2021); Rajbhandari et al. (2021).
+185
+      2.2.2    M ODEL STATE PARTITION
+186
+187   A major part of the training memory is consumed by the model states4 . ZeRO has three stages
+188   (ZeRO1/2/3) that partition these model states by different levels, with lower level being faster but
+189   more memory costly. For instance, in Table 2 of (Rajbhandari et al., 2020), ZeRO1/2/3 at most train
+190   7.6/14.4/128B models on 64 V100 GPUs.
+191
+      We take an example of mixed-precision Adam optimizer to train a model with Ψmodel parameters,
+192   which maintains a master copy (fp32) of optimizer states. and the half-precision parameters and
+193   gradients.
+194
+195
+      Optimizer state partition The optimizer states are the (master) parameters, variance and mo-
+196   mentum, each taking 4Ψmodel memory. ZeRO1 only applies the optimizer state partition and updates
+197   the parameters locally, reducing the memory cost of model states from 16Ψmodel for basic DataP to
+198         12
+      (4 + N d
+               )Ψmodel at each of Nd GPUs.
+199
+200
+201
+202
+203
+204
+205
+206   Figure 2: Mathematical (left two, same GPU allocation, different accuracy) and hardware (right two,
+207
+      different GPU allocation, same accuracy) gradient partition. Orange and blue are gradient groups
+      g[1] and g[2] in DP optimization equation 1.
+208
+209   Hardware gradient partition In addition to ZeRO1, during the back-propagation, ZeRO2 (and
+210   ZeRO3) further partitions the 2Ψmodel gradients into different GPUs, reducing the memory cost to
+           14
+211   (2 + N d
+               )Ψmodel at each GPU. Figure 2 illustrates the difference between the hardware partition and
+212   the mathematical partition in Section 2.1.
+213
+214      4
+           Another important part of memory consumption is the batch-size-related variables such as the activation
+215   tensors, which is instantiated during the forward propagation and independent to DP (which modifies the gra-
+      dient during the back-propagation).
+
+
+                                                           4
+      Under review as a conference paper at ICLR 2025
+
+
+216
+      Parameter partition In addition to ZeRO2, ZeRO3 also partitions the 2Ψmodel fp16 parameters,
+217                                       16
+      further reducing the memory cost to N   Ψmodel at each GPU.
+                                            d
+218
+219
+      2.3     M IXED - PRECISION TRAINING
+220
+221   Mixed-precision training (Micikevicius et al., 2018) performs the forward and backward propagation
+222   on the half precision (fp16 or bf16) parameters, activations, and gradients, while performing the
+223   model update in full precision (fp32). Compared to the full-precision training, it is capable of saving
+224   the memory by ≈ 50% and accelerating the computation by ≈ 20%. We note that fp16 has better
+225   precision but a limited range: its representable numbers are among 10−8 ∼ 105 , and vice versa for
+226   bf16. Therefore, loss scaling is necessary when using fp16 to prevent small gradients from being
+227   rounded to zero, thereby preserving the model’s accuracy (see Appendix C for details). In contrast,
+228
+      bf16 usually does not need loss scaling since it has the same range as fp32. However, bf16 is not as
+      widely supported as fp16, e.g. only available on NVIDIA Ampere GPUs or above (Nvidia).
+229
+230
+231   3       D IFFERENTIALLY PRIVATE Z E RO
+232
+233   3.1     A LGORITHM
+234
+      Our DP-ZeRO algorithm introduces the per-sample gradient clipping and noising to the standard
+235
+      ZeRO (Rajbhandari et al., 2020), while maintaining the efficiency. At high level, an iteration of
+236
+      ZeRO consists of the following steps:
+237                                                                       ×L layers
+238           all-gather → forward → all-gather → backward → reduce                   → update(SGD/Adam/...)
+239
+240   The operations in purple are global and require communication among GPUs, whereas the op-
+241   erations in green are locally computed within each GPU. In particular, DP optimization is only
+242   different from the standard optimization in the back-propagation, which can be decomposed into
+243
+                 backward =(output gradient → clipping factor → parameter gradient → noising)
+244
+245   To give more details, we consider training a neural network of linear layers using Nd GPUs. We
+246   emphasize that the following procedure is sufficiently generic to cover other layer types, such as
+247   convolution, embedding, normalization, and so on, which are all supported by DP-ZeRO. The full
+248                                                                                               (j)
+      algorithm is depicted in Figure 3, where we denote the j-th micro-batched variables like al , for
+249   1 ≤ j ≤ Nd .
+250
+      The forward propagation of DP optimization is the same as that of the standard optimization:
+251
+252                                     sl = al Wl + bl , al+1 = ϕl (sl ).                                     (2)
+253   At the l-th layer, al ∈ RBTl dl is the layer’s input, also known as the activation, sl ∈ RBTl pl is the
+254   layer’s output, Wl ∈ Rdl pl is the weight, bl ∈ Rpl is the bias, and ϕl is any inter-layer operation
+255   such as ReLU, tanh or pooling. We denote B as the physical micro-batch size5 and Tl as the hidden
+256   feature dimension (e.g. sentence length or number of pixels). During the forward propagation,  P the
+257   activations {al } are computed and stored in the computation graph, and the loss L =             i Li is
+258   derived, where Li is the per-sample losses. During the back-propagation, the output gradient is first
+259   computed based on the previous layer.
+260                          ∂L       ∂L ∂sl+1 ∂al+1              ∂L
+                                 =                  ◦         =          Wl+1 ◦ ϕ′l (sl ),
+261                          ∂sl    ∂sl+1 ∂al+1        ∂sl       ∂sl+1
+262   in which ◦ is element-wise multiplication. Specifically, the use of parameter Wl+1 necessitates the
+263   all-gather operation when the model is partitioned into multiple GPUs, which is not needed in single
+                                                                     ∂L
+264   GPU training. Next, the activation al is used together with ∂s    l
+                                                                           to compute the parameter gradient:
+265                          P
+                            ∂ i C i Li                                            ∂L
+266          DP gradient:              + σN (0, I) = a⊤  l diag(C1 , · · · , CB )     + σN (0, I).
+267
+                              ∂Wl                                                 ∂sl
+268      5
+           The micro-batch size B is the number of samples processed by each GPU, which determines the time
+269   and memory efficiency, but not the performance. The logical batch size that determines the performance is
+      B × Nd × gradient accumulation steps.
+
+
+                                                         5
+      Under review as a conference paper at ICLR 2025
+
+
+270
+271
+272
+273
+274
+275
+276
+277
+278
+279
+280
+281
+282
+283
+284
+285
+286
+287
+288
+289
+290
+291
+292
+293
+294                      Figure 3: Algorithm of DP-ZeRO with mixed-precision training.
+295
+296
+      Note the standard gradient can be viewed as Ci = 1, σ = 0. Here the per-sample gradient norm (or
+297
+      the clipping factor Ci ) can be computed at small cost, as we have discussed in Section 1.
+298
+299
+      3.2   T IME EFFICIENCY OF DP-Z E RO
+300
+301   The time efficiency of DP-ZeRO consists of two parts: the local computation (including forward and
+302   backward propagation) and the global communication (including intra-node and inter-node commu-
+303   nication). Given that the only difference between DP-ZeRO and ZeRO is the back-propagation,
+304   we claim that DP-ZeRO could enjoy high efficiency on-par with the standard ZeRO when (I) DP
+305   back-propagation exhibits a time efficiency comparable to the standard, similar to the single GPU
+306   training, and/or (II) the time efficiency of the parts other than back-propagation is not insignificant.
+307   We give the time of each part of DP-ZeRO in equation 3 to illustrate our claim.
+308                 DP-ZeRO speed           standard back-prop + forward prop + communication
+                                         =                                                                 (3)
+309              standard ZeRO speed           DP back-prop + forward prop + communication
+310   To be explicit, we summarize the time complexity in Table 2 and refer to Appendix B for details.
+311
+312
+313
+      Table 2: Time complexity (measured by float-point operations) of one iteration in distributed learn-
+      ing7 . We denote Ψtrain to be the number of trainable parameters (Ψtrain = Ψmodel in full parameter
+314
+      training), and define B, T below equation 2.
+315                     forward propagation                        back-propagation
+316                                                                                                communication
+                       activation   attention   output grad       param grad DP clipping& noise
+317     complexity    2BT Ψmodel O(BT 2 )       2BT Ψmodel        2BT Ψtrain      0.666BT Ψtrain     O(Ψmodel )
+318
+319   In what follows, we analyze the absolute and relative speed (to standard ZeRO) of DP-ZeRO under
+320   important settings.
+321       7
+            Here 0.666 is figurative and dependent on the DP mechanisms. For example, if we denote d, p as a layer’s
+322   input/output dimensions, then the complexity of BK algorithm Bu et al. (2023b) is 6BT pd + 2BT 2 (p + d) ·
+323   I(2T 2 < pd), which is non-linear in T but empirically the overall slowdown could be 0.666/6 ≈ 11%. Notice
+      that Ψtrain ≪ Ψmodel when most parameters are frozen, as is the case in parameter efficient fine-tuning.
+
+
+                                                              6
+      Under review as a conference paper at ICLR 2025
+
+
+324
+      3.2.1    N UMBER OF COMPUTATION DEVICES
+325
+326   When scaling from one GPU (zero communication) to one node (multiple GPUs) and to mul-
+327   tiple nodes, the communication efficiency decreases sub-linearly (↑communication). On a sin-
+328   gle node, multiple GPUs can communicate using the high-speed intra-node connections such as
+329   NVLink/NVSwitch (Foley & Danskin, 2017; Ishii et al., 2018). On multiple nodes, which are nec-
+330   essary for large models, the inter-node connections are 3 ∼ 24× slower than the intra-node connec-
+331
+      tions (Li et al., 2019; Zhang et al., 2022). In short, DP-ZeRO can be as fast as ZeRO by equation 3
+      when multiple nodes are employed.
+332
+333
+334   3.2.2    M EMORY- EFFICIENT DISTRIBUTED LEARNING
+335
+      The communication volume is specific to different distributed algorithms, most of which trade the
+336   communication or speed for memory, in order to feasibly train very large models. For example,
+337   ZeRO3 (but not ZeRO1/2) needs to all-gather the sharded parameters at each iteration, hence suffer-
+338   ing from 50% extra communication volume (↑communication). Another example is the activation
+339   check-pointing (also known as gradient check-pointint Chen et al. (2016)), where a second for-
+340   ward propagation re-computes the expensive activations during back-propagation, though at a 33%
+341   slower speed (↑forward propagation). These techniques improve the relative speed of DP-ZeRO but
+342   worsens the absolute speed.
+343
+344   3.2.3    PARAMETER EFFICIENT FINE - TUNING
+345
+      Parameter efficient fine-tuning (PEFT), such as LoRA (Hu et al., 2021), Adapter (Houlsby et al.,
+346
+      2019), and BiTFiT (Zaken et al., 2022), optimizes a small fraction (e.g. Ψtrain = 0.1%Ψmodel )
+347
+      of model parameters and thus boosts the efficiency of back-propagation and communication (↓DP
+348   back-propagation ↓back-propagation ↓communication). Consequently, (I) the communication vol-
+349   ume of the gradient can be reduced possibly by 1000×; (II) the local computation can accelerate by
+350   50% (Hu et al., 2021; Bu et al., 2022b), which can be seen by treating Ψtrain in Table 2 as almost
+351   zero; (III) the memory cost is saved on the non-trainable layers, which translates to larger batch size
+352   and faster computation. Hence, both relative and absolute speed of DP-ZeRO improve using PEFT.
+353
+354   3.3     M EMORY EFFICIENCY OF DP-Z E RO
+355
+356   We claim that DP-ZeRO is as memory efficient as the standard ZeRO, similar to the single GPU
+357   training, when we use (I) the mixed ghost norm trick Bu et al. (2022a; 2023b), instead of GhostClip
+358   (Goodfellow, 2015; Li et al., 2021) or per-sample gradient instantiation (Yousefpour et al., 2021);
+359   (II) the layer-wise clipping style instead of the all-layer clipping, so that the book-keeping (Bu et al.,
+360   2023b) does not store all output gradients; or (III) a large number of GPUs so that the micro-batch
+361
+      size B (i.e. per-GPU batch size) is small: specially, when B = 1 in the gradient accumulation, the
+      per-sample gradient is free. We empirically verify our claim in Figures 4 and 7.
+362
+363                                                                                                                       1400                                                                           100
+                    Throughput (samples/sec)
+
+
+                                                                                               Throughput (samples/sec)
+
+
+                                                                                                                                                                              Throughput (samples/sec)
+
+
+364                                            120
+                                                                                   85%                                    1200                                   82%                                     80
+                                               100                                                                                         88%
+365                                                            83%                                                        1000                                                                                           86%                 86%
+                                               80                                                                         800                                                                            60
+366                                            60                                                                         600                                                                            40
+367                                            40                                                                         400
+                                                                                                                                                                                                         20
+368                                            20                                                                         200
+                                                   0                                                                          0                                                                              0
+369                                                     full precision     mixed precision                                          full precision        mixed precision                                         full precision     mixed precision
+370                                       40                   113%      standard (non-DP)                           40                                standard (non-DP)                            40                             standard (non-DP)
+                                                                         DP layer-wise                                                                 DP layer-wise                                                               DP layer-wise
+                                                                                             Memory / GPU (GB)
+
+
+                                                                                                                                                                            Memory / GPU (GB)
+                  Memory / GPU (GB)
+
+
+371                                                                      DP all-layer                                                                  DP all-layer                                                      115%      DP all-layer
+                                          30                                                                         30                   157%                                                      30
+372                                                                                 107%
+                                          20                                                                         20                                                                             20                                        105%
+373                                                                                                                                                               155%
+374                                       10                                                                         10                                                                             10
+
+375                                            0                                                                          0                                                                              0
+                                                       full precision     mixed precision                                         full precision        mixed precision                                          full precision     mixed precision
+376
+377   Figure 4: Efficiency on ViT-Gigantic (left, 1.8B), ResNet152 (middle) and GPT2-XL (right, 1.5B).
+
+
+                                                                                                                                                   7
+      Under review as a conference paper at ICLR 2025
+
+
+378
+      3.4      M IXED - PRECISION TRAINING WITH DP
+379
+380   We now analyze the intricacy in mixed-precision training with
+381   DP, which is not unique to DP-ZeRO but present in the gen-         80
+
+
+                                                                                                 Test accuracy
+382   eral DP optimization. We emphasize that the per-sample gra-        60
+383   dient clipping already plays the role of scaling, and hence DP
+384   mixed-precision training must not use loss scaling, as illus-      40
+      trated in Table 3. Specifically, in standard mixed-precision
+385                                                                      20       standard
+386
+      training, there are two steps of scaling: (I) scaling up the                DP ( = 2)
+                    3      9                                              0
+      loss Li by 10 ∼ 10 (and consequently the output gradient
+387   ∂Li             ∂Li                                                   fp32    1       10 100.0 1000.0
+388    ∂s as well as ∂W ) before the back-propagation, to prevent                      loss scaling
+      the underflow where fp16 gradient is too small to be distin-
+389
+      guished from 0, and (II) scaling down the parameter gradient Figure 5: Accuracy of mixed-
+390    ∂Li                                                            precision training with loss scaling.
+391   ∂W , by the same factor, after the back-propagation to recover ViT-large on CIFAR100.
+      the correct magnitude of gradient. However, in DP mixed-
+392   precision training, scaling up the loss may cause overflow,
+393   while scaling down the gradient incorrectly over-shrinks the gradient and worsens the performance.
+394   See Figure 5 for a real example. We explain this intricacy step-by-step in Appendix C.
+395
+396
+397   Table 3: Illustration of overflow and underflow issues during mixed-precision training (ghost norm).
+                                                          ∂L      per-sample grad norm                              param grad          param grad
+398         loss scale=103    activation al   output grad ∂s
+                                                                                 ∂L ∂L ⊤
+                                                                                              clipping factor
+                                                  (scaled) l   vec(al a⊤
+                                                                       l )  vec( ∂s l ∂sl
+                                                                                          )                      (not scaled down)   (if scaled down)
+399    standard w/o scaling   10−3 ∼ 102       10−8 ∼ 101         N/A            N/A               1                10−7 ∼ 101          10−7 ∼ 101
+        standard w/ scaling   10−3 ∼ 102       10−5 ∼ 104         N/A            N/A               1                10−4 ∼ 104          10−7 ∼ 101
+400
+          DP w/o scaling      10−3 ∼ 102       10−8 ∼ 101      102 ∼ 103     10−6 ∼ 100        10−3 ∼ 102           10−7 ∼ 101          10−7 ∼ 101
+401        DP w/ scaling      10−3 ∼ 102       10−5 ∼ 104      102 ∼ 103      100 ∼ 106       10−6 ∼ 10−1           10−7 ∼ 101        10−10 ∼ 10−2
+402
+403   Remark 3.1. DP may be violated due to the floating-point vulnerability at any precision Mironov
+404   (2012), but the issues can be more severe at half-precision. Yet, it remains an open discussion
+405   whether precision-based attacks can non-trivially break the protection of DP in deep learning, since
+406   the model is updated through thousands of iterations which may cover the identifiability of data
+407   information. In fact, Bu et al. (2024); Yu et al. (2021b); Li et al. (2024) have demonstrated that DP
+408
+      mixed-precision training can empirically preserve the protection against various privacy attacks.
+409
+410   4      E MPIRICAL PERFORMANCE OF DP-Z E RO
+411
+412   We evaluate DP-ZeRO on five aspects : model architectures, efficiency, scalability, compatibility
+413   with various distributed learning and DP techniques. We use DP-ZeRO to train ResNet (He et al.,
+414   2016), ViT (Dosovitskiy et al., 2020; Zhai et al., 2022) and GPT (Radford et al., 2019; Brown
+415   et al., 2020), which are workhorses in computer vision and language tasks. We report two accuracy
+416   experiments in Appendix E.4 for ViT and GPT to show that the performance is consistent across
+417   systems and to verify our implementation. We do not aim for higher accuracy with larger models,
+418   because the accuracy depends on many traning hyperparameters like learning rate and number of
+419
+      epochs that are not relevant to the system designs. In fact, this is the norm of system papers including
+      the standard non-DP ZeRO Rajbhandari et al. (2020) and FSDP Zhao et al., where the focus is on
+420
+      the system efficiency.
+421
+422   We measure the time and memory efficiency of DP-ZeRO under settings such as PEFT and multiple
+423   precision formats (fp32 or fp16/bf16). We evaluate the scalability of DP-ZeRO in terms of number
+424   of GPUs and number of model parameters. Our experiments scale from single node (8 GPUs) to
+425
+      multiple nodes, up to 256 GPUs, and train models up to 100B trainable parameters. Moreover, DP-
+      ZeRO is compatible with mainstream implementations of ZeRO8 and with different clipping styles,
+426
+      clipping functions, privacy accountants, and so on. We leave the experimental details in Appendix D.
+427
+      By default, we use AdamW, mixed-precision training, layer-wise clipping style, B = 4, and A100
+428   GPU with 40GB memory, unless otherwise stated.
+429
+430       8
+            DP-ZeRO is implemented on DeepSpeed (supporting ZeRO1/2/3), FSDP (Zhao et al.) (supporting
+431   ZeRO3), MiCS (Zhang et al., 2022) (supporting ZeRO2/3), and any distributed optimizers supported on these
+      libraries.
+
+
+                                                                           8
+      Under review as a conference paper at ICLR 2025
+
+
+432
+      4.1   G ENERALITY OF DP-Z E RO
+433
+434   DP-ZeRO is generally applicable to different neural network architectures, clipping styles, and pre-
+435   cision formats. We test DP-ZeRO1 on single node and observe that different clipping styles are
+436   equally fast, but layer-wise clipping is more memory efficient than all-layer clipping. Comparing to
+437   the standard ZeRO, our DP-ZeRO enjoys almost the same speed and memory efficiency, while the
+438   gap will be further closed as we move to more advanced stages of ZeRO.
+439
+440   4.2   L IGHTER TRAINING OF DP-Z E RO
+441
+442                                             80                       40                                         200                  standard(full)
+
+
+                                                                                         Throughput (samples/sec)
+                                                                              Adam
+                     Throughput (samples/sec)
+
+
+                                                70                       35   SGD                                                        DP(full)
+443                                                                           PEFT                                                       standard(PEFT)
+
+
+                                                     Memory / GPU (GB)
+                                                60                       30   SGD+PEFT                              150                  DP(PEFT)
+444                                             50                       25
+445                                             40                       20                                         100
+
+446                                             30                       15
+                                                                                                                    50
+                                                20                       10
+447
+                                                10                        5
+448                                                                                                                  0
+                                                 0                        0                                               ViT-Gigantic   GPT2-XL
+449
+      Figure 6: Efficiency of DP-ZeRO with lighter training. Left&Middle: > 2× speedup with lighter
+450   training; ViT-5B, B = 1. Right: DP-ZeRO benefits more than ZeRO from PEFT.
+451
+      DP-ZeRO can employ low-memory optimizers and train on fewer parameters, therefore vastly reduc-
+452
+      ing the memory and communication cost. On a single node, we demonstrate that DP-ZeRO actually
+453   benefits (more than standard ZeRO and single-GPU training) from lighter training, following from
+454   our discussion in Section 3.2.
+455
+456   Low-memory optimizers Low-memory optimizers can boost the training efficiency at the cost of
+457   accuracy degradation. For example, SGD requires only 1/3 optimizer states of Adam and signifi-
+458   cantly saves the memory; 1-bit Adam (Tang et al., 2021) and signSGD compress the gradient and
+459   reduce the communication volume up to 32×.
+460
+461   Fewer trainable parameters In the fine-tuning phase, as we analyzed in Section 3.2.3, PEFT
+462   improves both the local computation and the communication volume. Hence, DP-ZeRO allows
+463   PEFT on ViT and GPT to be ≈ 2× faster than full fine-tuning, whereas the single GPU acceleration
+464   is ≤ 1.5×.
+465   Remark 4.1. We leverage DP-ZeRO3 with SGD to train ViT-10B (full parameters) and ViT-22B
+466   (PEFT; 1M trainable parameters) on one node. See Appendix D for configurations.
+467
+468
+      4.3   T HREE STAGES OF DP-Z E RO
+469   DP-ZeRO supports all stages of ZeRO under different implementations including DeepSpeed (de-
+470   fault) and FSDP.
+471   In Figure 7, the efficiency of DP-ZeRO catches up with the standard ZeRO when we move up the
+472   stages. For instance of ViT-Gigantic, the throughput increases from 83% by DP-ZeRO1 to 95-97%
+473   by DP-ZeRO3. Following equation 3, we can attribute the relatively fast training of DP-ZeRO to
+474   the increase cost of communication, especially in DP-ZeRO3. Additionally, we observe that the
+475   throughput of DP-ZeRO1/2 improves to over 95% on 4 nodes, as predicted by Section 3.2.1. Notice
+476   that we save DP-ZeRO3 of GPT to Section 4.4 on super-large scale.
+477
+478   4.4   S CALABILITY OF DP-Z E RO
+479
+480   We evaluate the scalability of DP-ZeRO3 in terms of large sequence length (2048), large model size
+481   (7 ∼ 100B), and large number of GPUs (up to 256). We use A100 with 80GB memory, as well as
+482
+      the activation check-pointing and ModelP.
+483   In Figure 8 (left), we observe that for a fixed model with 26B trainable parameters, DP-ZeRO is
+484   super-linearly scalable to the number of GPUs, achieving > 95% speed of the standard ZeRO. Here
+485   super-linearity is a property of ZeRO (see Figure 3 in Rajbhandari et al. (2020)) which allows more
+      GPUs to shard the model states (and reduce the per-GPU memory cost) more aggressively, and to
+
+
+                                                                                  9
+      Under review as a conference paper at ICLR 2025
+
+
+
+                                                                     140
+                                                                                                                                                                      standard, full prec
+
+
+                                          Throughput (samples/sec)
+486
+                                                                     120                                                                                              DP layer-wise, full prec
+487                                                                                      83%           84%                                                            standard, mixed prec
+                                                                     100                                                                                              DP layer-wise, mixed prec
+488                                                                                81%
+                                                                     80                          89%
+489
+                                                                     60                                                                                                 82% 83%       84% 83%
+490                                                                                                                                                     97%
+                                                                     40                                           94% 95%               98%
+491
+                                                                     20
+492
+                                                                         0
+493                                                                              ViT-ZeRO1     ViT-ZeRO2      ViT-ZeRO3            ViT-FSDP                          GPT-ZeRO1 GPT-ZeRO2
+494
+                                                                 40                                                                                                   standard, full prec
+495                                                                                                                                                                   DP layer-wise, full prec
+                                         Memory / GPU (GB)
+496                                                                                                                                                                   standard, mixed prec
+                                                                 30                                                                                                   DP layer-wise, mixed prec
+497
+                                                                                     59%
+498                                                              20                                                                                                         64%
+                                                                                                  46%                                         74%                                      67%
+499                                                                                                                 65%
+500                                                              10
+501
+                                                                     0
+502                                                                            ViT-ZeRO1      ViT-ZeRO2      ViT-ZeRO3             ViT-FSDP                          GPT-ZeRO1 GPT-ZeRO2
+503   Figure 7: Efficiency of DP-ZeRO on ViT-Gigantic and GPT2-XL under different implementations.
+504
+505
+506   train faster since the micro-batch size is larger. Furthermore, in Figure 8 (right), for a fixed number
+507   of GPUs, DP-ZeRO is linearly scalable to the model size, achieving the same speed and scalability
+508   as the standard ZeRO. In short, DP-ZeRO is almost equal to ZeRO in terms of training efficiency in
+509   super-large scale.
+                                                                                                                               120                                  20000
+510
+                         25000                                                                                                                                      17500
+511                                                                                                                            100                                                                                   10
+
+
+                                                                                                                                                                                                                          Relative speed to DP 100B
+512                      20000                                                                                                                                      15000
+                                                                                                                                                                                                                     8
+                                                                                                                                    Per-GPU TFlops
+
+
+                                                                                                                               80
+          Total TFlops
+
+
+                                                                                                                                                                    12500
+                                                                                                                                                     Total TFlops
+
+
+513                                                                                                                                                                                                non-DP (fixed B)
+                         15000                                                                                                 60                                                                  DP (fixed B)       6
+514                                                                                                                                                                 10000
+                                                                                                                                                                                                   Linear scalability
+                                                                                                                                                                    7500                           non-DP time
+515                      10000                                                                                                 40                                                                  DP time            4
+                                                                                                          Linear scalability
+516                                                                                                       non-DP (max B)                                            5000
+                         5000                                                                             DP (max B)           20                                                                                    2
+517                                                                          non-DP per-GPU               non-DP (fixed B)                                          2500
+                                                                             DP per-GPU                   DP (fixed B)
+518                                                                                                                            0                                       0                                             0
+                                 16 32     64                                   128                                  256                                                      7B 13B 26B                  100B
+519                                                                          Number of GPUs                                                                                 Number of model trainable parameters
+520
+      Figure 8: Scalability of DP-ZeRO3 on 26B model (left) and 256 GPUs (right). The colored lines
+521   match the left y-axis. The grey bars match the right y-axis. max B means we use the maximum
+522   micro-batch in each GPU and fixed B means B = 2.
+523
+524   Remark 4.2. In comparison to DP-ZeRO, DataP (DP or standard) at most fits 5B models (Rajb-
+525   handari et al., 2020) in 80GB memory, regardless of the number of GPUs. We cannot compare to
+526   DP-PipeP in He et al. (2022) because the codebase and experiment details (e.g. number of trainable
+527
+      parameters and sequence length) are not publicly available. Nevertheless, since DP-ZeRO resem-
+      bles the efficiency of standard ZeRO, the usefulness of DP-ZeRO can be demonstrated by comparing
+528
+      ZeRO to PipeP.
+529
+530
+531   5             D ISCUSSION
+532
+533   In this work, we develope DP-ZeRO that enables the optimization of models up to 100B trainable
+534   parameters, thus allowing DP distributed learning to be as efficient and scalable as the standard one,
+535   for as few as 2 and as many as hundreds of GPUs. We believe this is a significant milestone to pave
+536
+      the path towards DP foundation models, especially for its open-source nature (link to be released).
+537   We emphasize that, since DP only modifies the back-propagation, our DP-ZeRO is orthogonal to
+538   any large-scale training techniques that are not tied to back-propagation: for example, activation
+539   check-pointing, CPU offloading, weight/activation quantization (Dettmers et al., 2023; Xiao et al.,
+      2023), and tensor parallelism (Narayanan et al., 2021) in 3D parallelism (e.g. Megatron).
+
+
+                                                                                                                      10
+      Under review as a conference paper at ICLR 2025
+
+
+540
+      R EFERENCES
+541
+542   Martin Abadi, Andy Chu, Ian Goodfellow, H Brendan McMahan, Ilya Mironov, Kunal Talwar, and
+543    Li Zhang. Deep learning with differential privacy. In Proceedings of the 2016 ACM SIGSAC
+544    conference on computer and communications security, pp. 308–318, 2016.
+545   Tom Brown, Benjamin Mann, Nick Ryder, Melanie Subbiah, Jared D Kaplan, Prafulla Dhariwal,
+546     Arvind Neelakantan, Pranav Shyam, Girish Sastry, Amanda Askell, et al. Language models are
+547     few-shot learners. Advances in neural information processing systems, 33:1877–1901, 2020.
+548
+549
+      Zhiqi Bu, Jinshuo Dong, Qi Long, and Weijie J Su. Deep learning with gaussian differential privacy.
+        Harvard data science review, 2020(23), 2020.
+550
+551   Zhiqi Bu, Sivakanth Gopi, Janardhan Kulkarni, Yin Tat Lee, Hanwen Shen, and Uthaipon Tan-
+552     tipongpipat. Fast and memory efficient differentially private-sgd via jl projections. Advances in
+553     Neural Information Processing Systems, 34, 2021.
+554
+      Zhiqi Bu, Jialin Mao, and Shiyun Xu. Scalable and efficient training of large convolutional neu-
+555
+        ral networks with differential privacy. Advances in Neural Information Processing Systems, 35:
+556     38305–38318, 2022a.
+557
+558   Zhiqi Bu, Yu-Xiang Wang, Sheng Zha, and George Karypis. Differentially private bias-term only
+559     fine-tuning of foundation models. In Workshop on Trustworthy and Socially Responsible Machine
+560
+        Learning, NeurIPS 2022, 2022b.
+561   Zhiqi Bu, Yu-Xiang Wang, Sheng Zha, and George Karypis. Automatic clipping: Differentially pri-
+562     vate deep learning made easier and stronger. Advances in Neural Information Processing Systems,
+563     2023a.
+564
+      Zhiqi Bu, Yu-Xiang Wang, Sheng Zha, and George Karypis. Differentially private optimization on
+565
+        large model at small cost. In International Conference on Machine Learning, pp. 3192–3218.
+566
+        PMLR, 2023b.
+567
+568   Zhiqi Bu, Xinwei Zhang, Mingyi Hong, Sheng Zha, and George Karypis. Pre-training differentially
+569     private models with limited public data. arXiv preprint arXiv:2402.18752, 2024.
+570
+      Tianqi Chen, Bing Xu, Chiyuan Zhang, and Carlos Guestrin. Training deep nets with sublinear
+571     memory cost. arXiv preprint arXiv:1604.06174, 2016.
+572
+573   Soham De, Leonard Berrada, Jamie Hayes, Samuel L Smith, and Borja Balle. Unlock-
+574     ing high-accuracy differentially private image classification through scale. arXiv preprint
+575     arXiv:2204.13650, 2022.
+576   Tim Dettmers, Artidoro Pagnoni, Ari Holtzman, and Luke Zettlemoyer. Qlora: Efficient finetuning
+577     of quantized llms. arXiv preprint arXiv:2305.14314, 2023.
+578
+579   Jinshuo Dong, Aaron Roth, and Weijie J Su.           Gaussian differential privacy.   arXiv preprint
+580
+         arXiv:1905.02383, 2019.
+581   Alexey Dosovitskiy, Lucas Beyer, Alexander Kolesnikov, Dirk Weissenborn, Xiaohua Zhai, Thomas
+582     Unterthiner, Mostafa Dehghani, Matthias Minderer, Georg Heigold, Sylvain Gelly, et al. An im-
+583     age is worth 16x16 words: Transformers for image recognition at scale. In International Confer-
+584     ence on Learning Representations, 2020.
+585
+      Cynthia Dwork, Frank McSherry, Kobbi Nissim, and Adam Smith. Calibrating noise to sensitivity
+586
+        in private data analysis. In Theory of cryptography conference, pp. 265–284. Springer, 2006.
+587
+588   Denis Foley and John Danskin. Ultra-performance pascal gpu and nvlink interconnect. IEEE Micro,
+589     37(2):7–17, 2017.
+590
+      Roy Frostig, Matthew James Johnson, and Chris Leary. Compiling machine learning programs via
+591     high-level tracing. Systems for Machine Learning, 4(9), 2018.
+592
+593   Ian Goodfellow. Efficient per-example gradient computations. arXiv preprint arXiv:1510.01799,
+        2015.
+
+
+                                                      11
+      Under review as a conference paper at ICLR 2025
+
+
+594
+      Sivakanth Gopi, Yin Tat Lee, and Lukas Wutschitz. Numerical composition of differential privacy.
+595     Advances in Neural Information Processing Systems, 34, 2021.
+596
+597   Jiyan He, Xuechen Li, Da Yu, Huishuai Zhang, Janardhan Kulkarni, Yin Tat Lee, Arturs Backurs,
+598      Nenghai Yu, and Jiang Bian. Exploring the limits of differentially private deep learning with
+599      group-wise clipping. arXiv preprint arXiv:2212.01539, 2022.
+600
+      Kaiming He, Xiangyu Zhang, Shaoqing Ren, and Jian Sun. Deep residual learning for image recog-
+601
+        nition. In Proceedings of the IEEE conference on computer vision and pattern recognition, pp.
+602     770–778, 2016.
+603
+604   Neil Houlsby, Andrei Giurgiu, Stanislaw Jastrzebski, Bruna Morrone, Quentin De Laroussilhe, An-
+605     drea Gesmundo, Mona Attariyan, and Sylvain Gelly. Parameter-efficient transfer learning for nlp.
+606     In International Conference on Machine Learning, pp. 2790–2799. PMLR, 2019.
+607
+      Edward J Hu, Yelong Shen, Phillip Wallis, Zeyuan Allen-Zhu, Yuanzhi Li, Shean Wang, Lu Wang,
+608
+        and Weizhu Chen. Lora: Low-rank adaptation of large language models. arXiv preprint
+609
+        arXiv:2106.09685, 2021.
+610
+611   Yanping Huang, Youlong Cheng, Ankur Bapna, Orhan Firat, Dehao Chen, Mia Chen, HyoukJoong
+612     Lee, Jiquan Ngiam, Quoc V Le, Yonghui Wu, et al. Gpipe: Efficient training of giant neural
+613     networks using pipeline parallelism. Advances in neural information processing systems, 32,
+614     2019.
+615
+      Alex Ishii, Denis Foley, E Anderson, B Dally, G Dearth, L Dennison, M Hummel, and J Schafer.
+616
+        Nvswitch and dgx-2 nvlink-switching chip and scale-up compute server. In Hot Chips, 2018.
+617
+618   Angelos Katharopoulos, Apoorv Vyas, Nikolaos Pappas, and François Fleuret. Transformers are
+619     rnns: Fast autoregressive transformers with linear attention. In International conference on ma-
+620     chine learning, pp. 5156–5165. PMLR, 2020.
+621
+      Diederik P Kingma and Jimmy Ba. Adam: A method for stochastic optimization. arXiv preprint
+622
+        arXiv:1412.6980, 2014.
+623
+624   Antti Koskela, Joonas Jälkö, and Antti Honkela. Computing tight differential privacy guarantees
+625     using fft. In International Conference on Artificial Intelligence and Statistics, pp. 2560–2569.
+626     PMLR, 2020.
+627
+628
+      Alexey Kurakin, Steve Chien, Shuang Song, Roxana Geambasu, Andreas Terzis, and Abhradeep
+        Thakurta. Toward training at imagenet scale with differential privacy. arXiv preprint
+629
+        arXiv:2201.12328, 2022.
+630
+631   Jaewoo Lee and Daniel Kifer. Scaling up differentially private deep learning with fast per-example
+632     gradient clipping. Proceedings on Privacy Enhancing Technologies, 2021(1), 2021.
+633
+634   Ang Li, Shuaiwen Leon Song, Jieyang Chen, Jiajia Li, Xu Liu, Nathan R Tallent, and Kevin J
+635
+        Barker. Evaluating modern gpu interconnect: Pcie, nvlink, nv-sli, nvswitch and gpudirect. IEEE
+        Transactions on Parallel and Distributed Systems, 31(1):94–110, 2019.
+636
+637   Qinbin Li, Junyuan Hong, Chulin Xie, Jeffrey Tan, Rachel Xin, Junyi Hou, Xavier Yin, Zhun Wang,
+638     Dan Hendrycks, Zhangyang Wang, et al. Llm-pbe: Assessing data privacy in large language
+639     models. Proceedings of the VLDB Endowment, 17(11):3201–3214, 2024.
+640
+641   Shen Li, Yanli Zhao, Rohan Varma, Omkar Salpekar, Pieter Noordhuis, Teng Li, Adam Paszke, Jeff
+642
+        Smith, Brian Vaughan, Pritam Damania, et al. Pytorch distributed: Experiences on accelerating
+        data parallel training. Proceedings of the VLDB Endowment, 13(12).
+643
+644   Xuechen Li, Florian Tramer, Percy Liang, and Tatsunori Hashimoto. Large language models can be
+645     strong differentially private learners. arXiv preprint arXiv:2110.05679, 2021.
+646
+647   H Brendan McMahan, Daniel Ramage, Kunal Talwar, and Li Zhang. Learning differentially private
+        recurrent language models. In International Conference on Learning Representations, 2018.
+
+
+                                                     12
+      Under review as a conference paper at ICLR 2025
+
+
+648
+      Harsh Mehta, Abhradeep Thakurta, Alexey Kurakin, and Ashok Cutkosky. Large scale transfer
+649     learning for differentially private image classification. arXiv preprint arXiv:2205.02973, 2022.
+650
+651   Paulius Micikevicius, Sharan Narang, Jonah Alben, Gregory Diamos, Erich Elsen, David Garcia,
+652     Boris Ginsburg, Michael Houston, Oleksii Kuchaiev, Ganesh Venkatesh, et al. Mixed precision
+653     training. In International Conference on Learning Representations, 2018.
+654
+      Ilya Mironov. On significance of the least significant bits for differential privacy. In Proceedings of
+655
+         the 2012 ACM conference on Computer and communications security, pp. 650–661, 2012.
+656
+657   Deepak Narayanan, Mohammad Shoeybi, Jared Casper, Patrick LeGresley, Mostofa Patwary, Vi-
+658     jay Korthikanti, Dmitri Vainbrand, Prethvi Kashinkunti, Julie Bernauer, Bryan Catanzaro, et al.
+659     Efficient large-scale language model training on gpu clusters using megatron-lm. In Proceed-
+660     ings of the International Conference for High Performance Computing, Networking, Storage and
+661     Analysis, pp. 1–15, 2021.
+662
+      Nvidia. The most powerful end-to-end ai and hpc data center platform. https://www.nvidia.
+663     com/en-us/data-center/tensor-cores/?ref=blog.paperspace.com.
+664
+665   Alec Radford, Jeffrey Wu, Rewon Child, David Luan, Dario Amodei, Ilya Sutskever, et al. Language
+666     models are unsupervised multitask learners. OpenAI blog, 1(8):9, 2019.
+667
+      Samyam Rajbhandari, Jeff Rasley, Olatunji Ruwase, and Yuxiong He. Zero: Memory optimizations
+668
+        toward training trillion parameter models. In SC20: International Conference for High Perfor-
+669
+        mance Computing, Networking, Storage and Analysis, pp. 1–16. IEEE, 2020.
+670
+671   Samyam Rajbhandari, Olatunji Ruwase, Jeff Rasley, Shaden Smith, and Yuxiong He. Zero-infinity:
+672     Breaking the gpu memory wall for extreme scale deep learning. In Proceedings of the Inter-
+673     national Conference for High Performance Computing, Networking, Storage and Analysis, pp.
+674     1–14, 2021.
+675
+      Jie Ren, Samyam Rajbhandari, Reza Yazdani Aminabadi, Olatunji Ruwase, Shuangyan Yang, Min-
+676
+         jia Zhang, Dong Li, and Yuxiong He. {ZeRO-Offload}: Democratizing {Billion-Scale} model
+677      training. In 2021 USENIX Annual Technical Conference (USENIX ATC 21), pp. 551–564, 2021.
+678
+679   Zhuoran Shen, Mingyuan Zhang, Haiyu Zhao, Shuai Yi, and Hongsheng Li. Efficient attention:
+680     Attention with linear complexities. In Proceedings of the IEEE/CVF winter conference on appli-
+681     cations of computer vision, pp. 3531–3539, 2021.
+682
+      Pranav Subramani, Nicholas Vadivelu, and Gautam Kamath. Enabling fast differentially private
+683
+        sgd via just-in-time compilation and vectorization. Advances in Neural Information Processing
+684     Systems, 34, 2021.
+685
+686   Hanlin Tang, Shaoduo Gan, Ammar Ahmad Awan, Samyam Rajbhandari, Conglong Li, Xiangru
+687     Lian, Ji Liu, Ce Zhang, and Yuxiong He. 1-bit adam: Communication efficient large-scale training
+688     with adam’s convergence speed. In International Conference on Machine Learning, pp. 10118–
+689     10129. PMLR, 2021.
+690
+      Hugo Touvron, Thibaut Lavril, Gautier Izacard, Xavier Martinet, Marie-Anne Lachaux, Timothée
+691     Lacroix, Baptiste Rozière, Naman Goyal, Eric Hambro, Faisal Azhar, et al. Llama: Open and
+692     efficient foundation language models. arXiv preprint arXiv:2302.13971, 2023a.
+693
+694   Hugo Touvron, Louis Martin, Kevin Stone, Peter Albert, Amjad Almahairi, Yasmine Babaei, Niko-
+695     lay Bashlykov, Soumya Batra, Prajjwal Bhargava, Shruti Bhosale, et al. Llama 2: Open founda-
+696     tion and fine-tuned chat models. arXiv preprint arXiv:2307.09288, 2023b.
+697
+      Ashish Vaswani, Noam Shazeer, Niki Parmar, Jakob Uszkoreit, Llion Jones, Aidan N Gomez,
+698     Łukasz Kaiser, and Illia Polosukhin. Attention is all you need. Advances in neural informa-
+699     tion processing systems, 30, 2017.
+700
+701   Sinong Wang, Belinda Z Li, Madian Khabsa, Han Fang, and Hao Ma. Linformer: Self-attention
+        with linear complexity. arXiv preprint arXiv:2006.04768, 2020.
+
+
+                                                        13
+      Under review as a conference paper at ICLR 2025
+
+
+702
+      Guangxuan Xiao, Ji Lin, Mickael Seznec, Hao Wu, Julien Demouth, and Song Han. SmoothQuant:
+703     Accurate and efficient post-training quantization for large language models. In Proceedings of the
+704     40th International Conference on Machine Learning, 2023.
+705
+706   Liyang Xie, Kaixiang Lin, Shu Wang, Fei Wang, and Jiayu Zhou. Differentially private generative
+707     adversarial network. arXiv preprint arXiv:1802.06739, 2018.
+708   Xiaodong Yang, Huishuai Zhang, Wei Chen, and Tie-Yan Liu. Normalized/clipped sgd with per-
+709     turbation for differentially private non-convex optimization. arXiv preprint arXiv:2206.13033,
+710     2022.
+711
+712
+      Ashkan Yousefpour, Igor Shilov, Alexandre Sablayrolles, Davide Testuggine, Karthik Prasad, Mani
+        Malek, John Nguyen, Sayan Ghosh, Akash Bharadwaj, Jessica Zhao, Graham Cormode, and
+713
+        Ilya Mironov. Opacus: User-friendly differential privacy library in PyTorch. arXiv preprint
+714
+        arXiv:2109.12298, 2021.
+715
+716   Da Yu, Saurabh Naik, Arturs Backurs, Sivakanth Gopi, Huseyin A Inan, Gautam Kamath, Janardhan
+717     Kulkarni, Yin Tat Lee, Andre Manoel, Lukas Wutschitz, et al. Differentially private fine-tuning
+718     of language models. arXiv preprint arXiv:2110.06500, 2021a.
+719   Da Yu, Huishuai Zhang, Wei Chen, Jian Yin, and Tie-Yan Liu. Large scale private learning via low-
+720     rank reparametrization. In International Conference on Machine Learning, pp. 12208–12218.
+721     PMLR, 2021b.
+722
+723
+      Elad Ben Zaken, Yoav Goldberg, and Shauli Ravfogel. Bitfit: Simple parameter-efficient fine-tuning
+        for transformer-based masked language-models. In Proceedings of the 60th Annual Meeting of
+724
+        the Association for Computational Linguistics (Volume 2: Short Papers), pp. 1–9, 2022.
+725
+726   Xiaohua Zhai, Alexander Kolesnikov, Neil Houlsby, and Lucas Beyer. Scaling vision transformers.
+727     In Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition, pp.
+728     12104–12113, 2022.
+729
+      Zhen Zhang, Shuai Zheng, Yida Wang, Justin Chiu, George Karypis, Trishul Chilimbi, Mu Li, and
+730     Xin Jin. Mics: near-linear scaling for training gigantic model on public cloud. Proceedings of the
+731     VLDB Endowment, 16(1):37–50, 2022.
+732
+733   Yanli Zhao, Rohan Varma, Chien-Chin Huang, Shen Li, Min Xu, and Alban Desmaison. In-
+734     troducing pytorch fully sharded data parallel (fsdp) api. https://pytorch.org/blog/
+735
+        introducing-pytorch-fully-sharded-data-parallel-api/.
+736   Yuqing Zhu, Jinshuo Dong, and Yu-Xiang Wang. Optimal accounting of differential privacy via
+737     characteristic function. In International Conference on Artificial Intelligence and Statistics, pp.
+738     4782–4817. PMLR, 2022.
+739
+740
+741   A     T HE B OOK -K EEPING (BK) ALGORITHM
+742
+743   A.1   E FFICIENT COMPUTATION OF PER - SAMPLE GRADIENT NORMS
+744
+      The mixed ghost norm Bu et al. (2022a) is the state-of-the-art technique to compute the per-sample
+745   gradient norm of the weight, almost for free. It hybridizes two basic techniques – the per-sample
+746   gradient instantiation and the ghost norm – to compute the Frobenius norm of weight gradient,
+747                                                                             !
+                            2
+748                ⊤ ∂L       per-sample grad ∂Li 2 ghost norm       ∂L ∂L ⊤
+                 al,i            ==== ∥          ∥    ==== vec                     · vec(al,i a⊤
+                                                                                               l,i ) (4)
+749                   ∂sl,i                   ∂Wl Fro              ∂sl,i ∂sl,i
+750
+751
+      where ”vec” flattens the tensor to an one-dimensional vector. In words, Equation (4) gives two
+      equations that are equivalent mathematically, but significantly different in efficiency:
+752
+753                               2
+             • ∥X∥2Fro = A⊤ B   firstly computes A⊤ B and then its norm.
+754
+             • ∥X∥2Fro = vec AA⊤ · vec(BB ⊤ ) firstly computes AA⊤ , BB ⊤ ∈ RT T and then their dot
+
+755
+               product.
+
+
+                                                       14
+      Under review as a conference paper at ICLR 2025
+
+
+756
+      In summary, the mixed ghost norm always applies the cheaper of two techniques at each layer of a
+757   neural network.
+758
+759   Finally, we note that the per-sample gradient norm of the bias is computed differently. This is
+760
+      because
+                                                 ∂Li         ∂L
+761                                                  = 1⊤
+                                                 ∂bl        ∂sl,i
+762
+      is not actually a product of tensors like X = A⊤ B. In fact, the multiplication with 1 turns out to
+763
+      be a summation along the first dimension, and it suffices to use per-sample gradient instantiation for
+764
+      the bias.
+765
+766
+      A.2   B OOK - KEEPING THE OUTPUT GRADIENT
+767
+768   The BK algorithm uses two rounds of back-propagation (though each round only takes half the com-
+769   plexity, hence the total complexity of DP back-propagation matches the non-DP back-propagation).
+                                     ∂L
+770   Therefore, output gradients ∂s   l,i
+                                           are kept to avoid repeated computation. Notice that the output
+771   gradient are relatively cheap to book-keep (see Figure 4 and Figure 5 in Bu et al. (2023b)).
+772
+773
+      B     C OMPONENT- WISE TIME COMPLEXITY OF DP-Z E RO
+774
+775
+      In this section, we explain the time complexity of each part in Table 2, and demonstrate how the
+776   complexity can be different under different settings.
+777
+778   Forward propagation: The matrix multiplication during forward propagation results in 2BT Ψmodel
+779
+      complexity (see Bu et al. (2022a)). Notice that, if the activation check-pointing is used, essentially
+      two rounds of forward propagation take place in one iteration. Hence the time complexity doubles
+780
+      and becomes 4BT Ψmodel .
+781
+782   Back-propagation: This contains two sub-processes: the output gradients are computed at all lay-
+783   ers, taking 2BT Ψmodel complexity; the parameter gradients are computed only at trainable layers (a
+784   few if doing PEFT), taking 2BT Ψtrain complexity. Clearly, in full parameter training, the total is
+785
+      4BT Ψmodel , and in PEFT, about 2BT Ψmodel .
+786   Attention: The time complexity of attention is O(BT 2 ) in Vaswani et al. (2017), where T is the se-
+787   quence length (a.k.a. token length). When T is large, e.g. training with long context like T = 8192,
+788   this cost is prohibitively high. In this regard, a line of researches have proposed linear complexity
+789   attention, including but not limited to Wang et al. (2020); Katharopoulos et al. (2020); Shen et al.
+790   (2021).
+791   Communication: For algorithms that don’t shard the model, such as data parallelism and ZeRO1/2,
+792   the communication is only used to send gradients and optimizer states. Hence the communication
+793   volume is proportional to the number of trainable parameters O(Ψtrain ). Otherwise, for algorithms
+794   such as ZeRO3 and tensor parallelism, the communication volume is proportional to the number of
+795   total parameters O(Ψmodel ), because the forward propagation needs to gather the parameters from
+796   many GPUs. This makes a big difference in PEFT when Ψtrain ≪ Ψmodel .
+797
+798   C     L OSS SCALING IN MIXED - PRECISION TRAINING
+799
+800   We write the per-sample gradient with loss scaling S as
+
+801                                  ∂Ci Li         1     ⊤       ∂L
+802
+                                              = Ci · al,i S ·
+                                      ∂Wl          S             ∂sl,i
+803   This covers the standard gradient (Ci = 1) and DP gradient (e.g. Ci = 1/||gi ||, computed by the
+804   mixed ghost norm in Appendix A), in which S enlarges the output gradient to avoid underflow, and
+805   1
+      S shrinks the parameter gradient to the correct magnitude.
+806
+      Recall that a standard mixed-precision training (with loss scaling) uses steps 1 → 2 → 3 → 5 → 6
+807   9
+        , or 1 → 3 → 6 without loss scaling.
+808
+        9
+809       See                 https://docs.nvidia.com/deeplearning/performance/
+      mixed-precision-training/index.html#lossscaling.
+
+
+                                                       15
+      Under review as a conference paper at ICLR 2025
+
+
+810
+            1. Forward propagation (fp16 weights and activations) and get the loss.
+811
+812         2. Scaling up the loss by a factor S.
+813         3. Backward propagation on the scaled loss (fp16 parameters and their gradients).
+814
+815         4. Per-sample gradient clipping (sensitivity = 1) and noising for DP.
+816         5. Scaling down the parameter gradient by a factor of 1/S.
+817
+            6. Update the parameters with their gradients.
+818
+819
+      If we follow the same procedure under the DP regime, say using a hook function to be called
+820
+      after back-propagation creates the gradients like in Opacus (Yousefpour et al., 2021), Private-
+821
+      Transformers (Li et al., 2021), FastDP (Bu et al., 2023b), then the per-sample clipping factor is
+822   scaled up S times so as to normalize the gradient. Hence per-sample gradient clipping has already
+823   played the role of scaling down. If we scale down the gradient for a second time, the gradient is
+824   incorrectly over-shrunk. This is the case in Yu et al. (2021a) and in the alternative implementation
+825   of (Li et al., 2021, Appendix T) (see also Figure 5). To be sure, this approach is still DP, but the
+826   performance does not match fp32 DP training correctly, and usually degrades too much to be useful.
+827
+      One walk-around is to prevent per-sample gradient clipping to scale down the gradients and let step
+828   5 do its job, i.e. 1 → 2 → 3 → 4∗ → 5 → 6. We note that (Li et al., 2021, Appendix T) follows
+829   this path (though no experiment results or codes are available at the time of writing) by modifying
+830   step 4: clipping threshold (sensitivity)= S instead of 1, so that the clipped gradient is S times larger
+831   than the DP f32 training, to be scaled down by step 5. However, this introduces additional design
+832   decisions and does not prevent overflow when using fp16 (due to step 2, see Table 3).
+833
+      Another walk-around is to delete step 5 and let per-sample gradient clipping do its job, i.e. 1 →
+834   2 → 3 → 4 → 6. However, this approach is harder to implement because in the standard process
+835   step 2 and 5 are simultaneously enabled or disabled. Also we cannot prevent overflow when using
+836   fp16 as we still use step 2.
+837
+      Therefore, we propose to not use loss scaling (or equivalently we set S = 1 statically for all steps)
+838
+      during DP mixed-precision training, i.e. 1 → 3 → 4 → 6. Although, by not using step 2, we cannot
+839
+      prevent underflow when using fp16, this is much less a problem compared to overflow: underflow
+840   (treating small values as 0) makes the training less accurate but does not fail the training like overflow
+841   (treating large values as NAN). Lastly, the underflow issue is perfectly mitigated by bf16, which we
+842   recommend for DP mixed-precision training whenever possible .
+843
+844                   steps     fp16 issue                    note                        reference
+845    standard        136      underflow                                         Micikevicius et al. (2018)
+846    standard      12356         none                                           Micikevicius et al. (2018)
+847       DP        123456       overflow     incorrect due to over-shrinking          Li et al. (2021)
+848       DP        1234∗ 56     overflow       different clipping threshold           Li et al. (2021)
+849       DP          1346      underflow            perfect with bf16                       ours
+850
+          DP         12346       overflow            hard to implement                       ours
+851
+                                Table 4: Mixed-precision training with DP or not.
+852
+853
+854
+855   D    E XPERIMENT SETTINGS
+856
+857   Datasets: To evaluate the efficiency, it suffices to declare the data’s dimension (e.g. micro-batch
+858   size and feature dimension) without specifying the dataset (though sometimes specifying the dataset
+859   means declaring the dimension, e.g. MNIST usually means 28*28 pixels). This is the norm in
+860
+      system papers such as Rajbhandari et al. (2020; 2021); Zhao et al.. In this work, vision models are
+      trained with 224*224 pixels at ImageNet scale; GPT models are trained with sequence length 100,
+861
+      except in Figure 8 where sequence length is 2048.
+862
+863   Figure 5 and Table 3: We train ViT-large (300M parameters) and CIFAR100, 5 epochs, learning rate
+      5e-4, logical batch size 1000.
+
+
+                                                         16
+      Under review as a conference paper at ICLR 2025
+
+
+864
+      Figure 6: To fit as large a model as possible, we set B = 1 and use SGD. We set 48 attention heads,
+865   21 layers, MLP=4*width (also known as embedding dimension), and modify width for all models.
+866   For instance, ViT-10B uses width=768 ∗ 22, ViT-22B uses width=768 ∗ 34.
+867
+868
+      Figure 8: We train AdamW with layer-wise clipping. DP distributed learning is based on MiCS
+      (ZeRO3) using bf16 mixed-precision training. Most of GPT configuration is the same as Touvron
+869
+      et al. (2023a) (Table 2) in terms of embedding dimension, attention heads and number of layers.
+870
+      However, GPT-100B uses the configuration from Brown et al. (2020) (Table 2.1) but a smaller
+871   width.
+872
+873
+874   E     C ODEBASE DESIGN
+875
+876   E.1   W ITH FORWARD & BACKWARD HOOKS
+877
+878   Hooks10 are important functions to enrich the deep learning optimization. To be specific, there are
+879
+880         1. forward modular hook (nn.register forward hook),
+881         2. backward modular hook (nn.register backward hook),
+882
+883         3. backward tensor hook (tensor.register hook).
+884
+      DP libraries including Opacus Yousefpour et al. (2021), Private-transformers Li et al. (2021),
+885
+      Private-Vision Bu et al. (2022a), FastDP Bu et al. (2023b;a), FastGradClip Lee & Kifer (2021)
+886
+      and so on, use modular hooks to modify the standard optimization. However, ZeRO libraries in-
+887   cluding DeepSpeed and FSDP use tensor hooks. This difference in the types of hooks and many
+888   other differences (e.g. both ZeRO libraries and DP libraries modify the optimizer’s step function)
+889   cause non-trivial problems when combining DP with ZeRO. For example, to keep DP optimization
+890   as efficient as the standard, it is necessary to not waste time on computing the non-private gradient.
+891   However, if we skip such computation, then ZeRO’s tensor hook will not be triggered and the corre-
+892   sponding distributed-learning-related operations cannot carry on. For another example, because DP
+893   and ZeRO add different types of hooks, the number of hooks is larger than either optimization and
+894   they slows down the training: consider an 100-layer network, each layer with weight and bias (2 ten-
+895
+      sors), then DP-ZeRO in this subsection needs 100 modular hooks and 200 tensor hooks, adding to a
+      total of 300 hooks. In addition, the Book-Keeping algorithm (in FastDP) in its original form cannot
+896
+      be implemented together with ZeRO3, because all model states are partitioned including the output
+897
+      gradients which are meant to be book-kept. To work around this requires rewriting the distributed so-
+898   lution’s communication mechanism, and if successful, still requiring additional communication cost
+899   during the second back-propagation. Similar problems are present for Opacus and FastGradClip,
+900   which instantiates per-sample gradients that will be partitioned in ZeRO2/3 and requires additional
+901   communication cost when gathered to create the privatized gradient.
+902
+      As a consequence, the hooks are fully supported on DP-ZeRO1 and partially supported on DP-
+903
+      ZeRO2/3 under the layer-wise clipping.
+904
+905
+906   E.2   W ITHOUT HOOKS
+907
+      Instead of registering hooks on top of the original (non-DP) back-propagation, we can directly mod-
+908
+      ify the back-propagation following Appendix A: e.g., given the activation and output gradient,
+909
+910
+                                                  v                        !
+                                                                         ⊤
+                                                  u
+911                    ∂Ci Li            ∂L     . u        ∂L     ∂L
+                              = a⊤(l),i
+                                                  tvec                       · vec(a(l),i a⊤
+                                                                                           (l),i )
+912                    ∂Wl              ∂s(l),i          ∂s(l),i ∂s(l),i
+913
+914   This approach requires rewriting the back-propagation for each layer type (linear, embedding, con-
+915   volution, normalization, ...) and can be done at different levels (Pytorch, C++, CUDA kernel).
+916
+        10
+917        See      https://pytorch.org/tutorials/beginner/former_torchies/nnft_
+      tutorial.html#forward-and-backward-function-hooks.
+
+
+                                                       17
+      Under review as a conference paper at ICLR 2025
+
+
+918
+      E.3   U SER INTERFACE
+919
+920   DP-ZeRO can be enabled by one piece of code: after the model is instantiated,
+921
+922   privacy_engine = PrivacyEngine(model,
+923                   batch_size=256, sample_size=50000,
+924                   epochs=3, target_epsilon=3)
+925
+      The codebase is designed not to modify the optimizer, hence DP-ZeRO can work with arbitrary op-
+926
+      timizer. Because of this design, our DP-ZeRO will not distinguish micro-batches. This is different
+927   from the gradient accumulation in Opacus (version ==0.x) and Private-Vision, where only the last
+928   micro-batch is processed by ”optimizer.step()” but all other micro-batches are processed by ”opti-
+929   mizer.virtual step()”. In other words, the noise σDP N (0, I) is added on the last micro-batch, after
+930   the micro-batches are accumulated. But DP-ZeRO
+                                                   √      adds the noise on each micro-batch equally. Note
+931   that the noise level per micro-batch is σDP / Nd if a random seed is set across Nd GPUs, or σDP /Nd
+932   otherwise.
+933
+934   E.4   V ERIFICATION OF OUR IMPLEMENTATION
+935
+936
+      DP-ZeRO is implementing the same DP-SGD (hence the same utility) as in Abadi et al. (2016), only
+      in a much more scalable and distributed manner than libraries like Private Transformers and Opacus.
+937
+938   To be sure, we provide the results on 5 runs of ViT (image classficiation) and GPT2 (text generation),
+939   at ϵ = 8, with standard deviations in the parenthesis. We compare to other libraries (without mixed
+940   precision) and our DP-ZeRO uses mixed precision, in order to validate both (I) the correctness of
+941   DP mixed precision and (II) the correctness of our implementation of DP-ZeRO.
+942
+943
+                                        ViT/CIFAR100/accuracy        GPT2/E2E/BLEU
+                          Opacus              83.45(0.28)              63.35(0.50)
+944
+                          FastDP              83.46(0.19)              64.01(0.54)
+945
+                         GhostClip            83.51(0.33)              63.71(0.31)
+946
+                         DP-ZeRO1             83.46(0.13)              64.03(0.41)
+947
+                         DP-ZeRO2             83.43(0.09)              63.72(0.47)
+948                      DP-ZeRO3             83.48(0.18)              63.92(0.39)
+949
+950
+951
+952
+953
+954
+955
+956
+957
+958
+959
+960
+961
+962
+963
+964
+965
+966
+967
+968
+969
+970
+971
+
+
+
+                                                       18

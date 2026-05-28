@@ -1,0 +1,986 @@
+Under review as a conference paper at ICLR 2025
+
+
+000
+001
+      PARTIALLY C ONDITIONED PATCH PARALLELISM FOR
+002   ACCELERATED D IFFUSION M ODEL I NFERENCE
+003
+004
+005    Anonymous authors
+006    Paper under double-blind review
+007
+008
+009                                               A BSTRACT
+010
+011            Diffusion models have exhibited exciting capabilities in generating images and are
+012            also very promising for video creation. However, the inference speed of diffusion
+013            models is limited by the slow sampling process, restricting its use cases. The se-
+014            quential denoising steps required for generating a single sample could take tens or
+015            hundreds of iterations and thus have become a significant bottleneck. This limita-
+016
+               tion is more salient for applications that are interactive in nature or require small
+               latency. To address this challenge, we propose Partially Conditioned Patch Par-
+017
+               allelism (PCPP) to accelerate the inference of high-resolution diffusion models.
+018
+               Using the fact that the difference between the images in adjacent diffusion steps
+019            is nearly zero, Patch Parallelism (PP) leverages multiple GPUs communicating
+020            asynchronously to compute patches of an image in multiple computing devices
+021            based on the entire image (all patches) in the previous diffusion step. PCPP de-
+022            velops PP to reduce computation in inference by conditioning only on parts of the
+023            neighboring patches in each diffusion step, which also decreases communication
+024            among computing devices. As a result, PCPP decreases the communication cost
+025            by around 70% compared to DistriFusion (the state of the art implementation of
+026            PP) and achieves 2.36 ∼ 8.02× inference speed-up using 4 ∼ 8 GPUs compared
+027
+               to 2.32 ∼ 6.71× achieved by DistriFusion depending on the computing device
+               configuration and resolution of generation at the cost of a possible decrease in
+028
+               image quality. PCPP demonstrates the potential to strike a favorable trade-off,
+029
+               enabling high-quality image generation with substantially reduced latency.
+030
+031
+032   1   I NTRODUCTION
+033
+034   Diffusion models (Ho et al., 2020; Song et al., 2020; Dhariwal & Nichol, 2021) are very successful
+035   in modeling and generating unstructured data, such as images, molecular structures (Huang et al.,
+036   2022), and three-dimensional (3D) models (Qian et al., 2023). In recent years, with the release of
+037   the latent diffusion model (Rombach et al., 2021), its variants (Ho, 2022; Saharia et al., 2022) have
+038   become the center of attention in both academia and industry. Doing a diffusion process in the latent
+039
+      space, in which dimensionality can be much smaller than the image space, requires significantly
+      lesser computation to train a diffusion model and make inferences with it than in the image space.
+040
+      Despite the wide adoption and application of diffusion models, its sequential denoising process of
+041
+      hundreds or thousands of steps bottlenecks the inference speed and introduces non-trivial latency for
+042   interactive use cases. This challenge becomes more prevalent when the resolution of the generated
+043   images increases.
+044
+045
+      Two types of methods have been proposed to accelerate the inference of diffusion models: decreas-
+      ing the number of steps required for the denoising diffusion process and increasing the computing
+046
+      speed of diffusion steps. The most adapted diffusion models - Denoising Diffusion Probabilistic
+047
+      Models (DDPMs) (Ho et al., 2020) can take thousands of denoising steps to generate an image.
+048   Various works were introduced to decrease the denoising steps required but often at the cost of the
+049   quality of generation, such as Denoising Diffusion Implicit Models (DDIMs) (Song et al., 2020)
+050   and DPM-Solvers (Lu et al., 2022a;b). Other works were introduced to decrease the computation
+051   needed for each diffusion step, such as Spatially Sparse Inference (SSI) (Li et al., 2022) and Q-
+052   Diffusion (Li et al., 2023), also trading quality for speed. With the growing interest in fast inference
+053   for diffusion models, in addition to accelerating the diffusion process on a single device, researchers
+      began to study making inferences parallelly to generate a single image utilizing multiple devices.
+
+
+                                                         1
+      Under review as a conference paper at ICLR 2025
+
+
+054
+      ParaDiGMS (Shih et al., 2023) computes multiple diffusion steps in parallel while Patch Parallelism
+055   (PP) (Li et al., 2024) separates an image into patches and does diffusion on each patch in a dedicated
+056   device. Li et al. (2024) introduced DistriFusion, the current state-of-the-art diffusion model infer-
+057   ence acceleration method leveraging multiple devices, which implements PP using asynchronous
+058   communication among devices.
+059
+      In this paper, we empirically show that the denoising step of every patch of an image does not
+060
+      necessarily need to be conditioned on the entire feature map in the previous step. This allows
+061   the communication in DistriFusion to be optimized and further decreases the computation required
+062   for every diffusion step during inference. Our method Partially Conditioned Patch Parallelsim
+063   (PCPP) thus reduces latency compared to PP by reducing the amount of computation performed in
+064   the denoising step. As a result, PCPP decreases the communication cost by around 70% compared
+065   to DistriFusion and achieves 2.36 ∼ 8.02× inference speed-up using 4 ∼ 8 GPUs compared to
+066   2.32 ∼ 6.71× achieved by DistriFusion depending on the computing device configuration and
+067   resolution of generation.
+068
+069   2     BACKGROUND
+070
+071   2.1   D IFFUSION MODEL
+072
+073   Diffusion models, or diffusion probabilistic models (DPMs), are latent variable models defined by
+074   Markov chains. This stochastic model predicts the probability of a sequence of possible events
+075   occurring based on the previous event (Ho et al., 2020). The Markov chain is first trained through a
+076   forward diffusion process, during which noise is added to the sample using variational inference to
+077   control the strength of the Gaussian noise (Song et al., 2020). Subsequently, the forward diffusion
+078
+      process is reversed, denoising the sample at each timestep until the final image is generated (Li
+      et al., 2023). This denoising step can be achieved through either a noise prediction model, which
+079
+      attempts to predict the next noise components, or data prediction models, which predict the original
+080
+      data based on the noise at each timestep (Lu et al., 2022b). Currently, noise prediction models that
+081   utilize the U-Net (Ronneberger et al., 2015) architecture are typically used in practice for diffusion
+082   models with attention modules (Vaswani et al., 2017) in transformers (Li et al., 2023). Let the
+083   noise prediction model be ϵθ . The process begins with a Gaussian noise sample xT ∼ N (0, I) and
+084   iteratively denoises it for T steps to obtain the final image x0 . At each step t, the noisy image xt is
+085   fed into the model ϵθ along with the timestep t and an optional condition c (such as text), to predict
+086   the noise component ϵt = ϵθ (xt , t, c). The image xt−1 at the next timestep is then calculated using
+087   ϵt . The latency bottleneck often happens during the forward passes through the U-Net.
+088   For conditional sampling with diffusion models, guided sampling is a popular technique for saving
+089   sampling time by reducing the retraining steps of the network. It supports two guided sampling
+090   methods for the conditional noise prediction model ϵ̂θ (xt , t, c). The first method is classifier guid-
+091   ance, which uses a pretrained classifier to define the conditional noise prediction model on the
+092   variable guidance scale. The second method is classifier-free guidance, where the unconditional and
+093   conditional noise prediction models share the same model, combining the score estimates instead of
+094   relying on a specified classifier (Lu et al., 2022b). Our focus lies on the generative denoising process
+095
+      that utilizes the U-Net structured noise prediction models with classifier-free guidance.
+096
+097   2.2   PATCH PARALLELISM
+098
+099
+      One approach to designing parallelism for diffusion models is Patch Parallelism (PP), where a single
+      image is divided into patches and distributed across multiple GPUs for individual and parallel com-
+100
+      putations. In the naive approach to PP, i.e. with no communication between the patches, each device
+101
+      essentially creates its own full image. When brought together, these individual images form the final
+102   composite image (Li et al., 2024). To create one cohesive image using PP, synchronous communica-
+103   tion can be employed to obtain intermediate activations between patches at each step. This approach
+104   is similar to domain parallelism, where devices communicate by exchanging halo regions at their
+105   boundaries during forward and backward convolution passes, synchronizing between communica-
+106   tion and computation phases. However, when dealing with smaller tensors, this approach may incur
+107   significant communication overhead, which can mitigate the speedups gained from parallelizing the
+      process (Jin et al., 2018). To address this issue for single image generation across multiple devices,
+
+                                                         2
+      Under review as a conference paper at ICLR 2025
+
+
+108                             Prompt: A medical doctor in the universe, cold color palette, muted colors, detailed, 8k
+          No Context Shared    Margin Context             Minor Context              Half Context               Major Context       All Context Shared
+109          Partial= 0.0     Shared Partial= 0.1       Shared Partial= 0.3        Shared Partial= 0.5        Shared Partial= 0.8       Partial= 1.0
+
+110
+111
+112
+113
+114
+115
+116                                                            Partially Conditioned Attention
+
+117
+           Upper Patch         Upper Patch                Upper Patch                Upper Patch                Upper Patch           Upper Patch
+118
+119
+120       Neighbour Patch     Neighbour Patch          Neighbour Patch             Neighbour Patch            Neighbour Patch       Neighbour Patch
+121
+122
+123
+          Neighbour Patch     Neighbour Patch          Neighbour Patch             Neighbour Patch            Neighbour Patch       Neighbour Patch
+124
+125
+126        Lower Patch         Lower Patch                Lower Patch                Lower Patch                Lower Patch           Lower Patch
+
+127
+128
+      Figure 1: Example of images generated using Partially Conditioned Patch Parallelism (PCPP) with
+129
+      varying partial value. The images are generated with 4 GPUs using PCPP. Due to the use of
+130   classifier-free guidance, 2 GPUs are used in the denoising process to generate pixels directly. The
+131   image is separated into upper and lower patches computed by dedicated GPUs parallelly. To provide
+132   a clear comparison, warm-up synchronization steps are not applied, i.e., the computation of patches
+133   is separated at the very first step. The blue/green region refers to the activation used to compute the
+134   upper/lower region. The activation can consist of fresh activation of the local patch and partial stale
+135   activation from the last step of the neighbor patch, depending on the partial value used.
+136
+137
+138
+      communication needs to be introduced between patches while ensuring that no extra synchronization
+      costs are incurred in the overall processing time. This concept is explored in DistriFusion, which
+139
+      introduces a hidden communication element to PP (Li et al., 2024).
+140
+141   DistriFusion uses one synchronous communication to facilitate patch interaction, followed by asyn-
+142   chronous communication at each subsequent denoising step, where the slightly outdated activations
+143   from the previous step are reused to hide the communication overhead within the computation. Ad-
+144
+      ditionally, the process and image quality is optimized using classifier-free guidance, dividing the
+      devices into two batches: one for performing additional computations instead of creating an extra
+145
+      classifier, and the other for actual image computation. Due to batch splitting, the number of devices
+146
+      available for each image generation is limited, as only half of the devices are utilized for generating
+147   pixels (Li et al., 2024). As such, experiments conducted on 8 GPUs would equate to distributing the
+148   image patches across 4 GPUs. To extend DistriFusion, we delve deeper into the modules involved in
+149   each denoising step. We identify and experiment with areas that can be further parallelized through
+150   the use of partial activations and optimized communication, leading to the development of PCPP.
+151
+152
+      3     M ETHOD
+153
+154
+      In this section, we introduce our PCPP for parallelizing the inference of diffusion models using
+155
+      multiple devices asynchronously by point-to-point communication. The key idea is to partition the
+156   image horizontally into n non-overlapping patches and process each patch conditioned on only itself
+157   and the parts of its neighboring patches (from the previous step) on separate devices. This approach
+158   is based on the hypothesis that generating image patches does not always necessitate dependency
+159   on all other patches; instead, satisfactory results can be achieved by relying solely on neighboring
+160   patches. An illustration of image generation using PCPP is presented in Figure 1. To implement
+161   PCPP, we redesign the asynchronous communication in DistriFusion and adjust the input for every
+      self-attention module in the U-Net (Ronneberger et al., 2015) to reduce computation. Section 3.2
+
+
+                                                                              3
+      Under review as a conference paper at ICLR 2025
+
+
+162
+      explains how collective communication is optimized to point-to-point communication with neigh-
+163   boring patches, while Section 3.3 illustrates the adjustments made to the self-attention mechanism.
+164
+165
+      3.1   F ORMULATION
+166
+167   Let xt ∈ RH×W ×C denote the image at diffusion timestep t, where H, W , and C are the height,
+168   width, and number of channels, respectively. We divide xt horizontally into n non-overlapping
+                 (i)                       (i)
+169   patches {xt }ni=1 , with each patch xt ∈ Rh×W ×C , where h = H/n. Let ϵθ (·) represent the noise
+170   prediction model parameterized by θ, and c be the conditioning information (e.g., a text prompt). We
+171   use s ≥ 1 as the guidance scale for classifier-free guidance. We introduce a partial value p ∈ [0, 1]
+172   representing the percentage of the neighboring patch used in the context.
+173
+      Patch update with parts of a stale neighboring context. At each timestep t, we update each patch
+174     (i)
+      xt by incorporating its own state and a partial portion of the neighboring patches from the previous
+175                                                                                   (i)
+176
+      timestep xt+1 . Specifically, for patch (i), we define its neighboring context Nt (p) as:
+177                          n                    o
+                                             (i+1)
+178                           upper ph of xt+1 ,
+                                                                       if i = 1
+                             
+179                  (i)
+                             n
+                                             (i−1)              (i+1)
+                                                                      o
+180
+                    Nt (p) =    lower ph of xt+1 , upper ph of xt+1 , if 1 < i < n                                          (1)
+                              n                   o
+                              lower ph of x(i−1) ,
+                             
+181                          
+                                                                        if i = n
+                                             t+1
+182
+183                             (i+1)                                                                               (i+1)
+      Here, upper ph of xt+1 denotes the top ph pixels (height) of the neighboring patch xt+1 , and
+184                (i−1)                                                      (i−1)
+185   lower ph of xt+1 denotes the bottom ph pixels of the neighboring patch xt+1 .
+186                                                                     (i)
+      Adjusted noise prediction. For each patch xt , we compute the adjusted noise prediction
+187         (i)  (i)
+188
+      ϵ̂θ (xt , Nt (p), t, c) using classifier-free guidance:
+189
+190          (i)  (i)                 (i)  (i)
+
+                                                            (i)  (i)                 (i)  (i)
+
+191    ϵ̂θ (xt , Nt (p), t, c) = ϵθ (xt , Nt (p), t)+s ϵθ (xt , Nt (p), t, c) − ϵθ (xt , Nt (p), t) (2)
+192
+193               (i)     (i)
+      where ϵθ (xt , Nt (p), t) is the unconditional noise prediction, incorporating the partial neighbor-
+194                         (i)  (i)
+      ing context, and ϵθ (xt , Nt (p), t, c) is the conditional noise prediction.
+195
+196   Reverse diffusion step.        Using the adjusted noise prediction, we compute the mean
+           (i)  (i)
+197   µθ (xt , Nt (p), t) for the reverse diffusion process:
+198
+199
+
+                             (i)  (i)          1              (i)              βt           (i)  (i)
+200                     µθ (xt , Nt (p), t) = √             xt − √                    ϵ̂θ (xt , Nt (p), t, c)               (3)
+                                                αt                            1 − ᾱt
+201
+202                                                                                   Qt
+      where αt and βt are the noise schedule parameters, and ᾱt =                      s=1 αs .
+203
+                                (i)
+204   The updated patch xt−1 is then obtained by:
+205
+206                                     (i)       (i)   (i)
+                                      xt−1 = µθ (xt , Nt (p), t) + σt z,              z ∼ N (0, I)                          (4)
+207
+208
+      3.2   C OMMUNICATION WITH ONLY NEIGHBORING PATCHES
+209
+210   In DistriFusion, each denoising step t includes forward passes through L layers in the U-Net. At
+211                                                           (1)          (n)
+      each step, it first splits the input xt into n patches xt , . . . , xt . For each layer l and device i, when
+212                                     (i)
+      the input activation patches Al,t are received, two processes execute asynchronously: (1) On device
+213
+                                         (i)
+214   i, the activation patches Al,t are reintegrated into the previous step’s stale activations Al,t+1 , and
+215   then processed by the sparse operator Fl (which may be linear, convolutional, or an attention layer)
+      to carry out the necessary computations, and (2) Simultaneously, an AllGather operation collects
+
+
+                                                                    4
+      Under review as a conference paper at ICLR 2025
+
+
+216
+217                                                         GPU_01 (Rank=1)
+218                                               Async send/recv
+219
+220                                                                               ...
+                        Recv_buffer from rank 1      A0,9 A1,9 A2,10 A3,10                 AL,10 GPU_02 (Rank=2)
+221
+222
+                                      Layer 0       Layer 1         Layer 2       Layer 3                 Layer L   Layer 3 at time step 9
+223
+224                     Step t=10         A0,10      A1,10          A2,10          A3,10            ...    AL,10    recv       Computation
+225
+                                                                                                                     Complete async recv of
+226                                                                                                                   A2,9 from rank 1 and 3
+
+227                     Step t=9          A0,9       A1,9            A2,9           A3,9            ...    AL,9
+                                                                                                                     Async Send
+228
+229                                                                                                                  Start async send of A3,9 to
+                                                                                                                             rank 1 and 3
+230
+231                     Recv_buffer from rank 3      A0,9 A1,9 A2,9 A3,10         ...      AL,10
+232
+233                                               Async send/recv                                                          Step 10 Activations
+
+234                                                                                                                        Step 9 Activations
+                                                         GPU_03 (Rank=3)                                                   Current State Illustrations
+235
+236
+237   Figure 2: Partially Conditioned Patch Parallelism (PCPP) asynchronous communication design.
+238   This diagram captures the computation and recv buffer state at t = 9 and layer 3 for device rank 2
+239   prior to executing the self-attention computations. The device is confirming the completion of async
+240   recv of the previous layer’s activation from its adjacent rank; once this is completed, A2,10 in the
+241   recv buffer from rank 1 will be overwritten by A2,9 for subsequent use at time step t = 8. In the
+242   meantime, it initiates an (async send) of its own activation A3,9 to its neighboring rank, concurrent
+243
+      with the self-attention computation. As described in Section 3.3, the input to the self-attention
+                        (2)                                                           (1)        (3)
+244   computation is A2,9 and the two neighboring stale activations from last step A3,10 and A3,10 .
+245
+246    (i)
+247
+      Al,t from all devices to assemble the complete activation Al,t required for the subsequent denoising
+      step t − 1.
+248
+249   In PCPP, we replaced AllGather with asynchronous point-to-point Send and Receive. Figure 2
+250   provides a visualization of our proposed communication design during the diffusion inference phase.
+251   Specifically, each device maintains up to two receive buffers (recv buffer) for activations from its two
+252   neighboring ranks, each of size L. After the initial warm-up steps where we perform synchronous
+253
+      AllGather, the two recv buffer will be constantly overwritten by the newly received activations from
+      its neighboring ranks. For each layer l, device i and time step t, when the input activation patches
+254     (i)
+255
+      Al,t are received, we perform the following steps. Firstly, wait for the asynchronous send and
+                  (i)
+256   receive of Al−1,t to complete so that they will be saved into recv buffer (while they are not used in
+257   this step, they will be used in the next time step t − 1). Secondly, initiate an asynchronous send of
+                                 (i)
+258   its incoming activation Al,t to its neighbors i − 1 and i + 1. Lastly, compute attention as described
+259                                 (i)                                                                                     (i−1)                  (i+1)
+      in Section 3.3 using Al,t and the two neighboring stale activations from last step Al,t+1 and Al,t+1 ,
+260
+      which can be directly loaded from the two recv buffer. The communication overhead of the second
+261
+      step is hidden under the computation latency of the last step, as shown in the close-up illustration in
+262   Figure 2. The total communication cost is also greatly reduced due to the replacement of collective
+263   communication with point-to-point communication.
+264
+265   3.3    PARTIALLY CONDITIONED ATTENTION
+266
+267   In DistriFusion, the input to attention layers are the complete activations of the entire image assem-
+268   bled using stale activations from all other devices and the on-device activation as output from the
+269   previous module. In detail, the input hidden state is multiplied with matrices W q , W k , W v to create
+      query, key, and value tensors. Then, the key and value tensors are expanded to include stale keys and
+
+
+                                                                              5
+      Under review as a conference paper at ICLR 2025
+
+
+270
+271                   Local
+272                   Patch                                                      Neighboring
+                              heads
+273                                         Scaled Dot Product Attention           Patch 1
+274
+275
+276
+277
+278
+279
+280                                                                               Neighboring
+                                                                                    Patch 2
+281
+282
+283
+284
+285
+286
+      Figure 3: Overview of partially conditioned attention. The local patch receives partial QN P s and
+      KN P s from the neighboring patches. The size of partial keys and values is determined by the
+287
+      parameter partial, whose effect is shown in Figure 1. K and V are then assembled using QLP ,
+288
+      QN P s and KLP , KN P s respectively, instead of using all the patches from the entire image. LP
+289   means local patch, NP means neighboring patch. Black arrows refer to data transfer on the local
+290   device, and blue arrows refer to communication between patches on different devices.
+291
+292
+293   values from the last step from other devices by AllGather. We hypothesize that to generate patches
+294   that are cohesive in parallel, only neighboring context (pixels) is needed instead of the entire feature
+295   map. We test to use only a portion of the neighboring patches to generate patches in denoising steps
+296   as defined in equation (1). With this hypothesis, we propose partially conditioned attention to com-
+297   puting muti-head scaled dot product attention based on keys and values that consist of local context
+298   and partial neighboring context as shown in Figure 3.
+299   Figure 1 shows how the quality of the generated image changes with different partial values p, i.e.,
+300   the fraction of neighboring context used in the computation of key and value. In the case of using
+301   two GPUs to generate an image (and another two GPUs for classifier-free guidance (Ho, 2022)), if
+302   partial is set to 0, i.e., no neighboring context is considered when generating upper patch and lower
+303   patch in parallel, the resulting image contains two sub-images with a clear distinction between them
+304   as shown in the left-most image in Figure 1. Therefore, the computation of attention in a patch needs
+305   to be conditioned on at least a fraction of its neighboring patches to ensure a smooth connection
+306
+      between patches. From Figure 1, we notice that partial ≥ 0.3 guarantees to generate a cohesive
+      image when 2 GPUs are used. The tuning of partial for different numbers of GPUs used is further
+307
+      discussed in later sections.
+308
+309   Out of the three types of layers in the U-Net—Attention, Convolution, and Group Norm—we de-
+310   cided to enable PCPP for self-attention only, since it involves the largest amount of data to be sent
+311   and received from other devices, as shown later in Table 2. For Group Norm, Li et al. (2024) showed
+312
+      that synchronization is critical for group norms to be statically useful for good generation quality.
+      This is especially true when a large number of devices are used as group norms computed solely on
+313
+      on-device activations, which are insufficient for precise approximation. Hence, we used the same
+314
+      approach in DistriFusion instead of point-to-point communication with only the neighboring devices
+315   for computing group norms. Lastly, since the convolution layer only accounted for a small percent-
+316   age of the overall communication cost and only share the boundary pixels with other devices, we
+317   decided to leave the AllGather function for it as it is.
+318
+319
+320   4   E XPERIMENTS
+321
+322   We used the NCCL (NVIDIA Collective Communications Library) as the backend for the
+323   torch.distributed library to implement PCPP. In particular, we used batch isend irecv
+      for point-to-point communication among neighboring patches. Compared with individual isend
+
+
+                                                             6
+      Under review as a conference paper at ICLR 2025
+
+
+324   Table 1: Communication cost breakdown for three different resolutions on 8 A100s. The total buffer
+325   size is the sum of Group Norm, Conv2d, and Attn components, representing the number of bytes to
+326   send to other devices during one forward pass of the entire U-Net. Compared to the method used in
+327   DistriFusion, our method PCPP reduces the communication cost by around 70%.
+328
+329                  Method                        1024 × 1024 2048 × 2048 3840 × 3840
+330
+                     Total Buffer Size                0.218G        0.855G         2.98G
+331
+                       Group Norm                     0.006M        0.006M        0.006M
+332
+                       Conv2d                         0.008G        0.016G        0.031G
+333
+                       Attn                            0.21G        0.839G        2.949G
+334
+335                  Total Communication Amount
+336                    DistriFusion                   1.526G        5.985G        20.86G
+337                    Ours                           0.476G        1.79G         6.115G
+338
+339
+340
+341
+342
+343
+344
+345
+      and irecv, this helps avoid potential deadlocks and simplifies the bookkeeping and management
+      of the asynchronous requests in our code. A detailed description of our parallel implementation
+346
+      is included in Appendix A. For the parallel inference, we used Stable Diffusion XL (Podell et al.,
+347
+      2024) with a 50-step DDIM sampler, classifier-free guidance applied with guidance scale s of 5, and
+348   CUDA Graph to reduce launch overhead. All experiments were conducted on 2 compute nodes, each
+349   containing 4 NVIDIA A100 40GB GPUs, except for generating images of resolution 3840 × 3840
+350   on 1 NVIDIA A100 80GB GPU.
+351
+      To evaluate PCPP, we use the 2014 HuggingFace version of the Microsoft COCO (Common Ob-
+352
+      jects in Context dataset). The COCO caption dataset consists of human-generated captions for the
+353
+      dataset images (Chen et al., 2015). For our experiments, we utilize a portion of the HuggingFace
+354   COCO data, from which we sample a subset of 1K images with the caption for each from the vali-
+355   dation set. We compare the communication cost, image quality, and generation latency of our PCPP
+356   implementation to the results obtained using DistriFusion.
+357
+      Communication cost. In PCPP, nearly all communication happens in the self-attention, group-
+358
+      norm, and convolution layers of the U-Net. To measure the total communication amount, we use
+359
+      the total number of bytes sent and received by all the devices. First, we calculated the total amount
+360   of bytes needed to send to other devices for all three layers. For the AllGather operation in Patch
+361   Parallelism (PP), assuming the use of ring AllGather, the amount is calculated as bs × (n − 1) × 2,
+362   where bs is the send buffer size, n is the number of devices, and 2 is the 2 bytes for FP16 precision.
+363   For the isend irecv operations in PCPP, the communication amount is bs × 2 × 2, where each
+364   device sends to at most 2 neighbors. Note that since we have only implemented the PCPP for the
+365   self-attention layer, we would keep the calculation for the other layers the same as in the Patch
+366   Parallelism approach.
+367   Image quality. Following previous works (Li et al., 2020; 2024), we employ standard evaluation
+368   metrics, namely Peak Signal-to-Noise Ratio (PSNR), Learned Perceptual Image Patch Similarity
+369   (LPIPS), and Fréchet Inception Distance (FID). PSNR quantifies the difference between the nu-
+370   merical image representations of the benchmarked method outputs and the original diffusion model
+371   outputs, where higher values indicate better quality matching the original image. LPIPS assesses
+372   perceptual similarity between the two image outputs, with lower scores indicating greater perceptual
+373   similarity (Zhang et al., 2018). Finally, the FID score measures distributional differences between
+374
+      the two outputs, particularly evaluating the diversity and realism of the images, where lower scores
+      indicate better results (Heusel et al., 2017).
+375
+376   Latency. The latency is calculated as the average of 20 inferences on the same prompts. Before the
+377   measurement, there are 3 iterations of warm-up on the whole denoising process. The measurements
+      are obtained with CUDAGraph enabled to optimize some kernel launching overhead.
+
+
+                                                        7
+      Under review as a conference paper at ICLR 2025
+
+
+378   Table 2: Quantitative evaluation of image quality by 50-step DDIM sampler (Song et al., 2020).
+379   Four warm-up steps are used at the beginning, i.e., synchronizing the compute on the first four
+380   diffusion steps. w/ G.T. indicates that the metrics are calculated using the ground-truth images from
+381   the COCO dataset, while w/ Orig. indicates calculations using the original model’s samples on a
+382   single device. For PSNR, the w/ Orig. setting is reported.
+383
+384                                                               LPIPS (↓)              FID (↓)
+               #Devices       Method        PSNR (↑)
+385                                                      w/ Orig.       w/ G.T.   w/ Orig.    w/ G.T.
+386
+                   1          Original      –                 –          0.796       –             65.3
+387
+                   4        DistriFusion    31.9             0.146       0.797     20.8            65.5
+388
+                   4           Ours         29.2             0.352       0.800     38.4            65.2
+389
+390                8        DistriFusion    31.1             0.181       0.798     24.1            65.6
+                   8           Ours         28.8             0.403       0.805     42.2            64.8
+391
+392
+393
+394
+      5     R ESULTS
+395
+396
+397   5.1   L ATENCY
+398
+399   Since the communication is hidden                                                     140 s by 1 device
+
+400   by the computation in every mod-
+401   ule, as shown in Figure 2, the la-
+402   tency is determined by the computa-
+403   tion speed. By using different par-
+404
+      tial values for partially conditioned
+                                                                         23.7 s by 1 device
+      attention, we reduce the input size to
+405
+      the scaled dot product attention and
+406
+      thus speed up the computation. This
+407   effect is more salient when the res-
+408   olution is higher, as shown in Fig-
+409   ure 4. When the resolution is low, the          5.02 s by 1 device
+410   decrease in computation is not obvi-
+411   ous. However, when the resolution is
+412   high, the decrease in latency is more
+413   promising. Note that different partial
+414   for partially conditioned attention is
+415
+      used for 4 devices and 8 devices to Figure 4: Inference latency for generating one image with
+      ensure the quality of the image gen- 50-step DDIM sampler (Song et al., 2020) by resolution and
+416
+      erated. When more devices are used, device configuration. Our method sets the partial value for
+417
+      the height of every patch decreases, partially conditioned attention to 0.3 for 4 devices and 0.8
+418   resulting in less context contained in for 8 devices. The red numbers show the speed-up achieved
+419   a patch. We hypothesize that for a compared to inference on 1 device.
+420   large number of devices, more than
+421   the immediately neighboring patches are required for the partially conditioned attention to consider
+422   enough context.
+423
+424
+425   5.2   C OMMUNICATION COST
+426
+427   The results for communication cost are presented in Table 1. We followed the approach described in
+428   Section 4, which is not identical to the calculation in DistriFusion (Li et al., 2024). For consistency,
+429   we recalculated the total communication amount for DistriFusion. As expected, the point-to-point
+430   communication overhead of PCPP is significantly reduced compared to the collective communica-
+431   tion in PP, achieving an average of about 70% reduction in communication amount. The majority of
+      the savings come from the self-attention layer, which dominates the communication overhead.
+
+
+                                                         8
+      Under review as a conference paper at ICLR 2025
+
+
+432
+433
+434
+435
+436
+437
+438
+439
+440
+441
+442
+443
+444
+445
+446
+447
+448
+449
+450
+451
+452
+453   Figure 5: Visual comparison of sample images generated by three prompts that work relatively well
+454   with PCPP. More examples are available in Appendix B.
+455
+456
+457   5.3   G ENERATION QUALITY
+458
+459
+      As shown in Table 2, the images generated using our method PCPP generally achieved lower results
+      than DistriFusion. This difference is an expected trade-off resulting from our communication strat-
+460
+      egy. By employing point-to-point communication with only neighboring patches, the inference pro-
+461
+      cess inherently loses access to a significant amount of contextual information from non-neighboring
+462   regions. Nevertheless, PCPP achieved reasonably close PSNR scores compared with DistriFusion,
+463   indicating comparable reconstruction quality and noise level. In terms of LPIPS and FID, PCPP
+464   performed worse than DistriFusion, meaning that images generated using PCPP deviate more from
+465   those generated using one device than DistriFusion.
+466
+      In addition to numerical evaluations, we visually compared sample images generated by our PCPP
+467
+      method, the original image generated by one device, and the images generated by DistriFusion. As
+468   reflected in the metrics, a sizable portion of the generated images by PCPP has distortions and ir-
+469   rational parts. This suggests that having only part or all neighboring patches may not generate a
+470   coherent image for all prompts. In Figure 5, we show three prompts that work reasonably well with
+471   PCPP. In the elephant example, the images generated by PCPP are visually indistinguishable from
+472   those produced by DistriFusion, suggesting that our method can achieve comparable image quality
+473   for certain prompts. However, in the cat example, there are noticeable differences between the PCPP
+474   and DistriFusion outputs when 8 devices are used, although the PCPP-generated images still main-
+475   tain high fidelity and coherence. In the bird example, the image generated by PCPP with 8 devices
+476
+      is more similar to that generated by one device in terms of bird color. This shows the randomness in
+      the diffusion process, even with the same random seed. This discrepancy in the quality of generated
+477
+      images suggests that partial attention, which is important for the diffusion process, may not always
+478
+      come from the immediate neighboring parts. More comparisons are available in Appendix B.
+479
+480
+481   6     D ISCUSSION
+482
+483   In this research, we propose Partially Conditioned Patch Parallelism (PCPP) to accelerate the infer-
+484   ence of high-resolution diffusion models leveraging multiple computing devices. Trading generation
+485   quality for speed, we achieve better speed-up than DistriFusion - the state-of-the-art implementation
+      of Patch Parallelism (PP) - with less computation and communication. As a result, PCPP decreases
+
+
+                                                       9
+      Under review as a conference paper at ICLR 2025
+
+
+486
+      the communication cost by around 70% compared to DistriFusion and achieves 2.36 ∼ 8.02× infer-
+487   ence speed-up using 4 ∼ 8 GPUs compared to 2.32 ∼ 6.71× achieved by DistriFusion depending
+488   on the computing device configuration and resolution of generation at the cost of a decrease in image
+489   quality. PCPP demonstrates the potential to strike a favorable trade-off, enabling high-quality image
+490   generation with substantially reduced latency.
+491
+      Limitation and future directions. The experiments conducted are restricted by the computing
+492
+      resources available. As a result, a maximum of 8 GPUs and a highest resolution of 3840 × 3840 are
+493   used. The impact of having more GPUs, i.e., more patches, on the quality of generation by PCPP
+494   has thus not been studied. We hypothesize that for a larger number of GPUs, the context needed
+495   for the generation of a patch may extend beyond immediate neighboring patches, corresponding to a
+496   partial value larger than 1. The key insight from this research - reducing collective communication to
+497   point-to-point communication with neighboring patches - provides an interesting perspective on the
+498   trade-off between inference efficiency and generation quality in diffusion models. During parallel
+499   inference, how much and what context does the model really need, and how fresh should those stale
+500   activations from the previous denoising step be to achieve similar image quality? These questions
+501
+      deeply about diffusion may be further studied in future research. The inconsistent quality of images
+      generated by partially conditioned attention on parts of neighboring patches suggests that a more
+502
+      involved selection of relevant context is needed as a direction for future research. Furthermore, due
+503
+      to the scope of this research, the effect of PCPP on popular optimization and inference methods
+504   for diffusion models, such as ControlNet (Zhang et al., 2023) and LoRA (Hu et al., 2021), is left
+505   for future discussion. Previous studies in image generation by diffusion model following a patch-
+506   like approach for memory optimization in a single device (Yang et al., 2024; Ding et al., 2024)
+507   may also be integrated with PCPP to improve the generation quality while taking advantage of the
+508   asynchronous point-to-point communication.
+509
+      Another potential limitation of this research (and accelerating inference with multiple computing
+510   devices in general) is that requiring multiple GPU devices for a single-image generation might seem
+511   like an inefficient use of resources. However, we believe this approach has potential use cases in spe-
+512   cific areas, such as high-resolution image editing applications that demand high responsiveness. In a
+513   traditional single-device setup, generating a high-resolution image could take more than 2 minutes.
+514   In contrast, by leveraging PCPP, we can complete the same task in under 15 seconds without any
+515   significant decrease in image quality, as shown in Section 5. This significant reduction in latency can
+516   be particularly valuable in interactive applications where users expect near-instant feedback, such as
+517   real-time image editing tools.
+518   Ethics statement. PCPP does not intend to alter the image generated and its meaning. The gen-
+519   erated content is primarily determined by the diffusion model and the prompts given, with possible
+520   distortions introduced by the parallelizing computing approach. Therefore, the ethical practice of
+521   using generation service accelerated by PCPP is ensured by the design of the diffusion model and
+522   restrictions on the prompts as input, not as a part of PCPP.
+523   PCPP can be applied to accelerate the generation of images by diffusion models leveraging multiple
+524   resources. Compared to the previous state of the art approach, PCPP reduces computation and
+525   communication for the same inference, thus contributing to energy saving for image generation.
+526   The speed-up might be helpful for many applications requiring a timely response given a prompt.
+527   In addition, PCPP might also be applied to diffusion models that generate data structures other than
+528   images. We wish PCPP can be a useful tool for researchers, designers, and users of diffusion models.
+529   Reproducibility statement. We provided a detailed description of the method and its implemen-
+530   tation in Section 3. In addition, more implementation details are described in Appendix A. In
+531   Section 4, we included the computing device, dataset, and evaluation metrics for reproducing the
+532   experiments. We also plan to release the code and scripts necessary to reproduce our results.
+533
+534
+535
+536   R EFERENCES
+537
+538   Xinlei Chen, Hao Fang, Tsung-Yi Lin, Ramakrishna Vedantam, Saurabh Gupta, Piotr Dollár, and
+539     C. Lawrence Zitnick. Microsoft coco captions: Data collection and evaluation server. ArXiv,
+        abs/1504.00325, 2015.
+
+
+                                                        10
+      Under review as a conference paper at ICLR 2025
+
+
+540
+      Prafulla Dhariwal and Alex Nichol. Diffusion models beat gans on image synthesis. ArXiv,
+541     abs/2105.05233, 2021.
+542
+543   Zheng Ding, Mengqi Zhang, Jiajun Wu, and Zhuowen Tu. Patched denoising diffusion models for
+544     high-resolution image synthesis. In The Twelfth International Conference on Learning Represen-
+545     tations, 2024.
+546
+      Martin Heusel, Hubert Ramsauer, Thomas Unterthiner, Bernhard Nessler, and Sepp Hochreiter.
+547
+       Gans trained by a two time-scale update rule converge to a local nash equilibrium. In Neural
+548    Information Processing Systems, 2017.
+549
+550   Jonathan Ho. Classifier-free diffusion guidance. ArXiv, abs/2207.12598, 2022.
+551
+552   Jonathan Ho, Ajay Jain, and P. Abbeel.        Denoising diffusion probabilistic models.      ArXiv,
+553
+        abs/2006.11239, 2020.
+554   J. Edward Hu, Yelong Shen, Phillip Wallis, Zeyuan Allen-Zhu, Yuanzhi Li, Shean Wang, and
+555      Weizhu Chen. Lora: Low-rank adaptation of large language models. ArXiv, abs/2106.09685,
+556      2021.
+557
+558   Lei Huang, Hengtong Zhang, Tingyang Xu, and Ka chun Wong. Mdm: Molecular diffusion model
+559     for 3d molecule generation. ArXiv, abs/2209.05710, 2022.
+560
+      Peter H. Jin, Boris Ginsburg, and Kurt Keutzer. Spatially parallel convolutions. In International
+561     Conference on Learning Representations, 2018.
+562
+563   Muyang Li, Ji Lin, Yaoyao Ding, Zhijian Liu, Jun-Yan Zhu, and Song Han. Gan compression:
+564    Efficient architectures for interactive conditional gans. 2020 IEEE/CVF Conference on Computer
+565    Vision and Pattern Recognition (CVPR), pp. 5283–5293, 2020.
+566
+      Muyang Li, Ji Lin, Chenlin Meng, Stefano Ermon, Song Han, and Jun-Yan Zhu. Efficient spa-
+567
+       tially sparse inference for conditional gans and diffusion models. IEEE Transactions on Pattern
+568    Analysis and Machine Intelligence, 45:14465–14480, 2022.
+569
+570   Muyang Li, Tianle Cai, Jiaxin Cao, Qinsheng Zhang, Han Cai, Junjie Bai, Yangqing Jia, Ming-
+571    Yu Liu, Kai Li, and Song Han. Distrifusion: Distributed parallel inference for high-resolution
+572    diffusion models. In Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern
+573    Recognition (CVPR), 2024.
+574
+      Xiuyu Li, Long Lian, Yijia Liu, Hua Yang, Zhen Dong, Daniel Kang, Shanghang Zhang, and Kurt
+575     Keutzer. Q-diffusion: Quantizing diffusion models. 2023 IEEE/CVF International Conference
+576     on Computer Vision (ICCV), pp. 17489–17499, 2023.
+577
+578   Cheng Lu, Yuhao Zhou, Fan Bao, Jianfei Chen, Chongxuan Li, and Jun Zhu. Dpm-solver: A fast
+579     ode solver for diffusion probabilistic model sampling in around 10 steps. ArXiv, abs/2206.00927,
+580     2022a.
+581
+      Cheng Lu, Yuhao Zhou, Fan Bao, Jianfei Chen, Chongxuan Li, and Jun Zhu. Dpm-solver++: Fast
+582     solver for guided sampling of diffusion probabilistic models. ArXiv, abs/2211.01095, 2022b.
+583
+584   Dustin Podell, Zion English, Kyle Lacey, Andreas Blattmann, Tim Dockhorn, Jonas Müller, Joe
+585     Penna, and Robin Rombach. SDXL: Improving latent diffusion models for high-resolution image
+586     synthesis. In The Twelfth International Conference on Learning Representations, 2024.
+587
+      Guocheng Qian, Jinjie Mai, Abdullah Hamdi, Jian Ren, Aliaksandr Siarohin, Bing Li, Hsin-Ying
+588
+        Lee, Ivan Skorokhodov, Peter Wonka, S. Tulyakov, and Bernard Ghanem. Magic123: One image
+589     to high-quality 3d object generation using both 2d and 3d diffusion priors. ArXiv, abs/2306.17843,
+590     2023.
+591
+592   Robin Rombach, A. Blattmann, Dominik Lorenz, Patrick Esser, and Björn Ommer. High-resolution
+593     image synthesis with latent diffusion models. 2022 IEEE/CVF Conference on Computer Vision
+        and Pattern Recognition (CVPR), pp. 10674–10685, 2021.
+
+
+                                                      11
+      Under review as a conference paper at ICLR 2025
+
+
+594
+      Olaf Ronneberger, Philipp Fischer, and Thomas Brox. U-net: Convolutional networks for biomedi-
+595     cal image segmentation. ArXiv, abs/1505.04597, 2015.
+596
+597   Chitwan Saharia, William Chan, Saurabh Saxena, Lala Li, Jay Whang, Emily L. Denton, Seyed
+598     Kamyar Seyed Ghasemipour, Burcu Karagol Ayan, Seyedeh Sara Mahdavi, Raphael Gontijo
+599     Lopes, Tim Salimans, Jonathan Ho, David J. Fleet, and Mohammad Norouzi. Photorealistic
+600     text-to-image diffusion models with deep language understanding. ArXiv, abs/2205.11487, 2022.
+601   Andy Shih, Suneel Belkhale, Stefano Ermon, Dorsa Sadigh, and Nima Anari. Parallel sampling of
+602     diffusion models. ArXiv, abs/2305.16317, 2023.
+603
+604   Jiaming Song, Chenlin Meng, and Stefano Ermon. Denoising diffusion implicit models. ArXiv,
+605      abs/2010.02502, 2020.
+606
+      Ashish Vaswani, Noam M. Shazeer, Niki Parmar, Jakob Uszkoreit, Llion Jones, Aidan N. Gomez,
+607
+        Lukasz Kaiser, and Illia Polosukhin. Attention is all you need. In Neural Information Processing
+608     Systems, 2017.
+609
+610   Zhuoyi Yang, Heyang Jiang, Wenyi Hong, Jiayan Teng, Wendi Zheng, Yuxiao Dong, Ming Ding,
+611     and Jie Tang. Inf-dit: Upsampling any-resolution image with memory-efficient diffusion trans-
+612     former, 2024.
+613
+      Lvmin Zhang, Anyi Rao, and Maneesh Agrawala. Adding conditional control to text-to-image
+614     diffusion models. 2023 IEEE/CVF International Conference on Computer Vision (ICCV), pp.
+615     3813–3824, 2023.
+616
+617   Richard Zhang, Phillip Isola, Alexei A. Efros, Eli Shechtman, and Oliver Wang. The unreasonable
+618     effectiveness of deep features as a perceptual metric. 2018 IEEE/CVF Conference on Computer
+619     Vision and Pattern Recognition, pp. 586–595, 2018.
+620
+621
+622
+      A    PARALLEL I MPLEMENTATION
+623
+      Design Choice on Synchronization. In our current implementation, for any device i, we explicitly
+624
+      wait for the asynchronous operations of layer l at step t to complete at the beginning of layer l + 1 at
+625
+      the same step t, even if we won’t be using them until the layer l at the next denoising step t − 1. One
+626   might wonder why we don’t call the .wait() method when the activations are actually needed. We
+627   have considered this initially. However, the NCCL (NVIDIA Collective Communications Library)
+628   backend does not support tags in the isend and irecv operations. This means that if we allow
+629   isend and irecv operations of multiple layers to be in-flight at the same time, the receiving
+630   device won’t be able to identify which tensors are from which layers. As such, we decided to call
+631   the .wait() operation a bit earlier, so that it guarantees that at any given time, only one group of
+632   asynchronous send and receive operations between any two devices are in-flight. This ensures that
+633   the receiving device can properly match the incoming tensors to the correct layers.
+634
+635   Avoiding Potential Deadlocks. Since one device can simultaneously fire up to two pairs of
+636
+      isend and irecv calls to its two neighbors, if we were to issue these operations individually,
+      there are risks of deadlocks when the order of isend and irecv does not match each other. To
+637
+      address this issue, we decided to use torch.distributed.batch isend irecv, where we
+638
+      can issue all the send and receive operations for a given step in a single call, and the library handles
+639   the coordination and matching of the tensors on the receiving side. This not only avoids the potential
+640   for errors or mismatches, but also simplifies the bookkeeping and management of the asynchronous
+641   requests in our code. Instead of maintaining a separate list of isend and irecv requests for each
+642   layer, we can work with a single batch isend irecv request object, which makes the logic
+643   more concise.
+644
+645   Batched Communication of Layer Activations. One potential future work is to explore
+646   accumulating the activations for a few continuous layers before initiating the communica-
+647   tion. In our current implementation, we send the activations for each layer individually using
+      dist.batch isend irecv as soon as they are ready, as described in Section 3.2. However,
+
+
+                                                        12
+      Under review as a conference paper at ICLR 2025
+
+
+648
+      we could potentially optimize this by accumulating the activations for a couple of layers before trig-
+649   gering the communication. This would allow us to send a batch of activations for multiple layers at
+650   once, rather than sending them one layer at a time. This would reduce the overall communication
+651   overhead by amortizing the costs of setting up and tearing down the communication across mul-
+652   tiple layers. Additionally, sending larger batches of activations may allow the underlying NCCL
+653   communication libraries to optimize the transfers more effectively.
+654
+655
+      B    G ENERATION R ESULTS
+656
+657
+658
+659
+660
+661
+662
+663
+664   Figure 6: Prompt: a black and white bird with red eyes sitting on a tree branch. The style of the
+665   generated image using PCPP changes from a realistic image to a painting.
+666
+667
+668
+669
+670
+671
+672
+673
+674
+      Figure 7: Prompt: A box of donuts of different colors and varieties. The image generated using
+675   PCPP is almost identical to the image generated using DistriFusion.
+676
+677
+678
+679
+680
+681
+682
+683
+684
+685   Figure 8: Prompt: A boy covered up with his blanket holding the television remote. The image
+686   generated using PCPP slightly deviates from the original in terms of the TV background and the
+687   direction the boy is facing.
+688
+689
+690
+691
+692
+693
+694
+695
+696
+697   Figure 9: Prompt: The toilet is near the door in the bathroom. The image generated using PCPP has
+698
+      a slightly distorted rendering of the bathroom ceiling and floor.
+699
+700
+701
+
+
+
+                                                       13

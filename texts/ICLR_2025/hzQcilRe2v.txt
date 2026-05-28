@@ -1,0 +1,2872 @@
+Under review as a conference paper at ICLR 2025
+
+
+000
+001
+      E LASTIC AND BALANCED E ND - TO - END T RAINING OF
+002   DYNAMIC LLM S WITH DYN M O
+003
+004
+005    Anonymous authors
+006    Paper under double-blind review
+007
+008
+009                                                      A BSTRACT
+010
+011                To reduce the computational and memory costs of Large Language Models
+012                (LLMs), schemes that introduce dynamic training are increasingly emerging. Ex-
+013                amples of dynamic models are: a) Mixture of Experts (MoEs) at which token
+014                routing affects the compute balance, b) gradual pruning of the parameters of a
+015                model, c) dynamically freezing layers, d) dynamic sparse attention schemes, e)
+016                early exit of tokens as they pass through the model layers, and f) Mixture of
+017
+                   Depths (MoDs) schemes where tokens bypass blocks. One side effect that lim-
+                   its the practical value of dynamic models is the introduction of workload im-
+018
+                   balance among workers, which in turn negatively affects the efficiency in dis-
+019
+                   tributed training. We propose a dynamic load balancing solution (DYN M O), with
+020                a proof that it satisfies maximum reduction in imbalance, to adaptively maintain
+021                equal compute workloads among different workers in pipeline parallelism. In
+022                addition, DYN M O dynamically packs work into fewer workers, while sustaining
+023                training throughput, to release the idle workers back to the job manager. DYN M O
+024                supports both single nodes with multi-GPUs and systems with multi-GPU multi-
+025                nodes. In comparison to static distributed training solutions (Megatron-LM and
+026                DeepSpeed), DYN M O accelerates the end-to-end training of dynamic GPT models
+027                by up to 1.23x (MoEs), 3.18x (parameter pruning), 2.23x (layer freezing), 4.02x
+028
+                   (sparse attention), 4.52x (early exit), and 1.17x (MoDs). DYN M O is available at
+                   https://anonymous.4open.science/r/DynMo-4D04/.
+029
+030
+031
+      1       I NTRODUCTION
+032
+033
+      Sizes of neural networks used to train LLMs has exponentially grown since the introdution of trans-
+034   formers Vaswani et al. (2017). This growth demands more memory and compute power. Yet, nei-
+035   ther the memory capacity nor the compute capability of a single accelerator increases at the same
+036   rate Sevilla et al. (2022). As a result, high-performance computing centers and cloud providers use a
+037   mix of model and data parallelism for training large models Narayanan et al. (2021). One of the most
+038   commonly used forms of model parallelism in LLMs is pipeline parallelism, in which consecutive
+039   layers are grouped into stages, with each stage assigned to one accelerator (worker) Kahira et al.
+040   (2021). Input mini-batches are split into micro batches (chunks) to improve accelerator utilization
+041   by overlapping computation in a pipeline fashion Huang et al. (2019); Harlap et al. (2018); Fan et al.
+042
+      (2021); Li & Hoefler (2021); Qi et al. (2024).
+043   In traditional LLMs training schemes, the workload for each pipeline stage is known in advance and
+044   remains static throughout the training. To reduce computational resource requirements, new training
+045   schemes that introduce dynamic training workloads are emerging. This includes: a) neural networks
+046   where different input samples take different pathways through the model layers 1 , e.g. gated neural
+047   networks Shazeer et al. (2017a), sparsely activated Mixture of Experts (MoEs) Zhou et al. (2022b),
+048
+      Switch Transformers Fedus et al. (2022), Mixture of Depths (MoDs) Raposo et al. (2024) etc., b)
+      gradual pruning where the parameters of a model are pruned (i.e. sparsified) during training Gale
+049
+      et al. (2019), c) freeze training where some of the layers of the model are adapatively frozen during
+050
+      training Wang et al. (2022), d) different schemes to dynamically sparsify the attention matrix Liu
+051   et al. (2022a); Pagliardini et al. (2023); Tay et al. (2020), and e) early exit strategies where tokens
+052   skip remaining layers based on an exit decision Elbayad et al. (2020); Schuster et al. (2022); Liu et al.
+053
+          1
+              In this paper we use layer to refer to a transformer block (multi-head attention + a feed forward network)
+
+
+                                                                1
+      Under review as a conference paper at ICLR 2025
+
+
+054                             Mixture of                      Prune                         Layer                                                Sparse                                      Early                Mixture of
+055                           Experts (MoEs)                  Parameters                     Freezing                                             Attention                                    Exit               Depths (MoDs)
+                        40%                                                                                                           80%                                                                       40%
+                                                        80%                      100%
+056                              Bubble ratio                  Bubble ratio                   Bubble ratio                                       Bubble ratio                         Bubble ratio                      Bubble ratio
+                                                                                                                                                                               60%
+                                    ~25%                         ↑ ~5x           80%
+                                                                                                 ~40%                                              ↑ ~4x                                ↑ ~5x                              ~18%
+057                                                                                                                                                                                                             30%
+
+
+                                                                                                                    Idleness (in %)
+                                                                                                                                      60%
+      Idleness (in %)
+                        30%                             60%
+
+
+058                                                                              60%                                                                                           40%
+                        20%                             40%                                                                           40%                                                                       20%
+
+059                                                                              40%
+                                                                                                                                                                               20%
+060                     10%                             20%
+                                                                                 20%
+                                                                                                                                      20%                                                                       10%
+
+
+061
+                        0%                              0%                        0%                                                  0%                                       0%                               0%
+                         MixtralMixtral
+                                  8x7b  8x7B LLaMA-MoE-3.5B
+                                               LLaMA-MoE-3.5B Dense 30% 50% 70% 90%    Static
+                                                                                          Static Egeria
+                                                                                                   Egeria AutoFreeze                        Dense   Attn. Dyn.
+                                                                                                                                                           Sparse      Attn.         Static
+                                                                                                                                                                                      No Early CALM
+                                                                                                                                                                                                 CALM ADP-C
+                                                                                                                                                                                                       ADP-C          Expert Choice MoDs
+062                                                                                      Freezing
+                                                                                                           AutoFreeze                         Dense Attn.      Sparse Attn.
+                                                                                                                                                                                        Exit
+
+                              S-BASE   Load Bal. Loss                                   24 Layers                  32 Layers                                     40 Layers                          48 Layers
+                                                                                                                                                                                                    48 Layers
+063
+064
+      Figure 1: Average idleness percentage of GPUs (per iteration) for training dynamic GPT mod-
+065
+      els Radford et al. (2018). Five example cases use models parameterized to have between 24 and
+066
+      48 layers, and for one example case (MoEs) we report the average idleness percentage for Mix-
+067   tral 8x7b and LlaMA-MoE-3.5B models. For pipeline parallelism, we use the highest performing
+068   pipeline parallelism scheme known to the authors: the ”almost zero-bubble pipeline parallelism”
+069   scheme Qi et al. (2024). All reported bubble ratios are measured on a hybrid of pipeline parallelism
+070   and data parallelism on 720 H100 GPUs in total, excluding MoEs which uses 128 H100 GPUs in
+071   total. Mixture of Experts: we observe ∼25% bubble ratio in the pipeline on Mixtral 8x7b Jiang
+072   et al. (2024) and LLaMA-MoE-3.5b Team (2024), arising from the load imbalance imposed by the
+073   routing schemes used in token choice (S-BASE Lewis et al. (2021b) and load imbalance with auxil-
+074   iary loss Jiang et al. (2024)). Gradual prunning of model parameters: we observe almost a five
+075
+      fold increase in idleness at 90% sparsity levels. Note that idleness at Dense is the inherent pipeline
+      bubbles of a static model. Layer freezing: SoTA freezing schemes that incorporate load balancing
+076
+      (Egeria Wang et al. (2022) and AutoFreeze Liu et al. (2021)) yield ∼40% bubble ratio. Dynamic
+077
+      Sparse Flash Attention: locality sensitive hashing with support for flash attention Pagliardini et al.
+078   (2023) exhibits a 4x increase in the bubble ratio over the baseline dense attention. Early exit: SoTA
+079   early exit methods (CALM Schuster et al. (2022) and ADP-C Liu et al. (2022b)) exhibits up to 5x
+080   increase in the bubble ratio over the baseline (w/o early exit), mainly due to the accumulation of
+081   bubbles in late layers. Mixture of Depths: we observe ∼18% bubble ratio in the pipeline, arising
+082   from the load imbalance imposed by the routing scheme of expert choices that lacks information
+083   about future tokens Raposo et al. (2024).
+084
+085
+086   (2022b); Kim et al. (2022). Other than computational efficiency, there is a wide range of reasons
+087   that motivate the use of different forms of dynamic models to improve certain model attributes, such
+088   as explainability and generalization. We refer the reader to the surveys Han et al. (2021); Tay et al.
+089   (2022) on different forms of dynamic models.
+090   One of the main downsides of using dynamic models is that they introduce load imbalance in
+091   pipeline parallelism, effectively decreasing the throughput of LLM training Zhou et al. (2022a);
+092   He et al. (2022). For example, Figure 1 shows the average idleness of GPUs for GPT language
+093   models with different numbers of layers, for different types of dynamic models. Load imbalance
+094   manifests itself as bubbles that appear in the pipeline due to a stalling accelerator waiting to receive
+095   work from its late neighboring worker(s). Since a pipeline is only as fast as its slowest stage, load
+096   balancing becomes crucial for efficient resource utilization.
+097   Production distributed training solutions typically implement a static load balance at the beginning
+098   of training and maintain the same load distribution throughout the training. For instance, Megatron-
+099   LM Shoeybi et al. (2019) evenly distributes all transformer layers across the accelerators. Deep-
+100   Speed Smith (2023) currently offers three partitioning methods for distributing model layers: Uni-
+101   form, which balances the number of layers; param, which balances the number of parameters in each
+102   stage; and regex, which balances layers whose names match a given regex pattern. However, this
+103   approach operates on the assumption that the accelerators’ workloads remain roughly unchanged
+104
+      throughout training. As a result, it fails to address the pipeline stalls introduced by dynamic models,
+      ultimately leading to a decrease in computational efficiency.
+105
+106   Considering the increasing importance of efficient MoEs/MoDs, sparse dynamic models, layer freez-
+107   ing, and other dynamic training workloads, this work aims to mitigate the pipeline stalls introduced
+      by dynamic models. We introduce DYN M O, an elastic load-balancing framework designed for
+
+
+                                                                                                                2
+      Under review as a conference paper at ICLR 2025
+
+
+108
+      dynamic models, to ensure balanced pipeline stages during training. DYN M O dynamically re-
+109   distributes the workload among accelerators whenever an imbalance arises during training, con-
+110   sequently enhancing computational efficiency and leading to cost savings. DYN M O incorporates
+111   two different dynamic balancers, both proven to converge to the optimal workload balance among
+112   workers. Our experiments demonstrate that DYN M O incurs negligible overhead and can scale effec-
+113   tively in both: a) single-node multi-GPU environments and b) multi-node multi-GPU environments
+114   typically used for training LLMs with hybrid parallelism.
+115   DYN M O not only enhances performance through dynamic load balancing but also offers the ca-
+116   pability to elastically adapt GPU resources. Specifically, as the total workload decreases during
+117   training due to gradual pruning or early exit, the load balancer consolidates the work onto fewer
+118   GPUs –subject to memory capacity constraints– while maintaining performance. GPUs that are no
+119   longer needed for training can then potentially be released back to the job scheduler.
+120
+      DYN M O is the first work to study pipeline stalls caused by training dynamic models. Innovative
+121   designs of dynamic models struggle to deliver practical impact, at large scale training, unless there is
+122   a platform from which those models can be made efficient. DYN M O provides the essential platform
+123   for achieving efficiency in these models. Additionally, considering the substantial costs required
+124   for each training run of GPT-class models Li (2022); Heim (2022); Morgan (2022), improving the
+125   efficiency of dynamic models can result in significant cost savings.
+126
+      Finally, we emphasize that DYN M O has no impact on model accuracy, as its role is solely to
+127   redistribute workload, without interfering with the learning process or changing the learning
+128   regime in any way, i.e., DYN M O functions as a complementary system software solution that op-
+129   erates independently of the underlying strategies used for parameters pruning, early exist strategy,
+130   layer freezing, experts routing etc. This makes DYN M O extendable and compatible with various
+131   dynamic schemes. In principle, it can even be applied to models that undergo dynamic changes for
+132   reasons other than the six example cases we list in this paper, such as manufacturing variability of
+133   computing units Sinha et al. (2022). In short, our contributions are:
+134
+135   • We introduce DYN M O, which enables researchers to explore dynamic models and significantly
+136     improves the end-to-end training efficiency of such models, making their practical application
+137     more feasible. We invoke DYN M O to rebalance at regular intervals without prior knowledge of
+138     dynamism, hence balancing the load in a fully automated and transparent manner. DYN M O is or-
+139     thogonal to the underlying pipeline parallelism and dynamism scheme; it allows for compatibility
+140
+        with various dynamic compute and model reduction schemes.
+141
+      • We propose two load balancing algorithms proven to converge to optimal balancing in order to
+142
+        alleviate the negative effects of dynamic models on pipeline utilization. We further introduce a
+143     scheme for reducing the number of GPUs used during training by re-packing work to fewer GPUs.
+144
+145   • We show the benefits of the framework with six different example cases of dynamic models, in
+146     both single-node and multi-node settings. DYN M O achieves 1.23x (MoEs), 3.18x (parameter
+147     pruning), 2.23x (layer freezing), 4.02x (sparse attention), 4.52x (early exit), and 1.17x (MoDs)
+148     speedups over (static) Megatron-LM on multi-node hybrid data and pipeline parallelism with up
+149     to 720 H100 GPUs. We demonstrate that the re-packing strategy can be effective in reducing the
+150     number of GPUs by up to half while sustaining comparable performance.
+151
+152
+153   2     M OTIVATION AND BACKGROUND
+154
+155   2.1   B UBBLES IN P IPELINE PARALLELISM
+156
+157   There are two types of bubbles in pipeline parallelism: (i) inherent bubbles of the pipeline schedule
+158   (e.g. bubbles in-between forward and backward passes in GPipe Huang et al. (2019)), and (ii)
+159   bubbles introduced by the dynamic models during training (e.g. bubbles introduced by sparsification
+160   during training). We aim to reduce the latter type of bubbles by carefully redistributing the layers
+161   among stages to minimize the workload imbalance in the pipeline. Appendix B elaborates with
+      analysis of bubbles in pipeline parallelism.
+
+
+                                                         3
+      Under review as a conference paper at ICLR 2025
+
+
+162
+      2.2   DYNAMIC M ODELS
+163
+164   To reduce the compute and memory costs, training schemes that introduce dynamic training work-
+165   loads are increasingly emerging. The irregular control-flow in those dynamics models lead in-
+166   evitably to load imbalance. This leads to inefficiencies that often cause the dynamic model to be
+167   slower than the baseline, hence defeating the purpose of using a dynamic model.
+168   The load balancing problem considered can be formally defined as follows. Given a set of workers
+169   N = {N1 , N2 , . . . , Nn } and a set of tasks T = {t1 , t2 , . . . , tm }, each task tj ∈ T is associated
+170   with a workload cj . The total workload is denoted by:
+171
+172                                                              m
+                                                                 X
+173                                                  C=                cj .
+174                                                              j=1
+175
+176
+      Let A : T → N be a load assignment function that maps each task to a worker. The load of a worker
+      Ni ∈ N , denoted Li , is defined as the sum of the workloads of tasks assigned to it:
+177
+178                                                              X
+179                                              Li =                         cj .
+180                                                       tj ∈A−1 (Ni )
+181
+182
+      The objective of the load balancing problem is to minimize the maximum load among all workers:
+183                                                                                                    
+184                                                                                      X
+185                           min    max       Li = min          max                                cj  .
+                               A i∈{1,...,n}             A i∈{1,...,n}
+186                                                                              tj ∈A−1 (Ni )
+187
+      This optimization problem aims to distribute the tasks such that the workload is balanced across the
+188
+      workers, minimizing the worst-case scenario in terms of load.
+189
+190   In the following we list the dynamic model example cases we examine in this paper.
+191   Mixture of Experts
+192
+193   In Mixture of Experts (MoEs) Shazeer et al. (2017b), the model capacity is increased by routing
+194
+      input tokens selectively to specialized sub-networks known as experts, rather than processing all
+      tokens through the same feed-forward network. This design improves efficiency but introduces a
+195
+      new source of load imbalance.
+196
+197   We define the load imbalance in MoEs as follows. Let E = {e1 , e2 , . . . , ek } be the set of experts in
+198   an MoE layer, where each expert ei is assigned to a worker Ni ∈ N . During distributed training,
+199   tokens are routed to these experts based on a routing function R : T → E, where each token tj ∈ T
+200
+      is sent to one (or more) experts.
+201   The load of an expert ei , denoted Lei , is defined as the total workload of the tokens assigned to it:
+202
+203
+                                                                 X
+                                                Lei =                         cj .
+204
+                                                           tj ∈R−1 (ei )
+205
+206   Ideally, the load should be balanced across all experts, i.e., Lei ≈ Lej for all ei , ej ∈ E. However, in
+207   practice, the routing function R does not guarantee perfect balance due to the stochastic and learned
+208   nature of the routing process, which often includes an auxiliary loss Jiang et al. (2024) or a linear
+209   assignment problem Lewis et al. (2021b).
+210   Let Lmax and Lmin denote the maximum and minimum loads across the experts:
+211
+212
+213
+                                 Lmax =      max         Lei ,       Lmin =             min        L ei .
+                                           i∈{1,...,k}                               i∈{1,...,k}
+214
+215   The load imbalance ∆L is defined as the relative difference between the maximum and minimum
+      loads:
+
+
+                                                                 4
+      Under review as a conference paper at ICLR 2025
+
+
+216
+217                                                          Lmax − Lmin
+218
+                                                 ∆L =         1
+                                                                Pk       .
+                                                              k  i=1 Lei
+219
+220   In practical scenarios, even for large batch sizes, this imbalance can be significant. For example,
+221   empirical results from the Mixtral 8x7b model Jiang et al. (2024) demonstrate up to 40% difference
+222   between the busiest and least busy experts. This is consistent with the imbalance observed in token
+223   choice routing reported by several others (e.g., Zhou et al. (2022b); Raposo et al. (2024). This
+224   discrepancy arises because the routing function R often includes a learned component, such as
+225   an auxiliary loss attached to the MLPs or a linear assignment scheme, leading to suboptimal and
+226   dynamic routing choices.
+227   This imbalance propagates through the training pipeline, causing bubbles in the communication
+228   phase, particularly during the all to all collective operation, where tokens are returned to their orig-
+229   inal workers. The result is inefficiency in GPU utilization and increased latency, highlighting the
+230   importance of developing improved load balancing mechanisms for MoEs in distributed training
+231   systems.
+232   Parameter Pruning
+233
+234
+      Parameter pruning removes a subset of model parameters, resulting in a sparse network that can
+      maintain similar performance to the original dense model. However, pruning during training intro-
+235
+      duces load imbalance due to non-uniform pruning across different layers.
+236
+237   Parameter pruning methods, such as global magnitude pruning Hagiwara (1993), selectively remove
+238   parameters across the entire network based on their importance. Let L = {l1 , l2 , . . . , ld } be the set
+239   of layers in the neural network, and each layer li is assigned to a worker Ni ∈ N . During distributed
+240
+      training, the workload of each layer may change dynamically as parameters are pruned.
+241        (k)
+      Let pi denote the fraction of parameters retained in layer li at time step k. The effective workload
+242                                        (k)
+      of layer li at time step k, denoted ci , is proportional to the number of remaining parameters:
+243
+244
+                                                       (k)          (k)
+245                                                 ci       = pi         · ci ,
+246
+247
+      where ci is the initial workload of layer li before pruning. The total workload of the network at time
+      step k is:
+248
+249
+                                                                d
+250                                                             X  (k)
+251
+                                                    C (k) =       ci .
+                                                                i=1
+252
+253
+      Let A(k) : L → N be the load assignment function at time step k. The load of a worker Nj ∈ N ,
+254             (k)
+      denoted Lj , is defined as the sum of the effective workloads of the layers assigned to it:
+255
+256
+                                              (k)                                  (k)
+                                                                X
+257                                         Lj      =                              ci .
+258                                                      li ∈(A(k) )−1 (Nj )
+259
+                                                                                    (k)      (k)
+260   Ideally, the load should be balanced across all workers, i.e., Lj ≈ Lj ′ for all Nj , Nj ′ ∈ N . How-
+261   ever, if the pruning method does not prune each layer uniformly (e.g., global magnitude pruning),
+262                  (k)
+      the fraction pi may vary significantly across layers, leading to load imbalance.
+263
+            (k)        (k)
+264   Let Lmax and Lmin denote the maximum and minimum loads among the workers at time step k:
+265
+266                                                       (k)             (k)                     (k)
+                                L(k)
+                                 max =      max         Lj ,         Lmin =           min        Lj .
+267                                      j∈{1,...,n}                               j∈{1,...,n}
+268
+269   The load imbalance ∆L(k) at time step k is defined as the relative difference between the maximum
+      and minimum loads:
+
+
+                                                                5
+      Under review as a conference paper at ICLR 2025
+
+
+270
+271                                                               (k)         (k)
+                                                               Lmax − Lmin
+272                                            ∆L(k) =           Pn     (k)
+                                                                            .
+                                                               1
+273                                                            n   j=1 Lj
+274
+      In practice, non-uniform pruning introduces significant differences in layer workloads, causing im-
+275
+      balances that lead to pipeline stalls or bubbles Zhu & Gupta (2017); Frankle & Carbin (2018);
+276
+      Bellec et al. (2017). These bubbles occur because certain workers become idle while waiting for the
+277   completion of tasks assigned to workers handling more heavily pruned layers. This dynamic load
+278   imbalance emphasizes the need for adaptive load balancing strategies to efficiently handle pruned
+279   models in distributed training scenarios. Appendix B elaborates on the factors that drive pruning:
+280   pruning criteria, structure, schedule.
+281
+      Layer freezing
+282
+283   Layer freezing is a technique used to reduce computational costs during training by halting updates
+284   to certain layers of an LLM once they have converged. While layer freezing can lead to significant
+285   efficiency gains, it also introduces load imbalance when the frozen layers are unevenly distributed
+286
+      among workers.
+287   Let L = {l1 , l2 , . . . , ld } denote the set of layers in the DNN, where each layer li is assigned to a
+288   worker Ni ∈ N . During training, earlier layers of the network often converge faster Wang et al.
+                                                                                                   (k)
+289   (2022), leading to the possibility of freezing these layers to reduce computation. Let fi ∈ {0, 1}
+290   be an indicator variable for layer li at time step k, where:
+291
+292
+                                             1, if layer li is frozen at time step k,
+                                  (k)
+293                              fi =
+                                             0, otherwise.
+294
+295                                                                                     (k)
+      The effective workload of a layer li at time step k, denoted ci , is adjusted based on its frozen
+296
+      status:
+297
+298
+                                                   (k)                  (k)
+299                                               ci       = (1 − fi ) · ci ,
+300
+                                                                                         (k)              (k)
+301   where ci is the initial workload of layer li before freezing. If fi                      = 1, then ci     = 0, indicating
+302   that the layer contributes no computational load.
+303   The total workload at time step k is:
+304
+305                                                               d
+                                                                     (k)
+                                                                  X
+306                                                    C (k) =      ci .
+307                                                               i=1
+308
+309   Let A(k) : L → N be the load assignment function at time step k. The load of a worker wj ∈ W,
+                (k)
+310   denoted Lj , is defined as:
+311
+312                                            (k)
+                                                                  X              (k)
+                                             Lj        =                         ci .
+313
+                                                           li ∈(A(k) )−1 (wj )
+314
+315                                                                                      (k)       (k)
+316
+      Ideally, the load should be balanced across all workers, i.e., Lj ≈ Lj ′ for all Nj , Nj ′ ∈ N .
+317
+      However, if frozen layers are not evenly distributed among workers, this can lead to significant load
+      imbalance.
+318
+           (k)         (k)
+319   Let Lmax and Lmin denote the maximum and minimum loads among the workers at time step k:
+320
+321                                                         (k)         (k)                      (k)
+                               L(k)
+                                max =        max           Lj ,       Lmin =        min         Lj .
+322                                      j∈{1,...,n}                             j∈{1,...,n}
+323
+      The load imbalance ∆L(k) at time step k is defined as:
+
+
+                                                                  6
+      Under review as a conference paper at ICLR 2025
+
+
+324
+325                                                             (k)             (k)
+                                                             Lmax − Lmin
+326                                          ∆L(k) =           Pn     (k)
+                                                                          .
+                                                             1
+327                                                          n   j=1 Lj
+328
+329   In practice, this imbalance occurs because the frozen layers often reside in the earlier parts of the net-
+330   work, which may be unevenly assigned across workers. This uneven distribution can cause certain
+331   workers to experience reduced computational load while others handle non-frozen, heavier work-
+332
+      loads, resulting in pipeline stalls Shen et al. (2020). As a result, dynamic load balancing strategies
+      are needed to address the changing workload during training when using layer freezing.
+333
+334   Dynamic Sparse Flash Attention
+335
+      Dynamic sparse flash attention is a recent technique that combines hash-based sparse attention with
+336   FlashAttention Dao et al. (2024); Pagliardini et al. (2023). This approach leverages dynamic spar-
+337   sification to accelerate attention computations by restricting the attention matrix to specific blocks
+338   determined by hash codes. However, the varying levels of sparsification across layers introduce
+339   significant load imbalances during distributed training.
+340
+      Let L = {l1 , l2 , . . . , ld } be the set of layers in the neural network, where each layer li employs
+341
+      a dynamic sparse attention mechanism. The workload of each layer depends on the sparsity level
+342   induced by the hash-based attention mechanism, which varies dynamically during training.
+343
+                  (k)                                                                   (k)
+344   Define si as the sparsity factor of layer li at time step k, where si ∈ [0, 1] represents the fraction
+345   of non-zero elements in the attention matrix after sparsification. The effective workload of layer li
+                               (k)
+346   at time step k, denoted ci , is adjusted based on the sparsity factor:
+347
+348                                                    (k)       (k)
+                                                    ci       = si      · ci ,
+349
+350
+      where ci is the initial workload of layer li before applying dynamic sparsification. The total work-
+351   load at time step k is:
+352
+353
+                                                                d
+354                                                                (k)
+                                                                X
+                                                    C (k) =       ci .
+355
+                                                                i=1
+356
+357
+      Let A(k) : L → N be the load assignment function at time step k. The load of a worker Nj ∈ N ,
+358             (k)
+      denoted Lj , is defined as:
+359
+360
+                                              (k)                                 (k)
+                                                                X
+361                                         Lj      =                            ci .
+362                                                      li ∈(A(k) )−1 (Nj )
+363
+364                                                                                                    (k)   (k)
+      In an ideal scenario, the loads should be balanced across all workers, i.e., Lj ≈ Lj ′ for all
+365   Nj , Nj ′ ∈ N . However, due to the dynamic nature of hash-based sparse attention, the sparsity
+366            (k)
+      factor si can vary significantly across layers, causing discrepancies in the workloads assigned to
+367
+      different workers.
+368
+            (k)         (k)
+369   Let Lmax and Lmin denote the maximum and minimum loads among the workers at time step k:
+370
+371                                                       (k)          (k)                       (k)
+                                L(k)
+                                 max =      max         Lj ,        Lmin =            min       Lj .
+372                                      j∈{1,...,n}                              j∈{1,...,n}
+373
+374   The load imbalance ∆L(k) at time step k is defined as:
+375
+376                                                             (k)             (k)
+                                                             Lmax − Lmin
+377                                          ∆L(k) =           Pn     (k)
+                                                                          .
+                                                             1
+                                                             n   j=1 Lj
+
+
+                                                                7
+      Under review as a conference paper at ICLR 2025
+
+
+378
+      In practice, the dynamic sparsification introduced by hash-based attention leads to varying levels of
+379   computational effort among different layers and across different time steps Pagliardini et al. (2023).
+380   This variability results in significant load imbalances, as some workers may process layers with
+381   higher sparsity (lower workload), while others handle layers with denser attention matrices. Conse-
+382   quently, dynamic load balancing mechanisms are required to mitigate these imbalances and maintain
+383   efficient utilization of distributed resources during training.
+384
+      Early Exit
+385
+386   Early Exit is a technique that allows tokens to skip subsequent layers once they have reached a confi-
+387   dent state. While this method, also known as token pruning, can significantly reduce computational
+388
+      costs, it introduces a new form of load imbalance due to the uneven distribution of token processing
+      across layers.
+389
+390   Let L = {l1 , l2 , . . . , ld } denote the set of layers in the neural network, where tokens can exit the
+391   model early, skipping the remaining layers. Define t(k) as the total number of tokens being processed
+                                   (k)
+392   at time step k, and let ti be the number of tokens processed by layer li at time step k. In an Early
+393                   (k)
+      Exit scheme, ti generally decreases with the layer depth, as tokens exit before reaching deeper
+394   layers Schuster et al. (2022); Liu et al. (2022b).
+395
+                                                                                   (k)
+396   The effective workload of layer li at time step k, denoted ci , is proportional to the number of
+397   tokens processed by that layer:
+398
+399                                                             (k)
+                                                    (k)        ti
+400                                                ci      =        · ci ,
+                                                               t(k)
+401
+402   where ci is the initial workload of layer li before applying Early Exit. The total workload at time
+403   step k is:
+404
+405                                                            d
+                                                                  (k)
+                                                               X
+406                                                C (k) =       ci .
+407                                                            i=1
+408
+409   Let A(k) : L → N be the load assignment function at time step k. The load of a worker Nj ∈ N ,
+                (k)
+410   denoted Lj , is defined as:
+411
+                                             (k)                               (k)
+                                                               X
+412                                         Lj     =                          ci .
+413
+                                                        li ∈(A(k) )−1 (Nj )
+414
+415                                                                                      (k)       (k)
+      Ideally, the loads should be balanced across all workers, i.e., Lj                       ≈ Lj ′ for all Nj , Nj ′ ∈ N .
+416
+                                                                                                             (k)
+417   However, due to Early Exit, the number of tokens processed by deeper layers (ti for larger i)
+418   decreases significantly, leading to a reduced workload for workers handling these layers.
+419        (k)        (k)
+      Let Lmax and Lmin denote the maximum and minimum loads among the workers at time step k:
+420
+421                                                      (k)          (k)                        (k)
+422                            L(k)
+                                max =      max         Lj ,        Lmin =          min         Lj .
+                                         j∈{1,...,n}                           j∈{1,...,n}
+423
+424   The load imbalance ∆L(k) at time step k is defined as:
+425
+426                                                            (k)           (k)
+                                                            Lmax − Lmin
+427                                          ∆L(k) =          Pn     (k)
+                                                                         .
+                                                            1
+428                                                         n   j=1 Lj
+429
+430   In practice, Early Exit schemes cause severe load imbalances as fewer tokens reach the deeper
+431   layers, leading to underutilization of the workers responsible for these layers. The imbalance can be
+      exacerbated, resulting in increased bubble ratios (up to 5x) due to idle time Schuster et al. (2022).
+
+
+                                                               8
+      Under review as a conference paper at ICLR 2025
+
+
+432
+      This makes Early Exit an ideal case for dynamic load balancing strategies, such as repacking layers
+433   into fewer workers to sustain training throughput.
+434
+435   Mixture of Depths
+436   Mixture of Depths(MoDs) Raposo et al. (2024) is a technique that generalizes the early exit scheme
+437   by allowing tokens to skip not only the final layers but also intermediate ones. The version of MoDs
+438   used in this paper is based on expert choice, leveraging Mixture of Experts (MoEs) for enhanced
+439   performance. However, the dynamic nature of layer skipping and the inherent variability in expert
+440   choice introduce significant load imbalances during distributed training.
+441   Let L = {l1 , l2 , . . . , ld } be the set of layers in the neural network, and t(k) be the total number of
+442   tokens being processed at time step k. In the Mixture of Depths scheme, tokens can skip intermediate
+443   layers based on expert predictions, leading to a varying number of tokens processed at each layer.
+444        (k)
+      Let ti denote the number of tokens processed by layer li at time step k.
+445
+                  (k)
+446   Define ri as the routing weight for layer li , determined by an auxiliary MLP predictor that esti-
+447   mates whether a token should bypass that layer or not. The effective workload of layer li at time
+                       (k)
+448   step k, denoted ci , is then:
+449
+450                                               (k)           (k)      (k)
+                                                 ci       = ri        · ti     · ci ,
+451
+452   where ci is the initial workload of layer li before applying the MoD scheme. The total workload at
+453   time step k is:
+454
+455                                                               d
+                                                                     (k)
+                                                                  X
+                                                          (k)
+456                                                   C         =   ci .
+457                                                               i=1
+458         (k)
+      Let A : L → N be the load assignment function at time step k. The load of a worker Nj ∈ W,
+459            (k)
+460
+      denoted Lj , is defined as:
+461
+                                              (k)                                   (k)
+                                                                 X
+462                                         Lj        =                           ci .
+463                                                       li ∈(A(k) )−1 (Nj )
+464
+                                                                                                         (k)   (k)
+465   In an ideal scenario, the loads would be balanced across all workers, i.e., Lj ≈ Lj ′ for all
+466   wj , wj ′ ∈ W. However, two main factors contribute to load imbalance in the MoD scheme:
+467   1. **Prediction Inaccuracies**: The auxiliary MLP predictor used to route tokens can misesti-
+468   mate whether a token will be among the top-k selected for the next layer. These inaccuracies lead
+469                       (k)
+      to fluctuations in ri , causing variability in the token distribution across layers. 2. **Integration
+470   with MoEs**: The MoD implementation leverages Mixture of Experts (MoEs) for improved perfor-
+471   mance, which introduces additional variability in token routing. Since the MoE layers dynamically
+472                                                                    (k)
+      select experts based on token features, the effective workload ci may differ significantly from the
+473   expected workload, amplifying the imbalance.
+474
+            (k)         (k)
+475   Let Lmax and Lmin denote the maximum and minimum loads among the workers at time step k:
+476
+                                                           (k)           (k)                       (k)
+477                             L(k)
+                                 max =      max           Lj ,        Lmin =            min       Lj .
+478                                      j∈{1,...,n}                                j∈{1,...,n}
+
+479
+      The load imbalance ∆L(k) at time step k is defined as:
+480
+481
+                                                                 (k)             (k)
+482                                                             Lmax − Lmin
+                                              ∆L(k) =             Pn     (k)
+                                                                             .
+483                                                             1
+                                                                n   j=1 Lj
+484
+485   Empirically, we observe imbalances of up to 18% in the MoD scheme due to the combined effects
+      of routing prediction errors and the inherent variability in expert selection in MoEs Raposo et al.
+
+
+                                                                 9
+      Under review as a conference paper at ICLR 2025
+
+
+486
+      Algorithm 1 End-to-end Training of Dynamic LLMs with DYN M O
+487
+          Input: model, train iters, rank, workers
+488       Input: dynamism args, balance args, pack args
+489    1: dynamism rat, dynamism region, dynamism freq ← dynamism args
+490    2: is load balance, balancer ← balance args
+491    3: is pack, num workers to pack ← pack args
+       4: dynamism idx ← 0
+492
+       5: dynamism iter ← NULL
+493    6: profile ← 0
+494    7: for iter ← 0 to train iters do
+495    8:     train step(model, profile)
+496    9:     if iter in dynamism region AND iter % prune freq == 0 then
+      10:           worker dynamism(model, dynamism rat[dynamism idx], rank)           ▷ Algo. 2 in Appendix C
+497
+      11:           dynamism idx += 1
+498   12:           dynamism iter = iter
+499   13:           if is load balance then
+500   14:                profile = 1
+501   15:           end if
+      16:      end if
+502
+      17:      if is load balance AND iter == dynamism iter + 1 then
+503   18:           load balance(model, balancer)                                      ▷ Algo. 3 in Appendix C
+504   19:           profile ← 0
+505   20:      end if
+506   21:      if is pack AND iter == dynamism iter + 1 then
+      22:           pack workload(model, num workers to pack)                          ▷ Algo. 4 in Appendix C
+507
+      23:      end if
+508   24: end for
+509
+510
+511   (2024). These imbalances result in uneven workloads across workers, necessitating adaptive load
+512   balancing strategies to maintain efficient training throughput.
+513
+514
+515   3     DYN M O : E LASTIC AND BALANCED E ND - TO - END T RAINING OF DYNAMIC
+516         LLM S
+517
+518   3.1   OVERVIEW
+519
+520   In this work, we use six example cases of dynamic models for which current (static) distributed
+521   training systems are not ready to handle efficiently. Even though we show the efficiency of our load
+522   balancing system for dynamic LLMs with these example cases, they can be a basis for expanding to
+523   other forms of dynamic models.
+524   Algorithm 1 shows the overall flow of operations of DYN M O with model dynamism. The dynamism
+525   function (line 10) depends on the target case. For instance, if the target case is parameter pruning,
+526   the dynamism function would apply global pruning on different worker. The algorithm takes as in-
+527   put a model, the number of training iterations, the rank of the accelerator, and several arguments for
+528   managing the dynamism, balancing, and packing the model’s workloads. We start the training with
+529   the original model and train it until a user-specified dynamism to apply is reached. The frequency
+530   varies by the target case, in layer freezing it is as frequent as every 50 iterations, while in parameter
+531
+      tuning the pruning frequency is in the range of 3000-7000 iterations. The model or control flow
+      is altered only if the training is in the dynamism stage. In this stage, the model is adjusted every
+532
+      dynamism f req iteration, where the model (or control flow inside the model) is modified until it
+533
+      meets the specified stopping criteria (lines 9-16). The first iteration after each dynamism operation
+534   is used for profiling the time it takes to execute each layer in the altered model and the memory
+535   usage of all workers (accelerators) in the pipeline. Next, DYN M O collects the profiling information
+536   and decides on balancing the workload by moving layers across pipeline stages based on the execu-
+537   tion times of individual layers to minimize the pipeline stalls, subject to the constraints of memory
+538   capacity per worker (line 17-20). DYN M O also attempts to re-pack the total workload into fewer
+539   number of GPUs if the re-packing feature is enabled by the end user (line 21-23). Once the training
+      is out of the dynamism region, the balanced pipeline continues to execute with the model. Figure
+
+
+                                                         10
+      Under review as a conference paper at ICLR 2025
+
+
+540
+541
+542
+543
+544
+545
+546
+547
+548
+549
+550
+551
+552
+553
+554   Figure 2: Overview of DYN M O. The flow in the figure (top to bottom) is repeated until training is
+555   completed. Each yellow and orange rectangle represents a transformer layer. The size of a rectangle
+556   illustrates the amount of work in a layer. (1) shows the pipeline before the model starts to change
+557   due to dynamism. (2) some action (dynamically) changes the model, or the flow of work inside
+558   the model. (3) profiles the pipeline to check if there is any imbalance between stages, (4) performs
+559   load balancing based on the profiling results, (5) trains the balanced pipeline until the next time to
+560   rebalance, optionally it reduces the number of resources (GPUs) used in training by re-packing.
+561
+562
+      2 illustrates the overview of DYN M O with all its steps. The implementation of individual steps of
+563
+      model (or control-flow) altering, load balancing, and re-packing can be found in their respective
+564   sections.
+565
+566
+      3.2   P ROFILING THE DYNAMISM
+567
+568   To use DYN M O with different example cases of dynamic models, we profile the dynamism mecha-
+569   nism for each example case. By large, the mechanism for measuring the load balance, redistributing
+570   the load, and re-packing (when possible) does not vary from case to case. DYN M O operates as a
+571   black-box approach where the load balancing happens at regular fixed intervals, without any knowl-
+572   edge of whether the model has changed or not. As will be shown in the results section, the very low
+573   overhead allows DYN M O to be invoked even at the granularity of each iteration. More details on
+574   the dynamism in the example use cases, and the dynamic reconfiguration of the pipeline available in
+575
+      Appendix F.
+576
+577   3.3   L OAD BALANCING
+578
+579
+      DYN M O implements two load balancing algorithms, and can be extended to support other algo-
+      rithms. The first is centralized parameter-based partitioning that balances partitions based on the
+580
+      number of parameters. The load balancing algorithm is built on top of DeepSpeed’s load balanc-
+581
+      ing utility functions for partitioning in model parallelism Smith (2023). The second algorithm is
+582   an iterative decentralized diffusion-based algorithm that aims to minimize the variance between the
+583   workload of each rank by attempting to move layers from overloaded workers to underloaded ones
+584   in an iterative way. The workload cost can be described by either the layer execution times, or the
+585   parameter counts as in the centralized partitioning method.
+586
+      The diffusion-based load balancing algorithm achieves ideal load balancing by iteratively minimiz-
+587
+      ing workload imbalances using a Lyapunov-inspired approach. The potential function ϕ, defined as
+588   the sum of workload gaps between workers, serves as a measure of imbalance in the system. Each
+589   iteration of the algorithm reduces ϕ by redistributing tasks from overloaded to underloaded workers,
+590   prioritizing layer transfers that yield the largest reductions in imbalance while satisfying memory
+591   constraints. The algorithm’s probabilistic analysis guarantees that ϕ decreases towards a conver-
+592   gence threshold γ, with the rate of convergence bounded by O(N 2 log(SN /γ) log N ), where N
+593   is the number of workers and S is the total pipeline size. This systematic reduction ensures that
+      workload imbalances, quantified by the bubble ratio, are minimized, driving the system towards
+
+
+                                                       11
+      Under review as a conference paper at ICLR 2025
+
+
+594
+      an optimally balanced state. The theoretical guarantees of convergence and imbalance reduction
+595   underpin the algorithm’s robustness in dynamic environments.
+596
+597   We demonstrate that the two load balancing schemes (used in Algorithm 1) meet the goals for
+598
+      optimal load balancing by using the following lemmas. Lemmas proofs presented in Appendix C.
+599   Lemma 1. A centralized load balancer Lc over N workers satisfies maximum reduction in the
+600   imbalance Ni if and only if Ni reduces the bubble ratio to minimum.
+601
+      Lemma 2. An iterative decentralized diffusion based load balancer Ld over N workers satisfies
+602   maximum reduction in the imbalance Ni if and only if Ni reduces the bubble ratio to minimum.
+603   Also the load balancer is guaranteed to converge to the maximum reduction in imbalance in the
+604   following number of rounds
+605
+606
+607                                   2      SN           SN log N
+                               O min N log        log N ,
+608                                           γ              γ
+609
+610   where γ ∈ R>0 is the convergence factor and ∈ R>0 is the total number of stages in the pipeline.
+611
+612   3.4   R E - PACKING DYNAMIC M ODELS TO F EWER W ORKERS
+613
+614   Workload re-packing is the process of merging the total workload into a smaller number of work-
+615   ers (GPUs) with the purpose of using the available resources more efficiently, i.e. unused GPUs
+616   are released when the overall amount of work in training drops. This can be achieved with simple
+617   algorithms (in small scale) such as first-fit, best-fit, and round-robin as well as complex optimiza-
+618
+      tion heuristics. Workload re-packing aims to increase the worker utilization and reduce the overall
+      number of workers employed to continue the training process. For long training schedules that are
+619
+      common in LLM training, workload packing can result in substantial cost savings. It may also pro-
+620
+      vide improved performance due to reduction in the number of cross-worker communication calls,
+621   and smaller pipeline bubbles.
+622
+623   Re-packing Definition Re-packing occurs when the total workload C (k) decreases below a thresh-
+624   old τ . At this point, the model layers (tasks) are redistributed across a smaller subset of workers to
+625   optimize resource utilization. Let N (k) ⊆ N denote the active set of workers after re-packing at
+626   time step k, where |N (k) | ≤ n.
+627   The load assignment function after re-packing is denoted by A(k) : T → N (k) . The load of an
+628   active worker Ni ∈ N (k) is defined as:
+629
+630                                          (k)
+                                                               X              (k)
+631
+                                           Li      =                         cj .
+632                                                    tj ∈(A(k) )−1 (Ni )
+
+633
+      The objective after re-packing is to minimize the maximum load across the active workers:
+634
+635
+                                                                              (k)
+636                                          min               max           Li .
+                                          A(k) , N (k) i∈{1,...,|N (k) |}
+637
+638
+      Re-packing Condition Re-packing is triggered if:
+639
+640
+641                                      C (k) < τ        and |N (k) | < n.
+642
+643   The aim of re-packing is to reduce the number of active workers |N (k) |, while ensuring that the
+644
+      maximum load remains balanced:
+645
+646                                                             (k)        C (k)
+                                                max            Li     ≈            .
+647                                       i∈{1,...,|N (k) |}              |N (k) |
+
+
+                                                               12
+      Under review as a conference paper at ICLR 2025
+
+
+648
+      We use a first-fit algorithm for workload consolidation. The goal of this algorithm is to reduce the
+649   number of active workers (subject to memory capacity constraints). When the combined memory
+650   usage of every pair of workers is less than the memory capacity of a single worker, we migrate the
+651   layers in order to free one of the GPUs. This repeats in an iterative fashion for every two pairs until
+652   no more GPUs can be eliminated. Appendix C elaborates on our algorithm for efficient re-packing.
+653
+      When possible, repacking is an additional advantage to load balancing. We implement repacking in
+654
+      DYN M O at the load balancer level to enable the release of GPUs. To ensure the GPUs are released
+655   in a practical manner, we use the NCCL communicator splitting functionality to allow idle GPUs to
+656   be used by a concurrent communicator of the new job without the risk of deadlock. We elaborate
+657   on our method for releasing GPUs and list other alternative methods in Appendix C. DYN M O’s
+658   task ends at releasing the GPUs; reclamation of the released GPUs and assigning them new jobs
+659   by the middleware or scheduler is outside the scope of this paper. That being said, it is worth
+660   noting that in single-node multi-GPU systems, Nvidia Multi-Instance GPU (MIG) Nvidia (2023)
+661   supports node partitioning for multi-tenancy. GPUs that have been released can be returned to MIG
+662   for allocation to other tenants. In multi-node environments, cloud schedulers have the ability to
+663
+      acquire released resources and reassign them to other jobs, often leveraging technologies like elastic
+      Kubernetes Elastic (2023).
+664
+665
+666   3.5   OVERHEAD OF DYN M O AND F REQUENCY OF DYNAMISM
+667
+668   The overhead of DYN M O is negligible. For all the results we show in this paper, for all model
+669   sizes and different dynamism example cases, the percentage of overhead is a few single digits at
+670
+      its highest; this includes the complete overhead of DYN M O: profiling data collection, rebalancing
+      algorithm, and layers migration between GPUs. The evaluation section reports the load balancing
+671
+      overheads.
+672
+673   As a basic rule, we apply the rebalancing (via DYN M O) every time the model or the control flow
+674   changes. Since the overhead of DYN M O is very low, we could apply it as frequently as needed,
+675   based on the requirements of the applications. For example in gradual pruning the typical frequency
+676
+      of dynamism (i.e. model changes requiring load rebalancing) is in the order of 1,000s of iterations.
+      On the other hand, for MoEs and MoDs the rebalancing in every iteration since the imbalance
+677
+      is unpredictable and dependent on point the routing decision is taken, i.e., in the forward pass at
+678
+      each FFN. For MoEs and MoDs we rebalance in the back propagation phase where we attach the
+679   movement of layers to the pipeline parallelism scheme (i.e. we migrate the layers as we propagate
+680   the gradients back down the pipeline from the last layer to the first layer).
+681
+682
+683
+      3.6   L IMITATIONS
+684
+      We focus on dynamism for LLMs and currently do not support other types of DNNs. Our method
+685
+      cannot automatically detect imbalance in a way that is transparent to the training process, i.e., we
+686   apply DYN M O at a fixed frequency regardless of whether the model has changed or not. We also
+687   allow the user to set the frequency. As future work, a background light weight tracker can be used
+688   to identify the dynamism pattern. Another alternative would be training our method to forecast the
+689   imbalance during training.
+690
+691
+692   4     E VALUATION
+693
+694   This section contains empirical results and analysis of DYN M O’s effectiveness. Elaborate details on
+695   the software, hardware, and training environment in Appendix A.
+696   We conducted experiments using two dynamic load balancing algorithms, each with two different
+697   configurations. These algorithms were employed consistently the experiments for all six example
+698   cases of dynamic models. The first algorithm, referred to as Partition: by Param, is based on a
+699   DeepSpeed Rajbhandari et al. (2020) API. It uses a combination of binary search and linear probing
+700   to determine the optimal partitioning based on the parameter counts of the decoder layers. Another
+701   variation of this algorithm, called Partition: by Time, employs execution times of decoder layers as
+      input. The second algorithm is a decentralized iterative diffusion-based load balancing approach,
+
+
+                                                        13
+      Under review as a conference paper at ICLR 2025
+                                PERIODIC W/O and W Re-packing
+            720 A100 GPUs (90 nodes w\ 8x A100s) 30-way data parallel + 24-way pipeline
+702                            Mixture of Experts                                                   Gradual Pruning                                                        Layer Freezing
+                                                                                10,000                       Static (Megatron-LM)                                            Egeria
+703                                  Static (Megatron-LM)
+                                                                                                             Static (DeepSpeed)                                              DynMo w/o Re-packing
+                                     Static (DeepSpeed)                                                      DynMo w/o Re-packing                                  5,000
+704                          6,000
+                                                                                                             DynMo (Partition)                                               DynMo (Parition)
+                                     Tutel                                       8,000                       DynMo w/o Re-packing                                            DynMo w/o Re-packing
+705                                                      1.23x                                 2.32x         DynMo (Diffusion)
+                             5,000   DynMo w/o                                                                                                                     4,000     DynMo (Diffusion)
+                                     Re-packing                                                              2.78x                                                                1.36x
+706                                  DynMo w/o                                                                           2.84x
+
+
+                                                                   Tokens/sec
+
+
+                                                                                                                                                      Tokens/sec
+                                                                                 6,000
+                             4,000   Re-packing                                                                                                                                     1.48x
+                Tokens/sec
+707                                  DynMo (Partition)                                                                           2.61x                             3,000
+
+                             3,000   DynMo (Diffusion)                                                                                                                                 1.58x
+708                                   1.21x                                      4,000                                                                                                     1.69x
+                                                                                                                                                                   2,000
+709                          2,000
+
+710                                                                              2,000                                                                             1,000
+                             1,000
+711
+                                0                                                          0                                                                           0
+712                                                                                                 24        32         40       48                                         24     32   40       48
+                                Mixtral 8x7b LLaMA-MoE-3.5B
+713                                           Model
+                                                                                                           Number of Layers                                                    Number of Layers
+714                 Dynamic Sparse Attention                                                             Early Exit                                                         Mixture of Depths
+715                                     Dense Attn.                                                      No Early Exit                                5,000                    Static (Megatron-LM)
+                             6,000      DynMo w/o Re-packing                                   10,000
+                                        DynMo (Parition)                                                                                                                       Static (DeepSpeed)
+                                                                                                         DynMo w/o Re-packing
+716                                     DynMo w/o Re-packing                                                                                                                   DynMo w/o Re-packing
+                             5,000      DynMo (Diffusion)                                                DynMo (Parition)                             4,000
+717                                                                                             8,000                                                                          DynMo (Partition)
+                                             2.71x                                                       DynMo w/o Re-packing                                       1.17x      DynMo w/o Re-packing
+718                          4,000                 3.90x                                                 DynMo (Diffusion)
+                                                                                  Tokens/sec
+
+
+                                                                                                                                                                               DynMo (Diffusion)
+
+
+                                                                                                                                         Tokens/sec
+                                                                                                                                                      3,000                         1.17x
+                Tokens/sec
+
+
+719                                                                                             6,000         3.07x
+                             3,000
+                                                                                                                                                                                        1.16x
+720                                                4.02x                                                      2.70x                                                                       1.16x
+                                                                                                4,000                                                 2,000
+721                          2,000                                                                                    4.83x
+722                                                        3.73x                                                   2.39x
+                                                                                                2,000                                                 1,000
+                             1,000
+723
+724                              0                                                                 0                                                               0
+                                       24     32      40    48                                           24  32     40    48                                               24   32     40    48
+725                                     Number of Layers                                                 Number of Layers                                                   Number of Layers
+726
+      Figure 3: Throughput of end-to-end training for six different example cases. DYN M O rebalances
+727
+      at regular intervals w/o prior knowledge of dynamism. MoE, Sparse Attn., and MoDs: invoke
+728
+      DYN M O every iteration. Pruning, layer freezing, and early exit: invoke DYN M O every 100s to
+729   1,000s iterations. Speedup we report is the highest among balancing by number of parameters or
+730   layer execution time, divided by the highest among static Megatron-LM and DeepSpeed (or SoTA
+731   baseline, when available). MoEs and MoDs: we use 128 GPUs (16 nodes each with 4x H100s) in
+732   a hybrid of 8-way data parallel + 16-way pipeline). For gradual pruning, layer freezing, dynamic
+733   sparse attention, and early exit we use a total of 720 H100 GPUs (90 nodes each with 4x H100s) in
+734   a hybrid of 30-way data parallel + 24-way pipeline.
+735
+736   which iteratively minimizes load variances among workers. Similar to DeepSpeed, this balancer has
+737   two variants: Diffusion: by Param and Diffusion: by Time.
+738
+739   4.1    E ND - TO - END T RAINING T HROUGHPUT AND S PEEDUP
+740
+741   All our throughput and speedup results include the load balancing overhead, unless specified other-
+742   wise. We trained GPT models Radford et al. (2018) having different numbers of layers to determine
+743   the training throughput and speedup over static Megatron-LM and DeepSpeed (or SoTA baseline,
+744   when available). Figure 3 for MoEs, gradual pruning, and MoDs presents the highest throughput of
+745   two static and four dynamic load balancers. The first static balancer, Megatron-LM Shoeybi et al.
+746   (2019), evenly distributes layers across accelerators. The second static balancer, DeepSpeed Mi-
+747
+      crosoft (2023), balances the number of parameters before training begins. In contrast, each of the
+      two the dynamic load balancers (Partition and Diffusion) has two variants to redistribute the layers
+748
+      after each dynamism step: redistribute based on number of parameters or based on the layer exe-
+749
+      cution time. Parameter-based balancers require profiling after the pruning step for memory usage
+750   information, while time-based balancers require profiling for memory usage and layer execution
+751   time information. We report the highest among both. Figure 3 for layer freezing, dynamic sparse
+752   attention, and early exit compare the two dynamic load balancers (Partition and Diffusion) over
+753   SoTA baseline that exists for those example cases. We observed that the use of layer execution time
+754   for dynamic load balancing, such as diffusion or partitioning, consistently outperforms parameter
+755   count-based implementations across all scales. In every scale, execution time-based dynamic bal-
+      ancers surpass the baseline static balancers. As seen in the figure, most of the speedup reported
+
+
+                                                                                                               14
+      Under review as a conference paper at ICLR 2025
+
+
+                                                                                                                                                                                     H100
+
+756                                                 Re-packing Model While in-Training to Fewer GPUs                                                                                                                                                                         Load Balancing Overhead
+757                                  Throughput/# GPUs                  Throughput (Tokens/Sec)                                                                            Throughput/# GPUs       Throughput (Tokens/Sec)                                           Number of Layers à      24       32       40       48
+                            2,000
+                             8,000                  Gradual Pruning                                     10,000
+                                                                                                       40,000
+                                                                                                                                                            3,200
+                                                                                                                                                             800                     Freezing Layers                        5000
+                                                                                                                                                                                                                           16,000                                               Overhead    <0.1% <0.1% <0.1% <0.1%
+758                                                                                                                                                         2,800
+                                                                                                                                                             700                                                            4500
+                                                                                                                                                                                                                           14,000                                    Pruning
+                            1,800
+                             7,200                                                                      9,000
+                                                                                                       36,000                                                                                                                                                                   Breakdown
+                                                                                                                                                                                                                            4000                                     Param.
+
+
+                                                                                                                                                                                                                                           Throughput (Tokens/Sec)
+759                                                                                                                                                         2,400
+                                                                                                                                                             600                                                           12,000
+
+
+                                                                                                                                                       / # GPUs
+                            1,600
+                             6,400                                                                      8,000
+                                                                                                       32,000                                                                                                                                                                   Frequency   Every 2,300~4,400 iterations
+
+
+                                                                                                                                               (Tokens/Sec)
+                                                                                                                                                                                                                            3500
+      Throughput / # GPUs
+
+
+                                                                                                                                                             500
+                                                                                                                                                            2,000                                                          10,000
+                            1,400
+                             5,600   8   1st itr.    8   1st itr.   8    1st itr.   8   1st itr.       1st itr.
+                                                                                                      7,000
+                                                                                                   8 28,000                                                                                                                 3000                                                Overhead    <0.1% <0.1% <0.1% <0.1%
+760                                                                                                                                                          400
+                                                                                                                                                            1,600                                                              8,000
+                                                                                                                                                                                                                                2500                                 Layer
+
+
+                                                                                                                                            Throughput
+                            1,200
+                             4,800                                                                      6,000
+                                                                                                       24,000                                                                                                                                                                 Breakdown
+                                     6   2,300       6   3,000      6    3,600      6   4,400      6    5,800                                                                                                                   2000                                 Freezing
+761                         1,000
+                             4,000                                                                      5,000
+                                                                                                       20,000
+                                                                                                                                                             300
+                                                                                                                                                            1,200                                                              6,000
+                                                                                                                                                                                                                                1500                                          Frequency     Every 300 iterations
+
+
+                                                                                                                                                                                                                      OOM
+                                                                                                                                    Throughput
+                                     4   6,700       4   6,900      4    6,900      4   7,700      4 16,000
+                                                                                                       N/A                                                        200
+                                                                                                                                                                   800                                                          4,000
+762                           800
+                             3,200                                                                    4,000                                                                                                                     1000                                            Overhead        2%      7%       8%     13%
+
+
+                                                                                                                                                                                                                    OOM
+                                                                                                                                                                  100
+                                                                                                                                                                   400
+                              600
+                             2,400                                                                    3,000                                                                                                                    2,000
+                                                                                                                                                                                                                               500                                   Sparse
+                                     2   8,500       2   8,500      2    9,000      2   N/A        2 12,000
+                                                                                                       N/A                                                                                                                                                                      Breakdown
+763                           400
+                             1,600                                                                      2,000
+                                                                                                       8,000
+                                                                                                                                                                    0                                                          00                                    Attn.
+                                         5.4             5.7             5.9            6.4             7.2                                                              8 6 4 2 8 6 4 2 8 6 4 2 8 6 4 2                                                                        Frequency   (Ideally) every iteration
+
+
+                                                                                        OOM
+                                                                                        OOM
+                                                                                        OOM
+764                          200
+                              800         Average Number of GPUs Used Over 10,000 Iterations
+                                                                                                        1,000
+                                                                                                       4,000                                                             Throughput/#
+                                                                                                                                                                          24 Layers GPUs
+                                                                                                                                                                                      32 Layers Throughput
+                                                                                                                                                                                                 40 Layers (Tokens/Sec)
+                                                                                                                                                                                                              48 Layers
+                                                                                                                                                                                                                                                                                Overhead    <0.1%     0.1% 0.2% 0.3%
+                                                                                                                                        2,500
+                                                                                                                                        10,000                                                                            40,000
+                                                                                                                                                                                                                           10,000
+                                00                                                                     00                                                                                                                                                            Early
+765                                  8 6 4 2 8 6 4 2 8 6 4 2 8 6 4 2                                                                                                                    Early Exit                         9,000
+                                                                                                                                                                                                                          36,000
+                                                                                                                                                                                                                                                                     Exit
+                                                                                                                                                                                                                                                                                Breakdown
+                                                                                                                                        2,000
+                                                                                                                                         8,000                                                                             8,000
+                                                                                                                                                                                                                          32,000                                                Frequency   Every 100 iterations
+
+
+                                                                                                                                                                                                                                    Throughput (Tokens/Sec)
+                                     24 Layers       32 Layers      40 Layers       48 Layers
+766
+
+
+                                                                                                              Throughput / # GPUs
+                                                                                                                                                                                                                           7,000
+                                                                                                                                                                                                                          28,000
+                                     8   1st itr.    8   1st itr.   8    1st itr.   8   1st itr.                                                                                                                                                                                Overhead        2%      5%       5%      7%
+                                                                                                                                        1,500
+                                                                                                                                         6,000                                                                             6,000
+                                                                                                                                                                                                                          24,000
+767                                                                                                                                                                                                                        5,000
+                                                                                                                                                                                                                          20,000
+                                                                                                                                                                                                                                                                     MoDs       Breakdown
+                                     6   2,300       6   3,000      6    3,600      6   4,400
+                                                                                                                                        1,000                                                                              4,000                                                Frequency   Every iteration
+768                                                                                                                                      4,000                                                                            16,000
+
+                                     4   6,700       4   6,900      4    6,900      4   7,700                                                                                                                              3,000
+                                                                                                                                                                                                                          12,000                                     Models à               Mixtral 8x7b      LLaMA-3.5b
+769                                                                                                                                                500
+                                                                                                                                                   2,000                                                                   2,000
+                                                                                                                                                                                                                          8,000
+                                                                                                                                                                                                                                                                                Overhead                5%               4%
+
+
+                                                                                                                                                                                                        OOM
+
+                                                                                                                                                                                                               OOM
+                                                                                                                                                                                                               OOM
+                                                                                                                                                                                                               OOM
+                                     2   8,500       2   8,500      2    9,000      2   N/A                                                                                                                                1,000
+                                                                                                                                                                                                                          4,000
+770                                      5.4             5.7             5.9            6.4                                                                        0                                                      00                                         MoEs       Breakdown
+                                                                                                                                                                         8 6 4 2 8 6 4 2 8 6 4 2 8 6 4 2
+                                                                                                                                                                                                                                                                                Frequency   Every iteration
+771                                  Average Number of GPUs Used Over 10,000 Iterations
+                                                                                                                                                                         24 Layers   32 Layers   40 Layers    48 Layers
+
+772
+773
+      Figure 4: Re-packing the layers of GPT models into fewer GPUs as the model gets smaller due to
+774   dynamism. X-axis: Number of GPUs in pipeline parallelism using 90 nodes and up to 8 GPUs per
+775   node. Left Y-axis: throughput/number of GPUs shown with yellow bars. Right Y-axis: through-
+776   put (tokens/sec) shown with blue squares. Below: we show the average number of GPUs needed
+777   throughout the gradual pruning training at which we dynamically re-pack (total 10,000 iterations).
+778   Right: load balancing overhead for example cases. The overhead reported includes: profiling (in
+779        ), DYN M O load balancing algorithm (in       ), and migration of layers between GPUs (in
+780        ).
+781
+782
+783
+784   is attributed to balancing the load by redistributing the, and not due to the reduced communication
+785   when we re-pack: the speedup gain from re-packing is between 4 11% of the entire speedup gain. In
+786   other words, even if we do not re-pack at, the speedup gain remains almost the same. Hence we treat
+787   re-packing as just a way to be efficient by using less GPUs, and not as a way to speed up imbalanced
+788
+      dynamic training. Additional experiments demonstrating the effect of network bandwidth, vertical
+      scaling, and weak scaling are provided in Appendix E.
+789
+790   Mixture of Experts MoEs requires find-grained dynamism since the load vary from iteration to
+791   iteration. DYN M O shows more than 1.21x improvement on Mixtral 8x7b and LLaMA-MoE-3.5B in
+792   continual training. We do not change any of the hyperparameters from the original implementations.
+793   In addition to the Megatron-LM and DeepSpeed baselines, we also compare a highly MoE-tailored
+794
+      system: Tutel Hwang et al. (2022). DYN M O significantly outperforms Tutel: 1.18x on Mixtral 8x7b
+      and 1.21x on LLaMA-MoE-3.5B.
+795
+796   The improvement margins on MoEs and MoDs are in fact among the top in all six use cases, relative
+797   to how much for the bubble ratio was eliminated. DYN M O reduces the bubble ratios of MoEs
+798   and MoDs from 25% to 8% and 18% to 4%, respectively. As a result, the end-to-end training of
+799   two production models improve 1.21x on Mixtral 8x7b and 1.23x on LLaMA-MoE-3.5B. Those
+800
+      improvements would translate to significant cost savings, considering the huge cost of training those
+      models (and other similar models).
+801
+802   Gradual Pruning The pruning region starts from iteration 3000 and continues until iteration 7000
+803   and the model is pruned every 1000 iterations until the 90% target sparsity is reached. This corre-
+804   sponds to sparsity levels of 52%, 79%, and 90% after each pruning step. All other hyperparameters
+805   are the same as Megatron-LM. Using layer execution time for diffusion or partitioning dynamic load
+806
+      balancing outperforms the parameter count-based implementations in each scale, for up to 3.18x.
+807   Layer Freezing DYN M O ourperforms the SoTA layer freezing tool Egeria Wang et al. (2022). We
+808   can observe two main points. First, the speedups of different load balancing algorithms over static
+809   algorithms are largely similar. This is mainly because the different algorithms tend to arrive at
+      similar load balancing solutions when entire layers are frozen. Second, DYN M O shows increased
+
+
+                                                                                                                                                                                         15
+      Under review as a conference paper at ICLR 2025
+
+
+810
+      speedup as the number of layers increases, particularly with diffusion, primarily because Egeria’s
+811   overhead grows fast with the number of layers, while DYN M O overhead remains almost flat.
+812
+813   Dynamic Sparse Attention DYN M O achieves between 2.71x-4.02x speedup over the baseline
+814
+      dense attention (w/o sparsification). Dynamic sparse attention is the example case where DYN M O
+      is most efficient at removing the pipeline bubbles. That is since using layer time execution, which
+815
+      fluctuates a lot in dynamic sparse attention, enables effective redistribution of the layers.
+816
+      Early Exit DYN M O achieves more than 4x on average over the baseline w/o exit, i.e. when all
+817   tokens pass through the entire model. Similar to dynamic sparse attention, early exit benefits the
+818   most from DYN M O due to the big variance in load between earlier and later layers.
+819   Mixture of Depths Like MoEs, MoDs layer loads vary from iteration to iteration. DYN M O shows
+820   1.17x improvement on the baseline in continual training. We suspect MoDs will in the future be
+821   able to benefit more from custom load balancers that leverage the knowledge of how MoEs is used
+822   in hybrid with MoDs.
+823
+824   4.2   OVERHEAD OF L OAD BALANCING
+825
+826   Figure 4 (right) reports the load balancing overheads. This includes both the load balancing decision
+827
+      and the actual transfer of the parameters and other data of the layers to be sent or received, e.g., row
+      offsets and column indices in CSR format for gradual pruning, and gradients in the case of MoEs and
+828
+      MoDs. The overhead is generally negligible, hence giving the opportunity for the use of DYN M O in
+829
+      other forms of dynamic models, and not just the six example cases in this paper.
+830
+831
+      4.3   R E - PACKING M ODELS TO F EWER GPU S
+832
+833   In the re-packing experiments, the training starts with 8 GPUs per node in pipeline parallelism. After
+834   a dynamism step, DYN M O attempts to re-pack the total workload into fewer GPUs while satisfying
+835   the memory capacity constraints. Figure 4 reports the throughput/number of GPUs for each model
+836   size where the model is packed into 6, 4, and 2 GPUs. The 8 GPU setting for each model size serves
+837   as a baseline where there is no re-packing. This measurement also corresponds to the performance
+838   per dollar metric as the cost is directly proportional to the number of GPUs used in training.
+839   We observe that in all model scales, re-packing can allow the training to be continued with fewer
+840   GPUs which may result in significant cost savings. For example, in gradual pruning we reduce the
+841   GPU count from 8 to an average of 5.8 GPUs while sustaining the training throughout.
+842
+843
+      5     C ONCLUSION
+844
+845   DYN M O is a load-balancing system for dynamic models where the loads of the workers change
+846
+      during training. DYN M O provides better load balance than state-of-the-art static load balancing
+      approaches, which results in better efficiency and faster end-to-end training time. Empirical results
+847
+      for LLMs with six example cases of dynamic models show that DYN M O significantly improves the
+848
+      training throughput over the counterparts. We foresee that dynamic models will be more prominent
+849   in the future and dynamic load distribution will be of utmost importance.
+850
+851
+852
+853
+854
+855
+856
+857
+858
+859
+860
+861
+862
+863
+
+
+
+                                                        16
+      Under review as a conference paper at ICLR 2025
+
+
+864
+      R EFERENCES
+865
+866   Guillaume Bellec, David Kappel, Wolfgang Maass, and Robert Legenstein. Deep rewiring: Training
+867     very sparse deep networks. arXiv preprint arXiv:1711.05136, 2017.
+868
+      Dimitri P. Bertsekas. Auction algorithms for network flow problems: A tutorial introduction. Com-
+869
+        putational Optimization and Applications, 1(1):7–66, Oct 1992. doi: 10.1007/BF00247653. URL
+870
+        https://doi.org/10.1007/BF00247653.
+871
+872   Davis Blalock, Jose Javier Gonzalez Ortiz, Jonathan Frankle, and John Guttag. What is the state of
+873     neural network pruning? Proceedings of machine learning and systems, 2:129–146, 2020.
+874
+875
+      Yann Le Cun, John S. Denker, and Sara A. Solla. Optimal Brain Damage, pp. 598–605. Morgan
+        Kaufmann Publishers Inc., San Francisco, CA, USA, 1990. ISBN 1558601007.
+876
+877   Bin Dai, Chen Zhu, Baining Guo, and David Wipf. Compressing neural networks using the varia-
+878     tional information bottleneck. In International Conference on Machine Learning, pp. 1135–1144.
+879     PMLR, 2018.
+880
+881   Xiaoliang Dai, Hongxu Yin, and Niraj K Jha. Nest: A neural network synthesis tool based on a
+882     grow-and-prune paradigm. IEEE Transactions on Computers, 68(10):1487–1497, 2019.
+883
+      Tri Dao, Daniel Y. Fu, Stefano Ermon, Atri Rudra, and Christopher Ré. Flashattention: fast and
+884     memory-efficient exact attention with io-awareness. In Proceedings of the 36th International
+885     Conference on Neural Information Processing Systems, NIPS ’22, Red Hook, NY, USA, 2024.
+886     Curran Associates Inc. ISBN 9781713871088.
+887
+888   Kousik Dasgupta, Brototi Mandal, Paramartha Dutta, Jyotsna Kumar Mandal, and Santanu
+889     Dam. A genetic algorithm (ga) based load balancing strategy for cloud computing. Proce-
+890     dia Technology, 10:340–347, 2013. ISSN 2212-0173. doi: https://doi.org/10.1016/j.protcy.
+891
+        2013.12.369. URL https://www.sciencedirect.com/science/article/pii/
+        S2212017313005318. First International Conference on Computational Intelligence: Model-
+892
+        ing Techniques and Applications (CIMTA) 2013.
+893
+894   Marco Dorigo, Mauro Birattari, and Thomas Stutzle. Ant colony optimization. IEEE Computational
+895    Intelligence Magazine, 1(4):28–39, 2006. doi: 10.1109/MCI.2006.329691.
+896
+897   Elastic. Elastic cloud on kubernetes (eck), 2023. [Retrieved 22 January 2023].
+898
+      Maha Elbayad, Jiatao Gu, Edouard Grave, and Michael Auli. Depth-adaptive transformer. In In-
+899
+       ternational Conference on Learning Representations, 2020. URL https://openreview.
+900    net/forum?id=SJg7KhVKPH.
+901
+902   Erich Elsen, Marat Dukhan, Trevor Gale, and Karen Simonyan. Fast sparse convnets. In Proceedings
+903     of the IEEE/CVF conference on computer vision and pattern recognition, pp. 14629–14638, 2020.
+904
+      Shiqing Fan, Yi Rong, Chen Meng, Zongyan Cao, Siyu Wang, Zhen Zheng, Chuan Wu, Guoping
+905
+        Long, Jun Yang, Lixue Xia, et al. Dapple: A pipelined data parallel approach for training large
+906
+        models. In Proceedings of the 26th ACM SIGPLAN Symposium on Principles and Practice of
+907     Parallel Programming, pp. 431–445, 2021.
+908
+909   William Fedus, Barret Zoph, and Noam Shazeer. Switch transformers: Scaling to trillion parameter
+910    models with simple and efficient sparsity. J. Mach. Learn. Res., 23:120:1–120:39, 2022.
+911
+912
+      Wikimedia Foundation. Wikimedia downloads, 2023. URL https://dumps.wikimedia.
+       org.
+913
+914   Jonathan Frankle and Michael Carbin. The lottery ticket hypothesis: Finding sparse, trainable neural
+915     networks. arXiv preprint arXiv:1803.03635, 2018.
+916
+917   Trevor Gale, Erich Elsen, and Sara Hooker. The state of sparsity in deep neural networks. arXiv
+        preprint arXiv:1902.09574, 2019.
+
+
+                                                      17
+      Under review as a conference paper at ICLR 2025
+
+
+918
+      Trevor Gale, Matei Zaharia, Cliff Young, and Erich Elsen. Sparse gpu kernels for deep learning.
+919     In SC20: International Conference for High Performance Computing, Networking, Storage and
+920     Analysis, pp. 1–14. IEEE, 2020.
+921
+922   M. Hagiwara. Removal of hidden units and weights for back propagation networks. In Proceedings
+923    of 1993 International Conference on Neural Networks (IJCNN-93-Nagoya, Japan), volume 1, pp.
+924    351–354 vol.1, 1993. doi: 10.1109/IJCNN.1993.713929.
+925
+      Song Han, Jeff Pool, John Tran, and William Dally. Learning both weights and connections for
+926     efficient neural network. Advances in neural information processing systems, 28, 2015.
+927
+928   Yizeng Han, Gao Huang, Shiji Song, Le Yang, Honghui Wang, and Yulin Wang. Dynamic neural
+929     networks: A survey. IEEE Transactions on Pattern Analysis and Machine Intelligence, 2021.
+930
+      Aaron Harlap, Deepak Narayanan, Amar Phanishayee, Vivek Seshadri, Nikhil Devanur, Greg
+931
+        Ganger, and Phil Gibbons. Pipedream: Fast and efficient pipeline parallel dnn training. arXiv
+932     preprint arXiv:1806.03377, 2018.
+933
+934   Chaoyang He, Shen Li, Mahdi Soltanolkotabi, and Salman Avestimehr. Pipetransformer: Automated
+935     elastic pipelining for distributed training of transformers. arXiv preprint arXiv:2102.03161, 2021.
+936
+      Jiaao He, Jidong Zhai, Tiago Antunes, Haojie Wang, Fuwen Luo, Shangfeng Shi, and Qin Li.
+937
+         Fastermoe: Modeling and optimizing training of large-scale dynamic pre-trained models. In
+938
+         Proceedings of the 27th ACM SIGPLAN Symposium on Principles and Practice of Parallel
+939      Programming, PPoPP ’22, pp. 120–134, New York, NY, USA, 2022. Association for Com-
+940      puting Machinery. ISBN 9781450392044. doi: 10.1145/3503221.3508418. URL https:
+941      //doi.org/10.1145/3503221.3508418.
+942
+943   Yihui He, Ji Lin, Zhijian Liu, Hanrui Wang, Li-Jia Li, and Song Han. Amc: Automl for model
+944     compression and acceleration on mobile devices. In Proceedings of the European conference on
+945
+        computer vision (ECCV), pp. 784–800, 2018.
+946   Lennart Heim. Estimating palm’s training cost, Jun 2022. URL https://blog.heim.xyz/
+947     palm-training-cost/.
+948
+949   Torsten Hoefler, Dan Alistarh, Tal Ben-Nun, Nikoli Dryden, and Alexandra Peste. Sparsity in deep
+950     learning: Pruning and growth for efficient inference and training in neural networks. The Journal
+951
+        of Machine Learning Research, 22(1):10882–11005, 2021.
+952   Yanping Huang, Youlong Cheng, Ankur Bapna, Orhan Firat, Dehao Chen, Mia Chen, HyoukJoong
+953     Lee, Jiquan Ngiam, Quoc V Le, Yonghui Wu, et al. Gpipe: Efficient training of giant neural
+954     networks using pipeline parallelism. Advances in neural information processing systems, 32,
+955     2019.
+956
+957   Changho Hwang, Wei Cui, Yifan Xiong, Ziyue Yang, Ze Liu, Han Hu, Zilong Wang, Rafael Salas,
+958
+        Jithin Jose, Prabhat Ram, Joe Chau, Peng Cheng, Fan Yang, Mao Yang, and Yongqiang Xiong.
+        Tutel: Adaptive mixture-of-experts at scale. CoRR, abs/2206.03382, June 2022. URL https:
+959
+        //arxiv.org/pdf/2206.03382.pdf.
+960
+961   Robert A Jacobs, Michael I Jordan, Steven J Nowlan, and Geoffrey E Hinton. Adaptive mixtures of
+962     local experts. Neural computation, 3(1):79–87, 1991.
+963
+964   Albert Q. Jiang, Alexandre Sablayrolles, Antoine Roux, Arthur Mensch, Blanche Savary, Chris
+965
+        Bamford, Devendra Singh Chaplot, Diego de las Casas, Emma Bou Hanna, Florian Bressand, Gi-
+        anna Lengyel, Guillaume Bour, Guillaume Lample, Lélio Renard Lavaud, Lucile Saulnier, Marie-
+966
+        Anne Lachaux, Pierre Stock, Sandeep Subramanian, Sophia Yang, Szymon Antoniak, Teven Le
+967
+        Scao, Théophile Gervet, Thibaut Lavril, Thomas Wang, Timothée Lacroix, and William El Sayed.
+968     Mixtral of experts, 2024.
+969
+970   Albert Njoroge Kahira, Truong Thao Nguyen, Leonardo Bautista-Gomez, Ryousei Takano, Rosa M.
+971     Badia, and Mohamed Wahib. An oracle for guiding large-scale model/hybrid parallel training of
+        convolutional neural networks. In HPDC, pp. 161–173. ACM, 2021.
+
+
+                                                       18
+       Under review as a conference paper at ICLR 2025
+
+
+972
+       Nal Kalchbrenner, Erich Elsen, Karen Simonyan, Seb Noury, Norman Casagrande, Edward Lock-
+973      hart, Florian Stimberg, Aaron Oord, Sander Dieleman, and Koray Kavukcuoglu. Efficient neural
+974      audio synthesis. In International Conference on Machine Learning, pp. 2410–2419. PMLR, 2018.
+975
+976    Sehoon Kim, Sheng Shen, David Thorsley, Amir Gholami, Woosuk Kwon, Joseph Hassoun, and
+977      Kurt Keutzer. Learned token pruning for transformers. In Proceedings of the 28th ACM SIGKDD
+978
+         Conference on Knowledge Discovery and Data Mining, KDD ’22. ACM, August 2022. doi:
+         10.1145/3534678.3539260. URL http://dx.doi.org/10.1145/3534678.3539260.
+979
+980    J.K. Kruschke and J.R. Movellan. Benefits of gain: speeded learning and minimal hidden layers
+981       in back-propagation networks. IEEE Transactions on Systems, Man, and Cybernetics, 21(1):
+982       273–280, 1991. doi: 10.1109/21.101159.
+983
+       Dmitry Lepikhin, HyoukJoong Lee, Yuanzhong Xu, Dehao Chen, Orhan Firat, Yanping Huang,
+984
+        Maxim Krikun, Noam Shazeer, and Zhifeng Chen. Gshard: Scaling giant models with conditional
+985     computation and automatic sharding. arXiv preprint arXiv:2006.16668, 2020.
+986
+987    Mike Lewis, Shruti Bhosale, Tim Dettmers, Naman Goyal, and Luke Zettlemoyer. Base layers:
+988     Simplifying training of large, sparse models. In International Conference on Machine Learning,
+989     pp. 6265–6274. PMLR, 2021a.
+990    Mike Lewis, Shruti Bhosale, Tim Dettmers, Naman Goyal, and Luke Zettlemoyer. Base lay-
+991     ers: Simplifying training of large, sparse models. In Marina Meila and Tong Zhang (eds.),
+992     Proceedings of the 38th International Conference on Machine Learning, volume 139 of Pro-
+993     ceedings of Machine Learning Research, pp. 6265–6274. PMLR, 18–24 Jul 2021b. URL
+994     https://proceedings.mlr.press/v139/lewis21a.html.
+995
+       Chuan Li. Openai’s gpt-3 language model: A technical overview, Aug 2022. URL https://
+996
+         lambdalabs.com/blog/demystifying-gpt-3.
+997
+998    Hao Li, Asim Kadav, Igor Durdanovic, Hanan Samet, and Hans Peter Graf. Pruning filters for
+999      efficient convnets. arXiv preprint arXiv:1608.08710, 2016.
+1000
+       Shigang Li and Torsten Hoefler. Chimera: efficiently training large-scale neural networks with
+1001
+         bidirectional pipelines. In Proceedings of the International Conference for High Performance
+1002     Computing, Networking, Storage and Analysis, pp. 1–14, 2021.
+1003
+1004   Ji Lin, Yongming Rao, Jiwen Lu, and Jie Zhou. Runtime neural pruning. In Proceedings of the 31st
+1005      International Conference on Neural Information Processing Systems, NIPS’17, pp. 2178–2188,
+1006      Red Hook, NY, USA, 2017. Curran Associates Inc. ISBN 9781510860964.
+1007   Tao Lin, Sebastian U Stich, Luis Barba, Daniil Dmitriev, and Martin Jaggi. Dynamic model pruning
+1008     with feedback. arXiv preprint arXiv:2006.07253, 2020.
+1009
+1010   Liu Liu, Zheng Qu, Zhaodong Chen, Fengbin Tu, Yufei Ding, and Yuan Xie. Dynamic sparse
+1011
+         attention for scalable transformer acceleration. IEEE Transactions on Computers, 71(12):3165–
+         3178, 2022a. doi: 10.1109/TC.2022.3208206.
+1012
+1013   Yuhan Liu, Saurabh Agarwal, and Shivaram Venkataraman. Autofreeze: Automatically freezing
+1014     model blocks to accelerate fine-tuning, 2021.
+1015
+       Zhuang Liu, Zhiqiu Xu, Hung-Ju Wang, Trevor Darrell, and Evan Shelhamer. Anytime dense pre-
+1016
+         diction with confidence adaptivity. In ICLR. OpenReview.net, 2022b.
+1017
+1018   Microsoft. Deepspeed user guide: Pipeline parallelism. URL https://
+1019    deepspeed.readthedocs.io/en/latest/pipeline.html#deepspeed.pipe.
+1020    PipelineModule.
+1021
+       Microsoft. Microsoft/deepspeed: A deep learning optimization library that makes distributed
+1022
+        training and inference easy, efficient, and effective., 2023. URL https://github.com/
+1023    microsoft/deepspeed.
+1024
+1025   Mistral. Hugging face: Mixtral of experts, May 2024. URL https://huggingface.co/
+        papers/2401.04088.
+
+
+                                                     19
+       Under review as a conference paper at ICLR 2025
+
+
+1026
+       Decebal Constantin Mocanu, Elena Mocanu, Peter Stone, Phuong H Nguyen, Madeleine Gibescu,
+1027     and Antonio Liotta. Scalable training of artificial neural networks with adaptive sparse connec-
+1028     tivity inspired by network science. Nature communications, 9(1):1–12, 2018.
+1029
+1030   Dmitry Molchanov, Arsenii Ashukha, and Dmitry Vetrov. Variational dropout sparsifies deep neural
+1031
+        networks. In International Conference on Machine Learning, pp. 2498–2507. PMLR, 2017.
+1032   Timothy Prickett Morgan.    Counting the cost of training large language mod-
+1033     els, Dec 2022.         URL https://www.nextplatform.com/2022/12/01/
+1034     counting-the-cost-of-training-large-language-models/.
+1035
+       Hesham Mostafa and Xin Wang. Parameter efficient training of deep convolutional neural networks
+1036
+         by dynamic sparse reparameterization. In International Conference on Machine Learning, pp.
+1037     4646–4655. PMLR, 2019.
+1038
+1039   Michael C. Mozer and Paul Smolensky. Skeletonization: A Technique for Trimming the Fat from a
+1040    Network via Relevance Assessment, pp. 107–115. Morgan Kaufmann Publishers Inc., San Fran-
+1041
+        cisco, CA, USA, 1989. ISBN 1558600159.
+1042   Deepak Narayanan, Mohammad Shoeybi, Jared Casper, Patrick LeGresley, Mostofa Patwary, Vi-
+1043     jay Korthikanti, Dmitri Vainbrand, Prethvi Kashinkunti, Julie Bernauer, Bryan Catanzaro, et al.
+1044     Efficient large-scale language model training on gpu clusters using megatron-lm. In Proceed-
+1045     ings of the International Conference for High Performance Computing, Networking, Storage and
+1046     Analysis, pp. 1–15, 2021.
+1047   Nvidia. Nvidia nccl user guide. URL https://docs.nvidia.com/deeplearning/
+1048     nccl/user-guide/docs/usage/communicators.html.
+1049
+1050   Nvidia. Nvidia multi-instance gpu (mig), 2023. URL https://www.nvidia.com/en-us/
+1051
+         technologies/multi-instance-gpu/. [Retrieved 18 January 2023].
+1052   Matteo Pagliardini, Daniele Paliotta, Martin Jaggi, and François Fleuret. Fast attention over long se-
+1053    quences with dynamic sparse flash attention. In Thirty-seventh Conference on Neural Information
+1054    Processing Systems, 2023. URL https://openreview.net/forum?id=UINHuKeWUa.
+1055
+       Sai Prasanna, Anna Rogers, and Anna Rumshisky. When bert plays the lottery, all tickets are win-
+1056
+         ning. arXiv preprint arXiv:2005.00561, 2020.
+1057
+1058   Fareed Qararyah, Mohamed Wahib, Doğa Dikbayır, Mehmet Esat Belviranli, and Didem Unat. A
+1059     computational-graph partitioning method for training memory-constrained dnns. Parallel com-
+1060     puting, 104:102792, 2021.
+1061   Penghui Qi, Xinyi Wan, Guangxing Huang, and Min Lin. Zero bubble (almost) pipeline parallelism.
+1062     In The Twelfth International Conference on Learning Representations, 2024. URL https:
+1063     //openreview.net/forum?id=tuzTN0eIO5.
+1064
+       Alec Radford, Jeffrey Wu, Rewon Child, David Luan, Dario Amodei, and Ilya Sutskever. Lan-
+1065
+         guage models are unsupervised multitask learners. 2018. URL https://d4mucfpksywv.
+1066
+         cloudfront.net/better-language-models/language-models.pdf.
+1067
+1068   Samyam Rajbhandari, Jeff Rasley, Olatunji Ruwase, and Yuxiong He. Zero: Memory optimizations
+1069     toward training trillion parameter models. In SC20: International Conference for High Perfor-
+1070     mance Computing, Networking, Storage and Analysis, pp. 1–16. IEEE, 2020.
+1071   David Raposo, Sam Ritter, Blake Richards, Timothy P. Lillicrap, Peter Humphreys, and Adam San-
+1072     toro. Mixture-of-depths: Dynamically allocating compute in transformer-based language models.
+1073     2024. URL https://api.semanticscholar.org/CorpusID:268876220.
+1074
+1075
+       Alex Renda, Jonathan Frankle, and Michael Carbin. Comparing rewinding and fine-tuning in neural
+         network pruning. arXiv preprint arXiv:2003.02389, 2020.
+1076
+1077   Tal Schuster, Adam Fisch, Jai Gupta, Mostafa Dehghani, Dara Bahri, Vinh Q. Tran, Yi Tay, and
+1078     Donald Metzler. Confident adaptive language modeling. In Alice H. Oh, Alekh Agarwal, Danielle
+1079     Belgrave, and Kyunghyun Cho (eds.), Advances in Neural Information Processing Systems, 2022.
+         URL https://openreview.net/forum?id=uLYc4L3C81A.
+
+
+                                                         20
+       Under review as a conference paper at ICLR 2025
+
+
+1080
+       Jaime Sevilla, Lennart Heim, Anson Ho, Tamay Besiroglu, Marius Hobbhahn, and Pablo Villalobos.
+1081      Compute trends across three eras of machine learning. arXiv preprint arXiv:2202.05924, 2022.
+1082
+1083   Noam Shazeer, Azalia Mirhoseini, Krzysztof Maziarz, Andy Davis, Quoc Le, Geoffrey Hinton,
+1084
+         and Jeff Dean. Outrageously large neural networks: The sparsely-gated mixture-of-experts layer.
+         arXiv preprint arXiv:1701.06538, 2017a.
+1085
+1086   Noam Shazeer, Azalia Mirhoseini, Krzysztof Maziarz, Andy Davis, Quoc V. Le, Geoffrey E. Hin-
+1087     ton, and Jeff Dean. Outrageously large neural networks: The sparsely-gated mixture-of-experts
+1088     layer. In ICLR (Poster). OpenReview.net, 2017b. URL http://dblp.uni-trier.de/db/
+1089     conf/iclr/iclr2017.html#ShazeerMMDLHD17.
+1090   Sheng Shen, Alexei Baevski, Ari S Morcos, Kurt Keutzer, Michael Auli, and Douwe Kiela. Reser-
+1091     voir transformers. arXiv preprint arXiv:2012.15045, 2020.
+1092
+       Mohammad Shoeybi, Mostofa Patwary, Raul Puri, Patrick LeGresley, Jared Casper, and Bryan
+1093
+        Catanzaro. Megatron-lm: Training multi-billion parameter language models using model par-
+1094
+        allelism. arXiv preprint arXiv:1909.08053, 2019.
+1095
+1096   Prasoon Sinha, Akhil Guliani, Rutwik Jain, Brandon Tran, Matthew D Sinclair, and Shivaram
+1097     Venkataraman. Not all gpus are created equal: Characterizing variability in large-scale,
+1098
+         accelerator-rich systems. arXiv preprint arXiv:2208.11035, 2022.
+1099   Shaden Smith. Pipeline parallelism, Jan 2023. URL https://www.deepspeed.ai/
+1100     tutorials/pipeline/#load-balancing-pipeline-modules.
+1101
+       A. M. Sukhov and N. Kuznetsova. What type of distribution for packet delay in a global network
+1102
+         should be used in the control theory?, 2009.
+1103
+1104   Masahiro Tanaka, Kenjiro Taura, Toshihiro Hanawa, and Kentaro Torisawa. Automatic graph par-
+1105    titioning for very large-scale deep learning. In 2021 IEEE International Parallel and Distributed
+1106
+        Processing Symposium (IPDPS), pp. 1004–1013. IEEE, 2021.
+1107   Yi Tay, Dara Bahri, Liu Yang, Donald Metzler, and Da-Cheng Juan. Sparse sinkhorn attention,
+1108     2020.
+1109
+       Yi Tay, Mostafa Dehghani, Dara Bahri, and Donald Metzler. Efficient transformers: A survey.
+1110
+         ACM Comput. Surv., 55(6), dec 2022. ISSN 0360-0300. doi: 10.1145/3530811. URL https:
+1111     //doi.org/10.1145/3530811.
+1112
+1113   LLaMA-MoE Team. Llama-moe: Building mixture-of-experts from llama with continual pre-
+1114
+         training, May 2024. URL https://github.com/pjlab-sys4nlp/llama-moe.
+1115   Ashish Vaswani, Noam Shazeer, Niki Parmar, Jakob Uszkoreit, Llion Jones, Aidan N Gomez,
+1116     Łukasz Kaiser, and Illia Polosukhin. Attention is all you need. Advances in neural informa-
+1117     tion processing systems, 30, 2017.
+1118   Yiding Wang, Decang Sun, Kai Chen, Fan Lai, and Mosharaf Chowdhury. Efficient dnn training
+1119     with knowledge-guided layer freezing. arXiv preprint arXiv:2201.06227, 2022.
+1120
+1121   Mitchell Wortsman, Ali Farhadi, and Mohammad Rastegari. Discovering neural wirings. Advances
+1122
+        in Neural Information Processing Systems, 32, 2019.
+1123   Hao Zhang, Lianmin Zheng, Zhuohan Li, and Ion Stoica. Welcome to the ”big model” era:
+1124     Techniques and systems to train and serve bigger models, 2022. URL https://icml.cc/
+1125     virtual/2022/tutorial/18440.
+1126   Yanqi Zhou, Tao Lei, Hanxiao Liu, Nan Du, Yanping Huang, Vincent Zhao, Andrew Dai, Zhifeng
+1127     Chen, Quoc Le, and James Laudon. Mixture-of-experts with expert choice routing. arXiv preprint
+1128     arXiv:2202.09368, 2022a.
+1129
+       Yanqi Zhou, Tao Lei, Hanxiao Liu, Nan Du, Yanping Huang, Vincent Zhao, Andrew M. Dai, Zhifeng
+1130
+         Chen, Quoc V. Le, and James Laudon. Mixture-of-experts with expert choice routing. In NeurIPS,
+1131
+         2022b.
+1132
+1133   Michael Zhu and Suyog Gupta. To prune, or not to prune: exploring the efficacy of pruning for
+        model compression. arXiv preprint arXiv:1710.01878, 2017.
+
+
+                                                      21
+       Under review as a conference paper at ICLR 2025
+
+
+1134
+       A    S OFTWARE , H ARDWARE , AND T RAINING E NVIRONMENTS
+1135
+1136
+       Experiments were mainly conducted on a supercomputer at which each of the compute nodes con-
+1137   tains 2x AMD EPYC 9654 96-Core/2.4GHz processors, and 4x NVIDIA H100 SXM5 (80GB)
+1138   GPUs. The GPUs in the same node communicate with CPUs using PCIe Gen5 x16 per GPU,
+1139   and NVSwitch amongst the GPUs (NVLink34 x6). The compute nodes are connected by InfiniBand
+1140   NDR200 200Gbps x 4. We used CUDA 12.1, OpenMPI 4.0.7, and PyTorch 2.3.1 with NCCL 2.17.1
+1141   distributed backend.
+1142
+       We train the models on the Wikipedia dataset Foundation (2023). for Mixtral 7bx8 and LLaMA-
+1143   MoE-3.5B we do continual training. All models used for training have a sequence length of 2048, a
+1144   hidden size of 1024, 32 attention heads, and the models are trained with a micro-batch size of 2 and
+1145   batch size of 64 for 10,000 iterations, unless specified otherwise. For the multi-node experiments,
+1146   as we increase the number of workers (GPUs), we also increase the batch size to fix the number of
+1147   micro batches to four times the number of GPUs in the pipeline, as suggested in Huang et al. (2019)
+1148   to achieve good pipeline utilization.
+1149
+1150
+       B    B UBBLE R ATIO IN THE S TATIC M ODEL
+1151
+1152
+       In this Section we describe the theoretical bubble ratio that appears in the static model. The bubble
+1153   ratio refers to the ratio of the idle time of devices when different workers (GPUs) stall while waiting
+1154   for work to be available. Additional bubbles appear in the pipeline when the model become dynamic
+1155   (due to the load imbalance). The bubble ratio for the almost zero bubble pipeline scheme Qi et al.
+1156   (2024) we use in the paper is:
+1157                        2                         2                           2
+1158                      3 P2 − P + 6P − 2 P2 − P /P − 8 TC + 2 P2 − P TB
+1159                                                                                                       (1)
+                                      (3P 2 − 2P ) TC + (2P 2 − 2P ) TB + P 2 TF
+1160
+1161   where S is the number of pipeline stages, B is the number of micro-batches (chunks) in a single
+1162   iteration, P is the number of workers used in the pipeline, TF is the time cost for a complete forward
+1163   pass (all forward stages added together) divided by P, TB is the time cost for a complete backward
+1164
+       pass (all backward stages added together) divided by P, and TC is the communication time for
+       moving a from a worker to its neighbor for the un-overlappable portion of communication.
+1165
+1166   The bubble ratio is derived from the un-overlappable portions of communication TC and forward
+1167   pass TB (numerator of Equation
+                                      1) from the entire end-to-end span of the pipeline (denominator of
+                              2
+1168   Equation 1), where P2 − P is the gaps/stalls in the pipeline due to lack of components to overlap
+1169   after the forward and backward passes of the two duplicate models have been overlapped.
+1170
+1171   Figure 5 illustrates how the bubbles attributed to the dynamic sparsification adds up to, and is dif-
+1172
+       ferent from, the inherent bubbles that are observed in the pipeline scheme.
+1173
+1174
+1175
+1176
+1177
+1178
+1179
+1180
+1181
+1182
+1183
+1184
+1185
+1186   Figure 5: Illustration of bubble types in the almost zero bubble pipeline scheme Qi et al. (2024)
+1187
+       with 8 microbatches. Each row represent a GPU’s pipeline stages over time. Inherent bubbles in the
+       pipeline are shown in gray and bubbles introduced by dynamicity (e.g. sparsity) are shown in red.
+
+
+                                                         22
+       Under review as a conference paper at ICLR 2025
+
+
+1188
+       C        P RUNING , L OAD BALANCING , AND PACKING
+1189
+1190
+       C.1       N EURAL N ETWORKS P RUNING
+1191
+1192   There are three main considerations that need to be taken into account when applying network
+1193   pruning: criterion, structure, and schedule of the pruning.
+1194
+       Pruning Criterion: Every pruning scheme needs to define a criterion to choose which parameters to
+1195   prune. A non-exhaustive list of pruning criteria used in the literature includes: weight magnitude Li
+1196   et al. (2016); Renda et al. (2020), gradient magnitude Cun et al. (1990); Mozer & Smolensky (1989),
+1197   Bayesian statistics-based criteria Dai et al. (2018); Molchanov et al. (2017), and reinforcement learn-
+1198   ing based criteria Lin et al. (2017); He et al. (2018). These criteria can be applied either locally (i.e.
+1199   considering each layer’s weights separately) or globally (i.e. considering weights in all layers).
+1200
+       Pruning Structure: Parameters in a model can be removed in a structured or unstructured way.
+1201   Structured sparsity Kruschke & Movellan (1991) enforces a pattern to be applied while choosing
+1202   the parameters to be pruned. This can range from removing filters in a convolution layer to remov-
+1203   ing attention heads in a multi-headed attention layer. On the other hand, unstructured sparsity Han
+1204   et al. (2015) is not under the constraint of a pattern (i.e parameters can be freely removed), hence,
+1205   offers a finer granularity. Even though unstructured sparsity offers better flexibility, structured spar-
+1206   sity is more prevalent since it is difficult to implement efficient kernels for sparse data structures
+1207   in unstructured sparsity and deep learning frameworks have limited support for sparse computa-
+1208   tions. However, it has been shown that the enforcement of a certain structure for the pruning of
+1209
+       parameters can result in significant degradation in model quality compared to unstructured sparsity
+       Kalchbrenner et al. (2018); Elsen et al. (2020).
+1210
+1211   Pruning Schedule: After choosing the criterion and the structure of the pruning, one must decide
+1212   when to prune and how often to prune. The most popular schedule in the literature consists of
+1213   pruning after training is over, and then fine-tune the model to recover the loss introduced by the
+1214   pruning Han et al. (2015). Another effective approach is to remove a certain percentage of weights
+1215
+       progressively during the training until the target sparsity is reached Zhu & Gupta (2017), which
+       eliminates the fine-tuning process. There are also schedules that enforce a constant rate of sparsity
+1216
+       throughout the training Mocanu et al. (2018).
+1217
+1218   For a more comprehensive analysis of various sparsification procedures which are applied in deep
+1219   learning, we refer the reader to Hoefler et al. (2021).
+1220
+1221   C.2       G RADUAL G LOBAL M AGNITUDE P RUNING
+1222
+1223
+       For our pruning design, we use the gradual pruning schedule proposed in Zhu & Gupta (2017) which
+       is formulated as:
+1224
+1225
+                                                    t − t0 3
+1226                    St = Sf + (Si − Sf )(1 −          ) ,      t ∈ {t0 , t0 + ∆t, ..., t + n∆t}             (2)
+1227                                                 n∆t
+1228   where Si , Sf , n, t0 , and ∆t are initial sparsity, final sparsity, number of pruning steps, initial pruning
+1229   step, and pruning frequency, respectively. The aim of this schedule is to prune the model rapidly in
+1230   the initial pruning steps since there are many irrelevant connections, then reduce the pruning rate as
+1231   the number of parameters in the network gets smaller.
+1232
+       We employed an unstructured magnitude pruning technique as opposed to a structured one since
+1233   unstructured magnitude pruning typically retains better accuracy under high sparsity rates Prasanna
+1234   et al. (2020). Unstructured magnitude pruning is applied globally (taking all parameters in the model
+1235   into account) instead of locally since it has been empirically shown that global pruning yields better
+1236   accuracy under high compression ratios Blalock et al. (2020).
+1237
+       To our knowledge, there is no deep learning framework that supports global pruning on a distributed
+1238
+       model at the time of this writing (support is only for undistributed models). Thus we implemented
+1239   our own global pruning algorithm as shown in Algorithm 2. The global pruning method takes three
+1240   arguments, namely the model, target sparsity, and the rank of the device. Note that each rank2 has
+1241
+           2
+               We use one MPI rank per GPU.
+
+
+                                                            23
+       Under review as a conference paper at ICLR 2025
+
+
+1242
+       Algorithm 2 Dynamism (Global Pruning as an Example)
+1243
+           Input: model, sparsity, rank
+1244
+           Output: model
+1245    1: params ← concat params(model)
+1246    2: k ← num params × (1 - sparsity)
+1247    3: local topk, local topk indices ← topk(abs(params), k)
+1248    4: topk values ← gather(local topk)
+1249    5: if rank == 0 then
+1250    6:      global topk indices ← topk(abs(topk values), k)
+1251    7: end if
+1252    8: indices to keep ← scatter(global topk indices)
+1253
+        9: model = compress model(model, indices to keep)
+       10: return model
+1254
+1255
+1256
+1257
+       only its own portion of the model. First, each rank finds its own local top-k parameters in terms of
+       magnitude (line 3). Then, rank 0 gathers the top-k parameters of each rank (line 4). When rank 0
+1258
+       receives all top-k parameters, it calculates the indices of global top-k parameters to keep (line 6),
+1259
+       and sends the indices that belong to each rank (line 8). Finally, after each rank receives its indices
+1260   to keep, they prune (discard) parameters with all other indices in their local parameters (line 9).
+1261
+1262
+1263
+       C.3   L OAD BALANCING
+1264
+       DYN M O implements two load balancing algorithms, and can be extended to support other algo-
+1265
+       rithms. The first one is a centralized parameter-based partitioning method that balances partitions
+1266   based on the number of parameters. We also implemented a version where the same algorithm is
+1267   used for balancing partitions based on the layer execution times instead of the number of parame-
+1268   ters. This algorithm with two variants is built on top of DeepSpeed’s load balancing utility functions
+1269   for partitioning in model parallelism Smith (2023). The second algorithm is an iterative decentral-
+1270   ized diffusion-based algorithm that aims to minimize the variance between the workload of each
+1271   rank by attempting to move layers from overloaded ranks to underloaded ranks in an iterative way.
+1272   The workload can either be the layer execution times or the parameter counts as in the DeepSpeed-
+1273   based algorithms. The number of iterations to decide on the final load distribution is a user-defined
+1274
+       parameter.
+1275   Algorithm 3 shows the pseudo-code for the diffusion-based load balancing algorithm. At the start
+1276   of the balancing process, each worker evaluates their workload. A worker is deemed overloaded if
+1277   their total workload exceeds the average workload across all workers and underloaded otherwise.
+1278   Overloaded workers aim to offload some tasks to underloaded workers to achieve a more balanced
+1279   distribution.
+1280   The balancing process unfolds iteratively. In each iteration, overloaded workers identify a task that
+1281   contributes the least to their workload (e.g., a computational layer with minimal execution time).
+1282   This task is then considered for transfer to the underloaded worker with the lightest workload. For
+1283   every potential transfer, the algorithm computes the new workload distribution and evaluates the
+1284   variance. A transfer is accepted if it reduces the variance and satisfies the memory constraints of the
+1285   receiving worker. Accepted transfers are tracked, ensuring that tasks are redistributed efficiently.
+1286   By iteratively reducing workload variance through these localized decisions, the algorithm ensures a
+1287   progressively balanced distribution. After the balancing phase, the transfer information is distributed
+1288   to all workers, who update their local task assignments accordingly. This iterative and decentralized
+1289   approach allows for effective load balancing in dynamic, distributed systems.
+1290   We elaborat on the details of the algorithm in this paragraph. After rank 0 gathers the loads (i.e.
+1291   layer execution times or the number of parameters for each layer) from all ranks, it discovers all
+1292   layer transfers between ranks by calling a diffusion re-balance function. The number of iterations
+1293   to minimize the variance is an argument that can be tuned according to the workload. For each
+1294   iteration of balancing, the total load of each rank, variance, and average load are calculated (lines
+1295   3-5). Then, each rank is assigned a status: overloaded or underloaded (lines 6-7). After the status of
+       each rank is assigned, each overloaded rank attempts to send its least loaded layer to the least loaded
+
+
+                                                         24
+       Under review as a conference paper at ICLR 2025
+
+
+1296
+       Algorithm 3 Diffusion-based Load Balancing Algorithm
+1297
+           Input: loads, num ranks, max iters, times, mem info
+1298
+           Output: transfers (list)
+1299    1: transfers ← []
+1300    2: for iter ← 0 to max iters do
+1301    3:     total loads ← [sum(t) for t in times]
+1302    4:     avg load ← average(total loads)
+1303    5:     var ← variance(total loads)
+1304    6:     status ← [”Overloaded” if l > avg load
+1305    7:                    else ”Underloaded” for l ∈ loads]
+1306    8:     for src ← 0 to num ranks do
+1307
+        9:          if status[src] == ”Overloaded” then
+       10:               dst ← get least loaded rank(loads)
+1308
+       11:               lyr idx ← get least loaded layer(src, times)
+1309
+       12:               new loads ← update loads(src, dst, lyr idx, loads)
+1310   13:               new total loads ← [sum(l) for l ∈ new loads]
+1311   14:               new var ← variance(new total loads)
+1312   15:               mem req = sum(mem info[dst]) +
+1313   16:                         mem info[src][lyr idx]
+1314   17:               if new var < var && mem req < MAX MEM then
+1315   18:                   var ← new var
+1316   19:                   loads ← new loads
+1317   20:                   update mem info(src, dst, lyr idx, mem info)
+1318
+       21:                   transfers.append((src, dst, lyr idx))
+       22:               end if
+1319
+       23:          end if
+1320
+       24:     end for
+1321   25: end for
+1322   26: return transfers
+1323
+1324
+1325   rank (lines 7-24). Every time an overloaded rank attempts to send a layer to an underloaded rank,
+1326   new loads and variance are calculated (lines 12-14). If the new variance is smaller than the current
+1327   variance and it satisfies the memory constraints of the destination rank, the transfer is accepted and
+1328   added to the transfers list in the format of (source, destination, layer id) (lines 17-22). When rank
+1329   0 discovers all layer transfers from source ranks to destination ranks, it distributes the information
+1330   to other ranks and the sparse format data structures, CSR, of the layers to be transferred are sent to
+1331
+       their new destinations.
+1332   We now demonstrate that the two load balancing schemes (used in Algorithm 3) meet the goals for
+1333   optimal load balancing by using the following lemmas. Detailed proofs on the lemmas are presented
+1334   in the supplementary material.
+1335
+1336   C.3.1   P ROOF OF L EMMA 1
+1337
+       Lemma 1. A centralized load balancer Lc over N workers satisfies maximum reduction in the
+1338
+       imbalance Ni if and only if Ni reduces the bubble ratio to minimum.
+1339
+1340   Proof. We will prove by contradiction. Suppose a centralized load balancer Lc over N workers satis-
+1341   fies maximum reduction in the imbalance Ni when Ni has a bubble ratio higher then the minimum.
+1342
+       By the definition of maximum reduction in load balance, Lc must preserve minimum differential
+       between the loads of workers Ni and Nj , which Ni and Nj have the minimum load and maximum
+1343
+       loads in N , respectively. Consequently, increasing the bubble ratio of Nj changes the difference
+1344
+       of loads between Ni and Nj . This is in contradictory of Lc achieving the maximum reduction on
+1345   imbalance.
+1346
+1347   C.3.2   P ROOF OF L EMMA 2
+1348
+1349   Lemma 2. An iterative decentralized diffusion based load balancer Ld over N workers satisfies
+       maximum reduction in the imbalance Ni if and only if Ni reduces the bubble ratio to minimum.
+
+
+                                                        25
+       Under review as a conference paper at ICLR 2025
+
+
+1350
+       Also the load balancer is guaranteed to converge to the maximum reduction in imbalance in the
+1351   following number of rounds
+1352
+1353
+
+1354                                   2      SN           SN log N
+                                O min N log        log N ,
+1355                                           γ              γ
+1356
+1357   where γ ∈ R>0 is the convergence factor and S ∈ R>0 is the total number of stages in the pipeline.
+1358
+       Proof. We leverages core ideas from Lyapunov optimization. We first define a potential function, ϕ,
+1359
+       that measures at each round the total magnitude of workload gaps in the system:
+1360                                                   X
+1361                                 ∀r ≥ 0 : ϕ(r) =       |xu (r) − xv (r)|
+1362                                                   u,v∈V
+1363
+       Similar to a Lyapunov function, ϕ maps the system state (in this case, a vector of workloads for
+1364
+       N workers) at any given round to a non-negative scalar value that describes the desirability of the
+1365
+       current system state. As ϕ decreases toward 0, the system state becomes more desirable; i.e. the
+1366   workload is balanced across N . As in a standard Lyapunov optimization, we show below that the
+1367   modifications to a system state caused by executing a single round of our max neighbor algorithm
+1368   will drift the value of ϕ toward zero in a non-decreasing manner. We establish a probabilistic lower
+1369   bound for the amount of drift in a given round to obtain our time bounds.
+1370
+       For a given round r ≥ 0 and node pair u, v ∈ V , we define du,v (r) = |xu (r) − xv (r)| to describe
+1371
+       the gap between u and v’s workload at the end of that round. For each such r, we also define:
+1372   {{u, v} |u and v connected and averaged
+                                             Ptheir workloads in round r}, i.e., the set of node pairs that
+1373   connect and average in r, and Dr =       u,v∈Ar du,v (r − 1), i.e., the sum of gaps averaged in r.
+1374   Finally, we define tmax (r) = maxu,v∈V {du,v (r)} to describe the largest gap between any two
+1375   nodes at the end of round r. From the above analysis that ϕ(r) decreases by at least Dr in each
+1376   round r, we proceed to prove the converge time complexity bound.
+1377
+       For a maximum number of rounds to converge to the minimum imbalance:
+1378
+
+1379                                      2     SN             SN log N
+                            O min N log                log N ,
+1380                                             γ                γ
+1381
+1382   Note that these two bounds essentially coincide at Õ(N 2 ) with γ = Θ(S/n), where the notation Õ
+1383
+       hides logarithmic factors. In other words, if we want all nodes to have the same workload up to a
+1384   constant factor, the max neighbor strategy uses Õ(N 2 ) rounds. We first note that if we arrive at a
+1385
+       round r in which ϕ(r) ≤ γ, then the system ends this round γ-converged, i.e. the sum of the gaps is
+       at most γ, and thus clearly any individual gap is at most γ. Since ϕ is monotonically non-increasing,
+1386
+       it follows that every round r′ ≥ r is also γ-converged. So we just need to show that with high
+1387
+       probability, ϕ will decrease to γ in the time bound stated by the theorem statement.
+1388
+1389   For each r ≥ 1, we call r “good” if and only if ϕ(r − 1) − ϕ(r) ≥ smax (r − 1)/(60 ln(2n)). We
+1390   next calculate how many good rounds guarantee that ϕ falls below γ. To do so, we first note that,
+1391
+       non-good rounds cannot increase ϕ, so we are safe to focus only on reductions generated by good
+       rounds in calculating our bound.
+1392
+1393   By the definition of ϕ, for each r ≥ 1 we know that ϕ(r) < smax (r)n2 . It follows that if r is a good
+                                                                                        1
+1394   round, then it decreases ϕ(r − 1) by a multiplicative factor less than (1 − 60n2 ln(2n) ). Finally, we
+                                                                 2
+1395   also observe that smax (0) ≤ S and therefore ϕ(0) < Sn . Leveraging these observations, to find
+1396   the number of good rounds needed to decrease ϕ below γ, we just need to find the minimum s time
+1397   steps such that
+1398
+                                                          1
+
+1399                                       Sn2 1 −                   ≤γ
+                                                    60n2 ln(2n)
+1400
+1401   A simple calculation implies that scon = 60n2 ln(2n)ln(Sn2 γ −1 ) is sufficient to satisfy this in-
+1402   equality. We have now established that after scon good rounds the system will be γ-converged for
+1403   all future rounds. We are left to bound the number of rounds required to generate scon good rounds
+       with high probability.
+
+
+                                                        26
+       Under review as a conference paper at ICLR 2025
+
+
+1404
+       Algorithm 4 Re-pack Layers into Fewer Workers
+1405
+           Input: active workers, mem usage
+1406
+           Input: target num workers, num layers
+1407       Output: transfers (list)
+1408    1: transfers ← []
+1409    2: for src in range(num ranks) do
+1410    3:     for dst in range(src + 1, num ranks) do
+1411    4:         if mem usage[src] + mem usage[dst] < MAX MEM
+1412    5:        && sum(active workers) > target num workers then
+1413    6:             active workers[src] = 0
+1414    7:             for lyr idx in range(num layers[src]) do
+1415
+        8:                 transfers.append((src, dst, lyr idx))
+        9:             end for
+1416
+       10:             mem usage[dst] += mem usage[src]
+1417
+       11:             num layers[dst] += num layers[src]
+1418   12:         end if
+1419   13:     end for
+1420   14: end for
+1421   15: return transfers
+1422
+1423
+1424   For each round r, let Xr be the random indicator variable that evaluates to 1 if round r is good and
+1425   otherwise evaluates to 0. We know a given round r is good with probability at least 1/N , regardless
+1426   of the history of the execution through the round r − 1. We cannot, however, directly leverage this
+1427   observation to calculate (and concentrate) the expected sum of X variables for a given execution
+1428
+       length, as the distribution determining a given Xr might depend in part on the outcome of previous
+       experiments. To overcome this issue, we define for each round r, a trivial random indicator variable
+1429
+1430
+       X̂r that evaluates to 1 with independent probability 1/N and otherwise evaluates to 0. Note that for
+                                                                                    Ps
+1431   each r, Xr stochastically dominates X̂r , and therefore for each s > 0, Ys = r=1 Xr stochastically
+                                 Ps
+1432   dominates s > 0, Ŷs = r=1 X̂r . It follows for any s > 0, if Ŷs ≥ scon with some probability p
+1433   then Ys ≥ scon with probability at least p.
+1434   A Chernoff bound applied to Ŷs , for s = c.scon (where c ≥ 1 is a sufficiently large constant
+1435   defined with respect to the constants in scon and the constants in the Chernoff form used), provides
+1436   that Ŷs ≥ s con with high probability,  and therefore so is Ys . To conclude the proof, we note that
+1437
+
+       c.scon ∈ O N 2 log( SN γ  )logN   , as required by the theorem γ statement.
+1438
+1439
+1440   C.4   R E - PACKING DYNAMIC M ODELS TO F EWER W ORKERS
+1441
+1442   Workload re-packing is the process of merging the total workload into a smaller number of worker
+1443
+       (GPUs) with the purpose of using the available resources more efficiently, i.e. unused resources
+       can be released. This can be achieved with simple algorithms (in small scale) such as first-fit, best-
+1444
+       fit, and round-robin as well as complex optimization problems (for large scale) such as ant colony
+1445
+       optimization Dorigo et al. (2006) or genetic algorithms Dasgupta et al. (2013). Workload packing
+1446   aims to increase GPU utilization and reduce the overall number of GPUs employed to continue the
+1447   training process. For long training schedules that are common in LLM training, workload packing
+1448   can result in substantial cost savings. It may also provide improved performance due to reduction in
+1449   the number of cross-GPU communication calls, and smaller pipeline bubbles.
+1450
+       Algorithm 4 shows a first-fit algorithm that we used for workload consolidation. We iterate over all
+1451
+       the available GPUs (lines 2-3) and check if the combined memory usage of the two GPUs is less
+1452   than the maximum memory capacity of a single GPU, and the number of active GPUs is greater than
+1453   the target number of GPUs target num gpus for packing (lines 4-5). If that is the case, we transfer
+1454   all layers of the source GPU to the destination GPU (lines 7-8). Then, it updates the memory
+1455   usage and the number of layers on the destination GPU accordingly. This process continues until
+1456   all the available GPUs have been checked and processed. The goal of this algorithm is to reduce
+1457   the number of active GPUs to the target num gpus, while also ensuring that the total memory usage
+       remains within device limits.
+
+
+                                                        27
+       Under review as a conference paper at ICLR 2025
+
+
+1458
+       C.5     R ELEASING U NUSED GPU S AFTER R E - PACKING
+1459
+1460   The NCCL communicator cannot be resized, and there is no support for having more than one NCCL
+1461   rank per GPU in the same communicator. Solutions around that include:
+1462
+1463
+               • The solution implemented and used in DYN M O: While the NCCL communicator can not
+                 be resized, NCCL supports splitting the communicator (using the ncclCommSplit()
+1464
+                 function) into multiple sub-partitions, or even creating a single communicator with fewer
+1465
+                 ranks Nvidia. The GPUs to which the model is re-packed can be split to their own sub-
+1466             communicator, while the sub-communicator of the idle GPUs can be assigned to a different
+1467             concurrent communicator of the new job to which they will be assigned (concurrent com-
+1468             municator are allowed in NCCL Nvidia). Since the released GPUs would never be used in
+1469             the sub-communicator of the repacked GPUs, there is no risk or need to mitigate deadlocks
+1470             of multiple concurrent communicators.
+1471           • Since large-scale full training runs for a long time (days and weeks) and MTBF (Mean
+1472             Time Before Failure) in large scale training is typically in the order of hours, restarting
+1473             from checkpoints becomes inevitable. On restarting the training from a checkpoint, the
+1474             size of the communicator could be set to the new number of fewer GPUs.
+1475           • Different NCCL communicators can be used in a hierarchical fashion (and it is often the
+1476             case). To allow for repacking, one could use a hierarchy of communicators with the inten-
+1477             tion to repack to one branch of hierarchy, and then assign a new job to the GPUs in the idle
+1478             branch of the hierarchy.
+1479
+       Finally, we would like to emphasize that the primary focus of the paper is load balancing to make the
+1480
+       end-to-end training process faster. Re-packing (when possible) is an additional advantage to load
+1481   balancing. We implement repacking in DYN M O at the load balancer level to enable the release of
+1482   GPUs. We would like to point out that DYN M O’s task ends at releasing the GPUs: reclamation of
+1483   the released GPUs and assigning them new jobs by the middleware or scheduler is outside the scope
+1484   of this paper.
+1485
+1486
+       D       I MPLEMENTATION
+1487
+1488   The DYN M O load balancing system was developed on top of NVIDIA Megatron Core 0.5.03 . Each
+1489   component of DYN M O, namely hooking to dynamism point in model training, load balancing, and
+1490   re-packing is implemented in a separate package for ease of use and extension.
+1491
+       One particular challenging case in the six example cases is gradual pruning. The reminder of other
+1492
+       example cases did not require hard codes changes to be able to use DYN M O. We elaborate more on
+1493
+       gradual pruning. Unstructured pruning requires a sparse storage format to compactly store, train, and
+1494   transfer the pruned model. One of the most commonly used sparse formats is the compressed sparse
+1495   row (CSR) format. Using a sparse matrix format requires dense matrix multiplication (DMM) oper-
+1496   ations to be converted to sparse counterparts (SpMM). Since PyTorch does not support computing
+1497   the derivative of SpMM operations for backpropagation on a CSR tensor, we evaluated CSR-based
+1498   SpMM implementations available for use on GPUs, namely cuSPARSE by Nvidia and Sputnik Gale
+1499   et al. (2020). Figure 6 shows the performance of cuSPARSE and Sputnik against the dense coun-
+1500   terpart (cuBLAS). The SpMM kernel of Sputnik outperforms cuSPARSE in all sparsity levels. This
+1501   is mainly because Sputnik kernels were implemented by specifically considering the deep learning
+1502
+       workloads, unlike cuSPARSE kernels that mainly target the HPC workloads, which often have more
+       than 99% sparsity. It is also worth noticing that Sputnik starts to outperform cuBLAS after 75%
+1503
+       sparsity. Thus, for sparse operations, we implemented PyTorch bindings for the CUDA kernels of
+1504
+       Sputnik 4 .
+1505
+1506   The gather and scatter operations in global pruning were implemented by employing NCCL Peer-to-
+1507   Peer (P2P) send-receive operations instead of collective communication operations since the sizes
+1508
+       of the objects to be sent (local topk) and received (indices to keep) from each rank are different and
+       other ranks do not have this size information to participate in the collective call.
+1509
+           3
+1510      https://github.com/NVIDIA/Megatron-LM/releases/tag/core_v0.5.0
+           4
+1511      The Sputnik bindings are made available at the following link: https://anonymous.4open.
+       science/r/Torch-Sputnik-E926/README.md.
+
+
+                                                         28
+       Under review as a conference paper at ICLR 2025
+
+
+1512                                                Sputnik         cuBLAS         cuSPARSE
+1513
+1514
+                                     100
+1515
+
+
+                        Time (ms)
+1516
+1517
+                                       10
+1518
+1519
+1520
+1521                                    1
+1522                                     50%        60%         70%          80%            90%
+1523                                                             Sparsity
+1524
+1525                                                  H100
+       Figure 6: Sparse (Sputnik Gale et al. (2020) and cuSPARSE) vs Dense (cuBLAS) matrix multipli-
+1526   cation performance comparison for M=N=K=4096 on Nvidia H100. Starting at 75% sparsity level,
+1527   sparse kernels using Sputnik gives performance advantages over dense kernels.
+1528
+1529
+                                 Multi-Node End-to-End Training Performance: 720 H100 GPUs
+                                 Network Delay injected: 30-way data parallel + 24-way pipeline
+1530
+                                     36,000
+                                     9000
+1531
+                                     32,000
+                                     8000
+1532                                                                               Static (Megatron-LM)
+1533                                 28,000
+                                     7000
+1534                                 24,000
+                                     6000                                          Static (DeepSpeed)
+                        Tokens/sec
+
+
+1535                                 20,000
+                                     5000
+1536                                                                               DynMo
+                                     16,000
+                                     4000                                          (Partition by Time)
+1537
+                                     12,000
+                                     3000                                          DynMo
+1538                                                                               (Partition by Param)
+1539                                 2000
+                                      8,000                                        DynMo
+1540                                  4,000
+                                     1000                                          (Diffusion by Time)
+                                                                                   DynMo
+1541                                    00                                         (Diffusion by Param)
+1542                                           24     32       40       48
+1543                                                Number of Layers
+1544
+1545   Figure 7: Multi-node end-to-end early exit training throughput of GPT models for a network with
+1546   unstable bandwidth. We inject network delays up to 4x modeled by a normal distribution (as sug-
+1547
+       gested by Sukhov et al. Sukhov & Kuznetsova (2009)). The intended delay is achieved by inflating
+       the MPI message sizes based on the delay model.
+1548
+1549
+1550   The necessary information for load balancers such as layer execution times and memory usage
+1551   comes from the profiling iteration after each pruning iteration. The execution time profiling is im-
+1552   plemented by extending the built-in timers of Megatron-LM. The memory consumption of each
+1553   pipeline stage is gathered with PyTorch’s memory statistics for CUDA.
+1554
+1555
+1556
+       E     A DDITIONAL R ESULTS AND A BLATION
+1557
+1558
+       E.1   E FFECT OF C HANGE IN N ETWORK BANDWIDTH ON L OAD BALANCING
+1559
+       In fact DYN M O’s load balancing algorithm is desgined to, indirectly, handle variability/instability
+1560   in the network. That is since we define our diffusion load balancing algorithm to consider the gaps
+1561   between workers to include the total time until work arrives to node B from neighboring node A, i.e.
+1562   we include the amount of time that A spent on work plus the time it takes to transfer the activations
+1563   of the layers over the network. In intuitive terms, if worker B is stalling due to delay from neighbor
+1564   A (in part due to a slow network connection between A and B), the load balancer would push more
+1565   work to worker B until the amount of work in A plus the time it takes to transfer the activations over
+       the network is roughly equal to the amount of work on B.
+
+
+                                                                29
+       Under review as a conference paper at ICLR 2025
+
+
+1566
+1567   Table 1: Vertical scaling experiments show the throughputs (samples/sec) of baseline Megatron-
+1568   LM, and time-based algorithms, namely Diffusion by Time and Partition by Time for dynamic sparse
+1569   attention. The speed is calculated for the best-performing balancer in each case. The benefits of
+1570   dynamic load balancing increase as the number of GPUs in the pipeline increases. The number of
+1571
+       GPUs listed are the GPUs in pipeline parallelism (in a 90-way data parallelism)
+                             #        #      Megatron       Diff       Part     Speed
+1572
+                          Layers GPUs           LM       by Time by Time          Up
+1573
+                            24        2        10.67       12.38      12.88     1.20x
+1574
+                                      4        20.23       24.86      24.82     1.22x
+1575                                  8       37.253      46.939     45.071     1.26x
+1576                        32        2         8.28       10.35      10.12     1.25x
+1577                                  4        15.69       19.06      19.76     1.26x
+1578                                  8       30.809      39.899     37.933     1.29x
+1579                        40        2         7.14        8.84       9.13     1.28x
+1580                                  4        12.84       16.11      16.82     1.31x
+1581                                  8       26.425      35.262     33.296     1.33x
+1582                        48        2        OOM         OOM       OOM        OOM
+1583                                  4        10.89        14.7      14.54     1.35x
+1584                                  8       23.126      31.724     29.711     1.37x
+1585                        56        2        OOM         OOM       OOM        OOM
+1586                                  4        OOM         OOM       OOM        OOM
+1587                                  8       19.126      26.724     25.711     1.39x
+1588
+1589
+1590   Figure 7 shows results in a multi-node setting where we inject up to 4x delay in exchange of layers
+1591   between neighbor nodes to demonstrate the robustness of DYN M O load balancing w.r.t. fluctuations
+1592
+       in the network bandwidth. In fact the improvement of speedup of DYN M O over the baseline static
+       model increases since the static model suffers from higher stalling when the network bandwidth
+1593
+       fluctuates due to contention for instance.
+1594
+1595
+1596   E.2   V ERTICAL S CALING
+1597
+1598
+       In single-node multi-GPU vertical scaling experiments, the number of layers in the model and the
+       number of GPUs used in the pipeline are changed. In Table 1, we report throughputs of the static
+1599
+       baseline balancer (Megatron-LM) and the best-performing dynamic load balancers from end-to-end
+1600
+       training experiments (Diffusion by Time and Partition by Time). The dynamic load balancers speed
+1601   up the training in various degrees up to 1.39x for different numbers of GPUs.
+1602
+1603   One important observation is that as the number of GPUs used in the pipeline increases, the speed-
+1604
+       up gained by the usage of a dynamic balancer builds up. This suggests that the importance of load
+       balancing increases as the pipeline gets deeper because the additional bubbles that are introduced by
+1605
+       the dynamic nature of the model affect the efficiency of the pipeline more. This is important when
+1606
+       considering the fact that the model size of large language models doubles approximately every 3.9
+1607   months Zhang et al. (2022) which leads to deeper pipelines.
+1608
+1609
+1610   E.3   W EAK S CALING
+1611
+       For multi-nodes with multi-GPUs weak scaling experiments, we trained the GPT models having
+1612
+       different numbers of layers and batch sizes (with work volume proportional to the number of GPUs)
+1613
+       on up to 240 nodes, each of which contains 4x H100 GPUs. The pruning region starts from itera-
+1614   tion 30 and continues until iteration 70 and the model is pruned every 10 iterations until the 90%
+1615   target sparsity is reached. The pruning and load balancing over-heads are excluded from the mea-
+1616   surements since the number of iterations to do this scaling experiment is not sufficient enough to
+1617   amortize the overheads; in actual training (1000s to 10,000s iterations) the pruning and load balanc-
+1618   ing overheads would be negligible (elaborate overhead analysis in Appendix E.1). Figure 8 shows
+1619   that the pipeline that is dynamically balanced with Partition by Time algorithm of DYN M O reaches
+       higher throughputs in all scales and it provides speedups over baseline Megatron-LM up to 2.12x.
+
+
+                                                        30
+       Under review as a conference paper at ICLR 2025                                        H100
+
+
+
+1620                                                             Multi-node Weak Scaling                                                           Re-packing Model
+                                                                                                                                                         Re-packing   While
+                                                                                                                                                                    Model     Training
+                                                                                                                                                                          While           toD
+                                                                                                                                                                                Training to
+
+
+                                                                                                                       Reduction in Runtime (%)
+                        Throughput (Tokens/Sec)
+1621                                                                                                                                                                                  Throughput/# GPUs                Throu
+                                                                                                               100
+1622
+                                                  30
+                                                  30K                                                          80                                                       12
+
+
+                                                                                                                                                  Throughput / # GPUs
+1623
+                                                                                                                                                                        10
+1624                                              20
+                                                  20K                                                          60
+                                                                                                                                                                        8
+1625                                                                                                           40
+                                                  10
+                                                  10K
+                                                  40                                                                                                                    6
+1626                                                                                                           20
+                                                                                                                                                                        4
+1627                                              00                                                           0
+                                                         15
+                                                         30 Nodes     30
+                                                                       60 Nodes
+                                                                          Nodes      60 Nodes
+                                                                                    120 Nodes     120
+                                                                                                  240 Nodes                                                             2
+1628
+                                                        (120 GPUs)   (240 GPUs)    (480 GPUs)    (960 GPUs)                                                             0
+1629
+                                                                                                                                                                             8   6    4    2   8   6   4   2   8   6   4   2
+1630                                               Megatron-LM        Partition by Time     Reduction in Runtime (%)
+                                                                                                                                                                             24 Layers            Layers
+                                                                                                                                                                                               32 Layers       40 Layers
+1631                                               (Static)           (DynPipe)
+                                                                     (DynMo)
+1632
+1633   Figure 8: Gradual pruning weak scaling throughput (tokens/sec) comparison of baseline static load
+1634   balancing with Megatron-LM and dynamic load balancing with Partition by Time algorithm of
+1635
+       DYN M O.
+1636
+1637   E.4   DYNAMIC M INIBATCH /M ICROBATCH S IZE
+1638
+       In cases where the total load of the pipeline decreases such as gradual sparsification, dynamic sparse
+1639
+       attention, early exit, and freeze training, carefully changing the minibatch and microbatch size ac-
+1640
+       cording to the needs of the new pipeline after load balancing may increase the efficiency of the
+1641   training. For instance, GPipe Huang et al. (2019) suggests the number of micro batches to be greater
+1642   than four times the number of GPUs in the pipeline for optimal overlapping. Since the packing
+1643   decreases the number of GPUs in the pipeline, adjusting the number of micro batches in the pipeline
+1644   after packing could be beneficial. In addition, minibatch size can be increased after the pruning
+1645   operations since the memory requirement for execution is less after the pruning. DYN M O currently
+1646   does not support this feature, which if supported would further improve the speedup gains.
+1647
+1648   F     DYNAMISM
+1649
+1650
+       F.1   DYNAMIC R ECONFIGURATION OF THE P IPELINE
+1651
+1652   DeepSpeed’s PipelineModule Microsoft currently offers three partitioning strategies for distributing
+1653   model layers, which can be set using the partition_method() keyword argument passed to
+1654   the PipelineModule. This allows us to move the layers between GPUs, when needed. When a
+1655   layer is migrated from GPU A to GPU B, the memory allocated for the layer (weights, activation,
+1656   gradients, optimizers) is released on GPU A and allocated on GPU B. As the training resumes (after
+1657   the layers are migrated), the underlying pipeline scheme starts to pass the new mini-batches along
+1658
+       the new distribution of layers in the pipeline.
+1659
+1660   F.2   M IXTURE OF E XPERTS
+1661
+       We build on Mixtral 8x7b weights from Hugging Face Mistral (2024) and LLaMA-MoE-3.5B Team
+1662
+       (2024) in continual training by monitoring the imbalance between layers w.r.t. number of assigned
+1663
+       tokens. We used both the auxiliary load balance scheme adopted in Mixtral 8x7b Jiang et al. (2024)
+1664   and the S-BASE load balancer Lewis et al. (2021a). Since the imbalance is dependent on the point
+1665   the routing decision is taken, i.e., in the forward pass at each FFN, we rebalance in the back propa-
+1666   gation phase where we attach the movement of layers to the pipeline parallelism scheme.
+1667
+1668   F.3   G RADUAL G LOBAL M AGNITUDE P RUNING
+1669
+1670   For our pruning design, we use the gradual pruning schedule proposed in Zhu & Gupta (2017) which
+1671   is formulated as:
+1672
+1673                                                                     t − t0 3
+                     St = Sf + (Si − Sf )(1 −                                  ) ,        t ∈ {t0 , t0 + ∆t, ..., t + n∆t}                                                           (3)
+                                                                          n∆t
+
+                                                                                  31
+       Under review as a conference paper at ICLR 2025
+
+
+1674
+       To our knowledge, there is no deep learning framework that supports global pruning on a distributed
+1675   model at the time of this writing (support is only for undistributed models). Appendix C elaborates
+1676   on the unstructured magnitude pruning scheme we implemented in PyTorch.
+1677
+1678   F.4   L AYER F REEZING
+1679
+1680   DYN M O sits on top of layer freezing solutions. More specifically, we build on Wang et al. Wang
+1681   et al. (2022) Egeria solution by monitoring the rate by which the training loss changes, freezing
+1682   layers when they reach the convergence criterion, and drop frozen layers from in both the back
+1683   propagation phase and gradient exchange when data parallelism is used. It is important to note that
+1684   Egeria periodically updates the reference model (on the CPU) to drive the layer freezing, yet does
+1685
+       not actively try to remedy the load imbalance caused by layer freezing. The effect of load imbalance
+       is particularly pronounced since earlier layers tend to be more frozen than later layers, i.e. the
+1686
+       layer freezing is not uniformly occurring across the model. In comparison, DYN M O load balances
+1687
+       dynamically, and in an orthogonal fashion, the spread of layers on GPUs every time the reference
+1688   model that drives the freezing is updated.
+1689
+1690
+       F.5   DYANMIC S PARSE ATTENTION
+1691
+1692   We build on Pagliardini et al. dynamic sparse attention Pagliardini et al. (2023) in continual training
+1693   by implementing a binding from PyTorch to the CUDA kernel provided by authors of the paper. The
+1694   hash-based attention makes the causal attention mask irregular, i.e., we get blocked sparsity that is
+1695   then leveraged by the Flash Attention. The irregular causal structures caused by the hashing lead to
+1696   different amount of blocks/tiles in different layers.
+1697
+1698   F.6   E ARLY E XIT
+1699
+1700
+       We adapt the early exit methods CALM Schuster et al. (2022) and ADPC Liu et al. (2022b) to
+       observe the imbalance by peaking into the confidence measure prediction of CALM and ADPC.
+1701
+       Since early exit happens at the later layers, we start our observation from the first layer at which
+1702
+       tokens start to exit, and we assume all layers before than to have the same load. Early exit in
+1703   particular benefits greatly from re-packing, and that since the change in control flow of the model
+1704   happens in the later layers.
+1705
+1706
+       F.7   M IXTURE OF D EPTHS
+1707
+1708   We build on the MoDs work by Raposo et al. Raposo et al. (2024) by including in our GPT models
+1709   we use in testing the small auxiliary MLP predictor that predicts whether that token will be among
+1710   the top-k or not in the sequence. Similar to the case of MoEs, since the imbalance is dependent on
+1711   the point the router takes the decision, i.e. in the forward pass, we rebalance in the back propagation
+1712   phase where we attach the movement of layers to the pipeline parallelism scheme. Since the routing
+1713
+       happens around the entire block, i.e., the routing applies to both to both forward MLPs and multi-
+       head attention, we treat the skipped layers to be shadow layers when redistributing the layers on
+1714
+       workers.
+1715
+1716
+1717   G     R ELATED W ORK
+1718
+1719   G.1     L OAD BALANCING M ODEL -PARALLEL D EEP N EURAL N ETWORKS
+1720
+1721
+       G.1.1    L AYER - WISE LOAD BALANCING
+1722   Layer-wise balancing techniques work on layer granularity instead of operators. DeepSpeed Mi-
+1723   crosoft (2023) offers three partitioning methods to balance the workload of stages: parameters,
+1724   uniform, and regex. While the parameters method is trying to balance the number of parameters in
+1725   each stage, the uniform aims to distribute the layers evenly. Regex only distributes the layers that
+1726   match the given regex (e.g. transformer layers). Similar to the parameters method of DeepSpeed, He
+1727   et al. He et al. (2021) balance the stages based on the number of parameters in each stage. Narayanan
+       et al. Narayanan et al. (2021) assign each stage the same number of transformer layers to balance the
+
+
+                                                         32
+       Under review as a conference paper at ICLR 2025
+
+
+1728
+       load. None of the aforementioned studies use the actual execution time of the layers to decide on the
+1729   distribution of layers. DYN M O supports DeepSpeed’s partitioning scheme with both parameters and
+1730   layer execution times to guide load balancing, as well as a diffusion-based load balancing algorithm
+1731   out of the box.
+1732
+1733   G.1.2    L OAD BALANCING VIA GRAPH PARTITIONING
+1734
+1735   Graph partitioning-based load balancing schemes find atomic operations in the model and consider
+1736   them as nodes in a directed acyclic graph (DAG). Edges in the graph represent the dependencies be-
+1737   tween operations. Tanaka et al. Tanaka et al. (2021) partition the DAG in three phases at which they
+1738
+       first find atomic operations, then group these operations into blocks according to their computation
+       times, and finally, they combine blocks into final partitions by using a dynamic programming-based
+1739
+       algorithm. Qararyah et al. Qararyah et al. (2021) create disjoint clusters from the nodes of the graph
+1740
+       by finding critical paths and mapping these clusters to devices based on a mapping algorithm that
+1741   takes both critical-communication minimization and temporal load balancing into account. Both
+1742   studies perform profiling before the actual training and partition the graph once.
+1743
+1744   G.1.3    L OAD BALANCING IN M IXTURE OF E XPERTS M ODELS
+1745
+1746   The mixture of experts (MoE) Jacobs et al. (1991) models contain many sub-networks (experts)
+1747   where a router allocates inputs to top-k experts. At scale, experts are distributed across devices.
+1748   Lepikhin et al. Lepikhin et al. (2020) defines an expert’s capacity to limit the maximum number of
+1749
+       tokens that can be processed by an expert to achieve workload balance. Fedus et al. Fedus et al.
+       (2022) route each token to only one expert and use the same expert capacity for restrictions. Lewis
+1750
+       et al. Lewis et al. (2021a) employ an auction algorithm Bertsekas (1992) to solve the token-to-expert
+1751
+       assignment problem. This line of work is different from ours in the sense that their aim is to balance
+1752   workload in the feed-forward network while our work aims to balance all layers of the transformer
+1753   model.
+1754
+1755
+       G.2     PACKING
+1756
+1757   In dynamic neural network models, packing the total workload into fewer number accelerators can
+1758   provide significant cost-saving benefits. PipeTransformer He et al. (2021) offers an elastic pipelining
+1759   system for freeze training where some of the layers of the model are frozen during the training.
+1760   PipeTransformer packs the remaining active layers into fewer GPUs and creates pipeline replicas
+1761   if possible. When PipeTransformer receives a notification for layer freezing, it attempts to divide
+1762   the number of GPUs by 2 subject to the memory capacity constraints. On the other hand, our work
+1763
+       DYN M O can pack to an arbitrary number of GPUs specified by the user. Another difference between
+       the packing mechanism of DYN M O and PipeTransformer is that PipeTransformer uses the parameter
+1764
+       size as a proxy to estimate the memory usage while DYN M O uses the actual memory usage from the
+1765
+       profiling step before load balancing. Finally, PipeTransformer is only capable of packing layers to
+1766   fewer GPUs, and not load balancing. DYN M O, on top of being capable of re-packing when deemed
+1767   beneficial, it can also redistribute the workload to achieve a better load balance.
+1768
+1769
+       G.3     DYNAMIC P RUNING
+1770
+1771   Model pruning is a fast-paced research area. Since the optimization problem has many dimensions,
+1772   there are many approaches to prune a model. We mainly focus on the schedule of the pruning rather
+1773   than the decision of how to prune (e.g. magnitude pruning, variational dropout etc.) and what kind
+1774   of structure (e.g. unstructured pruning, structured pruning) to be applied while pruning.
+1775
+       One of the commonly used sparsification technique is sparsification during training (i.e. gradual
+1776   pruning) where the pruning starts before the model is trained until convergence. While some stud-
+1777   ies Wortsman et al. (2019); Lin et al. (2020) use a binary mask to specify whether a parameter is
+1778   pruned, which enables them to apply better weight regrowth or selection, others Gale et al. (2020)
+1779   delete the pruned parameters to reduce the memory usage and number of operations. There are also
+1780   many works on how fast to prune. For instance, Zhu and Gupta Zhu & Gupta (2017) prune the model
+1781   rapidly in the first pruning steps when there are many abundant parameters in the model, and then
+       reduce the pruning ratio as the number of parameters in the model are getting less and less. Dai et
+
+
+                                                         33
+       Under review as a conference paper at ICLR 2025
+
+
+1782
+       al. Dai et al. (2019) employ a three phase schedule (birth-brain, baby-brain, and adult-brain) similar
+1783   to the human brain development. Mostafa et al. Mostafa & Wang (2019) uses magnitude pruning as
+1784   criterion to prune the parameters and regrows parameters to comply with the training budget.
+1785
+1786
+1787
+1788
+1789
+1790
+1791
+1792
+1793
+1794
+1795
+1796
+1797
+1798
+1799
+1800
+1801
+1802
+1803
+1804
+1805
+1806
+1807
+1808
+1809
+1810
+1811
+1812
+1813
+1814
+1815
+1816
+1817
+1818
+1819
+1820
+1821
+1822
+1823
+1824
+1825
+1826
+1827
+1828
+1829
+1830
+1831
+1832
+1833
+1834
+1835
+
+
+
+                                                        34

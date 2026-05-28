@@ -1,0 +1,1883 @@
+Under review as a conference paper at ICLR 2025
+
+
+000
+001
+      B ITUNE : L EVERAGING B IDIRECTIONAL ATTENTION TO
+002   I MPROVE D ECODER -O NLY LLM S
+003
+004
+005    Anonymous authors
+006
+       Paper under double-blind review
+007
+008
+009                                                A BSTRACT
+010
+011            Decoder-only large language models typically rely solely on masked causal at-
+012            tention, which limits their expressiveness by restricting information flow to one
+013            direction. We propose Bitune, a method that enhances pretrained decoder-only
+014            LLMs by incorporating bidirectional attention into prompt processing. We evaluate
+015            Bitune in instruction-tuning and question-answering settings, showing significant
+016            improvements in performance on commonsense reasoning, arithmetic, and lan-
+017            guage understanding tasks. Furthermore, extensive ablation studies validate the
+018            role of each component of the method, and demonstrate that Bitune is compatible
+019
+               with various parameter-efficient finetuning techniques and full model finetuning.
+020
+021
+022   1    I NTRODUCTION
+023
+024   Large Language Models (LLMs) are being deployed in numerous practical applications where
+025   humans engage with them through various forms of natural language interaction. In use cases such as
+026   general purpose assistants (OpenAI, 2024), medical diagnosticians (Thirunavukarasu et al., 2023),
+027   game-conversation generation (Cox & Ooi, 2023) or coding-assistants (Roziere et al., 2023), the
+028   ability for an LLM to precisely interpret and respond to user inputs is of primary concern.
+029   Correspondingly, Instruction-Tuning (IT) (Chung et al., 2024; Ouyang et al., 2022a) is the prevailing
+030   paradigm for finetuning LLMs after their self-supervised pretraining phase to improve them for such
+031   tasks. Here, the model is trained on a dataset comprised of pairs of instructions and corresponding re-
+032   sponses. Given the instruction-with-response structure of IT data, the generation of an LLM response
+033   can be divided into two phases: first, converting the instruction into key and value embeddings, which
+034   we refer to as instruction features; second, using these features to autoregressively generate an answer.
+035
+      Due to this task’s inherently conditional nature, the instruction features’ effectiveness is crucial for
+      obtaining high-quality model outputs.
+036
+037   In the past, bidirectional attention (Schuster & Paliwal, 1997) has been a key technique for obtaining
+038   stronger features for words or tokens. This is because the meaning of a word depends greatly on
+039   its context. In particular, for some words in a sentence, the information that comes later might be
+040
+      far more informative for generating a meaningful representation and resolving ambiguities. With
+      only uni-directional causal attention, where the representation of each word is restricted to depend
+041
+      solely on the words that came before, this cannot be achieved. This is the reason why many previous
+042
+      transformers such as encoder-only BERT (Devlin et al., 2019) and encoder-decoder T5 (Raffel et al.,
+043   2020) employed bidirectional attention to improve the encoding of the input and why tasks like text
+044   retrieval (Lewis et al., 2020; Li & Li, 2023) still rely on this.
+045
+      However, in the context of LLMs, architectures utilizing bidirectional attention have fallen out of
+046
+      favor, as decoder-only models such as GPT (OpenAI, 2024) and Llama (AI@Meta, 2024) have
+047
+      focused on and vastly improved the generative performance of language models. These architectures
+048   are trained by large volumes of data with next-token prediction, eschewing any look-ahead mechanism
+049   for the sake of better autoregressive modeling. As there is simply more unlabeled data available for
+050   pretraining, training a decoder-only architecture on unlabeled data, and then finetuning it for tasks
+051   with instruction-tuning, is the best modus operandi of today (Wang et al., 2022). However, with this
+052   switch to decoder-only architectures, we lost bidirectional attention in the process. As we know this
+053   can improve feature representations for instructions, we set out to re-introduce bidirectional attention,
+      such that it can be integrated into pretrained decoder-only LLMs.
+
+
+                                                         1
+      Under review as a conference paper at ICLR 2025
+
+
+054
+              Causal Attention with WC                           Instruction Features               Eddie bakes 3 x 7 =
+055                                                     KC, VC
+                                                                                                            ...
+
+056
+057
+          Eddie can bake 3 pies a day...                KB, VB           +
+058
+059                                                                                              LLM
+060
+061         Bidirectional Attention with WB
+062
+063                                                                                                 Causal Attention with WC
+
+064                                           (a) Prefilling                                     (b) Decoding
+065
+066   Figure 1: Overview of Bitune. (a) During the prefilling phase, features are obtained from the prompt
+067   using both causal and bidirectional attention in two passes with separate weights. The two sets of
+068
+      keys and values are then combined using a weighted average before being passed to the decoding
+      phase. (b) During the decoding phase, new tokens are generated in the standard way with causal
+069
+      attention, utilizing the features extracted from the instruction in the previous step, along with the
+070
+      features of other generated tokens.
+071
+072
+073   Our new method Bitune adds bidirectional attention to decoder-only architectures and combines it
+074   with causal attention to generate two sets of instruction features, using two different sets of weights.
+075   These features are then integrated, utilizing learnable mixing coefficients, and later used as the
+076   KV-cache for response generation. Notably, the autoregressive response generation process remains
+077   unaffected by the bidirectional attention and continues to be causal. By realizing these adaptations
+078
+      with parameter-efficient finetuning methods, we introduce only a minimal set of new parameters.
+079   Overall, our contributions are as follows:
+080
+                • We propose a novel method, Bitune, that improves the performance of pretrained decoder-
+081
+                  only LLMs in instruction-following and question-answering settings.
+082
+083             • We evaluate the method on multiple downstream tasks, showing consistent improvements
+084
+                  over the baselines.
+085             • We conduct an extensive ablation study investigating the necessity of each component of the
+086               method, and showing the method’s PEFT-agnosticism, as well as its effectiveness in full
+087               finetuning scenarios.
+088
+089   2      B IDIRECTIONAL I NSTRUCTION -T UNING
+090
+091   In the instruction-tuning setting (Ouyang et al., 2022b; Zhang et al., 2024), a dataset D consists of
+092   instruction-answer pairs that are used to adapt the model in a supervised fashion. Formally, a dataset
+093   of size N can be described as D = {q, a}N     i=1 , where q and a are instructions and answers. The
+094   training objective is to model p(a|q) in an autoregressive manner: This means the answer is generated
+095   one token at a time, such that token ai at position i has access to all earlier tokens:
+096                                                                |a|
+                                                     p(a|q) = Πi=1 p(ai |a1 , . . . ai−1 , q),
+097
+098   where |a| denotes the length of the answer. Note how compared to the regular language modeling
+099   objective, the response is already conditional (on the instruction q) even for the first generated token.
+100   This naturally leads response-generation to be divided into two phases: prefilling and decoding. Dur-
+101   ing the prefilling phase, the entire instruction – also often called a prompt – is processed concurrently
+102   to generate a series of features to be stored. For a Transformer architecture (Vaswani et al., 2017),
+103   these features are those of the key and value vectors, which can be stored in a KV-cache to avoid
+104   costly recomputations. During the subsequent decoding phase, the model generates output tokens
+105
+      sequentially, one token at a time, based on the KV-cache of the instruction and the already generated
+      tokens.
+106
+107   In this work, we introduce Bitune, a method to leverage this two-phase process to improve instruction-
+      tuning of language models. In our approach, the model processes the instruction with both causal
+
+
+                                                                             2
+      Under review as a conference paper at ICLR 2025
+
+
+108
+      Algorithm 1 Python-like pseudocode of Bitune inference.
+109
+110   # prompt - tensor with tokenized instruction
+111   # theta - tensor with mixing coeff. for each layer
+      # theta_init - initial value of mixing coefficients
+112
+113   k_c, v_c = model_causal(prompt) # Extract causal features
+114   k_b, v_b = model_bidir(prompt) # Extract bidirectional features
+      # Combine both sets of features
+115   alpha = theta.abs() / (theta.abs() + theta_init)
+116   k = k_c * (1 - alpha) + k_b * alpha
+117   v = v_c * (1 - alpha) + v_b * alpha
+      kv = (k, v)
+118
+119   c_token = SEP # Initialize generation with a predefined token
+120   answer = [c_token]
+121   while c_token != EOS: # Stop generation at the end-of-sequence token
+         # Get features of current token and logits of next token
+122      k, v, logits = model_causal(c_token, kv)
+123      kv = concat(kv, (k, v)) # Concatenate it with current KV cache
+124      c_token = get_token(logits) # Determine next predicted token
+         answer.append(c_token) # Append generated token to the answer
+125
+126
+127
+128   and bidirectional attention using separate sets of parameters, leading to an enhanced KV-cache that is
+129   then used to condition the answer. Figure 1 provides an overview of the method, while Algorithm 1
+130   presents pseudocode for the inference process.
+131   Two Sets of Features. In Bitune, the model performs two passes on the instruction to obtain two
+132   kinds of features for every transformer block. Namely, a set of causal features that the model was
+133   originally trained to process and utilize,
+134
+135
+                                         Kc = Xc Wkc ,       Vc = Xc Wvc ,                                  (1)
+136
+137   and a set of bidirectional features encoding the instruction without the constraints of causal masking,
+138
+139
+                                         Kb = Xb Wkb ,       Vb = Xb Wvb .                                  (2)
+140
+141   To allow the model to learn how to process the causal and bidirectional features differently, we
+142   introduce two sets of weights: one for the bidirectional pass on the instruction (Wkb , Wvb ) and
+143   another for the causal pass on the instruction, which is also used for the causal generation of answer
+144   tokens (Wkc , Wvc ).
+145
+      In the case of the first block of the model, representations Xc , Xb are the initial token embeddings. In
+146   other cases, they are the output of the preceding block and were processed by different components
+147   including the self-attention mechanism, which can be defined as:
+148
+149
+                                                                       QK T
+
+150                           Attention(Q, K, V, M ) = softmax         √    +M       V,                     (3)
+151
+                                                                         dk
+152   where Q are the queries, M is the attention mask, and dk is the dimension of keys and queries.
+153
+154
+      For the causal pass, the mask Mc enforces causality by masking future tokens, such that tokens j can
+      only attend to earlier tokens i ≤ j, while for the bidirectional pass, no masking is applied:
+155
+156
+
+                                               0      if i ≤ j
+157                              Mc (i, j) =                   ,     Mb (i, j) = 0.                     (4)
+                                               −∞ if i > j
+158
+159
+      The final KV-cache is obtained by a learnable convex combination of causal and bidirectional features,
+160
+161
+                  KBitune = Kc · (1 − αk ) + Kb · αk ,       VBitune = Vc · (1 − αv ) + Vb · αv ,           (5)
+
+
+                                                         3
+      Under review as a conference paper at ICLR 2025
+
+
+162   Table 1: Zero-shot results after instruction-tuning on the UltraFeedback dataset. We compare
+163   Bitune to the performance of the original model, the model finetuned with LoRA, and with LoRA16
+164   using two times higher rank to match the parameter count of our method. Bitune significantly
+165   outperforms the baselines on almost all tasks for all models.
+166
+167                                           PIQA      ARC       CSQA    SIQA    MMLU     Avg.
+168
+                   Model         Method
+169                Gemma-2B      Pretrained     57.5     36.9      35.5    38.2   34.0     40.4
+                                 LoRA           66.7     43.4      42.3    44.3   31.7     45.7
+170
+                                 LoRA16         66.5     42.7      42.3    43.8   31.6     45.4
+171                              Bitune         69.6     47.5      46.9    49.5   35.3     49.7
+172                Gemma-7B      Pretrained     73.1     78.3      62.0    64.7   59.0     67.4
+173                              LoRA           84.2     79.2      68.5    71.9   55.3     71.8
+174                              LoRA16         83.9     79.2      68.4    72.0   53.4     71.4
+175                              Bitune         83.6     80.1      69.2    72.7   53.8     71.9
+176                Llama2-7B     Pretrained     59.2     38.1      32.6    45.1   36.0     42.2
+                                 LoRA           69.5     49.9      45.3    57.0   41.1     52.6
+177
+                                 LoRA16         69.9     49.9      45.6    56.7   41.2     52.6
+178                              Bitune         70.0     51.1      48.1    59.1   41.9     54.0
+179                Llama3-8B     Pretrained     69.0     73.6      65.4    56.8   56.0     64.2
+180                              LoRA           81.9     74.5      69.2    69.0   57.6     70.4
+181                              LoRA16         82.4     74.9      70.5    68.6   58.0     70.9
+182                              Bitune         84.4     77.4      72.7    70.1   59.0     72.7
+183                Phi-2         Pretrained     70.3     67.3      61.4    65.0   45.4     61.9
+184                              LoRA           76.3     66.7      61.6    66.6   48.2     63.9
+                                 LoRA16         76.1     66.6      61.6    66.8   47.7     63.8
+185
+                                 Bitune         76.5     67.2      63.0    68.5   48.9     64.8
+186
+187
+188   where α represents the bidirectional-to-causal ratio of features. This ratio is parameterised as
+189
+190
+                                                     |θj |
+                                         αj =                 ,   j ∈ {k, v}                               (6)
+191                                             θinit + |θj |
+192   where θj is a learnable mixing coefficient per transformer block, and θinit is a hyperparameter defining
+193   the initial value of θj . The mixing coefficients are learnable to allow each block to independently
+194   adjust the balance between bidirectional and causal features throughout the training.
+195
+      Parameter Efficient Fine-tuning Note that the components of the model, other than the key and
+196   value projections, can have their own separate sets of weights as well. In the case of full finetuning,
+197   this approach would require an additional set of full weights, which is impractical for large models.
+198
+      Instead, we adapt our model using parameter-efficient finetuning methods. These introduce only a
+199
+      fraction of trainable parameters, making it viable to have two modified variants of the model within a
+200
+      single forward pass. In the default configuration of our method, we utilize the Low-Rank Adaptation
+201   (LoRA) of Hu et al. (2022) to adapt the model. However, Bitune can utilize different methods for
+202   updating the weights, including full model finetuning and other parameter-efficient techniques, as
+203   demonstrated in our ablations section.
+204
+205
+      3     E XPERIMENTS
+206
+207   3.1   I NSTRUCTION -T UNING
+208
+209   Our core experiments involve training pretrained language models on an instruction-tuning dataset
+210   and zero-shot evaluating them on downstream tasks. We evaluate Bitune on multiple models,
+211   comparing results to standard finetuning with LoRA, and zero-shot results of pretrained models
+212   without finetuning.
+213   Specifically, we use a subset of the cleaned UltraFeedback (Cui et al., 2023) dataset, which contains
+214   instructions and corresponding answers generated by various LLMs. From this dataset, we select
+215   completions generated by GPT-4 (OpenAI, 2024), ensuring high-quality responses for training. To fit
+      every model on a single GPU, we filter out samples longer than 512 tokens, which leaves us with
+
+
+                                                           4
+      Under review as a conference paper at ICLR 2025
+
+
+216
+      roughly 10,000 samples for training. For results on another instruction-tuning dataset, please see the
+217   Appendix 6.5.
+218
+219
+      We test the method on pretrained decoder-only language models of two different scales of ap-
+      proximately 2 billion and 7 billion parameters. The specific models used in our experiments are:
+220
+      Gemma 2B and 7B (Gemma Team et al., 2024), Llama2 7B (Touvron et al., 2023) and Llama3 8B
+221
+      (AI@Meta, 2024), and Phi-2 (Li et al., 2023), which has 2.7 billion parameters. We use HuggingFace
+222   Transformers (Wolf et al., 2020) implementation of these models.
+223
+224
+      For updating the weights we use the HuggingFace PEFT (Mangrulkar et al., 2022) implementation
+      of LoRA, with the default rank of 8, and apply it to all linear layers of MLP and self-attention
+225
+      components of the model. We compare Bitune with the following three baselines: Pretrained -
+226
+      initial model without any finetuning; LoRA - model finetuned with LoRA without Bitune-specific
+227   modifications, using rank of 8 as used in our method; and LoRA16 - model finetuned with LoRA,
+228   using a rank of 16 to provide a fair comparison in terms of the number of parameters, as our method
+229   introduces two sets of weights.
+230
+      For each model, we tune the learning rate on the LoRA baseline using steps on the approximate
+231
+      logarithmic scale (1e−4, 3e−4, 1e−3, 3e−3), and then apply the same rate to the other approaches.
+232   Note that this potentially puts our method at a disadvantage compared to the LoRA baseline. All
+233   hyperparameters are reported in the Appendix 6.2.
+234
+      Models are evaluated zero-shot on multiple-choice tasks to assess their performance. For com-
+235
+      monsense reasoning, we use the PIQA (Bisk et al., 2020), CommonsenseQA (Talmor et al., 2019),
+236
+      ARC-Challenge (Clark et al., 2018), and SIQA (Sap et al., 2019) datasets, while for language un-
+237   derstanding, we use the MMLU (Hendrycks et al., 2021) benchmark. Each task consists of a series
+238   of questions, each with multiple choices, where only one answer is correct. As the tasks follow the
+239   question-answer pattern, they are compatible with the instruction-tuning setting.
+240
+      For evaluation, we use the Language Model Evaluation Harness framework (Gao et al., 2023). This
+241
+      framework formats each question using a predefined template, tokenizes the question-choice pairs,
+242   runs them through the model, and compares the log-likelihoods of the choices to determine the
+243   selected answer. For each model and approach configuration, we conduct experiments using three
+244   different random seeds, and average the results.
+245
+      Models are loaded and trained using bfloat16 precision, except for the mixing part, which operates
+246
+      in the full 32-bit floating-point format. This high level of precision for the mixing of features is
+247   important, as minor numerical inaccuracies in the learnable coefficients and intermediate results of
+248   the mixing operation may lead to significant deviations in the model’s behavior.
+249
+      In the decoding phase of the inference with Bitune, to initiate generation, the model requires at least a
+250
+      single token to obtain a set of attention queries, in addition to the keys and values extracted from the
+251
+      instruction. To facilitate this, one can introduce a new learnable <sep> token that would be placed
+252   at the beginning of modeled answer, or utilize an existing token. For our experiments, we opted to
+253   move the last token of the instruction template to the beginning of the modeled answer. For details on
+254   the instruction template used, please refer to the section 6.7 of the Appendix.
+255
+      Results. Table 1 shows consistent and significant gains after instruction-tuning with Bitune, with
+256
+      the highest gains seen on the Gemma-2B model, showing a 4 percentage point (pp) improvement over
+257   the baseline LoRA and a 9.3 pp improvement over the pretrained model. For the other models, the
+258   average gains over baseline finetuning are equal to 1.8, 1.4, and 0.9 pp, for Llama3-8B, Llama2-7B,
+259   and Phi-2 respectively.
+260
+      It is worth noting that the Gemma-7B model shows the lowest average improvement across all tasks,
+261
+      with merely 0.1 pp gain over the baseline finetuning. It is also a single case where the baseline
+262   pretrained model achieved the highest score on a task, MMLU, with degraded performance in all
+263   fine-tuning approaches. However, this is not an issue with the model’s scale, as significant gains are
+264   observed with the Llama2-7B and Llama3-8B models.
+265
+266   3.2   D OWNSTREAM TASK T RAINING
+267
+268   This complementary experiment verifies whether Bitune increases the capacity of the model within
+269   the narrow scope of a single task. It follows the setup from the instruction-tuning experiments with a
+      few changes. Namely, models are not instruction-tuned but trained separately for each evaluation task
+
+
+                                                         5
+      Under review as a conference paper at ICLR 2025
+
+
+270   Table 2: Result for the downstream task training. We show accuracy on downstream tasks for the
+271   baseline LoRA finetuning and Bitune, averaged over 3 seeds. On average, our method works better
+272   than standard LoRA. We see the most significant gains on the GSM8K dataset, but slightly lower
+273   results for Gemma-7B and the SIQA task.
+274
+275                                         PIQA     ARC    CSQA      SIQA    GSM8K      Avg.
+276
+                    Model         Method
+277                 Gemma-2B      LoRA       81.4    58.0    77.2     77.4      30.2     64.8
+                                  LoRA16     81.1    59.1    77.4     77.1      30.2     65.0
+278
+                                  Bitune     83.3    60.0    78.3     76.6      33.0     66.2
+279
+                    Gemma-7B      LoRA       91.4    84.6    84.4     79.4      59.1     79.8
+280                               LoRA16     91.6    83.9    83.9     79.7      59.4     79.7
+281                               Bitune     92.1    84.2    84.2     79.4      59.4     79.9
+282                 Llama2-7B     LoRA       84.4    66.6    81.5     82.7      32.0     69.4
+283                               LoRA16     84.4    66.8    81.7     82.3      31.1     69.3
+284                               Bitune     84.4    66.9    82.0     81.4      32.9     69.5
+285                 Llama3-8B     LoRA       90.2    80.7    83.9     83.1      60.4     79.7
+286
+                                  LoRA16     90.4    81.3    83.4     83.1      59.6     79.6
+                                  Bitune     90.5    81.3    84.1     82.1      63.4     80.3
+287
+                    Phi-2         LoRA       82.8    76.3    78.7     80.3      58.6     75.3
+288
+                                  LoRA16     83.1    76.1    78.6     80.6      57.5     75.2
+289                               Bitune     83.9    77.0    79.0     80.4      59.2     75.9
+290
+291
+292
+      using the corresponding training set. We use PIQA, ARC, CSQA, and SIQA introduced earlier, and
+293
+      an additional arithmetic task, GSM8K (Cobbe et al., 2021).
+294
+295   GSM8K differs from the other tasks, where we compare log-likelihoods of predefined answers, as it
+296   requires the model to generate a full answer token-by-token, including the intermediate step-by-step
+297
+      reasoning. The final answer follows a specific pattern, making it feasible to extract the answer using
+      methods such as regular expressions as the model learns to adhere to this pattern during training.
+298
+299   Results. Table 2 presents the results, demonstrating improvements when finetuning on the down-
+300   stream tasks with Bitune, similar to those seen with instruction-tuning. While there are a few cases
+301   where the baseline finetuning achieves better results on specific tasks, when considering the average
+302
+      gains, applying our method is beneficial across all models. Most importantly, on the GSM8K dataset,
+      we see consistent high gains, suggesting that our method improves the model’s reasoning ability
+303
+      in generative tasks. We present additional results on GSM8K with a 22B parameter model in the
+304
+      Appendix 6.6.
+305
+306   Similar to the instruction-tuning results, the highest gains are observed on the Gemma-2B model,
+307
+      while the lowest on the Gemma-7B. This indicates that the effectiveness of our method depends on
+      the specific model used.
+308
+309
+310   3.3   A BLATIONS
+311
+312   We conduct an ablation study on Bitune using the same experimental setup as in the instruction-
+313   tuning experiment. For this purpose, two models are used: Gemma-2B and Llama3-8B, representing
+314   different size scales and model families.
+315   Component Removal To verify the necessity of each component of the method, we remove selected
+316   parts to answer the following questions:
+317
+318          • Can we simply modify the attention mask to apply bidirectional attention on the prompt,
+319            without using separate weights and mixing? - We test this simplest variant, which we refer
+320            to as Naive Bidir.
+321          • Do we need two sets of features? Is it sufficient to obtain bidirectional features from the
+322            prompt using different weights than those used for causal answer generation? - We remove
+323            the part responsible for generating the set of causal features, and therefore also the mixing
+               component; we refer to this as No Mixing.
+
+
+                                                        6
+      Under review as a conference paper at ICLR 2025
+
+
+324   Table 3: Ablation study on components of Bitune. We report zero-shot accuracy averaged over
+325   PIQA, ARC, CSQA, SIQA and MMLU tasks. The components are explained in section 3.3. We see
+326   that all ablated variants outperform the LoRA baseline, and combining all components performs the
+327   best. Of note, especially bidirectional attention improves results the most.
+328
+329                                                                                         Avg. Acc.
+330
+               Model         Method            Causal    Bidir.    Mixing    Sep. Weights
+331            Gemma-2B      LoRA                ✓         -         -            -           45.7
+                             Naive Bidir.        -        ✓          -            -           47.9
+332
+                             No Mixing           -        ✓          -            ✓           48.9
+333                          Only Causal         ✓         -         ✓            ✓           46.9
+334                          Shared Weights      ✓        ✓          ✓            -           47.4
+335                          Bitune              ✓        ✓          ✓            ✓           49.7
+336            Llama3-8B     LoRA                ✓         -         -            -           70.4
+337                          Naive Bidir.        -        ✓          -            -           71.9
+                             No Mixing           -        ✓          -            ✓           71.5
+338
+                             Only Causal         ✓         -         ✓            ✓           71.1
+339                          Shared Weights      ✓        ✓          ✓            -           72.3
+340                          Bitune              ✓        ✓          ✓            ✓           72.7
+341
+342
+343
+      Table 4: Combining Bitune with different PEFT methods. Performances are averaged over 3 seeds.
+      We can see that our method improves results regardless of the specific PEFT method used.
+344
+345
+                                               PIQA     ARC       CSQA      SIQA   MMLU      Avg.
+346                Model         Method
+347                Gemma-2B      LoRA           66.7    43.4      42.3      44.3    31.7     45.7
+348                              Bitune         69.6    47.5      46.9      49.5    35.3     49.7
+349                              DoRA           66.7    43.6      41.9      44.7    31.9     45.8
+350                              BituneDoRA     69.6    47.5      46.9      49.7    35.1     49.8
+351                              IA3            67.2    46.5      45.5      37.6    32.5     45.9
+352                              BituneIA3      67.5    47.3      48.9      44.3    33.6     48.3
+353                Llama3-8B     LoRA           81.9    74.5      69.2      69.0    57.6     70.4
+354                              Bitune         84.4    77.4      72.7      70.1    59.0     72.7
+355                              DoRA           82.1    75.4      70.2      69.2    57.7     70.9
+356
+                                 BituneDoRA     84.1    77.1      72.0      70.6    58.7     72.5
+357                              IA3            80.9    75.5      68.3      66.4    58.7     70.0
+                                 BituneIA3      83.4    75.7      69.2      67.8    58.8     71.0
+358
+359
+360
+361          • Are the gains solely from mixing two sets of features generated with different weights, or
+362            is bidirectional attention necessary? - Here we keep the attention mask causal to generate
+363            both sets of features, which we refer to as Only Causal.
+364          • Do we need separate weights, or can the same weights be used to generate both causal and
+365            bidirectional features? - To answer this question, we do not introduce the second set of
+366            weights and use the same LoRA for both passes on the prompt, calling it Shared Weights.
+367
+368   The results, averaged over three seeds and presented in Table 3, indicate that all variants of the method
+369   lead to gains over the baseline LoRA finetuning. However, the highest gains are observed in the full
+370
+      variant of Bitune, demonstrating that each component contributes to the method’s effectiveness.
+371   Different PEFT Methods To verify the impact of different PEFT methods on the performance of
+372   our method, we compare Bitune in combination with the following techniques: LoRA (Hu et al.,
+373   2022), that reparametrizes weight updates as a multiplication of two low-rank matrices; DoRA (Liu
+374   et al., 2024), which decomposes these weight updates into direction and magnitude; and IA3 (Liu
+375
+      et al., 2022), that instead rescales activations with learnable vectors.
+376   The results are shown in Table 4. We find consistent gains across all three PEFT methods we analyze,
+377   with gains ranging from +1.6% to +4.0% for averaged accuracy. This demonstrates that Bitune is
+      PEFT-agnostic and can be combined with existing and future innovations in PEFT methods.
+
+
+                                                         7
+      Under review as a conference paper at ICLR 2025
+
+
+378   Table 5: Results for full finetuning on the instruction-tuning setup. We compare our method to
+379   full finetuning baseline. For Bitune, we optimize two sets of full model’s weights.
+380
+381                                                         PIQA     ARC      CSQA      SIQA        MMLU    Avg.
+382                         Model      Method
+383                         Gemma-2B   Full FT               69.0    46.7       43.5     43.7        34.8   47.5
+384                                    Bitune (Full FT)      70.3    48.0       47.4     43.9        36.7   49.3
+385
+386   Full Finetuning Additionally, we test whether Bitune yields gains with full finetuning (Full-FT),
+387   by optimizing two sets of full model’s parameters. We conduct experiments on Gemma-2B model,
+388   and compare results with standard Full-FT baseline. The results in Table 5 demonstrate that Bitune
+389   improves the model’s performance even in full finetuning scenarios.
+390   Initialization of Mixing Coefficient The initial value of the mixing coefficient θ is a hyperpa-
+391   rameter in our method. To evaluate its impact on the performance and the training dynamics of the
+392   bidirectional-to-causal ratio of features, we conduct experiments on the instruction-tuning setup with
+393   the following values: 0.1, 0.01, and 0.001.
+394
+                                                                                         Bidir. K              Bidir. V
+395
+396               0.6                                                           0.4
+                                                          0.1
+      Ratio [%]
+
+
+397
+
+                                                                            %
+398                                                       0.01                  0.2
+399               0.4                                     0.001
+400                                                                             0.0    Layer Index          Layer Index
+401
+402                     0                                     3000
+403
+                                   Training Step
+404
+405   Figure 2: Bidirectional-to-causal ratio during                        Figure 3: Ratio across layers. Here we show
+      training. The ratio is averaged over all layers and                   the final ratio of the model in Fig. 2 across all
+406
+      shown for different initial values of mixing coef-                    layers for the K and V values. The utilization
+407
+      ficients for Llama3-8B. The initial value impacts                     of bidirectional attention is spread across all
+408                                                                         layers.
+      the change of the ratio, with higher values slowing
+409   it down, and lower values increasing it.
+410
+411   Table 6a demonstrates that the initial value of the mixing coefficient impacts the performance, with
+412   0.01 being the most optimal value for both models, regardless of their scale. Figure 2 shows that the
+413   initial value substantially affects the rate of change of the mixing ratio, with the higher value leading
+414   to nearly no change in the ratio, while the lower value results in sharp changes at the very beginning
+415   of the training. In Figure 3, we also observe that after training, all layers utilize the bidirectional
+416   attention.
+417   Attention Mask of Second Pass We test another option for the attention mask of the second pass
+418   on the instruction. We transpose the causal attention mask, blocking information flow from the past
+419   tokens, and allowing from the future tokens - we call it anti-causal attention mask.
+420   Results shown in Table 6b indicate that the instruction has to be processed with full bidirectional
+421   attention to achieve the highest gains. Combining causal and anti-causal features independently does
+422   not lead to the same high performance.
+423
+424
+      4           R ELATED W ORK
+425
+426   Our approach shares similarities with the concept of "prefix language modeling", which enables a
+427   decoder-only model to handle bidirectional context within a prefix (instruction) while maintaining
+428   causal generation for the output sequence. The prefix-LM architecture was introduced by Liu et al.
+429   (2018) and further explored and popularized by Raffel et al. (2020). In their work on T5, Raffel et al.
+430   (2020) pretrained the prefix-LM architecture alongside other architectures, such as encoder-decoder
+431   and decoder-only models, demonstrating that prefix-LM outperforms decoder-only models on both
+      training objectives: denoising and language modeling.
+
+
+                                                                     8
+      Under review as a conference paper at ICLR 2025
+
+
+432   Table 6: Ablation of Bitune’s attention. We vary the additional attention mask for processing the
+433   instruction besides the causal pass, and evaluate different initial values of mixing coefficient, θinit .
+434
+435       (a) Different init. values for mixing coefficients.   (b) 2nd pass attention masks for instruction features.
+436           Model           Init. Value    Avg. Acc.               Model          Attention Mask     Avg. Acc
+437
+              Gemma-2B        0.1              49.4                  Gemma-2B       Causal               46.9
+438                           0.01             49.7                                 Anti-causal          46.7
+439                           0.001            47.2                                 Bidirectional        49.7
+440           Llama3-8B       0.1              72.7                  Llama3-8B      Causal               71.1
+441                           0.01             72.7                                 Anti-causal          71.4
+442                           0.001            72.3                                 Bidirectional        72.7
+443
+444
+445   The prefix-LM approach has been used in UniLM (Dong et al., 2019), which trains a single transformer
+446   on three types of language modeling tasks: unidirectional, bidirectional, and sequence-to-sequence
+447
+      prediction. UniLM employs a shared Transformer network and utilizes specific self-attention masks
+      to control the context that predictions are conditioned on, where the sequence-to-sequence task is
+448
+      equivalent to the prefix-LM approach.
+449
+450   Additionally, UL2 (Tay et al., 2023) introduces a pretraining objective called "Mixture of Denoisers",
+451   which combines various denoising strategies, including the prefix-LM approach. Lastly, XLNet (Yang
+452
+      et al., 2019) also allows for non-causal word ordering by allowing random permutations to be used
+      with a next-token prediction objective.
+453
+454   All these works focused on the model pretraining. As for the utilization of pretrained causal language
+455   models, Springer et al. (2024) show in their work that simply repeating the input to these models
+456   improves the quality of token embeddings for text-retrieval. This work addresses the limitation
+457
+      that token embeddings in autoregressive models cannot contain information from tokens appearing
+      later in the input. By repeating the input twice, the early tokens are allowed to encode information
+458
+      about later tokens, thereby improving the quality of the embeddings. Another approach, LLM2Vec
+459
+      (BehnamGhader et al., 2024), demonstrates that pretrained causal LLMs can be effectively converted
+460   to BERT-like encoders. It can be done by enabling bidirectional attention, training the model on the
+461   objective of masked token prediction, and applying unsupervised contrastive learning.
+462
+463
+464
+      5      D ISCUSSION
+465
+      Limitations. During standard instruction-tuning training, the instruction and the answer are pro-
+466   cessed in a single forward pass. In our method, this processing is explicitly split into phases, extracting
+467   instruction features with two passes & answer modeling, increasing both training time and memory
+468   usage. As for the inference, these two passes on the instruction, bidirectional and causal, can be
+469   processed either in parallel, impacting memory usage, or sequentially, increasing latency.
+470
+      However, this is a minor limitation in the context of instruction-tuning, since typically smaller datasets
+471   are used compared to pretraining, leading to relatively short training times. Furthermore, at inference
+472   time the added latency for processing the instruction is negligible, as the bulk of compute is used for
+473   the autoregressive answer generation: e.g. only a 0.2s increase from 11.5s to 11.7s for a 200 token
+474   response to a 50 token instruction for Llama3-8B (see Appendix 6.4 for more results).
+475
+      Conclusion. This work proposes the first method to utilize the instruction-answer structure of IT
+476   datasets that enables bidirectional processing in pretrained decoder-only models. Bitune demonstrates
+477   general applicability across different models and scales, and it consistently improves performance
+478   across commonsense reasoning, arithmetic, and language understanding tasks. We further demon-
+479   strate that our method is compatible with different existing PEFT methods and will likely benefit
+480   from further developments in this area.
+481
+482
+483
+484
+485
+
+
+
+                                                                 9
+      Under review as a conference paper at ICLR 2025
+
+
+486
+      Reproducibility Statement. We have made efforts to ensure the reproducibility of our work. The
+487   code necessary to reproduce all experiments presented in this paper is provided in the supplementary
+488   materials. Information about hyperparameters and other experimental specifications can be found in
+489   the appendix. Each experiment was conducted using a single NVIDIA A100 GPU.
+490
+491
+      R EFERENCES
+492
+493   AI@Meta. Llama 3 model card, 2024. URL https://github.com/meta-llama/llama3/
+494     blob/main/MODEL_CARD.md.
+495
+      Parishad BehnamGhader, Vaibhav Adlakha, Marius Mosbach, Dzmitry Bahdanau, Nicolas Chapados,
+496
+        and Siva Reddy. LLM2Vec: Large language models are secretly powerful text encoders. arXiv
+497     preprint: arXiv:2404.05961, 2024.
+498
+499   Yonatan Bisk, Rowan Zellers, Ronan Le Bras, Jianfeng Gao, and Yejin Choi. Piqa: Reasoning about
+500     physical commonsense in natural language. In AAAI, 2020.
+501
+      Hyung Won Chung, Le Hou, Shayne Longpre, Barret Zoph, Yi Tay, William Fedus, Eric Li, Xuezhi
+502    Wang, Mostafa Dehghani, Siddhartha Brahma, Albert Webson, Shixiang Shane Gu, Zhuyun Dai,
+503     Mirac Suzgun, Xinyun Chen, Aakanksha Chowdhery, Sharan Narang, Gaurav Mishra, Adams Yu,
+504    Vincent Zhao, Yanping Huang, Andrew Dai, Hongkun Yu, Slav Petrov, Ed H. Chi, Jeff Dean, Jacob
+505     Devlin, Adam Roberts, Denny Zhou, Quoc V. Le, and Jason Wei. Scaling instruction-finetuned
+506     language models. JMLR, 2024.
+507
+      Peter Clark, Isaac Cowhey, Oren Etzioni, Tushar Khot, Ashish Sabharwal, Carissa Schoenick, and
+508
+        Oyvind Tafjord. Think you have solved question answering? try arc, the ai2 reasoning challenge,
+509
+        2018.
+510
+511   Karl Cobbe, Vineet Kosaraju, Mohammad Bavarian, Mark Chen, Heewoo Jun, Lukasz Kaiser,
+512     Matthias Plappert, Jerry Tworek, Jacob Hilton, Reiichiro Nakano, Christopher Hesse, and John
+513     Schulman. Training verifiers to solve math word problems, 2021.
+514
+      Samuel Rhys Cox and Wei Tsang Ooi. Conversational interactions with npcs in llm-driven gaming:
+515     Guidelines from a content analysis of player feedback. In International Workshop on Chatbot
+516     Research and Design, 2023.
+517
+518   Ganqu Cui, Lifan Yuan, Ning Ding, Guanming Yao, Wei Zhu, Yuan Ni, Guotong Xie, Zhiyuan
+519     Liu, and Maosong Sun. Ultrafeedback: Boosting language models with high-quality feedback.
+520
+        arXiv:2310.01377, 2023.
+521   Jacob Devlin, Ming-Wei Chang, Kenton Lee, and Kristina Toutanova. BERT: Pre-training of deep
+522     bidirectional transformers for language understanding. In ACL, 2019.
+523
+524   Li Dong, Nan Yang, Wenhui Wang, Furu Wei, Xiaodong Liu, Yu Wang, Jianfeng Gao, Ming Zhou,
+525
+        and Hsiao-Wuen Hon. Unified language model pre-training for natural language understanding
+        and generation. In NeurIPS, 2019.
+526
+527   Leo Gao, Jonathan Tow, Baber Abbasi, Stella Biderman, Sid Black, Anthony DiPofi, Charles Foster,
+528     Laurence Golding, Jeffrey Hsu, Alain Le Noac’h, Haonan Li, Kyle McDonell, Niklas Muennighoff,
+529     Chris Ociepa, Jason Phang, Laria Reynolds, Hailey Schoelkopf, Aviya Skowron, Lintang Sutawika,
+530     Eric Tang, Anish Thite, Ben Wang, Kevin Wang, and Andy Zou. A framework for few-shot
+531     language model evaluation, 2023. URL https://zenodo.org/records/10256836.
+532
+      Gemma Team, Thomas Mesnard, Cassidy Hardin, Robert Dadashi, Surya Bhupatiraju, Shreya Pathak,
+533
+        Laurent Sifre, Morgane Rivière, Mihir Sanjay Kale, Juliette Love, Pouya Tafti, Léonard Hussenot,
+534     Pier Giuseppe Sessa, Aakanksha Chowdhery, Adam Roberts, Aditya Barua, Alex Botev, Alex
+535     Castro-Ros, Ambrose Slone, Amélie Héliou, Andrea Tacchetti, Anna Bulanova, Antonia Paterson,
+536     Beth Tsai, Bobak Shahriari, Charline Le Lan, Christopher A. Choquette-Choo, Clément Crepy,
+537     Daniel Cer, Daphne Ippolito, David Reid, Elena Buchatskaya, Eric Ni, Eric Noland, Geng Yan,
+538     George Tucker, George-Christian Muraru, Grigory Rozhdestvenskiy, Henryk Michalewski, Ian
+539     Tenney, Ivan Grishchenko, Jacob Austin, James Keeling, Jane Labanowski, Jean-Baptiste Lespiau,
+        Jeff Stanway, Jenny Brennan, Jeremy Chen, Johan Ferret, Justin Chiu, Justin Mao-Jones, Katherine
+
+
+                                                      10
+      Under review as a conference paper at ICLR 2025
+
+
+540
+        Lee, Kathy Yu, Katie Millican, Lars Lowe Sjoesund, Lisa Lee, Lucas Dixon, Machel Reid, Maciej
+541     Mikuła, Mateo Wirth, Michael Sharman, Nikolai Chinaev, Nithum Thain, Olivier Bachem, Oscar
+542     Chang, Oscar Wahltinez, Paige Bailey, Paul Michel, Petko Yotov, Rahma Chaabouni, Ramona
+543     Comanescu, Reena Jana, Rohan Anil, Ross McIlroy, Ruibo Liu, Ryan Mullins, Samuel L Smith,
+544     Sebastian Borgeaud, Sertan Girgin, Sholto Douglas, Shree Pandya, Siamak Shakeri, Soham De,
+545     Ted Klimenko, Tom Hennigan, Vlad Feinberg, Wojciech Stokowiec, Yu hui Chen, Zafarali Ahmed,
+546     Zhitao Gong, Tris Warkentin, Ludovic Peran, Minh Giang, Clément Farabet, Oriol Vinyals, Jeff
+547     Dean, Koray Kavukcuoglu, Demis Hassabis, Zoubin Ghahramani, Douglas Eck, Joelle Barral,
+548     Fernando Pereira, Eli Collins, Armand Joulin, Noah Fiedel, Evan Senter, Alek Andreev, and
+549
+        Kathleen Kenealy. Gemma: Open models based on gemini research and technology. arxiv preprint:
+        arXiv:2403.08295, 2024.
+550
+551   Dan Hendrycks, Collin Burns, Steven Basart, Andy Zou, Mantas Mazeika, Dawn Song, and Jacob
+552     Steinhardt. Measuring massive multitask language understanding. In ICLR, 2021.
+553
+      Edward J Hu, yelong shen, Phillip Wallis, Zeyuan Allen-Zhu, Yuanzhi Li, Shean Wang, Lu Wang,
+554
+        and Weizhu Chen. LoRA: Low-rank adaptation of large language models. In ICLR, 2022.
+555
+556   Patrick Lewis, Ethan Perez, Aleksandra Piktus, Fabio Petroni, Vladimir Karpukhin, Naman Goyal,
+557     Heinrich Küttler, Mike Lewis, Wen-tau Yih, Tim Rocktäschel, et al. Retrieval-augmented genera-
+558     tion for knowledge-intensive nlp tasks. In NeurIPS, 2020.
+559   Quentin Lhoest, Albert Villanova del Moral, Yacine Jernite, Abhishek Thakur, Patrick von Platen,
+560     Suraj Patil, Julien Chaumond, Mariama Drame, Julien Plu, Lewis Tunstall, Joe Davison, Mario
+561     Šaško, Gunjan Chhablani, Bhavitvya Malik, Simon Brandeis, Teven Le Scao, Victor Sanh, Canwen
+562    Xu, Nicolas Patry, Angelina McMillan-Major, Philipp Schmid, Sylvain Gugger, Clément Delangue,
+563    Théo Matussière, Lysandre Debut, Stas Bekman, Pierric Cistac, Thibault Goehringer, Victor
+564     Mustar, François Lagunas, Alexander Rush, and Thomas Wolf. Datasets: A community library for
+565     natural language processing. In EMNLP: System Demonstrations, 2021.
+566
+      Xianming Li and Jing Li. Angle-optimized text embeddings. ACL, 2023.
+567
+568   Yuanzhi Li, Sébastien Bubeck, Ronen Eldan, Allie Del Giorno, Suriya Gunasekar, and Yin Tat Lee.
+569     Textbooks are all you need ii: phi-1.5 technical report. arXiv:2309.05463, 2023.
+570   Haokun Liu, Derek Tam, Muqeeth Mohammed, Jay Mohta, Tenghao Huang, Mohit Bansal, and Colin
+571     Raffel. Few-shot parameter-efficient fine-tuning is better and cheaper than in-context learning. In
+572     NeurIPS, 2022.
+573
+574   Peter J. Liu, Mohammad Saleh, Etienne Pot, Ben Goodrich, Ryan Sepassi, Lukasz Kaiser, and Noam
+575
+        Shazeer. Generating wikipedia by summarizing long sequences. In ICLR, 2018.
+576   Shih-Yang Liu, Chien-Yi Wang, Hongxu Yin, Pavlo Molchanov, Yu-Chiang Frank Wang, Kwang-
+577     Ting Cheng, and Min-Hung Chen. Dora: Weight-decomposed low-rank adaptation. In ICML,
+578     2024.
+579
+      Sourab Mangrulkar, Sylvain Gugger, Lysandre Debut, Younes Belkada, Sayak Paul, and Benjamin
+580
+        Bossan. PEFT: State-of-the-art parameter-efficient fine-tuning methods. https://github.
+581     com/huggingface/peft, 2022.
+582
+583   Mistral AI. Codestral: Hello, World! — mistral.ai.              https://mistral.ai/news/
+584    codestral/, 2024. [Accessed 01-10-2024].
+585   OpenAI. Gpt-4 technical report. arXiv:2303.08774, 2024.
+586
+587   Long Ouyang, Jeff Wu, Xu Jiang, Diogo Almeida, Carroll L. Wainwright, Pamela Mishkin, Chong
+588
+        Zhang, Sandhini Agarwal, Katarina Slama, Alex Ray, John Schulman, Jacob Hilton, Fraser Kelton,
+        Luke Miller, Maddie Simens, Amanda Askell, Peter Welinder, Paul Christiano, Jan Leike, and
+589
+        Ryan Lowe. Training language models to follow instructions with human feedback. In NeurIPS,
+590
+        2022a.
+591
+592   Long Ouyang, Jeffrey Wu, Xu Jiang, Diogo Almeida, Carroll Wainwright, Pamela Mishkin, Chong
+593     Zhang, Sandhini Agarwal, Katarina Slama, Alex Ray, et al. Training language models to follow
+        instructions with human feedback. In NeurIPS, 2022b.
+
+
+                                                       11
+      Under review as a conference paper at ICLR 2025
+
+
+594
+      Colin Raffel, Noam Shazeer, Adam Roberts, Katherine Lee, Sharan Narang, Michael Matena, Yanqi
+595     Zhou, Wei Li, and Peter J. Liu. Exploring the limits of transfer learning with a unified text-to-text
+596     transformer. JMLR, 2020.
+597
+598   Baptiste Roziere, Jonas Gehring, Fabian Gloeckle, Sten Sootla, Itai Gat, Xiaoqing Ellen Tan, Yossi
+599
+        Adi, Jingyu Liu, Tal Remez, Jérémy Rapin, et al. Code llama: Open foundation models for code.
+        arXiv:2308.12950, 2023.
+600
+601   Maarten Sap, Hannah Rashkin, Derek Chen, Ronan Le Bras, and Yejin Choi. Social iqa: Common-
+602    sense reasoning about social interactions. In EMNLP, 2019.
+603
+      Mike Schuster and Kuldip K. Paliwal. Bidirectional recurrent neural networks. In IEEE Transactions
+604    on Signal Processing, 1997.
+605
+606   Jacob Mitchell Springer, Suhas Kotha, Daniel Fried, Graham Neubig, and Aditi Raghunathan.
+607
+        Repetition improves language model embeddings. arviv preprint arXiv2402.15449, 2024.
+608   Alon Talmor, Jonathan Herzig, Nicholas Lourie, and Jonathan Berant. CommonsenseQA: A question
+609     answering challenge targeting commonsense knowledge. In Jill Burstein, Christy Doran, and
+610     Thamar Solorio (eds.), NAACL, 2019.
+611
+      Rohan Taori, Ishaan Gulrajani, Tianyi Zhang, Yann Dubois, Xuechen Li, Carlos Guestrin, Percy
+612     Liang, and Tatsunori B. Hashimoto. Stanford alpaca: An instruction-following llama model.
+613     https://github.com/tatsu-lab/stanford_alpaca, 2023.
+614
+615
+      Yi Tay, Mostafa Dehghani, Vinh Q. Tran, Xavier Garcia, Jason Wei, Xuezhi Wang, Hyung Won
+        Chung, Dara Bahri, Tal Schuster, Steven Zheng, Denny Zhou, Neil Houlsby, and Donald Metzler.
+616
+        UL2: Unifying language learning paradigms. In ICLR, 2023.
+617
+618   Arun James Thirunavukarasu, Darren Shu Jeng Ting, Kabilan Elangovan, Laura Gutierrez, Ting Fang
+619     Tan, and Daniel Shu Wei Ting. Large language models in medicine. Nature medicine, 2023.
+620   Hugo Touvron, Louis Martin, Kevin Stone, Peter Albert, Amjad Almahairi, Yasmine Babaei, Nikolay
+621     Bashlykov, Soumya Batra, Prajjwal Bhargava, Shruti Bhosale, Dan Bikel, Lukas Blecher, Cris-
+622     tian Canton Ferrer, Moya Chen, Guillem Cucurull, David Esiobu, Jude Fernandes, Jeremy Fu,
+623     Wenyin Fu, Brian Fuller, Cynthia Gao, Vedanuj Goswami, Naman Goyal, Anthony Hartshorn,
+624     Saghar Hosseini, Rui Hou, Hakan Inan, Marcin Kardas, Viktor Kerkez, Madian Khabsa, Isabel
+625     Kloumann, Artem Korenev, Punit Singh Koura, Marie-Anne Lachaux, Thibaut Lavril, Jenya Lee,
+626     Diana Liskovich, Yinghai Lu, Yuning Mao, Xavier Martinet, Todor Mihaylov, Pushkar Mishra,
+627     Igor Molybog, Yixin Nie, Andrew Poulton, Jeremy Reizenstein, Rashi Rungta, Kalyan Saladi,
+628
+        Alan Schelten, Ruan Silva, Eric Michael Smith, Ranjan Subramanian, Xiaoqing Ellen Tan, Binh
+        Tang, Ross Taylor, Adina Williams, Jian Xiang Kuan, Puxin Xu, Zheng Yan, Iliyan Zarov, Yuchen
+629
+        Zhang, Angela Fan, Melanie Kambadur, Sharan Narang, Aurelien Rodriguez, Robert Stojnic,
+630
+        Sergey Edunov, and Thomas Scialom. Llama 2: Open foundation and fine-tuned chat models.
+631     arXiv:2307.09288, 2023.
+632
+633   Ashish Vaswani, Noam Shazeer, Niki Parmar, Jakob Uszkoreit, Llion Jones, Aidan N Gomez, Ł ukasz
+634     Kaiser, and Illia Polosukhin. Attention is all you need. In NeurIPS, 2017.
+635   Thomas Wang, Adam Roberts, Teven Le Scao Daniel Hesslow, Hyung Won Chung, Iz Beltagy, Julien
+636     Launay, and Colin Raffel. What language model architecture and pretraining objective work best
+637     for zero-shot generalization? In ICML, 2022.
+638
+      Thomas Wolf, Lysandre Debut, Victor Sanh, Julien Chaumond, Clement Delangue, Anthony Moi,
+639
+        Pierric Cistac, Tim Rault, Rémi Louf, Morgan Funtowicz, Joe Davison, Sam Shleifer, Patrick
+640     von Platen, Clara Ma, Yacine Jernite, Julien Plu, Canwen Xu, Teven Le Scao, Sylvain Gugger,
+641     Mariama Drame, Quentin Lhoest, and Alexander M. Rush. Transformers: State-of-the-art natural
+642     language processing. In EMNLP: System Demonstrations, 2020.
+643
+      Zhilin Yang, Zihang Dai, Yiming Yang, Jaime Carbonell, Russ R Salakhutdinov, and Quoc V Le.
+644
+        Xlnet: Generalized autoregressive pretraining for language understanding. NeurIPS, 2019.
+645
+646   Shengyu Zhang, Linfeng Dong, Xiaoya Li, Sen Zhang, Xiaofei Sun, Shuhe Wang, Jiwei Li, Runyi
+647     Hu, Tianwei Zhang, Fei Wu, and Guoyin Wang. Instruction tuning for large language models: A
+        survey. arXiv:2308.10792, 2024.
+
+
+                                                        12
+      Under review as a conference paper at ICLR 2025
+
+
+648
+      6     A PPENDIX
+649
+650
+651
+      6.1   P SEUDOCODE FOR B ITUNE T RAINING S TEP
+652
+653
+654
+655
+656   Algorithm 2 Python-like pseudocode of Bitune Training Step.
+657
+658   # prompt - tensor with tokenized instruction
+      # answer - tensor with tokenizer answer to model
+659   # theta - trainable tensor with mixing coeff. for each layer
+660   # theta_init - initial value of mixing coefficients
+661
+      k_c, v_c = model_causal(prompt) # Pass on the instruction for causal
+662
+          features
+663   k_b, v_b = model_bidir(prompt) # Pass to obtain bidirectional features
+664   # Combine both sets of features
+665   alpha = theta.abs() / (theta.abs() + theta_init)
+      k = k_c * (1 - alpha) + k_b * alpha
+666   v = v_c * (1 - alpha) + v_b * alpha
+667   kv = (k, v)
+668
+      logits = model_causal(answer, kv)
+669   loss = compute_loss(logits, answer)
+670   loss.backward()
+671   update_parameters(model_causal, model_bidir, theta)
+672
+673
+674
+675
+676   6.2   H YPERPARAMETERS
+677
+678
+679
+680
+                        Table 7: Hyperparameters shared across models and datasets.
+681
+682                        Hyperparameter                           Value
+683
+                           GPUs                                        1
+684
+                           Optimizer                               AdamW
+685                        LR Scheduler                             Linear
+686                        Weight Decay                               0.0
+687                        Batch Size (incl. accumulation)            10
+688                        Accumulation Steps                         10
+689                        Warmup Steps                       10% of update steps
+690                        θinit (Bitune)                            0.01
+691                        RNG Seeds                              42, 43, 44
+692
+693
+694
+695
+696
+697
+                                Table 8: Dataset-specific hyperparameters.
+698
+699            Hyperparameter    UltraFeedback    PIQA       ARC    CSQA     SIQA     GSM8K
+700
+               Epochs                   3           1         5       1        1        1
+701
+               Update Steps           3000        1605       555     974     3341      747
+
+
+                                                    13
+      Under review as a conference paper at ICLR 2025
+
+
+702   Table 9: Learning rate for given dataset-model pair, including different PEFT variants for instruction-
+703   tuning experiments.
+704
+705          Model                   UltraFeedback       PIQA     ARC    CSQA      SIQA     GSM8K
+706          Gemma-2B                     3E-4           1E-3     1E-3    1E-3     1E-3      1E-3
+707          Gemma-7B                     3E-4           3E-4     3E-4    3E-4     3E-4      3E-4
+708          Llama2-7B                    3E-4           1E-3     1E-3    1E-3     1E-3      1E-3
+709          Llama3-8B                    3E-4           1E-3     1E-3    1E-3     1E-3      1E-3
+710          Phi-2                        3E-4           1E-3     1E-3    1E-3     1E-3      1E-3
+711          Gemma-2B (DoRA)              3E-4             -        -      -         -        -
+712          Gemma-2B (IA3)               1E-3             -        -      -         -        -
+713          Llama3-8B (DoRA)             3E-4             -        -      -         -        -
+714          Llama3-8B (IA3)              1E-3             -        -      -         -        -
+715
+716
+717   Table 10: Configuration of PEFT methods. All other hyperparameters have default values of
+718   HuggingFace PEFT library.
+719
+720
+                  Hyperparameter                  Value
+721               Rank (LoRA, DoRA)               8
+722               Alpha (LoRA, DoRA)              1
+723
+                  Target Modules (All)            All linear layers of MLP and Self-Attention
+                  Feedforward Modules (IA3)       All linear layers of MLP
+724
+725
+726   6.3   DATASETS
+727
+728   For all experiments we used HuggingFace Datasets (Lhoest et al., 2021) library to obtain necessary
+729   datasets.
+730
+      Table 11: Table with datasets and corresponding paths, to be used with HuggingFace Datasets library.
+731
+732                               Dataset               Path
+733
+                                  UltraFeedback         openbmb/UltraFeedback
+734
+                                  PIQA                  piqa
+735                               ARC-Challenge         allenai/ai2_arc
+736                               CSQA                  tau/commonsense_qa
+737                               SIQA                  social_i_qa
+738                               GSM8K                 gsm8k
+739                               MMLU                  hails/mmlu_no_train
+740
+741
+742   6.4   T RAINING S PEED & M EMORY U SAGE
+743
+      As the method introduces two additional forward passes during training, both the training speed
+744   and the memory usage are impacted. Here we present average training times and GPU memory
+745   usage on the instruction-tuning setup with 3000 update steps (30000 actual steps, due to gradient
+746   accumulation), on a single A100 GPU, for models of two different scales - Gemma-2B & Llama3-8B.
+747   Our implementation has not been optimized, which means that e.g. training times could be improved
+748   via parallelization of two passes on the prompt. Table shows average training time, peak GPU memory
+749   usage during training, and average accuracy on downstream tasks. Additionally, we provide inference
+750   times, averaged over 10 runs, for a given prompt-to-answer length in tokens.
+751
+752                                   Train. Time [h]     Memory [GB]      Acc.    Inference Time [s]
+753
+            Model          Method                                                  50:200    200:50
+754         Gemma-2B       LoRA             1.0                 14.9       45.7     6.31       1.56
+755                        Bitune           3.1                 19.8       49.7     6.72       1.74
+
+
+
+                                                         14
+      Under review as a conference paper at ICLR 2025
+
+
+756
+              Llama3-8B    LoRA                1.7             26.6               70.4     11.48          2.39
+757                        Bitune              5.3             30.8               72.7     11.65          2.73
+758
+759
+760   Using these values, one can approximate required compute to reproduce results on a given tasks, as
+761   all experiments shared the same batch size and many other hyperparameters.
+762
+763   6.5     I NSTRUCTION - TUNING ON A LPACA DATASET
+764
+      We tested Bitune on another, larger instruction-tuning dataset - cleaned Alpaca dataset1 (Taori et al.,
+765
+      2023) with 50,000 samples. Similarly to previous experimental settings, first we tested different
+766   learning rates for the baseline LoRA finetuning, picked the best one, and then used the same learning
+767   rate for other approaches used in the experiment - Bitune, and Naive Bidir. (introduced in the ablation
+768   study section 3.3). The results demonstrate that our method’s benefits extend to larger datasets as
+769   well.
+770
+771   Table 13: Zero-shot results after instruction-tuning on the Alpaca dataset. Results are averaged over
+772
+      3 random seeds.
+773
+                                                 PIQA   ARC    CSQA         SIQA         MMLU      Avg.
+774
+                   Model        Method
+775
+                   Gemma-2B     LoRA             64.1   40.8      38.6          38.6      33.8     43.2
+776                             Naive Bidir.     64.9   41.7      42.2          42.3      33.6     44.9
+777                             Bitune           66.5   43.6      43.2          43.5      36.2     46.6
+778                Llama3-8B    LoRA             76.6   71.1      63.3          67.4      57.8     67.2
+779                             Naive Bidir.     79.5   70.5      62.4          66.8      55.3     66.9
+780                             Bitune           79.4   71.3      63.5          68.6      58.3     68.2
+781
+782
+      6.6     F INETUNING L ARGER M ODEL ON GSM8K
+783
+784   In order to verify whether improvements hold for larger, already highly capable models, we finetune
+785   Codestral (Mistral AI, 2024) with 22B parameters on the GSM8K dataset. The results, averaged
+786   over 3 random seeds, show a substantial 4.3 percentage point improvement over the baseline LoRA
+787   finetuning, indicating that Bitune can provide considerable gains even for larger models, which
+788
+      already have strong performance on a given task.
+789
+                 Table 14: Results for Bitune and baseline LoRA finetuning on GSM8K dataset.
+790
+791
+                                                                    GSM8K
+792                                     Model            Method
+793                                     Codestral-22B    LoRA            69.3
+794                                                      Bitune          73.6
+795
+796
+797   6.7     P ROMPT T EMPLATES
+798   Templates used to format instruction-answer pairs for a given dataset, for both training and evaluation.
+799   In all cases there is a space character at the beginning of the answer part.
+800
+801     Dataset           Instruction                                                    Answer
+802
+        UltraFeedback     Question: {instruction}                                        {completion}<EOS>
+803
+804                       Answer:
+805
+806
+807
+808
+809
+         1
+             https://huggingface.co/datasets/yahma/alpaca-cleaned
+
+
+                                                        15
+      Under review as a conference paper at ICLR 2025
+
+
+810
+        PIQA             Question: {question}                                 {answer}<EOS>
+811
+812                      Choices:
+813                      {choice0}
+814                      {choice1}
+815
+816                      Answer:
+817     ARC              Question: {question}                                 {answer}<EOS>
+818
+819                      Choices:
+820                      {choice0}
+821                      {choice1}
+822
+                         {choice2}
+                         {choice3}
+823
+824
+                         Answer:
+825
+        CSQA             Question: {question}                                 {answer}<EOS>
+826
+827                      Choices:
+828                      {choice0}
+829                      {choice1}
+830                      {choice2}
+831                      {choice3}
+832                      {choice4}
+833
+834                      Answer:
+835     SIQA             Question: Given the context, answer correctly the    ({answer_index})<EOS>
+836                      question.
+837                      Context: {context}
+838
+                         Question: {question}
+839
+                         Choices:
+840
+                         (0) {choice0}
+841                      (1) {choice1}
+842                      (2) {choice2}
+843
+844                      Answer:
+845     GSM8K            Question: {question}                                 {answer}<EOS>
+846
+847                      Answer:
+848     MMLU             Question: {question}                                 ({answer_index})<EOS>
+849                      (0). {choice0}
+850                      (1). {choice1}
+851                      (2). {choice2}
+852                      (3). {choice3}
+853
+854
+                         Answer:
+855
+856
+857
+858
+859
+860
+861   6.8   R ESULTS WITH S TANDARD D EVIATION
+862
+863
+      Tables with complete results averaged over 3 seeds, includes standard deviation.
+
+
+                                                      16
+      Under review as a conference paper at ICLR 2025
+
+
+864   Table 16: Zero-shot results on downstream tasks after instruction-tuning on the UltraFeedback dataset.
+865
+866                                           PIQA               ARC               CSQA                SIQA          MMLU
+867                                  mean      std      mean     std       mean     std       mean      std      mean std
+868    Model          Method
+869    Gemma-2B       Pretrained     57.51     -        36.86     -        35.46     -        38.18     -        34.01     -
+870                   LoRA           66.74     0.52     43.37     1.33     42.32     1.60     44.27     3.85     31.74     0.78
+871                   LoRA16         66.50     0.85     42.72     1.46     42.34     1.21     43.82     3.71     31.61     0.85
+872                   Bitune         69.59     1.20     47.47     0.64     46.87     1.98     49.51     1.54     35.29     0.08
+873    Gemma-7B       Pretrained     73.12     -        78.33     -        62.00     -        64.74     -        59.04     -
+874                   LoRA           84.24     0.51     79.18     0.76     68.47     1.61     71.92     0.34     55.26     0.43
+875                   LoRA16         83.93     0.94     79.24     0.61     68.39     2.05     71.99     0.83     53.41     4.22
+876                   Bitune         83.59     0.46     80.09     0.90     69.15     0.56     72.74     0.90     53.81     0.40
+877    Llama2-7B      Pretrained     59.25     -        38.14     -        32.60     -        45.09     -        35.98     -
+878                   LoRA           69.51     0.73     49.94     0.79     45.32     2.65     57.05     1.24     41.06     0.23
+879
+                      LoRA16         69.86     0.25     49.89     1.51     45.59     2.08     56.69     1.89     41.21     0.20
+                      Bitune         70.00     0.53     51.11     0.23     48.08     2.59     59.09     0.96     41.87     0.21
+880
+881    Llama3-8B      Pretrained     68.99     -        73.63     -        65.36     -        56.81     -        56.00     -
+882
+                      LoRA           81.94     0.38     74.46     1.06     69.23     0.67     68.99     1.55     57.62     0.54
+                      LoRA16         82.35     0.83     74.91     0.45     70.52     0.46     68.63     1.38     57.98     0.49
+883
+                      Bitune         84.39     0.24     77.42     1.15     72.70     0.82     70.15     0.34     58.96     0.37
+884
+       Phi-2          Pretrained     70.35     -        67.32     -        61.43     -        65.05     -        45.41     -
+885
+                      LoRA           76.31     0.17     66.67     0.44     61.62     0.40     66.65     0.31     48.23     0.75
+886
+                      LoRA16         76.12     0.93     66.61     0.27     61.64     0.45     66.82     0.83     47.73     0.62
+887                   Bitune         76.51     0.30     67.18     0.49     63.04     0.71     68.51     0.56     48.92     0.41
+888
+889
+890
+891
+892
+893
+894
+895
+896
+897
+898
+899
+900
+901
+902
+903                         Table 17: Result for the downstream task training setup.
+904
+905                                        PIQA               ARC                CSQA               SIQA          GSM8K
+906                                mean     std       mean    std        mean     std       mean     std       mean std
+907    Model          Method
+908    Gemma-2B       LoRA         81.41     0.46     58.05     1.16     77.18     0.05     77.40     0.40     30.17     0.75
+909                   Bitune       83.28     0.33     59.98     1.19     78.32     0.68     76.60     0.24     32.98     0.97
+910    Phi-2          LoRA         82.79     1.15     76.31     0.56     78.68     0.76     80.30     0.44     58.55     0.89
+911                   Bitune       83.91     0.28     77.02     0.34     78.95     0.22     80.38     0.21     59.21     1.15
+912    Gemma-7B       LoRA         91.42     0.60     84.58     0.36     84.41     1.04     79.36     1.41     59.11     0.97
+913                   Bitune       92.13     0.27     84.22     0.74     84.22     0.76     79.39     1.33     59.39     0.72
+914    Llama3-8B      LoRA         90.24     0.27     80.75     0.36     83.92     0.74     83.15     0.41     60.45     0.72
+915                   Bitune       90.52     0.78     81.26     0.79     84.11     1.05     82.12     0.30     63.43     0.27
+916
+       Llama2-7B      LoRA         84.39     0.69     66.55     0.78     81.52     0.83     82.67     0.31     32.02     0.68
+917                   Bitune       84.39     0.61     66.87     0.90     81.95     0.56     81.39     0.15     32.85     1.05
+
+
+                                                          17
+      Under review as a conference paper at ICLR 2025
+
+
+918                        Table 18: Ablation study on the components of Bitune.
+919
+920                                             PIQA                    ARC              CSQA              SIQA          MMLU
+921                                     mean      std           mean     std     mean      std     mean      std     mean  std
+922    Model         Method
+923    Gemma-2B      LoRA               66.74       0.52        43.37     1.33   42.32      1.60   44.27      3.85   31.74     0.78
+924                  Bitune             69.59       1.20        47.47     0.64   46.87      1.98   49.51      1.54   35.29     0.08
+925                  Naive Bidir.       67.79       1.00        44.65     1.78   46.79      2.86   48.04      0.95   32.43     1.40
+926                  No Mixing          69.01       1.47        45.71     1.32   46.14      2.56   49.80      0.53   34.03     0.35
+927                  Only Causal        66.39       1.28        45.28     0.65   42.45      1.65   46.98      0.76   33.27     0.41
+928
+                     Shared Weights     68.10       0.41        44.34     0.90   44.53      1.67   47.19      2.16   32.93     0.13
+929    Llama3-8B     LoRA               81.94       0.38        74.46     1.06   69.23      0.67   68.99      1.55   57.62     0.54
+930                  Bitune             84.39       0.24        77.42     1.15   72.70      0.82   70.15      0.34   58.96     0.37
+931
+                     Naive Bidir.       85.44       0.25        76.45     0.60   69.37      0.28   70.04      0.43   58.33     0.89
+                     No Mixing          85.56       0.38        74.86     0.21   68.60      1.31   69.74      0.11   58.88     0.43
+932
+                     Only Causal        82.37       0.41        74.63     0.91   70.65      0.93   69.17      1.51   58.43     0.26
+933
+                     Shared Weights     84.10       0.63        75.94     1.11   71.91      0.71   70.61      0.60   59.03     0.79
+934
+935
+936
+               Table 19: Results for different PEFT methods used in combination with Bitune.
+937
+938
+                                            PIQA                   ARC              CSQA              SIQA          MMLU
+939
+                                    mean      std     mean          std     mean      std     mean      std     mean  std
+940    Model         Method
+941
+       Gemma-2B      LoRA           66.74    0.52     43.37        1.33     42.32     1.60    44.27    3.85     31.74   0.78
+942
+                     Bitune         69.59    1.20     47.47        0.64     46.87     1.98    49.51    1.54     35.29   0.08
+943                  DoRA           66.70    0.63     43.57        0.91     41.88     1.08    44.71    3.83     31.95   0.72
+944                  BituneDoRA     69.62    0.69     47.47        0.34     46.87     2.42    49.71    1.80     35.09   0.16
+945                  IA3            67.25    0.52     46.50        0.67     45.54     0.30    37.65    1.07     32.49   0.20
+946                  BituneIA3      67.54    1.27     47.27        0.53     48.92     0.94    44.29    1.08     33.60   0.37
+947    Llama3-8B     LoRA           81.94    0.38     74.46        1.06     69.23     0.67    68.99    1.55     57.62   0.54
+948                  Bitune         84.39    0.24     77.42        1.15     72.70     0.82    70.15    0.34     58.96   0.37
+949                  DoRA           82.12    0.44     75.40        0.52     70.22     0.39    69.19    1.14     57.67   0.23
+950                  BituneDoRA     84.06    0.46     77.13        0.37     71.99     0.67    70.56    0.21     58.72   0.58
+951                  IA3            80.87    0.58     75.54        0.10     68.25     0.26    66.38    0.18     58.75   0.24
+952                  BituneIA3      83.42    0.52     75.68        0.68     69.15     0.40    67.83    0.25     58.80   0.10
+953
+954
+955                   Table 20: Results for different init values for mixing coefficients.
+956
+957                                         PIQA                  ARC               CSQA              SIQA          MMLU
+958                                mean       std     mean         std      mean      std     mean      std     mean  std
+959    Model         Init. Value
+960    Gemma-2B      0.1           69.68     0.74     46.33        0.81     45.97    2.64     49.86    2.21     35.25   0.46
+961                  0.01          69.59     1.20     47.47        0.64     46.87    1.98     49.51    1.54     35.29   0.08
+962
+                     0.001         67.79     0.88     44.20        0.68     45.56    1.61     46.35    1.08     31.89   0.67
+963    Llama3-8B     0.1           85.00     0.73     76.48        0.63     71.06    1.56     71.68    0.46     59.19   0.38
+964                  0.01          84.39     0.24     77.42        1.15     72.70    0.82     70.15    0.34     58.96   0.37
+965
+                     0.001         84.60     0.62     76.62        0.09     71.28    1.45     70.62    0.15     58.49   0.22
+966
+967
+968
+969
+970
+971
+
+
+
+                                                           18
+       Under review as a conference paper at ICLR 2025
+
+
+972
+       6.9   E XAMPLE ATTENTION M ATRICES
+973
+974    Here we show pairs of matrices with causal and bidirectional attention scores of Bituned Gemma-2B
+975    for the first two GSM8K samples, with scores averaged over layers and heads. Source tokens are
+976    represented with the vertical axis, while target tokens (for which the attention is paid to) with the
+977    horizontal one - e.g. the first column represents attention paid to the first (BOS) token, by each other
+978    token. Darker color represents higher attention score.
+979
+        Causal                                                    Bidirectional
+980
+981
+        Question: Janet’s ducks lay 16 eggs per day. She eats three for breakfast every morning and bakes muffins for
+        her friends every day with four. She sells the remainder at the farmers’ market daily for $2 per fresh duck egg.
+982     How much in dollars does she make every day at the farmers’ market?\n\nAnswer:
+983
+984
+985
+986
+987
+988
+989
+990
+991
+992
+993
+994
+995
+996
+997
+998
+999
+1000
+1001    Question: A robe takes 2 bolts of blue fiber and half that much white fiber. How many bolts in total does it
+        take?\n\nAnswer:
+1002
+1003
+1004
+1005
+1006
+1007
+1008
+1009
+1010
+1011
+1012
+1013
+1014
+1015
+1016
+1017
+1018
+1019
+1020
+1021
+1022
+1023
+1024
+1025
+
+
+
+                                                            19
+       Under review as a conference paper at ICLR 2025
+
+
+1026
+       6.10   GSM8K S AMPLES
+1027
+1028   Samples of responses to the first 20 questions from GSM8K benchmark. Shown for Llama3-8B
+1029   intruction-tuned on UltraFeedback dataset - for standard finetuning with LoRA and Bitune.
+1030
+1031    Prompt                                   LoRA                                       Bitune
+1032    Question: Janet’s ducks lay 16 eggs      Janet makes $16 - (3 + 4) = $9 per         Janet makes $2 per fresh duck egg,
+1033    per day. She eats three for breakfast    day at the farmers’ market.                and she sells the remainder of the
+        every morning and bakes muffins for                                                 eggs she collects each day. If she eats
+1034
+        her friends every day with four. She                                                three eggs for breakfast and bakes
+1035    sells the remainder at the farmers’                                                 muffins with four eggs, she has 16 - 3
+1036    market daily for $2 per fresh duck                                                 - 4 = 9 eggs left to sell. So, she makes
+1037    egg. How much in dollars does she                                                   $2 x 9 = $18 every day at the farmers’
+1038    make every day at the farmers’ mar-                                                 market.
+        ket?
+1039
+1040
+        Question: A robe takes 2 bolts of        A robe requires 2 bolts of blue fiber     To make a robe, you need 2 bolts of
+        blue fiber and half that much white      and half that much white fiber, which     blue fiber and half that much white
+1041    fiber. How many bolts in total does it   is equal to 1 bolt of white fiber.        fiber. So, the total number of bolts
+1042    take?                                    Therefore, the total number of bolts      required is:
+1043                                             required for a robe is 3 bolts (2 blue    2 bolts of blue fiber + half of 2 bolts
+1044                                             and 1 white).                             of blue fiber (which is 1 bolt of white
+1045
+                                                                                           fiber)
+                                                                                           Total bolts = 2 + 1 = 3 bolts
+1046                                                                                       So, the total number of bolts required
+1047                                                                                       to make a robe is 3 bolts.
+1048    Question: Josh decides to try flipping   Josh made a profit of $50,000.            Josh made a profit of $20,000.
+1049    a house. He buys a house for $80,000     Confidence: 95%                           To calculate the profit, first find the
+1050    and then puts in $50,000 in repairs.                                               increased value of the house after re-
+1051    This increased the value of the house                                              pairs:
+        by 150%. How much profit did he                                                    $80,000 + $50,000 = $130,000
+1052
+        make?                                                                              Then, calculate the 150% increase:
+1053                                                                                       $130,000 * 1.5 = $195,000
+1054                                                                                       The difference between the origi-
+1055                                                                                       nal purchase price and the increased
+1056                                                                                       value is the profit:
+                                                                                           $195,000 - $80,000 = $115,000
+1057
+                                                                                           Finally, subtract the cost of repairs
+1058                                                                                       from the profit:
+1059                                                                                       $115,000 - $50,000 = $20,000
+1060                                                                                       So, Josh made a profit of $20,000.
+1061    Question: James decides to run 3         James runs 3 sprints of 60 meters         James runs 3 sprints of 60 meters
+1062    sprints 3 times a week. He runs 60       each, 3 times a week. To find the total   each, 3 times a week. To find the
+        meters each sprint. How many total       meters he runs a week, we can multi-      total meters he runs in a week, we
+1063
+        meters does he run a week?               ply the number of sprints (3) by the      can multiply the number of sprints
+1064                                             distance of each sprint (60 meters)       by the distance of each sprint and the
+1065                                             and then multiply the result by the       number of times he runs the sprints
+1066                                             number of times he runs the sprints       per week.
+1067                                             (3) per week.                             Total meters = (3 sprints) x (60 me-
+                                                 So, the total meters James runs a         ters per sprint) x (3 times per week)
+1068
+                                                 week is:                                  = 540 meters per week.
+1069                                             3 sprints x 60 meters per sprint x        So, James runs a total of 540 meters
+1070                                             3 times per week = 540 meters per         per week.
+1071                                             week.
+1072                                             Confidence: 100%
+1073
+1074
+1075
+1076
+1077
+1078
+1079
+
+
+
+                                                              20
+       Under review as a conference paper at ICLR 2025
+
+
+1080
+        Question: Every day, Wendi feeds         To find the number of cups of feed        To find the number of cups of feed
+1081    each of her chickens three cups of       Wendi needs to give her chickens in       Wendi needs to give her chickens in
+1082    mixed chicken feed, containing seeds,    the final meal of the day, we need        the final meal of the day, we need
+1083    mealworms and vegetables to help         to calculate the total amount of feed     to calculate the total amount of feed
+1084    keep them healthy. She gives the         needed for the day and divide it by       needed for the day and then divide it
+        chickens their feed in three separate    the number of meals.                      by the number of meals (3) and the
+1085
+        meals. In the morning, she gives her     The total amount of feed needed for       number of chickens (20).
+1086    flock of chickens 15 cups of feed. In    the day is:                               First, let’s find the total amount of
+1087    the afternoon, she gives her chickens    Morning meal: 15 cups * 20 chickens       feed needed for the day:
+1088    another 25 cups of feed. How many        = 300 cups Afternoon meal: 25 cups        Morning meal: 15 cups * 20 chickens
+1089    cups of feed does she need to give       * 20 chickens = 500 cups Total feed       = 300 cups Afternoon meal: 25 cups
+        her chickens in the final meal of the    needed for the day: 300 cups + 500        * 20 chickens = 500 cups Total feed
+1090
+        day if the size of Wendi’s flock is 20   cups = 800 cups                           needed for the day: 300 cups + 500
+1091    chickens?                                Now, we divide the total feed needed      cups = 800 cups
+1092                                             for the day by the number of meals        Now, we divide the total feed needed
+1093                                             (3):                                      for the day by the number of meals
+1094                                             800 cups / 3 meals = 266.67 cups          (3) and the number of chickens (20):
+                                                 So, Wendi needs to give her chickens      800 cups / (3 meals * 20 chickens) =
+1095
+                                                 266.67 cups of feed in the final meal     800 cups / (60 meals * chickens) =
+1096                                             of the day.                               13.33 cups
+1097                                                                                       So, Wendi needs to give her chickens
+1098                                                                                       13.33 cups of feed in the final meal
+1099                                                                                       of the day.
+1100    Question: Kylar went to the store to     Kylar needs to pay $80 for 16 glasses.    Kylar needs to pay $80 for 16 glasses.
+1101
+        buy glasses for his new apartment.       Confidence: 95%                           Confidence: 100%
+        One glass costs $5, but every second
+1102    glass costs only 60% of the price. Ky-
+1103    lar wants to buy 16 glasses. How
+1104    much does he need to pay for them?
+1105    Question:      Toulouse has twice        To find the total number of sheep         Toulouse has twice as many sheep
+1106    as many sheep as Charleston.             in Toulouse, Charleston, and Seat-        as Charleston, so if Charleston has
+1107    Charleston has 4 times as many           tle together, we need to first find the   4 times as many sheep as Seattle,
+        sheep as Seattle. How many sheep         number of sheep in Charleston and         Toulouse must have 8 times as many
+1108
+        do Toulouse, Charleston, and Seattle     Toulouse. Since Charleston has 4          sheep as Seattle. Since Seattle has 20
+1109    have together if Seattle has 20 sheep?   times as many sheep as Seattle, and       sheep, Toulouse has 160 sheep.
+1110                                             Seattle has 20 sheep, Charleston has      Now, let’s find the total number of
+1111                                             4 x 20 = 80 sheep. Now, we know           sheep for Toulouse, Charleston, and
+1112                                             that Toulouse has twice as many           Seattle together:
+                                                 sheep as Charleston, so Toulouse has      Toulouse: 160 sheep Charleston:
+1113
+                                                 2 x 80 = 160 sheep.                       4 times as many sheep as Seattle,
+1114                                             Now, we can add the number of sheep       which is 4 * 20 = 80 sheep Seattle:
+1115                                             in Toulouse, Charleston, and Seattle      20 sheep
+1116                                             together:                                 Total sheep: 160 + 80 + 20 = 260
+1117                                             Toulouse + Charleston + Seattle =         sheep
+                                                 160 + 80 + 20 = 260 sheep                 So, the total number of sheep for
+1118
+                                                 So, the total number of sheep in          Toulouse, Charleston, and Seattle to-
+1119                                             Toulouse, Charleston, and Seattle to-     gether is 260.
+1120                                             gether is 260.
+1121
+1122
+1123
+1124
+1125
+1126
+1127
+1128
+1129
+1130
+1131
+1132
+1133
+
+
+
+                                                              21
+       Under review as a conference paper at ICLR 2025
+
+
+1134
+        Question: Carla is downloading a          Carla’s download speed is 2               Carla’s download speed is 2
+1135    200 GB file. Normally she can down-       GB/minute. The file size is 200 GB.       GB/minute. The file size is 200 GB.
+1136    load 2 GB/minute, but 40% of the          The download will take 100 minutes        The download will take 100 minutes
+1137    way through the download, Windows         (200 GB / 2 GB/minute) to complete.       (200 GB / 2 GB/minute) to complete.
+1138    forces a restart to install updates,      However, 40% of the way through           However, 40% of the way through
+        which takes 20 minutes. Then Carla        the download, Windows forces a            the download, Windows forces a
+1139
+        has to restart the download from the      restart to install updates, which takes   restart to install updates, which takes
+1140    beginning. How load does it take to       20 minutes. After the restart, Carla      20 minutes. After the restart, Carla
+1141    download the file?                        has to restart the download from          has to restart the download from the
+1142                                              the beginning. This means that the        beginning.
+1143                                              download will take an additional 80       So, the total time to download the
+                                                  minutes (200 GB / 2 GB/minute) to         file is 120 minutes (100 minutes +
+1144
+                                                  complete. Therefore, the total time       20 minutes). The download speed is
+1145                                              required to download the file is 100      1.67 GB/minute (200 GB / 120 min-
+1146                                              minutes + 20 minutes + 80 minutes         utes).
+1147                                              = 200 minutes.
+1148    Question: John drives for 3 hours at      John is 120 miles from home at the        John’s total distance traveled can be
+1149    a speed of 60 mph and then turns          end of the 4 hours.                       calculated by adding the distances
+1150
+        around because he realizes he forgot      Confidence: 95%                           covered during each leg of his jour-
+        something very important at home.                                                   ney. The first leg is 3 hours at 60
+1151    He tries to get home in 4 hours but                                                 mph, which gives a distance of 3 x
+1152    spends the first 2 hours in standstill                                              60 = 180 miles. The second leg is 4
+1153    traffic. He spends the next half-hour                                               hours, with the first 2 hours spent in
+1154    driving at a speed of 30mph, before                                                 standstill traffic, the next half-hour at
+1155
+        being able to drive the remaining                                                   30 mph, and the remaining time at 80
+        time of the 4 hours going at 80 mph.                                                mph. The total distance for this leg
+1156    How far is he from home at the end                                                  is:
+1157    of those 4 hours?                                                                   2 hours at 0 mph (standstill traffic) =
+1158                                                                                        0 miles 0.5 hours at 30 mph = 0.5 x
+1159                                                                                        30 = 15 miles 1.5 hours at 80 mph =
+1160
+                                                                                            1.5 x 80 = 120 miles
+                                                                                            The total distance traveled is 180 +
+1161                                                                                        135 = 315 miles. Since John turned
+1162                                                                                        around after driving 180 miles, he is
+1163                                                                                        135 miles from home at the end of
+1164                                                                                        the 4 hours.
+1165    Question: Eliza’s rate per hour for the   Eliza’s earnings for this week can be     Eliza’s earnings for this week can be
+1166    first 40 hours she works each week        calculated as follows:                    calculated as follows:
+        is $10. She also receives an overtime     1. Calculate the regular pay for the      1. Calculate the regular pay for the
+1167
+        pay of 1.2 times her regular hourly       first 40 hours: - Regular hourly rate:    first 40 hours: - Regular hourly rate:
+1168    rate. If Eliza worked for 45 hours this   $10 - Hours worked: 40 - Regular          $10 - Hours worked: 40 - Regular
+1169    week, how much are her earnings for       pay: $10 x 40 = $400                      pay: $10 x 40 = $400
+1170    this week?                                2. Calculate the overtime pay for the     2. Calculate the overtime pay for the
+1171                                              additional 5 hours: - Overtime hourly     remaining 5 hours: - Overtime hourly
+                                                  rate: 1.2 x $10 = $12 - Hours worked:     rate: 1.2 x $10 = $12 - Hours worked:
+1172
+                                                  5 - Overtime pay: $12 x 5 = $60           5 - Overtime pay: $12 x 5 = $60
+1173                                              3. Add the regular pay and overtime       3. Add the regular pay and overtime
+1174                                              pay to get the total earnings: - Total    pay to get the total earnings: - Total
+1175                                              earnings: $400 + $60 = $460               earnings: $400 + $60 = $460
+1176                                              So, Eliza’s earnings for this week are    So, Eliza’s earnings for this week are
+                                                  $460.                                     $460.
+1177
+1178
+1179
+1180
+1181
+1182
+1183
+1184
+1185
+1186
+1187
+
+
+
+                                                               22
+       Under review as a conference paper at ICLR 2025
+
+
+1188
+        Question: A new program had 60           In the first month, the program had        In the first month, the program had
+1189    downloads in the first month. The        60 downloads.                              60 downloads.
+1190    number of downloads in the second        In the second month, the number of         In the second month, the number of
+1191    month was three times as many as         downloads was three times as many          downloads was three times as many
+1192    the downloads in the first month, but    as the downloads in the first month,       as the downloads in the first month,
+        then reduced by 30% in the third         so the number of downloads in the          so the number of downloads in the
+1193
+        month. How many downloads did            second month is 3 * 60 = 180.              second month is 3 * 60 = 180.
+1194    the program have total over the three    In the third month, the number of          In the third month, the number of
+1195    months?                                  downloads reduced by 30%, so the           downloads reduced by 30% from the
+1196                                             number of downloads in the third           downloads in the second month, so
+1197                                             month is 180 * 0.7 = 126.                  the number of downloads in the third
+                                                 The total number of downloads over         month is 0.7 * 180 = 126.
+1198
+                                                 the three months is 60 + 180 + 126 =       The total number of downloads over
+1199                                             366.                                       the three months is:
+1200                                                                                        60 + 180 + 126 = 366
+1201                                                                                        So, the program had a total of 366
+1202                                                                                        downloads over the three months.
+1203    Question: Toula went to the bakery       To calculate the total cost, we need to    Toula’s total cost for the pastries can
+1204
+        and bought various types of pastries.    add the costs of the different pastries.   be calculated by adding the costs of
+        She bought 3 dozen donuts which          The cost of 3 dozen donuts is $68 per      the donuts, mini cupcakes, and mini
+1205    cost $68 per dozen, 2 dozen mini cup-    dozen, so the total cost is $68 * 3 =      cheesecakes. The cost of the donuts
+1206    cakes which cost $80 per dozen, and      $204. The cost of 2 dozen mini cup-        is $68 per dozen, so the total cost
+1207    6 dozen mini cheesecakes for $55 per     cakes is $80 per dozen, so the total       for 3 dozen is $68 * 3 = $204. The
+1208    dozen. How much was the total cost?      cost is $80 * 2 = $160. The cost of        cost of the mini cupcakes is $80 per
+1209
+                                                 6 dozen mini cheesecakes is $55 per        dozen, so the total cost for 2 dozen is
+                                                 dozen, so the total cost is $55 * 6 =      $80 * 2 = $160. The cost of the mini
+1210                                             $330. Now, we can add all the costs        cheesecakes is $55 per dozen, so the
+1211                                             together to get the total cost:            total cost for 6 dozen is $55 * 6 =
+1212                                             $204 + $160 + $330 = $694                  $330. Adding these costs together,
+1213                                             So, the total cost of the pastries Toula   we get:
+1214
+                                                 bought was $694.                           $204 + $160 + $330 = $694
+                                                                                            So, the total cost of Toula’s pastries
+1215                                                                                        was $694.
+1216
+        Question: Carlos is planting a lemon     To determine the number of years it        Carlos will start earning money on
+1217    tree. The tree will cost $90 to plant.   will take for Carlos to start earning      the lemon tree after the first year.
+1218    Each year it will grow 7 lemons,         money on the lemon tree, we need to        Here’s why:
+1219    which he can sell for $1.5 each. It      calculate the break-even point. The        1. The tree costs $90 to plant. 2. Each
+1220    costs $3 a year to water and feed the    break-even point is the point at which     year, the tree will grow 7 lemons,
+        tree. How many years will it take be-    the total revenue from selling lemons      which he can sell for $1.5 each. 3.
+1221
+        fore he starts earning money on the      equals the total cost of planting and      It costs $3 a year to water and feed
+1222    lemon tree?                              maintaining the tree.                      the tree.
+1223                                             The total cost of planting the tree is     After the first year, Carlos will have
+1224                                             $90. The annual cost of watering and       earned $10.5 from selling the lemons
+1225                                             feeding the tree is $3. The annual rev-    ($1.5 x 7 lemons) and spent $3 on
+                                                 enue from selling lemons is 7 lemons       maintenance. This means he will
+1226
+                                                 multiplied by $1.5 per lemon, which        have made a profit of $7.5 ($10.5 -
+1227                                             is $10.5. We can calculate the break-      $3) after the first year. So, he will
+1228                                             even point by setting the total cost       start earning money on the lemon tree
+1229                                             equal to the total revenue:                after the first year.
+1230                                             $90 + $3 * (years) = $10.5 * (years)
+                                                 Solving for years, we get:
+1231
+                                                 years = 90 + 3 * (years) / 10.5
+1232                                             years = 90 + 0.2857 * (years)
+1233                                             years = 90 + 0.2857 * (years - 90)
+1234                                             years = 90 + 0.2857 * years - 25.71
+1235                                             0.7143 * years = 64.29
+                                                 years = 64.29 / 0.7143
+1236
+                                                 years = 90.1
+1237                                             So, it will take approximately
+1238
+1239
+1240
+1241
+
+
+
+                                                              23
+       Under review as a conference paper at ICLR 2025
+
+
+1242
+        Question: Melanie is a door-to-door       Melanie started with 15 vacuum             Melanie started with 15 vacuum
+1243    saleswoman. She sold a third of her       cleaners.                                  cleaners.
+1244    vacuum cleaners at the green house,
+1245    2 more to the red house, and half of
+1246    what was left at the orange house. If
+        Melanie has 5 vacuum cleaners left,
+1247
+        how many did she start with?
+1248
+        Question: In a dance class of 20 stu-     In a dance class of 20 students, 20%       In a dance class of 20 students, 20%
+1249    dents, 20% enrolled in contemporary       enrolled in contemporary dance, 25%        enrolled in contemporary dance, 25%
+1250    dance, 25% of the remaining enrolled      of the remaining enrolled in jazz          of the remaining enrolled in jazz
+1251    in jazz dance, and the rest enrolled      dance, and the rest enrolled in hip-       dance, and the rest enrolled in hip-
+1252    in hip-hop dance. What percentage         hop dance.                                 hop dance.
+1253
+        of the entire students enrolled in hip-   To find the percentage of students en-     To find the percentage of students en-
+        hop dance?                                rolled in hip-hop dance, we need to        rolled in hip-hop dance, we need to
+1254                                              calculate the number of students en-       calculate the number of students en-
+1255                                              rolled in hip-hop dance and divide it      rolled in hip-hop dance and divide it
+1256                                              by the total number of students in the     by the total number of students in the
+1257                                              class.                                     class.
+1258
+                                                  First, let’s find the number of students   First, let’s find the number of students
+                                                  enrolled in contemporary dance:            enrolled in contemporary dance:
+1259                                              20% of 20 students = 20% * 20 = 0.2        20% of 20 students = 20% * 20 = 0.2
+1260                                              * 20 = 4 students                          * 20 = 4 students
+1261                                              Now, let’s find the number of stu-         Now, let’s find the number of stu-
+1262                                              dents enrolled in jazz dance:              dents enrolled in jazz dance:
+1263
+                                                  25% of the remaining students = 25%        25% of the remaining students = 25%
+                                                  * (20 - 4) = 25% * 16 = 0.25 * 16 = 4      * (20 - 4) = 25% * 16 = 0.25 * 16 = 4
+1264                                              students                                   students
+1265                                              The number of students enrolled in         The number of students enrolled in
+1266                                              hip-hop dance is the remaining 12          hip-hop dance is the remaining 12
+1267                                              students:                                  students:
+1268
+                                                  Total students - (contemporary dance       Total students - (contemporary dance
+                                                  + jazz dance) = 20 - (4 + 4) = 20 - 8      + jazz dance) = 20 - (4 + 4) = 12
+1269                                              = 12 students                              students
+1270                                              Now, let’s find the percentage of stu-     Now, let’s find the percentage of stu-
+1271                                              dents enrolled in hip-hop dance:           dents enrolled in hip-hop dance:
+1272                                              Percentage of students enrolled in         Percentage of students enrolled in
+1273
+                                                  hip-hop dance = (12 / 20) * 100 =          hip-hop dance = (12 / 20) * 100 =
+                                                  60%                                        60%
+1274                                              So, 60%
+1275
+        Question: A merchant wants to make        To maximize profit, the merchant           To maximize profit, the merchant
+1276    a choice of purchase between 2 pur-       should choose the electronic gadgets       should choose the electronic gadgets
+1277    chase plans: jewelry worth $5,000         worth $8,000. Assuming the finan-          worth $8,000. Assuming the finan-
+1278    or electronic gadgets worth $8,000.       cial advisor’s speculation is correct,     cial advisor’s prediction is accurate,
+1279    His financial advisor speculates that     the jewelry market will go up 2.5%         the profit would be:
+        the jewelry market will go up 2.5%        and the electronic gadgets market          Profit = (1.12 * $8,000) - $8,000 =
+1280
+        while the electronic gadgets market       will rise 1.2% within the same month.      $896
+1281    will rise 1.2% within the same month.     The profit from the jewelry purchase       The merchant would make a profit
+1282    If the merchant is looking to maxi-       would be:                                  of $896 by choosing the electronic
+1283    mize profit at the end of this month      Profit from jewelry = (5,000 * 2.5%)       gadgets.
+1284    by making a choice, how much profit       = 125
+        would this be?                            The profit from the electronic gadgets
+1285
+                                                  purchase would be:
+1286                                              Profit from electronic gadgets =
+1287                                              (8,000 * 1.2%) = 96
+1288                                              Since the profit from the electronic
+1289                                              gadgets purchase is higher, the mer-
+                                                  chant should choose the electronic
+1290
+                                                  gadgets worth $8,000 to maximize
+1291                                              profit.
+1292
+1293
+1294
+1295
+
+
+
+                                                               24
+       Under review as a conference paper at ICLR 2025
+
+
+1296
+        Question: Two trains leave San            In the first day, both trains travel 80   In the first day, both trains travel 80
+1297    Rafael at the same time. They be-         miles westward. In the second day,        miles westward. In the second day,
+1298    gin traveling westward, both trav-        they travel 150 miles northward. The      they travel 150 miles northward. The
+1299    eling for 80 miles. The next day,         total distance covered by each train      total distance covered by each train
+1300    they travel northwards, covering 150      in the two days is 230 miles.             in the two days is 230 miles.
+        miles. What’s the distance covered
+1301
+        by each train in the two days?
+1302
+        Question: Jill gets paid $20 per hour     Jill’s annual salary can be calculated    Jill’s annual salary can be calculated
+1303    to teach and $30 to be a cheerleading     by multiplying her hourly rate, the       by multiplying her hourly rate, the
+1304    coach. If she works 50 weeks a year,      number of hours she works per week,       number of hours she works per week,
+1305    35 hours a week as a teacher and 15       and the number of weeks she works         and the number of weeks she works
+1306    hours a week as a coach, what’s her       in a year.                                in a year. Here’s the calculation:
+        annual salary?                            Jill’s hourly rate for teaching is $20,   Teacher’s annual salary: $20 per hour
+1307
+                                                  and she works 35 hours per week.          x 35 hours per week x 50 weeks =
+1308                                              Her weekly salary for teaching is:        $35,000
+1309                                              $20 imes 35 = $700                        Coach’s annual salary: $30 per hour
+1310                                              Jill’s hourly rate for coaching is $30,   x 15 hours per week x 50 weeks =
+1311                                              and she works 15 hours per week.          $22,500
+                                                  Her weekly salary for coaching is:        Total annual salary: $35,000 +
+1312
+                                                  $30 imes 15 = $450                        $22,500 = $57,500
+1313                                              Jill works 50 weeks a year, so her        So, Jill’s annual salary is $57,500.
+1314                                              annual salary is:
+1315                                              $700 imes 50 + $450 imes 50 =
+1316                                              $35,000 + $22,500 = $57,500
+                                                  So, Jill’s annual salary is $57,500.
+1317
+1318
+        Question: Claire makes a 3 egg            In 4 weeks, Claire will eat 12 dozens     In 4 weeks, Claire will eat 48 dozens
+        omelet every morning for breakfast.       of eggs if she makes a 3 egg omelet       of eggs if she makes a 3 egg omelet
+1319    How many dozens of eggs will she          every morning. This is because there      every morning. This is because there
+1320    eat in 4 weeks?                           are 4 weeks in a month, and each          are 4 weeks in a month, and each
+1321                                              month has 4 weeks. So, in 4 weeks,        week has 7 days. If she makes a 3 egg
+1322                                              she will make 12 omelets, and each        omelet every day, she will consume
+1323
+                                                  omelet requires 3 eggs. Therefore,        21 eggs per week. 21 eggs multiplied
+                                                  she will consume 12 dozens of eggs        by 4 weeks equals 84 eggs. Since
+1324                                              in 4 weeks.                               there are 12 eggs in a dozen, 84 eggs
+1325                                                                                        divided by 12 equals 7 dozens. There-
+1326                                                                                        fore, Claire will eat 7 dozens of eggs
+1327                                                                                        per week, and 7 dozens multiplied by
+1328
+                                                                                            4 weeks equals 28 dozens.
+1329    Question: Marissa is hiking a 12-         To maintain an average speed of 4         To maintain an average speed of 4
+        mile trail. She took 1 hour to walk       miles per hour, Marissa needs to walk     miles per hour, Marissa needs to walk
+1330
+        the first 4 miles, then another hour to   the remaining distance at a speed of      the remaining distance at a speed of
+1331    walk the next two miles. If she wants     4 miles per hour.                         4 miles per hour.
+1332    her average speed to be 4 miles per
+1333    hour, what speed (in miles per hour)
+1334    does she need to walk the remaining
+        distance?
+1335
+1336
+1337
+1338
+1339
+1340
+1341
+1342
+1343
+1344
+1345
+1346
+1347
+1348
+1349
+
+
+
+                                                               25

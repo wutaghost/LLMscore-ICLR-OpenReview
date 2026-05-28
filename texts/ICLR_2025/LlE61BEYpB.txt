@@ -1,0 +1,784 @@
+000
+001
+      FLARE: F INETUNING R E LU A ND FIRE                                                             FOR
+002   E FFICIENT L ONG -C ONTEXT I NFERENCE
+003
+004
+005    Anonymous authors
+006    Paper under double-blind review
+007
+008
+009                                              A BSTRACT
+010
+011
+               Deploying large language models (LLMs) on resource-constrained edge devices
+012            is challenging due to computational bottlenecks, memory bottlenecks, and – for
+013            long-contexts – specifically the Softmax operation in the attention mechanism.
+014            While using ReLU in place of Softmax has been explored, and FIRE as an al-
+015            ternative to RoPE has been explored for models trained from scratch, there has
+016            been little work towards exploring fine-tuning models to utilize these efficient al-
+017            gorithms, or the combination of the two.
+018            In this paper, we contribute FLARE, a method for fusing Rectified Linear Acti-
+019            vations (ReLU) with Relative Encodings (specifically FIRE), and we share a par-
+020            ticular recipe which allows these to be fine-tuned effectively into existing models
+021            and fused to create efficient long-context inference. Following this recipe yields
+022            markedly better validation loss, long-context inference speed, and successfully
+023
+               introduces the property of length-generalization – the property where the model
+               gains high accuracy for contexts lengths several times larger than trained – unlike
+024
+               RoPE – without further fine-tuning.
+025
+026
+               Once FIRE and ReLU are both fine-tuned into a model, we show these can be
+               mathematically fused into a single, more efficient operation, which on average
+027
+               was found to shave 98.9% of FIRE operations and produce a Probability matrix
+028
+               with 98.9% zeros in its lower-triangle.
+029
+               Finally, we benchmark inference speed improvements for custom hardware as
+030
+               well with custom CUDA kernels. Using Power, Performance, and Area (PPA)
+031
+               analysis, we show that FLARE operates at eight times the frequency of Softmax
+032            while consuming only 0.1% of the power and 0.11% of the energy per cycle. Our
+033            custom CUDA Kernel shows 3.8x faster operation than Softmax FlashAttention.
+034            We believe this shows the potential of fine-tuning new algorithms in pre-trained
+035            models, and we share our fine-tuning recipes, code and custom hardware designs
+036            at https://anonymous.4open.science/r/nanoGPTBD54.
+037
+038
+039   1   I NTRODUCTION
+040
+041
+      Transformers (Vaswani et al., 2017) have revolutionized natural language processing by en-
+042   abling parallel processing of sequences through self-attention mechanisms. However, deploying
+043   transformer-based models on resource-constrained edge devices remains challenging, especially for
+044   long-context applications. Edge devices often lack the computational resources and memory band-
+045   width to efficiently implement latency-optimization techniques for Softmax, such as FlashAttention
+046   (Dao et al., 2022), resulting in significant performance bottlenecks. This problem has inspired alter-
+047   native hardware algorithms for targeting custom hardware (Stevens et al. (2021), Liu et al. (2024)).
+048   While using ReLU in place of Softmax is a computationally efficient alternative, it has been noted
+049   in literature that pre-training models with ReLU results in lower machine learning performance than
+050   Softmax (Wortsman et al. (2023), Shen et al. (2023), Zhang et al. (2021)). The potential efficiency
+051   improvements despite the performance gap has prompted numerous attempts to introduce additional
+052   operations and normalization techniques to mitigate the shortcomings of ReLU, including following
+053   the PV multiplication with a layernorm (Zhang et al., 2021) as well as specialized and learned
+      divisors for the result of the ReLU activation (Wortsman et al. (2023), Shen et al. (2023)). Notably,
+
+
+                                                        1
+054
+      these prior had not explored fine-tuning ReLU into Softmax pre-trained Transformer models, or
+055   whether this could improve validation loss per token trained.
+056
+057   Context length mainly hinges upon the Transformer model’s position encoding mechanism. While
+058
+      long-context operation via RoPE and the extension of context length with RoPE has been explored
+      (Su et al. (2023), Chen et al. (2023)), the RoPE operation requires element-wise multiplications
+059
+      input vectors which, while not a bottleneck, are less computationally efficient than additive relative
+060
+      position encodings, such as FIRE Li et al. (2024).
+061
+062   In this paper, we address the hardware-efficient long-context operation. We make the following
+063   contributions:
+064
+065
+             • Experiments showing training with Softmax first and then fine-tuning ReLU as a direct
+               elementwise replacement, yields significantly better next-token-prediction accuracy than
+066
+               training with ReLU from the start, for the same number of training steps and and input
+067
+               training tokens.
+068
+069          • The FLARE algorithm reorders adjacent FIRE and ReLU operations in inference, offering
+070
+               the ability to bypass addition operations in FIRE.
+071          • A hardware implementation and performance, power, and area (PPA) analysis, showing
+072            substantial efficiency gains of ReLU over Softmax in specialized EdgeLLM-accelerators.
+073          • A CUDA Kernel for accelerating a ReLU-Augmented forward-pass, with analysis of gains
+074            over Softmax-based FlashAttention, and PyTorch source code for supporting accelerated
+075            training and fine-tuning of FLARE and ReLU-Attention models.
+076
+077
+078
+      2     BACKGROUND
+079
+      Custom hardware for Transformer-based models must determine low-level implementations of self-
+080
+      attention mechanisms and positional encoding strategies, and hence are greatly affected by paral-
+081
+      lelism limitations and involved operations.
+082
+083
+084
+      2.1   I NEFFICIENCIES OF S OFTMAX IN S PECIALIZED H ARDWARE
+085
+      At the core of the Transformer is the self-attention mechanism, which relies on the Softmax function
+086   to compute attention scores. The Softmax function is defined as:
+087
+088
+                                                          exi −smax
+089                                       Softmax(xi ) = P xj −smax                                      (1)
+090                                                       je
+091
+092
+      where smax = max xj is subtracted from each input to improve numerical stability.
+093
+094   2.2   S OFTMAX I NEFFICIENCY IN H ARDWARE
+095
+096
+      Implementing Softmax efficiently in hardware poses significant challenges:
+097
+            1. Non-linearity: Implementing the exponential function in hardware requires approxima-
+098
+               tions or lookup tables, adding need for larger silicon area.
+099
+100         2. Sequential Operations: The max and sum computations introduce data dependencies that
+101
+               limit parallelism, resulting in stalls in the pipelining.
+102         3. Long Context Inefficiencies: Challenges in pipelining and the need to maintain precision
+103            for accumulated values – especially for the denominator – will inflate the size required for
+104            this module, with complexity scaling with max supported context length.
+105
+106   2.3   R E LU AS A S OFTMAX R EPLACEMENT
+107
+      The Rectified Linear Unit (ReLU) function is defined as:
+
+
+                                                        2
+108
+109
+                                               ReLU(xi ) = max(xi , 0)                                      (2)
+110
+111   Replacing Softmax with ReLU offers significant advantages when implementing in edge hardware:
+112
+113                                                                                 2
+                • Simplified Non-Linearity: The total number of operations is N2 comparisons, removing
+114               need for look up tables.
+115
+116
+                • Element-wise Operation: ReLU can be applied independently to each element, allowing
+                  full-parallelization and simplifying pipeline-implementations.
+117
+118             • Long-Context Efficiency: Via introducing full-parallelism, removing the normalization
+119               terms, and simplifying the non-linearity (essentially setting to zero if negative or value
+120               leaving as is), the total size of the resulting implementation of ReLU is not tied to the max
+121
+                  context length.
+122
+123   2.4      L ONG -C ONTEXT S CALING OF P OSITIONAL E MBEDDINGS
+124
+125
+      RoPE (Su et al., 2023) and Learned Absolute Position Embeddings (Vaswani et al., 2017) both tie
+      a trained model a specific max supported context length. Should longer context length be desired,
+126
+      the Learned Absolute Position Embeddings table will become larger and linearly with the context
+127
+      length. RoPE would require fine-tuning, e.g. via interpolation Chen et al. (2023), at the longer-
+128   context length.
+129
+130   Functional Interpolation for Relative Position Encoding (FIRE) (Li et al., 2024) is a relative posi-
+131
+      tional encoding method which results in additive bias after the QK T multiplication. This is a type
+      of relative position encoding which exhibits context-length generalization. With FIRE (and many
+132
+      other additive embeddings) one can train on a smaller context length and then simply inference on a
+133
+      longer context lengths than trained. This encourages easy scalability of any hardware solutions, as
+134   well to longer context lengths.
+135
+136
+137   3       M ETHODS
+138
+139   In this section, we describe the methodologies employed in our study, including the experimental
+140   setup, datasets, training configurations, the detailed recipes for integrating ReLU and FIRE into
+141
+      Transformer models, the implementation of the FLARE algorithm, the development of the ReLU-
+      augmented FlashAttention mechanism, and the hardware implementation and performance, power,
+142
+      and area (PPA) analysis.
+143
+144
+145
+      3.1      E XPERIMENTAL S ETUP
+146
+      Our experiments are conducted using PyTorch (Paszke et al., 2019) for model training and evalua-
+147   tion, and custom CUDA kernels for implementing and profiling ReLU-based attention mechanisms.
+148   We extend the NanoGPT repository (Karpathy, 2022) for language model fine-tuning and the llm.c
+149   repository (Karpathy, 2023) for implementing and benchmarking our ReLUFlashAttention kernels.
+150   The modified code and resources are available at the following anonymous links:12 .
+151
+      All experiments are performed on NVIDIA A100 GPUs, leveraging their computational capabilities
+152
+      for efficient training and inference of large language models.
+153
+154
+155
+      3.2      DATASET AND T RAINING S ETTINGS
+156
+      We utilize the OpenWebText dataset (Gokaslan & Cohen, 2019), an open-source replication of the
+157   WebText corpus used for training GPT-2. The dataset consists of high-quality web content extracted
+158   from Reddit submissions with an upvote score of at least 3, providing a diverse and representative
+159   sample of internet text.
+160
+          1
+161           https://anonymous.4open.science/r/nanoGPTBD54
+          2
+              https://anonymous.4open.science/r/llmc27B0
+
+
+                                                           3
+162
+      For model training, we use a maximum context length of 1024 tokens. Unless otherwise speci-
+163   fied, we initialize our models from the GPT-2 small checkpoint, which contains approximately 124
+164   million parameters. Training is performed using a batch size of 32 and a learning rate of 6 × 10−4 ,
+165   optimized with the Adam optimizer (Kingma & Ba, 2014) and a cosine learning rate decay schedule.
+166   Gradient clipping is applied with a maximum norm of 1.0 to stabilize training.
+167
+168   3.3     R ECIPES FOR R E LU I NTEGRATION
+169
+170   We conducted a series of experiments to compare different training recipes for effectively integrating
+171   the ReLU activation function as a replacement for the Softmax function in the attention mechanism
+172   of Transformer models. Our goal was to identify strategies that mitigate the performance degradation
+173   typically observed when training models with ReLU from scratch.
+174
+175   3.3.1    E XPERIMENT 1: T RAINING FROM S CRATCH VS . F INE - TUNING WITH R E LU
+176
+      In the first experiment, over the same total number of training iterations, we compared the perfor-
+177
+      mance of models trained with ReLU from scratch against models that were first trained with Softmax
+178
+      and then fine-tuned with ReLU.
+179
+180           • Training with ReLU from Scratch: We trained a Transformer model with the ReLU-
+181             based attention mechanism from scratch for 30,000 iterations. The model was initialized
+182             randomly and did not utilize any pre-trained weights. We tracked the validation loss at
+183             regular intervals to assess the learning progress.
+184
+              • Fine-tuning ReLU into a Softmax Pre-trained Model: We first trained the model with
+185
+                the standard Softmax-based attention mechanism for 20,000 iterations. After this initial
+186             training phase, we replaced the Softmax function with ReLU and fine-tuned the model for
+187             an additional 10,000 iterations. We monitored the validation loss throughout both phases.
+188
+189   3.3.2    E XPERIMENT 2: S EQUENTIAL VS . S IMULTANEOUS I NTEGRATION OF R E LU AND
+190            FIRE
+191
+192   In the second experiment, we investigated the impact of integrating ReLU and FIRE positional
+193   embeddings into a pre-trained model, comparing sequential integration in different orders with si-
+194   multaneous integration. Our goal was to determine the most effective strategy for incorporating
+195
+      both ReLU and FIRE and to understand how the order of integration affects model performance and
+      training stability.
+196
+197
+              • Simultaneous Training of ReLU and FIRE: Starting from the GPT-2 124M checkpoint,
+198
+                we simultaneously replaced the Softmax function with ReLU in the attention mechanism
+199             and the absolute positional embeddings with FIRE. We then trained the model for 20,000
+200             iterations, integrating both changes at once. Throughout the training process, we tracked
+201             the validation loss and monitored the input and output distributions of the ReLU activation
+202             function to observe how the model adapted to these simultaneous changes.
+203
+              • Sequential Training with ReLU Followed by FIRE: We first fine-tuned the GPT-2 124M
+204             model by replacing the Softmax function with ReLU while retaining the absolute positional
+205             embeddings. We trained the model for 10,000 iterations to allow it to adapt to the ReLU
+206             activation in the attention mechanism. Subsequently, we replaced the absolute positional
+207             embeddings with FIRE and continued fine-tuning for another 10,000 iterations. During
+208             both phases, we monitored the validation loss and activation statistics to assess the model’s
+209             adaptation and performance.
+210           • Sequential Training with FIRE Followed by ReLU: Conversely, we also explored the
+211             effect of introducing FIRE before ReLU. Starting from the GPT-2 124M checkpoint, we
+212             replaced the absolute positional embeddings with FIRE while retaining the Softmax func-
+213             tion and trained the model for 10,000 iterations to allow it to adapt to FIRE. Then, we re-
+214             placed the Softmax function with ReLU and fine-tuned the model for an additional 10,000
+215             iterations. We monitored validation loss and activation statistics throughout both training
+                phases to evaluate the model’s performance and stability.
+
+
+                                                         4
+216
+      By comparing these three integration strategies—simultaneous integration and sequential integration
+217   in both orders—we aimed to determine the most effective approach for incorporating both ReLU and
+218   FIRE into a pre-trained Transformer model. This comparison allowed us to assess how the order of
+219   integration influences the model’s ability to adapt, the training stability, and the final performance in
+220   terms of validation loss and length generalization capabilities.
+221
+222   3.3.3    E XPERIMENT 3: L ENGTH G ENERALIZATION E VALUATION
+223
+224   In the final experiment, we assessed the ability of each trained model to generalize to longer context
+225   lengths than those used during training.
+226
+227           • Evaluation on Extended Context Lengths: We evaluated all models on context lengths
+228
+                of 2048 and 4096 tokens, to test length generalization from their trained maximum con-
+                text length of 1024 tokens. We measured the validation loss at these extended lengths to
+229
+                determine how well each training recipe enabled length generalization.
+230
+231
+      This evaluation allowed us to understand the impact of different integration strategies on the models’
+232   ability to handle longer sequences, and acts as a figure of merit for how well FIRE was integrated.
+233
+234
+      3.4     I MPLEMENTATION OF THE FLARE A LGORITHM
+235
+236   To further improve computational efficiency, we proposed a fused FLARE algorithm which com-
+237   bines FIRE position encoding with sparsity producing ReLU. This algorithm reorders comparison
+238   of ReLU to occur before FIRE bias addition step for positional encoding.
+239
+      In the standard attention mechanism with FIRE and ReLU, attention score matrix S is computed as:
+240
+241
+242                                          sij = max(aij + fij , 0)                                      (3)
+243
+244   where A = QK⊤ is the scaled dot-product of queries and keys, and F represents the FIRE bias
+245   matrix.
+246
+      The FLARE algorithm optimizes this computation by observing that if fij ≤ −aij , then sij = 0,
+247
+      and the addition can be skipped. This leads to a case-wise expression:
+248
+249
+250                                                 0,          if fij ≤ −aij
+                                        sij =                                                              (4)
+251                                                 aij + fij , otherwise
+252
+253   By implementing this logic, we can avoid unnecessary addition operations when fi j <= −ai j. We
+254   conduct experiments to measure the proportion of operations which take this branch, reporting in
+255   the results section.
+256   Figure 1 illustrates the original attention architecture, the ReLU with FIRE, and the optimized
+257   FLARE module.
+258
+259
+260
+261
+262
+263
+264
+265
+266
+267
+268
+269
+                      Figure 1: Original attention architecture, ReLU+FIRE, and FLARE
+
+
+                                                            5
+270
+      3.5     R E LU ATTENTION CUDA I MPLEMENTATION
+271
+272   We contribute implementation and analysis and CUDA kernel for efficient forward pass of ReLU
+273   for facilitating community ML development of models utilizing using ReLU-attention.
+274
+275   3.5.1     D EVELOPMENT OF C USTOM CUDA K ERNELS
+276
+      We developed custom CUDA kernels that implement the ReLU-based attention mechanism with
+277
+      tiling optimization techniques inspired by FlashAttention (Dao et al., 2022). By leveraging shared
+278
+      memory and tiling strategies, we optimized memory access patterns and reduced bandwidth require-
+279   ments. This is crucial for handling large attention matrices, especially with long sequences.
+280
+281   The simplified ReLUFlashAttention forward pass algorithm is outlined in Algorithm 1.
+282
+283
+      Algorithm 1 ReLUFlashAttention
+284   Require: Matrices Q, K,  V ∈ RN ×d in high-bandwidth
+                                                        M     memory (HBM), on-chip shared memory (SM) of size M .
+                                     M
+      1: Set block sizes Bc = 4d         , Br = min 4d       ,d .
+285   2: Initialize O = 0     N ×d
+                                   lin HBM.
+                                        m                                                            l      m
+286   3: Divide Q into Tr = BNr blocks Q1 , . . . , QTr of size Br × d, and divide K, V into Tc = BNc blocks K1 , . . . , KTc and
+287       V1 , . . . , VTc of size Bc × d.
+288   4: for j = 1 to Tc do
+      5:      Load Kj , Vj from HBM to SM.
+289   6:      for i = 1 to Tr do
+290   7:           Load Qi from HBM to SM.
+      8:           Compute Aij = Qi Kj⊤ .
+291   9:           Apply FLARE logic to compute Sij :
+292   10:               For each element apq in Aij and fpq in Fij :
+293   11:                 If fpq ≤ −apq , set spq = 0.
+      12:                 Else, compute spq = apq + fpq .
+294   13:            Update Oi ← Oi + Sij Vj .
+295   14:       end for
+296   15: end for
+      16: return O.
+297
+298
+299   3.6     H ARDWARE I MPLEMENTATION AND PPA A NALYSIS
+300
+301   To demonstrate the hardware efficiency gains of using ReLU algorithm over Softmax in custom
+302   hardware, we implemented these functions in a custom hardware and performed a performance,
+303
+      power, and area (PPA) analysis compared to a Softmax implementation from literature.
+304
+      3.6.1     H ARDWARE S YNTHESIS
+305
+306   We synthesized hardware implementations of the ReLU function and the Softmax function using a
+307   130nm CMOS process technology. The implementations were designed to:
+308
+309           • Exploit Parallelism: Both ReLU implementations were designed to operate on multiple
+310             inputs simultaneously, leveraging parallelism to increase throughput.
+311           • Minimize Critical Path Delays: By simplifying the logic and avoiding complex opera-
+312             tions, we reduced the critical path delays, allowing for higher operating frequencies.
+313           • Optimize Resource Utilization: The designs aimed to minimize silicon area and power
+314             consumption, making them suitable for resource-constrained edge devices.
+315
+316   3.6.2     P ERFORMANCE M ETRICS
+317
+      We measured key performance metrics for each implementation, including:
+318
+319           • Maximum Operating Frequency (MHz): The highest frequency at which the circuit can
+320             operate reliably.
+321
+              • Power Consumption (mW): The total power consumed by the circuit during operation.
+322
+              • Energy per Cycle (pJ): The energy consumed per clock cycle.
+323
+              • Silicon Area (mm2 ): The physical area occupied by the circuit on the chip.
+
+
+                                                                  6
+324
+      3.6.3    A NALYSIS AND C OMPARISON
+325
+326   By comparing the synthesized hardware modules, we quantified the efficiency gains of ReLU over
+327   Softmax in terms of speed, power efficiency, and hardware resource requirements. The results are
+328   detailed in Section 6.2.
+329
+330
+      4     R ESULTS
+331
+332
+      4.1     P RE - TRAINING WITH S OFTMAX VS R E LU
+333
+334   We start by comparing the performance of ReLU fine-tuning vs training from scratch.
+335
+336
+337
+338
+339
+340
+341
+342
+343
+344
+345
+346
+347
+348
+349   Figure 2: Comparison of validation loss between ReLU trained for 30k iterations vs fine-tuning for
+350   10k iterations after training Softmax for 20k
+351
+352   Figure 2 shows that, over the same number of total training iterations, a model trained with Softmax
+353   and fine-tuned with ReLU performs better than a model trained using just ReLU. After replacing
+354   Softmax with ReLU, the validation loss quickly overtakes that of the model with ReLU from scratch.
+355
+      Furthermore, due to benefits of highly optimized Softmax attention on GPU with FlashAttention,
+356   we observed all-in-all a reduction in training time for the fine-tuning recipe.
+357
+358   Training on a single A100 80GB GPU, the training from scratch with ReLU took 59% longer than
+359
+      the Softmax-Then-ReLU fine-tuning recipe. ReLU pre-training took 17 hours, where as the total
+      training time from Softmax and ReLU fine-tuned took 12 hours in total.
+360
+361
+362   4.2     R ESULTS OF D IFFERENT R ECIPES FOR F INE - TUNING R E LU AND FIRE INTO M ODELS
+363
+      Between fine-tuning simultaneously with ReLU and FIRE, fine-tuning sequentially (first FIRE then
+364
+      ReLU or first ReLU then FIRE), the best validation losses are nearly the same with fine-tuning
+365
+      simultaneously and fine-tuning FIRE-then-ReLU.
+366
+367   However, we find definitely that only fine-tuning with FIRE first then ReLU was able to successfully
+368   impart length-generalization capability to the model, as evidenced form figure 5.
+369
+370   4.3     I NPUT AND O UTPUT S TATISTICS
+371
+372   We monitored input and output statistics during fine-tuning to understand how the model adapts its
+373   input and output ranges when accommodating a vastly different activation function in the attention
+374
+      module.
+375   Figures 6 and 7 show that the output distributions for ReLU stabilize after around 3k iterations.
+376   While Softmax’s distribution of inputs was very symmetrical, ReLU’s distribution pulled towards
+377   the negative side, clearly selecting a smaller proportion of its outputs – on average only 1.1% of its
+      outputs – for the non-zero values in the output probability matrix.
+
+
+                                                        7
+378
+379
+380
+381
+382
+383
+384
+385
+386
+387
+388
+389
+390   Figure 3: Comparison of fine-tuning GPT-2 models using either ReLU followed by FIRE or FIRE
+391   followed by ReLU. Above is shown only the last 15k of 20k iterations.
+392
+393
+394
+395
+396
+397
+398
+399
+400
+401
+402
+403
+404
+405
+                     Figure 4: Validation loss for Softmax variants fine-tuned with FIRE
+406
+407
+408
+409
+      5   FLARE B RANCHING R ESULTS
+410
+411
+      From evaluation of final checkpoint inference, we determined that the "Probability Matrix" output
+      of ReLU is 98.9% zeros in the lower-left triangle for causal attention.
+412
+413   This high degree of sparsity means that that 98.9% of the time the fi j <= −ai j branch will be
+414   taken, and the comparison alone will suffice for 98.9% of ReLU outputs.
+415
+416
+417
+418
+419
+420
+421
+422
+423
+424
+425
+426
+427
+428
+429
+430
+      Figure 5: Validation loss measurements for each fine-tuning recipe, with NopE and RoPE provided
+      as baselines. Note how fine-tuning Fire for 10k iterations then ReLU 10k iterations yields strong
+431
+      length-generalization vs other FIRE + ReLU recipes
+
+
+                                                     8
+432
+433
+434
+435
+436
+437
+438
+439
+440
+441
+442
+443
+444
+445
+446
+447
+448
+      Figure 6: Input statistics of ReLU being finedtuned into a Softmax pre-trained model over 20k
+449
+      iterations
+450
+451
+452
+453
+454
+455
+456
+457
+458
+459
+460
+461
+462
+463
+464
+465
+466
+467
+      Figure 7: Output statistics of ReLU being fine-tuned into a Softmax pre-trained model over 20k
+468
+      iterations
+469
+470
+471   6     P ROFILING AND H ARDWARE I MPLEMENTATION
+472
+473   6.1   P ERFORMANCE E VALUATION
+474
+475   We compared the forward pass inference time between ReLUFlashAttention and FlashAttention
+476   across different context lengths. As shown in Figure 8, ReLUFlashAttention achieves an average
+477   speedup of 3.8x over FlashAttention for context lengths of 512 to 4096.
+478
+479   6.2   H ARDWARE C OMPARISON
+480
+      We conducted a performance, power, and area (PPA) analysis between ReLU and Softmax imple-
+481
+      mentations synthesized in a 130nm CMOS process. As summarized in Table 1, ReLU has:
+482
+483          • 8x higher maximum frequency.
+484
+             • 0.1% of the power consumption of Softmax.
+485
+             • 0.11% energy per cycle compared to Softmax.
+
+
+                                                    9
+486
+487
+488
+489
+490
+491
+492
+493
+494
+495
+496
+497
+498
+499
+500         Figure 8: Inference time comparison between ReLUFlashAttention and FlashAttention
+501
+502
+503         • Only 1% of the silicon area used by Softmax.
+504
+505                Table 1: Hardware comparison of ReLU and Softmax in 130nm CMOS
+506
+507                              Metric                     ReLU     Softmax
+508
+                                 Max Frequency (MHz)         1667         200
+509
+                                 Area (mm2 )               0.0028      0.2564
+510
+                                 Power (mW)                   4.87     516.28
+511
+                                 Energy per Cycle (pJ)         2.9     2581.4
+512
+513
+514
+515
+      7   C ONCLUSION
+516
+517
+      In this paper, we explore fine-tuning as a method for improving performance ReLU in the atten-
+      tion block for Transfomers. We demonstrate that fine-tuning models with ReLU achieves better
+518
+      validation-loss-per-iteration with ReLU from scratch, without adding additional compute steps.
+519
+520   We also show that with the correct fine-tuning-recipe, one can introduce both FIRE and ReLU into
+521   a pre-trained model, obtaining the length-generalization, better improved final validation loss, and
+522   high (98.9%) zeros introduced via ReLU’s output sparsity.
+523   Our proposed FLARE algorithm efficiently fuses ReLU and FIRE, significantly reducing computa-
+524   tional complexity by reordering the computation.
+525
+      Finally, our analysis shows that ReLU offers substantial performance, power, and area advantages
+526
+      over Softmax, making it highly suitable for edge devices. The ReLU-augmented FlashAttention
+527   implementation can catalyze training of theser efficient models.
+528
+529   Overall, we hope this work relays the possibilities within exploration of fine-tuning recipes for
+530
+      various efficient algorithms, and support unblocking deploying hardware-friendly large language
+      models on edge devices without compromising performance or longer-context capabilities.
+531
+532
+533   R EFERENCES
+534
+      Shouyuan Chen, Sherman Wong, Liangjian Chen, and Yuandong Tian. Extending context window
+535
+        of large language models via positional interpolation, 2023. URL https://arxiv.org/
+536     abs/2306.15595.
+537
+538   Tri Dao, Dan Fu, Stefano Ermon, Atri Rudra, and Christopher Ré. Flashattention: Fast and memory-
+539     efficient exact attention with io-awareness. Advances in Neural Information Processing Systems,
+        2022.
+
+
+                                                      10
+540
+      Aaron Gokaslan and Vanya Cohen. Openwebtext corpus. http://Skylion007.github.io/
+541     OpenWebTextCorpus, 2019.
+542
+543   Andrej Karpathy. Nanogpt video lecture. https://github.com/karpathy/nanoGPT,
+544     2022.
+545
+      Andrej Karpathy. llm.c. https://github.com/karpathy/llm.c, 2023.
+546
+547   Diederik P. Kingma and Jimmy Ba. Adam: A method for stochastic optimization, 2014. URL
+548     https://arxiv.org/abs/1412.6980.
+549
+      Shanda Li, Chong You, Guru Guruganesh, Joshua Ainslie, Santiago Ontanon, Manzil Zaheer, Sumit
+550
+        Sanghai, Yiming Yang, Sanjiv Kumar, and Srinadh Bhojanapalli. Functional interpolation for
+551     relative positions improves long context transformers. In The Twelfth International Conference
+552     on Learning Representations, 2024.
+553
+554   Shiwei Liu, Guanchen Tao, Yifei Zou, Derek Chow, Zichen Fan, Kauna Lei, Bangfei Pan, Den-
+555     nis Sylvester, Gregory Kielian, and Mehdi Saligane. Consmax: Hardware-friendly alternative
+556
+        softmax with learnable parameters. In Proceedings of the ICCAD 2024, 2024.
+557   Adam Paszke, Sam Gross, Francisco Massa, Adam Lerer, James Bradbury, Gregory Chanan, Trevor
+558     Killeen, Zeming Lin, Natalia Gimelshein, Luca Antiga, Alban Desmaison, Andreas Köpf, Ed-
+559     ward Yang, Zach DeVito, Martin Raison, Alykhan Tejani, Sasank Chilamkurthy, Benoit Steiner,
+560     Lu Fang, Junjie Bai, and Soumith Chintala. Pytorch: An imperative style, high-performance deep
+561     learning library. 2019. URL https://arxiv.org/abs/1912.01703.
+562
+      Kai Shen, Junliang Guo, Xu Tan, Siliang Tang, Rui Wang, and Jiang Bian. A study on relu and
+563
+        softmax in transformer. arXiv preprint arXiv:2302.06461, 2023.
+564
+565   Jacob R. Stevens, Rangharajan Venkatesan, Steve Dai, Brucek Khailany, and Anand Raghunathan.
+566     Softermax: Hardware/software co-design of an efficient softmax for transformers. In Proceedings
+567     of the 58th ACM/IEEE Design Automation Conference (DAC), pp. 469–474, 2021.
+568
+      Jianlin Su, Yu Lu, Shengfeng Pan, Ahmed Murtadha, Bo Wen, and Yunfeng Liu. Roformer: En-
+569      hanced transformer with rotary position embedding, 2023. URL https://arxiv.org/abs/
+570      2104.09864.
+571
+572   Ashish Vaswani, Noam Shazeer, Niki Parmar, Jakob Uszkoreit, Llion Jones, Aidan N. Gomez,
+573     Łukasz Kaiser, and Illia Polosukhin. Attention is all you need. In Advances in Neural Infor-
+574
+        mation Processing Systems, pp. 6000–6010, 2017.
+575   Mitchell Wortsman, Jaehoon Lee, Justin Gilmer, and Simon Kornblith. Replacing softmax with relu
+576    in vision transformers. arXiv preprint arXiv:2309.08586, 2023.
+577
+578   Biao Zhang, Ivan Titov, and Rico Sennrich. Sparse attention with linear units. arXiv preprint arXiv:
+579
+        2104.07012, 2021.
+580
+581
+582
+583
+584
+585
+586
+587
+588
+589
+590
+591
+592
+593
+
+
+
+                                                      11

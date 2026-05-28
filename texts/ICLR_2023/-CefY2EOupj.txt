@@ -1,0 +1,2418 @@
+Published as a conference paper at ICLR 2023
+
+
+M AXIMIZING C OMMUNICATION E FFICIENCY                                                               FOR
+L ARGE - SCALE T RAINING VIA 0/1 A DAM
+ Yucheng Lu∗                Conglong Li       Minjia Zhang        Christopher De Sa        Yuxiong He
+ Cornell University         Microsoft         Microsoft           Cornell University       Microsoft
+
+
+
+                                               A BSTRACT
+
+            1-bit gradient compression and local steps are two representative techniques that
+            enable drastic communication reduction in distributed SGD. Their benefits, however,
+            remain an open question on Adam-based large model pre-training (e.g. BERT
+            and GPT). In this paper, we demonstrate the non-linearity in Adam causes slow
+            convergence even when 1-bit compression or local steps are individually applied.
+            To alleviate this limitation, we propose 0/1 Adam that linearizes each Adam step via
+            approximating its optimizer states using their stale estimates and linear correlation.
+            0/1 Adam performs an Adam-like step to preserve the adaptivity, while its linearity
+            allows utilizing 1-bit compression and local steps simultaneously for wall-clock
+            time speed up. We provide convergence guarantee for 0/1 Adam on smooth
+            non-convex objectives. On various large-scale benchmarks such as BERT-Base,
+            BERT-Large, GPT-2 pre-training and ImageNet, we demonstrate on up to 128 GPUs
+            that 0/1 Adam is able to reduce up to 87% of data volume, 54% of communication
+            rounds, and achieve up to 2× higher training throughput and end-to-end training
+            time reduction compared to the state-of-the-art baseline 1-bit Adam; while enjoying
+            the same statistical convergence speed and end task model accuracy on GLUE
+            dataset and ImageNet validation set.
+
+
+1       I NTRODUCTION
+
+Over the past few years, we have witnessed outstanding performance of foundation models on many ap-
+plications. However, these models, including BERT Devlin et al. (2018) and GPT Radford et al. (2019a);
+Brown et al. (2020), usually have hundreds of millions or even billions of parameters and require to be
+trained on massive GPUs. For example, the largest dense transformer model, 530B MT-NLG Smith et al.
+(2022), was trained over 4000 GPUs in more than a month. At this scale, the expensive communication
+overhead across computing processors and servers hinders the scalability (Alistarh et al., 2017).
+1-bit gradient compression and local steps are two representative methods to mitigate the commu-
+nication bottleneck. 1-bit compression drastically reduces the communication volume by quantizing
+each value in gradients with ultra-low bits (i.e., as low as 1 bit) Seide et al. (2014); Bernstein et al.
+(2018a); and local steps alternatively saves the bandwidth by periodically skipping communication
+rounds(Stich, 2018). While these techniques demonstrate tremendous success on distributed SGD,
+their benefits over large-scale Adam-based model training, such as for BERT and GPT pre-training,
+remains an open question (Kingma and Ba, 2014; Wang et al., 2019a). Comparing to SGD where the
+model parameters are linearly dependent on the gradients, the non-linearity in Adam updates (Kingma
+and Ba, 2014) limits the direct usage of compression or local steps. In particular, this non-linearity
+incurs two challenges: 1) when aggressively compressing the gradient such as with 1-bit quantizer,
+all the coordinate-wise effect learning rate will become the same value, so that Adam no longer enjoys
+adaptive and fast convergence; 2) to ensure all parallel workers reach consensus on the optimizer
+states, which is critical for convergence, the existence of non-linearity incurs the overhead of iteratively
+synchronizing the states when using local steps.
+Tang et al. (2021) undertook the first investigation of fixing this non-linearity towards compression
+and proposed 1-bit Adam. The algorithm follows a two-stage training paradigm: first run Adam
+
+    ∗
+        This work was done during Yucheng Lu’s internship at Microsoft. Contact: yl2967@cornell.edu.
+
+
+                                                      1
+Published as a conference paper at ICLR 2023
+
+
+with full-precision communication (full-precision stage1 ); and then switch to 1 bit when the variance
+becomes stable (compression stage). While this paradigm avoids compressing non-linear information
+with a one-time frozen variance, the experimental results from (Tang et al., 2021) indicate the full-
+precision stage still incurs non-trivial overhead. Furthermore, 1-bit Adam is restricted in the scope of
+gradient compression, and cannot be trivially adapted when other techniques are used, such as local
+steps. Besides, the empirical success of (Tang et al., 2021) was not substantiated on GPT-style models,
+for instance, 175B GPT-3 Brown et al. (2020), 530B MT-NLG Smith et al. (2022), etc.
+In this paper, we address this gap by proposing 0/1 Adam. 0/1 Adam breaks the barrier of non-linearity
+from two aspects: first it adaptively freezes variance, so that given agreement on a stale variance
+state, the parallel workers only need to communicate momentum that is linearly dependent on the
+model update; This technique allows reducing the previous two-stage compression scheme to a unified
+single stage; 2) it leverages the insight that in adjacent Adam steps, the changes to optimizer states are
+generally bounded, so that with frozen variance, parallel workers can linearly approximate momentum
+and parameter updates locally without additional synchronization. This further pushes the limit of
+communication reduction towards its extreme, achieving the state-of-the-art speed up for large-scale
+model training. To summarize, our contributions are as follows:
+ • We propose 0/1 Adam, which addresses the limitations of previously proposed 1-bit Adam when
+   applying aggressive 1-bit quantization and local steps (Section 4).
+ • We provide convergence guarantee of 0/1 Adam on smooth and non-convex objectives (Section 5).
+ • We conduct experiments on a wide range of large-scale model training tasks, including BERT-Base,
+   BERT-Large, GPT-2 pre-training and ImageNet. We demonstrate on up to 128 GPUs that 0/1 Adam
+   is able to reduce up to 87% of data volume, 54% of communication rounds, and achieve up to 2×
+   higher throughput and training time reduction compared to the state-of-the-art 1-bit Adam without
+   compromising end-to-end model accuracy (Section 6).
+ • The 0/1 Adam optimizer and corresponding experimental scripts (e.g. BERT pre-training and GLUE
+   finetuning) have been open sourced in a deep learning optimization library called DeepSpeed2 .
+
+2    R ELATED W ORK
+
+Communication-efficient training. There has been various lines of research focusing on improving
+communication efficiency in large-scale training, such as using asynchrony (Niu et al., 2011; Lian et al.,
+2015; Xie et al., 2020), decentralization (Lian et al., 2017; Lu and De Sa, 2021), gradient quantization
+(Alistarh et al., 2017; Wen et al., 2017), gradient sparsification (Wangni et al., 2017; Wang et al., 2018a),
+local steps (Stich, 2018; Lin et al., 2018), etc. In this paper we study the aggressive 1-bit compression,
+which was first introduced in (Seide et al., 2014) to speed up speech model training, where an algorithm
+called 1-bit SGD is proposed. After that, Wen et al. (2017) proposes adding 0 as an additional numerical
+level and Liu et al. (2018) discusses the use of zero-th order oracle in 1-bit SGD. Chen et al. (2019a);
+Balles and Hennig (2018); Xu and Kamilov (2019) study the correlation and combination between
+1-bit SGD and other techniques. Convergence analysis on 1-bit SGD is given in (Bernstein et al., 2018a;
+Karimireddy et al., 2019; Safaryan and Richtárik, 2021). Bernstein et al. (2018b); Sohn et al. (2019);
+Le Phong and Phuong (2020); Lyu (2021) investigate the robustness of 1-bit SGD. Among all the
+variants of 1-bit communication, the design with error feedback mechanism has shown to work best
+both empirically (Seide et al., 2014) and theoretically (Karimireddy et al., 2019). Other lines of research
+applies 1-bit communication to various scenarios such as federated learning (Jin et al., 2020; Yue et al.,
+2021), decentralized learning (Lu and De Sa, 2020; Koloskova et al., 2019), meta learning (Fan et al.,
+2021), etc. Perhaps the closest works to this paper are (Tang et al., 2021; Li et al., 2021a), which propose
+using two-stage training to enable 1-bit Adam and 1-bit Lamb, respectively. Different from those
+two work, 0/1 Adam addresses non-linearity challenges in adaptive optimizers by considering both
+extreme quantization and local steps. Furthermore, we also study how to apply extreme communication
+compression on GPT-style models, which to the best our knowledge is still under-explored.
+Adaptive learning rate optimizers. One of the most popular adaptive optimizers is Adam, which
+was first introduced in (Kingma and Ba, 2014). It uses both first and second moment information of
+stochastic gradient to perform optimizer steps and has shown significant benefits on training deep
+    1
+      In the original 1-bit Adam paper, this stage is referred to as warmup stage. We use a slightly different term
+to avoid confusion with learning rate warmup.
+    2
+      https://github.com/microsoft/DeepSpeed
+
+
+                                                        2
+Published as a conference paper at ICLR 2023
+
+
+                                            (0)                                               (0)
+          (a) ∥vt −vt−1 ∥            (b) ∥vt −vt ∥            (c) ∥mt −mt−1 ∥            (d) ∥mt −mt ∥
+
+Figure 1: Momentum and variance Profiling for BERT-Large sequence 128 pretraining with original
+Adam using 64 GPUs. For variance, we profile two types of metrics: the first is the difference between
+                             (0)              (0)
+local and global variance: ∥vt −vt ∥, where vt and vt denotes the variance term computed via local
+gradient on worker-0 and the gradient from full-precision AllReduce, respectively. We also profile
+the variance difference in adjacent step ∥vt −vt−1 ∥. Similarly, we profile the same two metrics for
+the momentum.
+
+
+learning models. Reddi et al. (2019) spots the issue of Adam convergence and provides a variant
+called AMSGrad while Zaheer et al. (2018) argues the Adam only converges with large batch sizes.
+Multiple lines of theoretical study on Adam are given in (Fang and Klabjan, 2019; Alacaoglu et al.,
+2020; Défossez et al., 2020). Additionally, Chen et al. (2018); Zhou et al. (2018a); Lu et al. (2020);
+Danilova et al. (2020); Zou et al. (2019) provide more general analysis on Adam-type optimizers.
+Subsequently, other variants of Adam are proposed in (Luo et al., 2019; Chen et al., 2019b; Huang
+et al., 2018; Wang et al., 2019b; Zhou et al., 2018b; Zhuang et al., 2021; 2020). Unlike these methods,
+which focus on improving the convergence of generic optimizations for DNN models, our work studies
+how to maximize the communication efficiency of Adam in large-scale distributed training settings.
+
+
+3       A C LOSER L OOK AT N ON - LINEARITY IN A DAM
+
+In this section, we provide a more formal description on the problem setting and illustrate the
+limitations from the original Adam and the state-of-the-art 1-bit Adam (Tang et al., 2021).
+Problem Formulation. In this paper, we consider the following optimization problem:
+                                   min f (x) = Eζ∼D f (x;ζ).                                             (1)
+                                            x∈Rd
+where x denotes the d-dimensional model. D denotes the training set and f (x;ζ) is the loss incurred
+over sample ζ given model parameters x. The structure of the problem naturally captures many of
+the model training problems.
+The non-linearity in Adam. At step t ≥ 0, denote xt and gt as the model parameters and stochastic
+gradient computed at step t, respectively. The update formula of SGD and Adam3 can be summarized as:
+                             SGD update: xt+1 ← xt −γgt .                                       (2)
+                           Adam update: mt+1 ← β1 mt +(1−β1 )gt ,
+                                                  vt+1 ← β2 vt +(1−β2 )(gt )2 ,
+                                                                    γ
+                                                  xt+1 ← xt −    √           ·mt ,                       (3)
+                                                                   vt +ϵ
+                                                                 | {z }
+                                                               effective learning rate
+where γ is the learning rate, ϵ is a small constant to prevent zero division, β1 and β2 are tunable
+decaying factors. The linearity in SGD update implies when using compression or local steps, the
+potential noise from (accumulated) gradients is in the order of O(γ), which approaches zero when
+learning rate is decaying or set to be small. By comparison, the two auxiliary optimizer states in Adam,
+momentum (m) and variance (v), introduce non-linearity in the model update.
+Equation (3) gives the formula of Adam when running it sequentially. In a distributed setting with
+n workers, gt in Equation (3) is often computed in parallel on different workers. Mathematically, if
+           (i)
+we denote gt as the stochastic gradient computed on the i-th worker at step t, then distributed Adam
+    3
+        Note that in Adam, operations like division should act element-wise.
+
+
+                                                          3
+Published as a conference paper at ICLR 2023
+
+
+
+                                       Pn (i)
+can be written as replacing gt with 1/n i=1 gt in Equation (3) as follows:
+                                      Xn (i)                               Xn (i)  2
+      mt+1 ← β1 mt +(1−β1 ) 1/n            gt , vt+1 ← β2 vt +(1−β2 ) 1/n     gt     .
+                                              i=1                                            i=1
+
+Issue with non-linearity on 1-bit compression. The main bottleneck in running distributed Adam
+                              Pn (i)
+is the accumulation of 1/n i=1 gt since the gradients are usually high-dimensional. Based on the
+profiling results from (Tang et al., 2021; Li et al., 2021a), the communication of gradients could take
+up to 94% of the total training time on modern clusters. Gradient compression mitigates this issue by
+sending and averaging gradients with fewer bits. However, in Adam this causes the loss on the learning
+rate adaptivity. Consider using the aggressive 1-bit compression (Liu et al., 2018), which sends each
+gradient with only signs and a shared, usually the average over all the coordinates, magnitude. More
+specifically, denote C[·] as the 1-bit compression, then
+                                             ∥a∥1
+                                      C[a] =       ·sign(a),∀a ∈ Rd .                                (4)
+                                               d
+It is straightforward to observe that naively applying 1 bit to compress gradients in the original Adam
+loses coordinate-wise
+         √               adaptivity since sharing magnitude makes all the coordinates-wise learning
+rate γ/ vt +ϵ the same value. This makes Adam no difference than momentum SGD.
+Issue with non-linearity on local steps. In SGD (Equation (2)), the model updates are linearly
+dependent on the gradients and has zero additional states. It implies with local steps, the parallel
+workers can entirely reach consensus after a single round of synchronization, even with compression
+(Basu et al., 2020). However, in Adam simply synchronizing the model can still leave the momentum
+and variance out-of-sync. This makes parallel workers fail to capture the global adaptivity when the
+system scales up. To give a more concrete example, we profile a full run of BERT-Large pre-training
+with original Adam, and summarize different metrics of momentum and variance in Figure 1. As
+shown in Figure 1(d) and 1(b), the difference between local and global optimizer states, momentum
+and variance, remain constants and do not decrease to zero.
+1-bit Adam and its limitations. 1-bit Adam (Tang et al., 2021) is a state-of-the-art solution that
+addresses non-linearity in 1-bit compression. 1-bit Adam adopts a pre-conditioned variance state from
+running original Adam for T0 steps first. The intuition there is that at later stage of training, the variance
+state becomes stable so that vT0 can be a good approximation of variance state for the remaining steps.
+As paritally illustrated in Section 1, the full-precision stage of 1-bit Adam still presents non-trivial
+overhead. For instance: as illustrated in (Tang et al., 2021), when training BERT-Large on 64 GPUs
+using Ethernet, while the full-precision stage contains 15% of the total steps, it can take more than
+50% of the entire training in terms of the wall-clock time4 . Additionally, 1-bit Adam is restricted in
+the scope of compression, how it handles other techniques such as local steps remains open question.
+
+
+4    0/1 A DAM
+
+In this section, we give the full description of 0/1 Adam. To maximize the communication efficiency,
+ideally we want an algorithm that enables adaptive convergence like Adam, while allowing aggressive
+compression (e.g. 1 bit) and requires no additional synchronization on the optimizer states when using
+local steps. 0/1 Adam solves this problem from two aspects.
+Adaptive Variance Freezing. To begin with, 0/1 Adam creates a linear environment that freezes
+the variance adaptively. The intuition is leveraged from the observation in Figure 1(a): the change of
+variance over steps in Adam is generally smooth. While 1-bit Adam captures a reasonable variance
+estimate via one-time freezing, it is reasonable to also presume that before its freezing point, the variance
+within several adjacent steps will stay close due to its smoothness. This motivates us to extend the
+one-time freezing policy in 1-bit Adam into an adaptive one, by letting workers agree upon the freezing
+points from a given step index set Tv ⊆ {0,···,T −1}. The frozen variance creates multiple intervals
+over training, during which the workers have agreement on the denominator (Equation (3)) and the only
+uncertainty is then left in the nominator that is linearly dependent on the model update, just like SGD.
+    4
+      Concretely, it shows in (Tang et al., 2021) Section 7.1 that to train BERT-Large on 64 GPUs using Ethernet,
+the full-precision Adam takes 174.3 hours in total while 1-bit Adam takes 51.5 hours. By a simple calculation,
+we know that full-precision stage of 1-bit Adam takes approximately 26.37 hours while the compression stage
+takes 25.13 hours.
+
+
+                                                       4
+Published as a conference paper at ICLR 2023
+
+
+Algorithm 1 Proposed 0/1 Adam Algorithm
+                                            (i)
+Require: local model on the i-th node x0 , learning rate {γt }Tt=1 , m0 = 0, v0 = 0, auxiliary buffer u0 = 0,
+    total number of iterations T , decaying factor β1 , β2 from Adam, numerical constant ϵ, variance update step
+    index set Tv , synchronization step index set Tu , the most recent step with synchronization t′ = 0.
+ 1: for t = 0,···,T −1 do
+                                              (i)
+ 2:     Compute local stochastic gradient gt .
+                                (i)          (i)             (i)
+ 3:     Update momentum: mt+ 1 = β1 mt +(1−β1 )gt .
+                                    2
+                          (i)      (i)       (i)  √
+ 4:     Update model: xt+ 1 = xt −γt mt / vt +ϵ.
+                                2
+                          (i)       (i)         (i)
+ 5:     Update buffer: ut+ 1 = ut +γt mt .
+                                2
+ 6:     if t ∈ Tu then
+                                                              (i)
+ 7:          Perform 1-bit AllReduce: ut+ 1 = 1bit-AllReduce ut+ 1 .
+                                               2                 2
+                                                             (i)
+            Approximate momentum with compressed buffer: mt+1 = ut+ 1 / th=t′ γh .
+                                                                        P
+ 8:
+                                                                      2
+                                                  (i)    (i)        √
+ 9:         Update model with compressed buffer: xt+1 = xt′ −ut+ 1 / vt +ϵ.
+                                                                         2
+                                          (i)
+10:         Reset the auxiliary buffer: ut+1 = 0.
+11:         Update the synchronization step: t′ = t.
+12:     else
+             (i)      (i)     (i)       (i)   (i)    (i)
+13:         xt+1 = xt+ 1 ; mt+1 = mt+ 1 ; ut+1 = ut+ 1 .
+                         2                 2               2
+14:     end if
+15:     if t ∈ Tv then
+                                                                (i)
+16:          Perform full-precision AllReduce: g t = AllReduce gt .
+17:         Update the variance: vt+1 = β2 vt +(1−β2 )(g t )2 .
+18:     else
+19:         Use the stale variance for the next iteration: vt+1 = vt .
+20:     end if
+21: end for
+22: return xT .
+
+
+
+Including 1-bit Compression and Local Steps. With frozen variance, we make another observation
+based on Equation (3) that the model difference on workers will be linearly dependent to the momentum.
+So that, the momentum can be approximated locally rather than synchronized additionally based on
+the communicated model difference, given the premise that the change of momentum is not abrupt
+                                           (i)   (i)  (i)
+within close steps. Formally, denote xt , mt , vt as the model, momentum, variance on worker
+i at step t, respectively. Suppose all the workers are synchronized at step t′ , then with frozen variance
+v over all the workers,
+         (i)
+               Xt            (i)
+       ut =             γk mk           Actual sent tensors in the communication.
+                   k=t′
+                           Pn    (i)
+        (i)     (i)  1/n i=1 ut
+      xt+1 = xt′ −        √             Sync model parameters with the sent tensors.
+                            v+ϵ
+                    Pn      (i)
+        (i)    1/n i=1 ut
+    mt+1 ≈ Pt                           Approximate momentum via linear estimates via sent tensor.
+                    k=t′ γk
+
+where we omit the compression part for brevity. Combined with compression, we provide the full
+description of 0/1 Adam5 in Algorithm 1. Note that here we defer the details of 1-bit compression
+to Appendix A and treat it as a black-box procedure named 1bit-AllReduce while the original
+full-precision AllReduce is referred to as AllReduce.
+We also remark that although both techniques appear to be natural, to the best of our knowledge, we
+are the first to apply them to addressing the non-linearity challenges in 1-bit compression and local
+steps for maximizing the communication efficiency of Adam optimizer.
+
+   5
+     The name comes from the fact that the algorithm can potentially reduce the per-parameter volume to some
+number between 0 and 1 bit on average.
+
+
+                                                         5
+Published as a conference paper at ICLR 2023
+
+
+5    C ONVERGENCE A NALYSIS
+In this section, we provide the convergence guarantee for 0/1 Adam (Algorithm 1) under arbitrary
+freezing policy Tv and local steps policy Tu . In the main paper, we provides the convergence rate
+in the general case. However, different Tv or Tu gives us the opportunity to obtain tighter bounds.
+We leave these discussion in the appendix. We start by making the following assumptions.
+Assumption 1. Lipschitzian gradient: f (·) is assumed to be with L-Lipschitzian gradients, which
+means ∥∇f (x)−∇f (y)∥ ≤ L∥x−y∥,∀x,∀y.
+Assumption 2. Bounded variance: The stochastic gradient computed on each worker is unbiased
+and has bounded variance:Eζ∼D ∥∇f (x;ζ)−∇f (x)∥2 ≤ σ 2 , ∀x.
+Assumption 3. Bounded gradient: The infinity norm of stochastic gradient is bounded by a constant
+G∞ > 0 such that ∥gt ∥∞ ≤ G∞ ,∀t.
+Assumption 4. Compression error in Algorithm 1: For arbitrary x ∈ Rd , there exists a constant
+                                                                                   2
+∆, such that the output of compressor C[·] has the following error bound: E∥C[x]−x∥ ≤ ∆2 .
+Assumption 5. Given ordered set Tu , denote tj as the j-th element in Tu , we assume there exists
+a constant H ≥ 0, it holds that max1≤j<|Tu | (tj+1 −tj ) ≤ H.
+
+Remarks on the assumptions. Assumption 1, 2 and 3 are standard in the domain of non-convex
+optimization. Comparing with the 1-bit Adam paper (Tang et al., 2021), we do not explicitly assume
+the uniform lower bound on the variance coordinate, i.e., e⊤
+                                                           j v > vmin > 0,∀j for some constant vmin .
+Instead we assume an infinity-norm bound on the gradient as in Assumption 3 which is more realistic.
+Assumption 4 is also assumed in (Tang et al., 2021), in the appendix we discuss the variant of 0/1
+Adam that converges with weaker condition on the C.
+The convergence for Algorithm 1 is then given in the follow theorem.
+Theorem 1. Under Assumption 1 to 5, let m = |Tv |, select β1 , β2 ∈ [0, 1) that fulfills
+m ≤ log(1−β1 )/log(β2 ), if we run(Algorithm 1 with a constant learning rate:
+                                                                         ) for all t ≥ 0
+                                   r                        p
+                                        n        1              2
+                                                           2 G∞ +ϵ 1
+                       γt = min            , p           ,           ,     ,
+                                      σ 2 T 4L G2∞ +ϵ          L       6
+then it holds that
+                      T −1
+                                                        H 2 ∆2 (m+n) 1
+
+                    1X                  2        σ
+                            E∥∇f (x̃t )∥ ≤ O √ +                       +      ,
+                    T t=0                        nT           T           T
+                 Pn  (i)
+where x̃t = 1/n i=1 xt and we omit f (0)−inf x∈Rd f (x), G∞ , d, ϵ, β1 , β2 and L as constants.
+
+Theorem 1 shows that 0/1 Adam Algorithm 1 essentially admits the same√convergence rate as
+distributed SGD in the sense that it achieves linear speed up, at rate 1/O( nT ). The effect of
+compression (∆) and local steps (H) only appears on a non-dominating term.
+
+6    E XPERIMENTS
+In this section we evaluate the performance of 0/1 Adam over several large-scale model training tasks
+comparing with baselines (1-bit Adam (Tang et al., 2021) and original Adam (Kingma and Ba, 2014)).
+Since Tang et al. (2021) already demonstrated that 1-bit Adam has similar statistical results to Adam, we
+omit the comparison of end-to-end model accuracy to Adam for brevity. Throughout the experiments,
+we enable FP16 training for all the tasks following (Tang et al., 2021). That makes the full-precision
+communication (including Adam, full-precision stage in 1-bit Adam and full-precision AllReduce
+in 0/1 Adam) use 16-bit per number. We use the 1-bit compressor (Equation (4)) in 0/1 Adam.
+Experimental details. We adopt the following tasks for the evaluation: BERT-Base (L = 12, H = 768,
+A = 12, 110M params) and BERT-Large (L = 24, H = 1024, A = 16, 340M params) pre-training,
+training Resnet18 (12M params) on ImageNet (He et al., 2016) and GPT-2 pre-training. For BERT
+model, we use the same dataset as (Devlin et al., 2018), which is a concatenation of Wikipedia and
+BooksCorpus with 2.5B and 800M words respectively. We use the GLUE fine-tuning benchmark (Wang
+et al., 2018b) to evaluate the convergence of the BERT models trained by different algorithms. For
+ImageNet, we adopt ImageNet-1k dataset, which contains 1.28M images for training and 50K images
+
+
+                                                   6
+Published as a conference paper at ICLR 2023
+
+
+                                    (a) BERT-Base pretraining seq128
+
+
+                                    (b) BERT-Large pretraining seq128
+
+
+                                        (c) Resnet18 on ImageNet
+
+
+Figure 2: Sample-wise and time-wise convergence for BERT-Base/Large pre-training sequence length
+128 and Resnet18 pretraining on ImageNet using 128 GPUs on the Ethernet cluster. Note that the
+time on the right side is measured on both algorithms processing the same number of samples.
+
+
+  (a) BERT-Base (Ethernet) (b) BERT-Large (Ether-(c) BERT-Large (Infini-(d) ImageNet (Ethernet)
+  batch size=4096          net) batch size=4096  Band) batch size=4096 batch size=256
+
+Figure 3: End-to-end average throughput for BERT-Base/Large pre-training sequence length 128
+and Resnet18 pretraining on ImageNet using 128 V100 GPUs on the Ethernet/InfiniBand cluster. Note
+that since for ImageNet, both batch size (256) and model (Resnet18) are small compared to BERT,
+and its parallelism speed up will be limited if applied to the same large system on BERT (128 GPUs).
+And so we test it for 4 to 32 GPUs in Figure (d).
+
+
+for validation (Deng et al., 2009). For GPT-2 we adopt the model from its original paper (Radford et al.,
+2019b), which contains 117M parameters (48 layers, 1600 hidden size, 25 attention heads). For training
+data, we adopt the same dataset blend as in (Shoeybi et al., 2019): Wikipedia (Devlin et al., 2018),
+CC-Stories (Trinh and Le, 2018), RealNews (Zellers et al., 2019), and OpenWebtext (Radford et al.,
+2019b). Other details including learning rate schedules, hyperparameters can be found in Appendix C.
+Hardware. We evaluate two clusters: one with 4 NVIDIA V100 GPUs per node and 40 Gigabit
+Ethernet inter-node network (2.7 Gbps effective bandwidth); the other one with 8 V100 GPUs per node
+and 100 Gigabit InfiniBand EDR inter-node network (close to theoretical peak effective bandwidth).
+We use 4 to 128 GPUs for BERT and ImageNet pretraining tasks to measure 0/1 Adam’s performance
+gain. We use 64 GPUs for GPT-2 pre-training. Additionally, for ImageNet training we apply the
+accelerated data loading technique from lmdb6 .
+Policy for Tv and Tu in 0/1 Adam. We first illustrate our policy on Tv . Observing from our motivation
+study (Figure 1) that the variance difference in adjacent steps decreases roughly exponentially. Denote
+kj as the step where j-th variance update takes place, we select Tv such that, kj+1 −kj = 2⌊j/κ⌋ ,∀κ > 0.
+We adopt κ = 16 for all the three tasks.
+   6
+       https://github.com/xunge/pytorch_lmdb_imagenet
+
+
+                                                   7
+Published as a conference paper at ICLR 2023
+
+
+Table 1: GLUE development set results. BERT-Base/Large(original) results are from (Devlin et al.,
+2018). BERT-Base/Large(Adam and 1-bit Adam) results are from (Tang et al., 2021). The scores
+are the median scores over 10 runs with different seeds, and are obtained on the checkpoints trained
+by both sequence 128 and sequence 512 datasets.
+                            RTE MRPC STS-B CoLA SST-2 QNLI QQP MNLI-(m/mm) Avg
+  BERT-Base(Original)       66.4 84.8 85.8 52.1 93.5 90.5 89.2                   84.6/83.4    81.1
+  BERT-Base(Adam)           68.2 84.8 85.1 56.8 91.8 90.9 90.9                   83.6/83.5    81.8
+  BERT-Base(1-bit Adam) 69.0 84.8 83.6 55.6 91.6 90.8 90.9                       83.6/83.9    81.5
+  BERT-Base(0/1 Adam) 69.7 85.1 84.9 54.4 91.9 90.3 90.7                         83.7/83.7    81.6
+  BERT-Large(Original)      70.1 85.4 86.5 60.5 94.9 92.7 89.3                   86.7/85.9    83.6
+  BERT-Large(Adam)          70.3 86.0 86.9 60.3 93.1 92.2 91.4                   86.1/86.2    83.6
+  BERT-Large(1-bit Adam) 70.4 86.1 86.1 62.0 93.8 91.9 91.5                      85.7/85.4    83.7
+  BERT-Large(0/1 Adam) 71.7 86.2 86.9 59.9 93.2 91.6 91.4                        85.6/85.6    83.6
+
+
+Table 2: The first column shows Top1 accuracy on ImageNet of Resnet at the end of epoch 90 from differ-
+ent algorithms. The original accuracy is provided by Pytorch pretrained model library (Pytorch, 2014).
+For the other two algorithms, the accuracy is the highest score over 3 runs. The other two columns shows
+zero-shot evaluation of the trained GPT-2 on WikiText-103 and LAMBADA datasets, the evaluation
+methodology follows (Shoeybi et al., 2019). The number for Adam is obtained from (Li et al., 2021b).
+                          ImageNet Top1 Acc. ↑ WikiText Perplexity ↓ LAMBADA Acc. ↑
+      Original Adam                69.76                      27.78                     33.19
+      1-bit Adam                   69.93                      28.37                     33.21
+      0/1 Adam                     69.88                      28.07                     33.51
+
+
+Then we move on to discuss the policy for Tu . Based on the derivation in Section 4, the approximation
+noise from local step is proportional to the learning rate. And so if we denote tj as the step where j-th
+synchronization takes place, then our intuition is to increase tj+1 −tj roughly inversely proportional to
+the learning rate at tj so as to make the approximation noise bounded. For BERT-Base/Large pretraining,
+as illustrated before, the learning rate exponentially decreases by 0.99 every 520 steps after 12.5K linear
+increase warmup steps. So that we set tj+1 −tj = 1 for the first 12.5K steps and after that let it multiply
+by 2 every 32678 steps based on the calculation that the learning rate will decrease by half. Similarly,
+for ImageNet we set tj+1 −tj = 1 for the first 50050 steps (10 epochs) and after that let it multiply by 2
+every 50050 steps (10 epochs). We clip the interval at 16 in all the tasks. This corresponds to H = 16 in
+Assumption 5.Finally, since our theory in Section 5 indicates that approximation will be more accurate
+when the variance is frozen. So that we additionally stop updating variance when tj+1 −tj > 1.
+
+Remarks on the selected policy. As described, the policies for Tv and Tu generally follow the
+learning rate schedule adopted. This is favored in practice for three reasons: (1) It does not require too
+much hyperparameter tuning. Consider adopting a constant or decaying policy based on some utility
+function, capturing the dynamics of the training to reach a useful interval would require tedious search-
+ing on the hyperparameters and retraining; (2) Learning rate policy is well-motivated. As naturally,
+communication is a way of eliminating the difference among workers. If workers adopt a larger learning
+rate, more frequent communication will be needed since the workers are taking large steps in the weight
+space and so we require higher-frequent communication for them to reach consensus; (3) Learning rate
+schedule is universally used in all the ML/DL applications, and thus the method can be easily adapted
+to other applications. In fact, if we consider the scope of large model training, a typical learning rate
+schedule is a linear warm-up followed by a decaying phase, which is very similar to our test cases here.
+
+6.1   C ONVERGENCE S PEED AND Q UALITY A NALYSIS
+
+Figure 2 presents the sample-wise and time-wise convergence results for different algorithms with
+128 GPUs on the Ethernet cluster. We find that 0/1 Adam provides the same sample-wise convergence
+speed compared to the baseline, with up to 2× time-wise speed up. Table 1 summarizes the GLUE
+results using the checkpoints from our BERT pretraining experiments. 0/1 Adam achieves similar
+end task accuracy compared to the numbers reported in previous work. 0/1 Adamachieves faster
+training time than prior work because it reduces the communication overhead in distributed training
+
+
+                                                    8
+Published as a conference paper at ICLR 2023
+
+
+Figure 4: Reduction on number of bits per parameter used and number of communication rounds in
+different tasks. Note that the communication round numbers are normalized due to scale difference
+in different tasks. Note that original Adam uses 16bits per parameter and communicate at evert step.
+
+
+Figure 5: Evaluation BERT-Base/Large pretraining throughput using 0/1 Adam without communica-
+tion rounds skipping. Comparing with Figure 4 and 2, local steps breaks the barrier on the performance
+gain.
+
+
+by using both 1-bit quantizer to compress the communication volume (up to 32× reduction) and
+1-bit AllReduce to reduce the expensive synchronization overhead for local steps in both warmup
+and non-warmup phases. Table 2 provides the ImageNet validation accuracy of trained models from
+different algorithms, and we find the final accuracy can achieve the reported accuracy from Pytorch
+library (Pytorch, 2014). For brevity, convergence comparison on GPT-2 is given in the Appendix C.
+
+6.2   T RAINING T HROUGHPUT A NALYSIS
+
+Figure 3 summarizes the throughput results on different tasks and different clusters. We observe that
+0/1 Adam can consistently outperform baselines in all settings. It is also worth mentioning that 0/1
+Adam on Ethernet (2.7 Gbps effective bandwidth, 4 GPUs per node) is able to achieve comparable
+throughput as 1-bit Adam on InfiniBand (near 100 Gbps effective bandwidth, 8 GPUs per node), as
+shown in the red line in Figure 3(b) and the blue line in Figure 3(c), which demonstrates 0/1 Adam
+further removes the redundancy in communication effectively that exceeds the hardware barrier.
+Communication reduction and the role of local steps. To better understand the importance and effect
+of local steps, we additionally run a special case of 0/1 Adam where we keep the same policy of Tv but
+use Tu = {0,···,T −1}. This special version of 0/1 Adam does not skip rounds but use the same variance
+freezing policy. We plot the data volume usage and throughput results in Figure 4 and 5, respectively.
+We see that although no local steps suffice to reduce the data volume overhead from 1-bit Adam towards
+1-bit-per-parameter in general, the throughput improvement is limited compared to Figure 2.
+
+
+7     C ONCLUSION
+
+In this paper, we study the challenges of using 1-bit communication on Adam, and limitations of
+the state-of-the-art 1-bit Adam algorithm. We propose an algorithm named 0/1 Adam that adopts
+two novel design: adaptive variance state freezing and 1-bit sync. We provide convergence proof for
+0/1 Adam and measure its effectiveness over baseline Adam and 1-bit Adam on various benchmarks,
+including BERT-Base/Large, GPT-2 pretraining and ImageNet.
+
+ACKNOWLEDGMENTS
+
+Yucheng Lu is supported by Meta PhD Fellowship. The authors would like to thank anonymous
+reviewers from ICLR2023 for providing valuable feedback.
+
+
+                                                  9
+Published as a conference paper at ICLR 2023
+
+
+R EFERENCES
+Jacob Devlin, Ming-Wei Chang, Kenton Lee, and Kristina Toutanova. Bert: Pre-training of deep
+  bidirectional transformers for language understanding. arXiv preprint arXiv:1810.04805, 2018.
+Alec Radford, Jeff Wu, Rewon Child, David Luan, Dario Amodei, and Ilya Sutskever. Language
+  models are unsupervised multitask learners. 2019a.
+Tom B. Brown, Benjamin Mann, Nick Ryder, Melanie Subbiah, Jared Kaplan, Prafulla Dhariwal,
+  Arvind Neelakantan, Pranav Shyam, Girish Sastry, Amanda Askell, Sandhini Agarwal, Ariel
+  Herbert-Voss, Gretchen Krueger, Tom Henighan, Rewon Child, Aditya Ramesh, Daniel M. Ziegler,
+  Jeffrey Wu, Clemens Winter, Christopher Hesse, Mark Chen, Eric Sigler, Mateusz Litwin, Scott
+  Gray, Benjamin Chess, Jack Clark, Christopher Berner, Sam McCandlish, Alec Radford, Ilya
+  Sutskever, and Dario Amodei. Language models are few-shot learners. CoRR, abs/2005.14165,
+  2020. URL https://arxiv.org/abs/2005.14165.
+Shaden Smith, Mostofa Patwary, Brandon Norick, Patrick LeGresley, Samyam Rajbhandari, Jared
+  Casper, Zhun Liu, Shrimai Prabhumoye, George Zerveas, Vijay Korthikanti, Elton Zheng, Rewon
+  Child, Reza Yazdani Aminabadi, Julie Bernauer, Xia Song, Mohammad Shoeybi, Yuxiong He,
+  Michael Houston, Saurabh Tiwary, and Bryan Catanzaro. Using deepspeed and megatron to train
+  megatron-turing NLG 530b, A large-scale generative language model. CoRR, abs/2201.11990, 2022.
+Dan Alistarh, Demjan Grubic, Jerry Li, Ryota Tomioka, and Milan Vojnovic. Qsgd: Communication-
+  efficient sgd via gradient quantization and encoding. Advances in Neural Information Processing
+  Systems, 30:1709–1720, 2017.
+Frank Seide, Hao Fu, Jasha Droppo, Gang Li, and Dong Yu. 1-bit stochastic gradient descent and
+  its application to data-parallel distributed training of speech dnns. In Fifteenth Annual Conference
+  of the International Speech Communication Association. Citeseer, 2014.
+Jeremy Bernstein, Yu-Xiang Wang, Kamyar Azizzadenesheli, and Animashree Anandkumar. signsgd:
+   Compressed optimisation for non-convex problems. In International Conference on Machine
+  Learning, pages 560–569. PMLR, 2018a.
+Sebastian U Stich. Local sgd converges fast and communicates little. arXiv preprint arXiv:1805.09767,
+  2018.
+Diederik P Kingma and Jimmy Ba. Adam: A method for stochastic optimization. arXiv preprint
+  arXiv:1412.6980, 2014.
+Dong Wang, Yicheng Liu, Wenwo Tang, Fanhua Shang, Hongying Liu, Qigong Sun, and Licheng Jiao.
+  signadam++: Learning confidences for deep neural networks. In 2019 International Conference
+  on Data Mining Workshops (ICDMW), pages 186–195. IEEE, 2019a.
+Hanlin Tang, Shaoduo Gan, Ammar Ahmad Awan, Samyam Rajbhandari, Conglong Li, Xiangru Lian,
+  Ji Liu, Ce Zhang, and Yuxiong He. 1-bit adam: Communication efficient large-scale training with
+  adam’s convergence speed. arXiv preprint arXiv:2102.02888, 2021.
+Feng Niu, Benjamin Recht, Christopher Ré, and Stephen J Wright. Hogwild!: A lock-free approach
+  to parallelizing stochastic gradient descent. arXiv preprint arXiv:1106.5730, 2011.
+Xiangru Lian, Yijun Huang, Yuncheng Li, and Ji Liu. Asynchronous parallel stochastic gradient for
+  nonconvex optimization. Advances in Neural Information Processing Systems, 28:2737–2745, 2015.
+Cong Xie, Sanmi Koyejo, and Indranil Gupta. Zeno++: Robust fully asynchronous sgd. In
+  International Conference on Machine Learning, pages 10495–10503. PMLR, 2020.
+Xiangru Lian, Ce Zhang, Huan Zhang, Cho-Jui Hsieh, Wei Zhang, and Ji Liu. Can decentralized
+  algorithms outperform centralized algorithms? a case study for decentralized parallel stochastic
+  gradient descent. arXiv preprint arXiv:1705.09056, 2017.
+Yucheng Lu and Christopher De Sa. Optimal complexity in decentralized training. In International
+  Conference on Machine Learning, pages 7111–7123. PMLR, 2021.
+
+
+                                                 10
+Published as a conference paper at ICLR 2023
+
+
+Wei Wen, Cong Xu, Feng Yan, Chunpeng Wu, Yandan Wang, Yiran Chen, and Hai Li. Terngrad:
+ Ternary gradients to reduce communication in distributed deep learning. arXiv preprint
+ arXiv:1705.07878, 2017.
+
+Jianqiao Wangni, Jialei Wang, Ji Liu, and Tong Zhang. Gradient sparsification for communication-
+   efficient distributed optimization. arXiv preprint arXiv:1710.09854, 2017.
+
+Hongyi Wang, Scott Sievert, Zachary Charles, Shengchao Liu, Stephen Wright, and Dimitris
+  Papailiopoulos. Atomo: Communication-efficient learning via atomic sparsification. arXiv preprint
+  arXiv:1806.04090, 2018a.
+
+Tao Lin, Sebastian U Stich, Kumar Kshitij Patel, and Martin Jaggi. Don’t use large mini-batches, use
+  local sgd. arXiv preprint arXiv:1808.07217, 2018.
+
+Sijia Liu, Pin-Yu Chen, Xiangyi Chen, and Mingyi Hong. signsgd via zeroth-order oracle. In
+  International Conference on Learning Representations, 2018.
+
+Xiangyi Chen, Tiancong Chen, Haoran Sun, Zhiwei Steven Wu, and Mingyi Hong. Distributed
+  training with heterogeneous data: Bridging median-and mean-based algorithms. arXiv preprint
+  arXiv:1906.01736, 2019a.
+
+Lukas Balles and Philipp Hennig. Dissecting adam: The sign, magnitude and variance of stochastic
+  gradients. In International Conference on Machine Learning, pages 404–413. PMLR, 2018.
+
+Xiaojian Xu and Ulugbek S Kamilov. Signprox: One-bit proximal algorithm for nonconvex stochastic
+  optimization. In ICASSP 2019-2019 IEEE International Conference on Acoustics, Speech and
+  Signal Processing (ICASSP), pages 7800–7804. IEEE, 2019.
+
+Sai Praneeth Karimireddy, Quentin Rebjock, Sebastian Stich, and Martin Jaggi. Error feedback
+  fixes signsgd and other gradient compression schemes. In International Conference on Machine
+  Learning, pages 3252–3261. PMLR, 2019.
+
+Mher Safaryan and Peter Richtárik. Stochastic sign descent methods: New algorithms and better
+ theory. In International Conference on Machine Learning, pages 9224–9234. PMLR, 2021.
+
+Jeremy Bernstein, Jiawei Zhao, Kamyar Azizzadenesheli, and Anima Anandkumar. signsgd with
+  majority vote is communication efficient and fault tolerant. arXiv preprint arXiv:1810.05291, 2018b.
+
+Jy-yong Sohn, Dong-Jun Han, Beongjun Choi, and Jaekyun Moon. Election coding for distributed
+  learning: Protecting signsgd against byzantine attacks. arXiv preprint arXiv:1910.06093, 2019.
+
+Trieu Le Phong and Tran Thi Phuong. Distributed signsgd with improved accuracy and network-fault
+  tolerance. IEEE Access, 8:191839–191849, 2020.
+
+Lingjuan Lyu. Dp-signsgd: When efficiency meets privacy and robustness. In ICASSP 2021-2021
+  IEEE International Conference on Acoustics, Speech and Signal Processing (ICASSP), pages
+  3070–3074. IEEE, 2021.
+
+Richeng Jin, Yufan Huang, Xiaofan He, Huaiyu Dai, and Tianfu Wu. Stochastic-sign sgd for federated
+  learning with theoretical guarantees. arXiv preprint arXiv:2002.10940, 2020.
+
+Kai Yue, Richeng Jin, Chau-Wai Wong, and Huaiyu Dai. Federated learning via plurality vote. arXiv
+  preprint arXiv:2110.02998, 2021.
+
+Yucheng Lu and Christopher De Sa. Moniqua: Modulo quantized communication in decentralized
+  sgd. In International Conference on Machine Learning, pages 6415–6425. PMLR, 2020.
+
+Anastasia Koloskova, Tao Lin, Sebastian U Stich, and Martin Jaggi. Decentralized deep learning with
+  arbitrary communication compression. arXiv preprint arXiv:1907.09356, 2019.
+
+Chen Fan, Parikshit Ram, and Sijia Liu. Sign-maml: Efficient model-agnostic meta-learning by
+  signsgd. arXiv preprint arXiv:2109.07497, 2021.
+
+
+                                                 11
+Published as a conference paper at ICLR 2023
+
+
+Conglong Li, Ammar Ahmad Awan, Hanlin Tang, Samyam Rajbhandari, and Yuxiong He. 1-bit lamb:
+  Communication efficient large-scale large-batch training with lamb’s convergence speed. arXiv
+  preprint arXiv:2104.06069, 2021a.
+Sashank J Reddi, Satyen Kale, and Sanjiv Kumar. On the convergence of adam and beyond. arXiv
+  preprint arXiv:1904.09237, 2019.
+Manzil Zaheer, Sashank Reddi, Devendra Sachan, Satyen Kale, and Sanjiv Kumar. Adaptive methods
+ for nonconvex optimization. Advances in neural information processing systems, 31, 2018.
+Biyi Fang and Diego Klabjan. Convergence analyses of online adam algorithm in convex setting and
+  two-layer relu neural network. arXiv preprint arXiv:1905.09356, 2019.
+Ahmet Alacaoglu, Yura Malitsky, Panayotis Mertikopoulos, and Volkan Cevher. A new regret analysis
+  for adam-type algorithms. In International Conference on Machine Learning, pages 202–210.
+  PMLR, 2020.
+Alexandre Défossez, Léon Bottou, Francis Bach, and Nicolas Usunier. A simple convergence proof
+  of adam and adagrad. arXiv preprint arXiv:2003.02395, 2020.
+Xiangyi Chen, Sijia Liu, Ruoyu Sun, and Mingyi Hong. On the convergence of a class of adam-type
+  algorithms for non-convex optimization. arXiv preprint arXiv:1808.02941, 2018.
+Dongruo Zhou, Jinghui Chen, Yuan Cao, Yiqi Tang, Ziyan Yang, and Quanquan Gu. On the convergence
+  of adaptive gradient methods for nonconvex optimization. arXiv preprint arXiv:1808.05671, 2018a.
+Yucheng Lu, Jack Nash, and Christopher De Sa. Mixml: A unified analysis of weakly consistent
+  parallel learning. arXiv preprint arXiv:2005.06706, 2020.
+Marina Danilova, Pavel Dvurechensky, Alexander Gasnikov, Eduard Gorbunov, Sergey Guminov,
+ Dmitry Kamzolov, and Innokentiy Shibaev. Recent theoretical advances in non-convex optimization.
+ arXiv preprint arXiv:2012.06188, 2020.
+Fangyu Zou, Li Shen, Zequn Jie, Weizhong Zhang, and Wei Liu. A sufficient condition for
+  convergences of adam and rmsprop. In Proceedings of the IEEE/CVF Conference on Computer
+  Vision and Pattern Recognition, pages 11127–11135, 2019.
+Liangchen Luo, Yuanhao Xiong, Yan Liu, and Xu Sun. Adaptive gradient methods with dynamic
+  bound of learning rate. arXiv preprint arXiv:1902.09843, 2019.
+Xiangyi Chen, Sijia Liu, Kaidi Xu, Xingguo Li, Xue Lin, Mingyi Hong, and David Cox. Zo-
+  adamm: Zeroth-order adaptive momentum method for black-box optimization. arXiv preprint
+  arXiv:1910.06513, 2019b.
+Haiwen Huang, Chang Wang, and Bin Dong. Nostalgic adam: Weighting more of the past gradients
+  when designing the adaptive learning rate. arXiv preprint arXiv:1805.07557, 2018.
+Guanghui Wang, Shiyin Lu, Weiwei Tu, and Lijun Zhang. Sadam: A variant of adam for strongly
+  convex functions. arXiv preprint arXiv:1905.02957, 2019b.
+Zhiming Zhou, Qingru Zhang, Guansong Lu, Hongwei Wang, Weinan Zhang, and Yong Yu. Adashift:
+  Decorrelation and convergence of adaptive learning rate methods. arXiv preprint arXiv:1810.00143,
+  2018b.
+Juntang Zhuang, Yifan Ding, Tommy Tang, Nicha Dvornek, Sekhar C Tatikonda, and James Duncan.
+  Momentum centering and asynchronous update for adaptive gradient methods. Advances in Neural
+  Information Processing Systems, 34, 2021.
+Juntang Zhuang, Tommy Tang, Yifan Ding, Sekhar C Tatikonda, Nicha Dvornek, Xenophon
+  Papademetris, and James Duncan. Adabelief optimizer: Adapting stepsizes by the belief in observed
+  gradients. Advances in neural information processing systems, 33:18795–18806, 2020.
+Debraj Basu, Deepesh Data, Can Karakus, and Suhas N Diggavi. Qsparse-local-sgd: Distributed
+  sgd with quantization, sparsification, and local computations. IEEE Journal on Selected Areas in
+  Information Theory, 1(1):217–226, 2020.
+
+
+                                                12
+Published as a conference paper at ICLR 2023
+
+
+Pytorch. Torchvision 0.11.0 documentation — pytorch.org. https://pytorch.org/vision/
+  stable/models.html, 2014.
+
+Mohammad Shoeybi, Mostofa Patwary, Raul Puri, Patrick LeGresley, Jared Casper, and Bryan
+ Catanzaro. Megatron-lm: Training multi-billion parameter language models using model
+ parallelism. arXiv preprint arXiv:1909.08053, 2019.
+
+Conglong Li, Minjia Zhang, and Yuxiong He. Curriculum learning: A regularization method for
+  efficient and stable billion-scale gpt model pre-training. arXiv preprint arXiv:2108.06084, 2021b.
+
+Kaiming He, Xiangyu Zhang, Shaoqing Ren, and Jian Sun. Deep residual learning for image
+  recognition. In Proceedings of the IEEE conference on computer vision and pattern recognition,
+  pages 770–778, 2016.
+
+Alex Wang, Amanpreet Singh, Julian Michael, Felix Hill, Omer Levy, and Samuel R Bowman. Glue:
+  A multi-task benchmark and analysis platform for natural language understanding. arXiv preprint
+  arXiv:1804.07461, 2018b.
+
+Jia Deng, Wei Dong, Richard Socher, Li-Jia Li, Kai Li, and Li Fei-Fei. Imagenet: A large-scale
+   hierarchical image database. In 2009 IEEE conference on computer vision and pattern recognition,
+   pages 248–255. Ieee, 2009.
+
+Alec Radford, Jeffrey Wu, Dario Amodei, Daniela Amodei, Jack Clark, Miles Brundage, and Ilya
+  Sutskever. Better language models and their implications. OpenAI blog, 1:2, 2019b.
+
+Trieu H Trinh and Quoc V Le. A simple method for commonsense reasoning. arXiv preprint
+  arXiv:1806.02847, 2018.
+
+Rowan Zellers, Ari Holtzman, Hannah Rashkin, Yonatan Bisk, Ali Farhadi, Franziska Roesner, and
+  Yejin Choi. Defending against neural fake news. Advances in neural information processing
+  systems, 32, 2019.
+
+
+A    F ULL D ESCRIPTION TO A LL R EDUCE
+
+As introduced in Section 2, the error feedback based 1bit-AllReduce works best both in theory and
+in practice. In fact, the original 1-bit Adam also adopts the error-feedback design (Tang et al., 2021).
+We give the full description of this 1bit-AllReduce in Algorithm 2, to replace the 1bit-AllReduce
+in Algorithm 1. In the theoretical analysis, our proofs will also rely on this algorithm. Note that
+this algorithm does not require any additional assumptions for our theory to hold, since this fits the
+black-box procedure in Algorithm 4 and Algorithm 1.
+
+Algorithm 2 The full description of Error Feedback 1 bit Communication (1bit-AllReduce)
+                                    (i)                (i)
+Require: communication buffer zt , worker error δt , server error δ t , 1-bit compressor C[·]. Both
+    worker and server errors will be initialized at 0 at t = 0.
+ 1: (On i-th node)
+                   (i)            (i)       (i)        (i)
+ 2: Compress zt           into ẑt    = C[zt + δt ], and update the compression error by
+     (i)     (i)      (i)     (i)
+    δt+1 = zt +δt − ẑt .
+           (i)
+ 3: Send ẑt to the server.
+ 4: (On server)
+                                       (i)                            Pn (i)
+ 5: Take the average over all the ẑt and compress it into z t = C[ n1 i=1 ẑt+1 +δ t ], and update the
+                                       Pn (i)
+    compression error by δ t+1 = n1 i=1 ẑt +δ t −z t .
+ 6: Send z t to all the workers.
+ 7: (On i-th node)
+                  (i)
+ 8: return z t , δt+1 , δ t+1 .
+
+
+                                                  13
+Published as a conference paper at ICLR 2023
+
+
+Algorithm 3 The full description of AllReduce
+                                    (i)
+Require: communication buffer zt .
+ 1: (On i-th node)
+           (i)
+ 2: Send zt to the server.
+ 3: (On server)
+                                   (i)            Pn (i)
+ 4: Take the average over all the zt into z t = n1 i=1 zt .
+ 5: Send z t to all the workers.
+ 6: (On i-th node)
+ 7: return z t .
+
+
+
+B       P ROFILING R ESULTS FOR F IXED C OST OF C OMMUNICATION
+
+We profile the time taken in computation and others (including initialization of a communication round
+and compression) during one 1-bit AllReduce round at different scales on Ethernet cluster in Table 3.
+
+
+Table 3: Profiling on Ethernet cluster the time taken in computation and others (including initialization
+of a communication round and compression) during one 1-bit AllReduce round at different scales.
+ ImageNet           4 node (16 GPUs) 8 node (32 GPUs) 16 node (64 GPUs) 32 node (128 GPUs)
+ Computation 73ms                         68ms                44ms                    51ms
+ Others             8ms                   6ms                 21ms                    19ms
+ BERT-Base          4 node (16 GPUs) 8 node (32 GPUs) 16 node (64 GPUs) 32 node (128 GPUs)
+ Computation 941ms                        490ms               263ms                   162ms
+ Others             153ms                 250ms               397ms                   658ms
+ BERT-Large 4 node (16 GPUs) 8 node (32 GPUs) 16 node (64 GPUs) 32 node (128 GPUs)
+ Computation 1840ms                       970ms               640ms                   332ms
+ Others             340ms                 510ms               590ms                   931ms
+
+
+C       A DDITIONAL E XPERIMENTAL D ETAILS
+
+Training Parameters. For BERT pretraining, we follow the settings from (Devlin et al., 2018) and
+let the learning rate linearly increases to 4×10−4 as a warmup in the first 12.5K steps, then decays
+into 0.99 of the original after every 520 steps. We set β1 = 0.9 and β2 = 0.999 for all the algorithms.
+We adopt the batch size of 4096. For 1-bit Adam, we follow the hyperparameters given in (Tang et al.,
+2021) and set the full-precision stage for 1-bit Adam as 16K and 23K on BERT-Base and BERT-Large,
+respectively. All the hyperparameters used here (e.g. learning rate) strictly follow (Tang et al., 2021)
+for fair comparison. For ImageNet, we follow the example script from Pytorch7 and use batch size
+of 256 and a milestone decay learning rate schedule: starting at 1e-4 and decay by a factor of 10 at
+epoch 30 and 60, with 90 epochs in total. We set 10 epochs (50050 steps) as the full-precision stage
+for 1-bit Adam. For GPT-2 we set batch size to be 512, and use 300K training steps (158B tokens). The
+learning rate schedule follows a linear warmup of 3K steps and a single cycle consine decay over the
+remaining 297K steps (1×10−5 min). For 1-bit Adam, we set its full-precision stage length to be 80K
+steps, and for the 0/1 Adam, we follow the same learning rate based policy from BERT on Tv and Tu .
+For GLUE benchmarks we use Adam optimizer and perform single-task training on the dev set.
+Following the setup in the BERT paper (Devlin et al., 2018) and 1-bit Adam paper (Tang et al.,
+2021), we search over the hyperparameter space with batch sizes ∈ {8,16,32} and learning rates
+{1×10−5 ,3×10−5 ,5×10−5 ,8×10−5 }.
+The convergence plots for GPT-2 pre-training are given in Figure 6.
+
+    7
+        https://github.com/pytorch/examples/blob/master/imagenet/main.py
+
+
+                                                  14
+Published as a conference paper at ICLR 2023
+
+
+Figure 6: Training loss (left) and validation perplexity (right) with respect to Tokens for 1-bit Adam
+and 0/1 Adam.
+
+
+Figure 7: Training loss and Validation error of ResNet18-CIFAR10 task. Hyperparameters that are
+not related to 0/1 Adam is set to be {learning rate: 1e−4, weight decay: 5e−4}. For hyperparameters
+associated with 0/1 Adam, we use the same ones as used in ImageNet with no additional tuning.
+
+
+D     T HEORETICAL A NALYSIS
+
+D.1    A NALYSIS TO AN INTERMEDIATE VERSION OF 0/1 A DAM
+
+Algorithm 4 Generic framework of applying 1-bit communication to Adam with frozen variance state.
+1-bit Adam can be viewed as a special case of setting Tv = {0,···,T0 −1} where T0 denotes its total
+number of steps in the full-precision stage.
+                                           (i)
+Require: initialized model on worker i: x0 , learning rate {γt }Tt=1 , m0 = 0, v0 = 0, total number of iterations
+    T , decaying factor β1 , β2 from Adam, numerical constant ϵ, variance update step index set Tv .
+ 1: for t = 0,···,T −1 do
+                                              (i)      (i)
+ 2:      Locally compute stochastic gradient gt over xt .
+ 3:      if t ∈ Tv then
+                                  (i)
+ 4:           g t = AllReduce gt .
+ 5:        Set vt+1 = β2 vt +(1−β2 )(g t )2 .
+ 6:    else
+                                              (i)
+ 7:        g t = Compressed-AllReduce gt .
+ 8:        Set vt+1 = vt .
+ 9:    end if
+10:     Update momentum: mt+1 = β1 mt +(1−β1 )g t .
+                        (i)    (i)            √
+11:     Update model: xt+1 = xt −γt mt / vt +ϵ.
+12: end for
+             (i)
+13: return xT ,∀i.
+
+
+We start from a special case of 0/1 Adam that compresses gradients without local steps. This is given
+in Algorithm 4. Note that the following proof will use Algorithm 2 to replace Compressed-AllReduce
+in Algorithm 4, as introduced in Section A.
+Algorithm 4 allows us to work with weaker assumption as given in the following
+Assumption 6. Compression error in Algorithm 4: For arbitrary x ∈ Rd , there exists a constant
+0 ≤ ω < 1, such that the output of compressor C[·] has the following error bound:
+                                                    2          2
+                                       E∥C[x]−x∥ ≤ ω∥x∥ .
+
+
+                                                      15
+Published as a conference paper at ICLR 2023
+
+
+Theorem 2. Under Assumption 1, 2, 3, and 6, let m = |Tv |, and select β1 , β2 ∈ [0, 1) such that
+m ≤ log(1−β1 )/log(β2 ). If we run Algorithm 4 with a constant learning rate: for all t ≥ 0
+                                      (r                           )
+                                             n        1         1
+                             γt = min           , p          ,       ,
+                                           σ 2 T 2L G2∞ +ϵ 125
+then it holds that
+                              T −1
+                            1X               2     σ    m+n     1
+                                  E∥∇f (xt )∥ ≤ O √ +         +    ,
+                            T t=0                  nT (1−ω)4 T T
+where we omit f (0)−inf x∈Rd f (x), G∞ , d, ϵ, β1 , β2 and L as constants.
+
+Proof. The main update of Algorithm 4 (with constant learning rate) can be summarized as: for every
+t = 0,···,T −1,
+                        mt+1 = β1 mt +(1−β1 )g t
+                                                   P             2
+                                   β2 vt +(1−β2 ) n1 ni=1 gt(i)
+                                                                    t ∈ Tv ,
+                         vt+1 =
+                                  
+                                     vt                              t ̸∈ Tv .
+                                  
+                                          mt
+                         xt+1 = xt −γ √         ,
+                                          vt +ϵ
+where the g t is the output of the 1-bit AllReduce algorithm8 . Note that based on Algorithm 2, the
+gradient approximation term follows:
+                              n
+                           1 X (i)
+                      gt =       ĝ +δ t −δ t+1
+                           n i=1 t
+                                 n
+                             1 X  (i) (i) (i)
+                           =       g +δt −δt+1 +δ t −δ t+1
+                             n i=1 t
+                                n         n
+                                                  !        n
+                                                                      !
+                             1 X (i)   1 X (i)          1 X (i)
+                           =      g +       δ −δ t −         δ −δ t+1
+                             n i=1 t   n i=1 t          n i=1 t+1
+                           =gt +δt −δt+1 ,
+where we denote
+                                                        n
+                                                      1 X (i)
+                                               gt =        g
+                                                      n i=1 t
+                                                        n
+                                                      1 X (i)
+                                               δt =        δ −δ t .
+                                                      n i=1 t
+To prove the convergence, we now define the following auxiliary sequence: for any t ≥ 0,
+                                                    γmt            γδt
+                                    yt = x t −         √       −√         .
+                                               (1−β1 ) vt +ϵ       vt +ϵ
+The rest of the proof is to use this auxiliary sequence to bound two types of steps separately. We call a
+step t as reuse step if t ̸∈ Tv and update step otherwise. We see for all the update steps, vt ̸= vt+1 while
+for all the reuse steps vt = vt+1 . The bounds on two different types of steps are provides by Lemma 5
+and Lemma 6. Specifically, denoting V1 = √v11 +ϵ , from Lemma 5 we obtain for all the reuse steps,
+                                                        1
+      X         γ                     2
+             p          E∥∇f (xt )∥
+     t̸∈Tv
+           4 G2∞ +ϵ
+                                                               p
+      X                             227γ 3 L2 V12 (1+ω)3 G2∞ d G2∞ +ϵ(T −m) Lγ 2 σ 2 V1 (T −m)
+   ≤       E[f (yt )−f (yt+1 )]+                                                  +                     .
+                                                β22m (1−β1 )2 (1−ω)4                        2nβ2m
+      t̸∈Tv
+
+   8
+     In the original Algorithm 4, the g t is the output of the AllReduce when t ∈ Tv . This, however, does not affect
+our analysis, since our proof holds for a noisier case. The original Algorithm 4 is mainly for practical concern
+– we avoid redundant AllReduce rounds when 1-bit AllReduce is performed.
+
+
+                                                         16
+Published as a conference paper at ICLR 2023
+
+
+while from Lemma 6 we obtain for all the update steps,                 !
+                                                                          σ2
+
+  X       γ               2
+                               X                         34γ     γ             2
+       p       E∥∇f (xt )∥ ≤       E[f (yt )−f (yt+1 )]+     + p        ·    +G∞ d m
+      4 G2∞ +ϵ                                            L   4 G2∞ +ϵ    n
+ t∈Tv                         t∈Tv
+
+                                  32γ(1+β1 )2 (1+ω)3 V1 G2∞ dmL
+                                +                                        .
+                                         β2m (1−β1 )2 (1−ω)4
+Note that the two inequalities above hold when
+                                           (       the learning rate fulfills
+                                                                      )
+                                                      β2m          1
+                                  γ ≤ min             p         ,        .
+                                              2V1 L G2∞ +ϵ 125
+Combine them together,
+   T −1                                                             p
+ 1 X E∥∇f (xt )∥2 f (0)−f ∗ 227γ 2 L2 V12 (1+ω)3 G2∞ d G2∞ +ϵ(T −m) Lγσ 2 V1 (T −m)
+                      ≤            +                                                   +
+                                                  β22m (1−β1 )2 (1−ω)4 T                      2nβ2m T
+          p
+ T t=0 4 G2∞ +ϵ            γT
+                                               !
+                                                      σ2            m 32(1+β1 )2 (1+ω)3 V1 G2∞ dmL
+
+                            34         1
+                        +       + p               ·      +G2∞ d        +
+                             L 4 G∞ +ϵ  2             n             T          β2m (1−β1 )2 (1−ω)4 T
+Dropping the constants, we finally obtain
+   T −1
+                           f (0)−f ∗                 γ2               γσ 2                              σ2 m
+
+ 1X                 2                                                                  ωm
+        E∥∇f (xt )∥ ≤O                + 2m                         +        +                        +
+T t=0                          γT       β2 (1−β1 )2 (1−ω)4 nβ2m β2m (1−β1 )2 (1−ω)4 T                    nT
+                                    ∗               2                  2                              2
+
+                           f (0)−f                γ                γσ                 ωm            σ m
+                      ≤O              +                       +             +                    +          ,
+                               γT       (1−β1 )4 (1−ω)4 n(1−β1 ) (1−β1 )3 (1−ω)4 T                   nT
+                                                                      m
+where in the last step we use the condition in the theorem that β2 ≥ 1−β1 . To meet the requirement
+of learning rate we set                 (r                                 )
+                                                n           1          1
+                               γt = min              , p            ,        ,
+                                              σ 2 T 2L G2∞ +ϵ 125
+then it holds that
+                           T −1
+                         1X                 2            σ        m+n          1
+                                E∥∇f (xt )∥ ≤ O √ +                         +      .
+                         T t=0                           nT (1−ω)4 T T
+That completes the proof.
+
+D.2    P ROOF TO T HEOREM 1
+
+Note that the following proof will use Algorithm 2 to replace 1bit-AllReduce in Algorithm 1, as
+introduced in Section A.
+Theorem 1. Under Assumption 1 to 5, let m = |Tv |, select β1 , β2 ∈ [0, 1) that fulfills
+m ≤ log(1−β1 )/log(β2 ), if we run(Algorithm 1 with a constant learning rate:
+                                                                          ) for all t ≥ 0
+                                   r                         p
+                                        n        1         2  G  2 +ϵ   1
+                                                                 ∞
+                       γt = min            , p           ,            ,     ,
+                                      σ 2 T 4L G2∞ +ϵ          L        6
+then it holds that
+                      T −1
+                                                        H 2 ∆2 (m+n) 1
+
+                    1X                           σ
+                            E∥∇f (x̃t )∥2 ≤ O √ +                       +      ,
+                    T t=0                        nT            T           T
+                 Pn  (i)
+where x̃t = 1/n i=1 xt and we omit f (0)−inf x∈Rd f (x), G∞ , d, ϵ, β1 , β2 and L as constants.
+
+Proof. We now prove Theorem 1. Similar to the proof to Theorem 2, in this proof we discuss the case
+of t ∈ Tv and t ̸∈ Tv separately. Following the proof of Theorem 2, we define the following auxiliary
+sequence
+                                                    γ m̃t      γδt
+                                  ỹt = x̃t −          √     −√       ,
+                                              (1−β1 ) vt +ϵ     vt +ϵ
+where
+                                                        n
+                                                     1 X (i)
+                                               x̃t =      x
+                                                     n i=1 t
+
+
+                                                    17
+Published as a conference paper at ICLR 2023
+
+
+                                                           n
+                                                         1 X (i)
+                                                m̃t =         m .
+                                                         n i=1 t
+And we additionally define that
+                                                           n
+                                                         1 X (i)
+                                                ũt =         u
+                                                         n i=1 t
+                                                           n
+                                                   1 X (i)
+                                                 g̃t =   g .
+                                                   n i=1 t
+Note that the definition of g̃t is different from the gt in Theorem 2 since the former is computed on
+local models which potentially can be different before the sync step.
+To expect a compression error bound to scale in the order of O(γ 2 ), we slightly modify the update
+of line 5, 8, 9 of Algorithm 1 into
+                                     (i)    (i)   (i)
+                                    ut+ 1 =ut +mt
+                                            2
+                                                          t
+                                          (i)
+                                                          X
+                                        mt+1 =ut+ 12 /
+                                                    k=t′
+                                          (i)   (i)          √
+                                         xt+1 =xt′ −γut+ 12 / vt +ϵ.
+Note that since Theorem 1 states the convergence results for constant learning rate, such modification
+does not change the semantics of the original Algorithm 1. Based on Algorithm 2, we know that
+                              n
+                           1 X (i)
+                  ut+ 21 =      û 1 +δ t −δ t+1
+                           n i=1 t+ 2
+                                 n
+                             1 X  (i)       (i)    (i)
+
+                           =        ut+ 1 +δt −δt+1 +δ t −δ t+1
+                             n i=1      2
+
+
+                                n               n
+                                                         !      n
+                                                                           !
+                             1 X (i)        1 X (i)          1 X (i)
+                           =       u 1+           δ −δ t −        δ −δ t+1
+                             n i=1 t+ 2     n i=1 t          n i=1 t+1
+                     =ũt+ 21 +δt −δt+1 .
+Based on Lemma 10, we know that for all the t ∈ Tv , we have the following bound,
+       X γE∥∇f (x̃t )∥2 X                                2γσ 2 m 106γH 2 V1 (M +∆2 )mL
+                        ≤      Ef (ỹt )−Ef (ỹt+1 )+            +
+                                                                         β2m (1−β1 )2
+             p
+            4 G2∞ +ϵ                                       nL
+         t∈Tv                    t∈Tv
+
+                                        γσ 2 m        γG2 dm
+                                 +     p          + p∞          .
+                                    4n G2∞ +ϵ 4 G2∞ +ϵ
+On the other hand, for all the t ̸∈ Tv , we have the following bound,
+         X γE∥∇f (x̃t )∥2
+                p
+        t̸∈Tv
+               4 G2∞ +ϵ
+            X                        36γ 3 H 2 V1 (3G2∞ d+25∆2 )L2 (1+L)(G2∞ +ϵ+1)(T −m)
+        ≤       Ef (ỹt )−Ef (ỹt+1 )+                              p
+        t̸∈Tv
+                                                        β2m (1−β1 )4 G2∞ +ϵ
+                                                                   p
+           Lγ 2 V1 σ 2 (T −m) 48γ 3 V1 (H +1)2 (3G2∞ d+24∆2 ) G2∞ +ϵ(T −m)
+        +                      +                                                .
+                  nβ2m                                β2m (1−β1 )4
+Note that they hold if learning rate is(
+                                       set to be                        )
+                                                             p
+                                                β2m         2 G2∞ +ϵ 1
+                              γ ≤ min          p          ,         ,    .
+                                         4V1 L G2∞ +ϵ          L      6
+Combine them together, we obtain
+        T −1
+      1 X E∥∇f (xt )∥2
+                p
+      T t=0 4 G2∞ +ϵ
+        f (0)−f ∗ 2σ 2 m 106H 2 V1 (M +∆2 )mL     σ2 m      G2 dm     LγV1 σ 2
+    ≤            +      +     m               + p        + p∞       +
+            γT     nLT                 2
+                            β2 (1−β1 ) T       4n G2∞ +ϵT 4 G2∞ +ϵT    nβ2m
+
+                                                         18
+Published as a conference paper at ICLR 2023
+
+
+         36γ 2 H 2 V1 (3G2∞ d+25∆2 )L2 (1+L)(G2∞ +ϵ+1)
+      +                              p
+                        β2m (1−β1 )4 G2∞ +ϵ
+                                             p
+         48γ 2 V1 (H +1)2 (3G2∞ d+24∆2 ) G2∞ +ϵ
+       +                                               .
+                         β2m (1−β1 )4
+Omitting constants:
+         T −1
+                                  f (0)−f ∗ γ 2 H 2 ∆2 γσ 2 σ 2 m H 2 ∆2 m m
+
+       1X                 2
+             E∥∇f (x̃t )∥ ≤O                  +          +       +      +          +
+       T t=0                          γT          β2m      nβ2m nT           β2m T    T
+                                  f (0)−f ∗ γ 2 H 2 ∆2         γσ 2    σ 2 m H 2 ∆2 m m
+
+                            ≤O                +          +           +       +          +      ,
+                                      γT         1−β1      n(1−β1 ) nT          (1−β1 )T T
+where in the last step we use the condition in the theorem that β2m ≥ 1−β1 . To meet the requirement
+of learning rate we set             (r                                      )
+                                                               p
+                                           n         1        2 G2∞ +ϵ 1
+                           γt = min            , p          ,           ,     ,
+                                         σ 2 T 4L G2∞ +ϵ           L      6
+then it holds that
+                          T −1
+                                                           H 2 ∆2 (m+n) 1
+
+                        1X                 2         σ
+                              E∥∇f (x̃t )∥ ≤ O √ +                        +      .
+                        T t=0                        nT           T          T
+And that completes the proof.
+
+D.3    T ECHNICAL L EMMA
+
+Lemma 1. Consider running Algorithm 2 over a communication buffer z (same notation in
+Algorithm 2) under Assumption 6, let δt denote:
+                                                 n
+                                              1 X (i)
+                                         δt =      δ −δ t
+                                              n i=1 t
+                                                                           (i)
+then based on Assumption 6 and 3, it holds that t ≥ 0, if E∥zt ∥2 ≤ C for some constant C > 0,
+                                            2   32ω(1+ω)3 C
+                                     E∥δt ∥ ≤                  .
+                                                    (1−ω)4
+
+Proof. Note that the error is initialized by 0, so that when t = 0 the bound trivially holds. We next
+prove the case for t ≥ 1.
+                                                                                 (i)
+For any i ∈ {1,···,n} and t ≥ 1, by the definition of the sequence δt ,
+                                    2                                      2
+                             (i)                  (i)     (i)        (i)
+                        E δt            =E zt−1 +δt−1 − ẑt−1
+                                                          h         i 2
+                                            (i)   (i)       (i) (i)
+                                        =E zt−1 +δt−1 −C zt−1 +δt−1
+                       Assumption 6                                 2
+                                                    (i)       (i)
+                             ≤              ωE zt−1 +δt−1
+                                   ∀η>0                             2                        2
+                                                              (i)                      (i)
+                                    = ω(1+η)E δt−1                      +ω(1+1/η)E zt−1
+                                   ∞
+                       Assumption 3X
+                                                              j
+                             ≤                    [ω(1+η)] ω(1+1/η)C
+                                            j=0
+                                            ω(1+1/η)
+                                        ≤            C.
+                                            1−ω(1+η)
+Selecting η = 1−ω
+               2ω , we obtain
+                                                          2       2ω(1+ω)
+                                                    (i)
+                                             E δt             ≤           C.
+                                                                   (1−ω)2
+Similarly, we can show that for any t ≥ 1,
+                                      n                  2
+                          2       1 X (i)
+                    E δ t =E            ẑ +δ t−1 −z t−1
+                                  n i=1 t−1
+
+
+                                                              19
+Published as a conference paper at ICLR 2023
+
+
+                                      n
+                                                     " n             # 2
+                                   1 X (i)            1 X (i)
+                                =E      ẑ +δ t−1 −C       ẑ +δ t−1
+                                   n i=1 t−1          n i=1 t−1
+                                          n                                   2
+                                    1 X (i)
+                                ≤ωE      ẑ +δ t−1
+                                    n i=1 t−1
+                                                                                                      n       2
+                                                                 2              1 X (i)
+                                ≤ω(1+η)E δ t−1                       +ω(1+1/η)E      ẑ
+                                                                                n i=1 t−1
+                                                                                                  n         2
+                                                                 2                            1X        (i)
+                                ≤ω(1+η)E δ t−1                       +ω(1+1/η)·                     E ẑt−1 ,
+                                                                                              n i=1
+                                                                                                                               2
+                                                                                                                         (i)
+where in the last step we apply the Jensen Inequality. Since we do not assume a bound on the ẑt−1                                 ,
+we need to bound it in terms of
+                                          2                                                   2
+                                    (i)                    (i)             (i)          (i)
+                                E ẑt−1       =E zt−1 +δt−1 −δt
+                                                                                     2                    2
+                                                            (i)             (i)                   (i)
+                                              ≤2E zt−1 +δt−1                             +2E δt
+                                                4(1+ω)     4ω(1+ω)
+                                              ≤        C+          C
+                                                (1−ω)2      (1−ω)2
+                                                4(1+ω)2
+                                              ≤         C,
+                                                 (1−ω)2
+                                                                              2
+                                                                     (i)
+where we apply the results from the bound on E δt                                 . Given this bound, and following the analysis
+              2                                        2
+        (i)
+for E δt          , we can now bound the E δ t             as follows
+                                               2     2ω(1+ω) 4(1+ω)2
+                                     E δt          ≤          ·      C
+                                                      (1−ω)2 (1−ω)2
+                                                     8ω(1+ω)3
+                                                   =            C.
+                                                       (1−ω)4
+Finally, we obtain t ≥ 1,
+                                                             n                           2
+                                          2  1 X (i)
+                                   E∥δt ∥ =E      δ −δ t
+                                             n i=1 t
+                                                                                         n        2
+                                                                     2       1 X (i)
+                                              ≤2E δ t                    +2E      δ
+                                                                             n i=1 t
+                                                                                    n      2
+                                                                     2        1X       (i)
+                                              ≤2E δ t                    +2         E δt
+                                                                              n i=1
+                                                   32ω(1+ω)3 C
+                                              ≤                .
+                                                     (1−ω)4
+That completes the proof.
+
+Lemma 2. For the variance term, we have the following upper and lower bound: for any t ≥ 1,
+                                 m/2 √        √        p
+                               β2      v1 +ϵ ≤ vt +ϵ ≤ G2∞ +ϵ,
+where the inequality holds element-wise.
+
+Proof. On one hand, for any tj ≤ t < tj+1 , where tj denotes an update step, we obtain element-wise:
+                                  vt ≥ β2 vtj ≥ ··· ≥ β2j v1 ≥ β2m v1 ,
+so that
+                     √          p               q
+                                                                     m/2 √
+                        vt +ϵ ≥ β2m v1 +ϵ ≥ β2m (v1 +ϵ) = β2               v1 +ϵ.
+
+
+                                                                  20
+Published as a conference paper at ICLR 2023
+
+
+On the other hand, for any t ≥ 1 and j ∈ {1,···,d},
+                         t                     n
+                                                        !2            ∞
+                                     t−k 1          (i)
+                        X                    X                       X
+               [vt ]j =     (1−β2 )β2            [gk ]j ≤ G2∞ (1−β2 ) β2k ≤ G2∞ ,
+                                           n i=1
+                        k=1                                          k=1
+so that                                  √           p
+                                           vt +ϵ ≤ G2∞ +ϵ.
+That completes the proof.
+Lemma 3. In Algorithm 4, for any t ≥ 0,
+                                                2       195(1+ω)3 G2∞ d
+                                       E∥mt ∥ ≤                         .
+                                                            (1−ω)4
+
+Proof. For any t ≥ 0,
+                                       t                 2
+                       2
+                                       X
+              E∥mt ∥ =E (1−β1 )             β1t−k g k
+                                      k=0
+                                   Xt
+                                                  2
+                           ≤(1−β1 ) β1t−k E∥g k ∥
+                                   k=0
+                                   Xt
+                                                          2
+                           ≤(1−β1 ) β1t−k E∥gk +δk −δk+1 ∥
+                                    k=0
+                                    Xt
+                                                       2        2           2
+                           ≤(1−β1 )       β1t−k 3E∥gk ∥ +3E∥δk ∥ +3E∥δk+1 ∥
+                                    k=0
+                                                                                                
+                                      t                      n    2
+                                      X             1 X (i)                  2               2
+                           ≤(1−β1 )       β1t−k 3E      g            +3E∥δk ∥ +3E∥δk+1 ∥ 
+                                                    n i=1 k
+                                    k=0
+                                      t             n
+                                                                                            !
+                                                 3X           2
+                                                          (i)
+                                      X                                 2            2
+                           ≤(1−β1 ) β1t−k              E gk     +3E∥δk ∥ +3E∥δk+1 ∥
+                                                 n i=1
+                                      k=0
+                                       t
+                                                         192ω(1+ω)3 G2∞ d
+                           (i)        X
+                                          t−k       2
+                           ≤(1−β1 ) β1          3G∞ d+
+                                                              (1−ω)4
+                                      k=0
+                                                                               ∞
+                                 3(1+ω)3 G2∞ d 192(1+ω)3 G2∞ d
+                                                                              X
+                           ≤                  +                     ·(1−β 1 )    β1k
+                                    (1−ω)4             (1−ω)4
+                                                                              k=0
+                               195(1+ω)3 G2∞ d
+                           ≤                   ,
+                                   (1−ω)4
+where in the step (i) we use Lemma 1. That completes the proof.
+Lemma 4. For any a, b ∈ Rd , the following bound holds:
+                                            2
+                                        a           2 1
+                                       √      ≤ ∥a∥       .
+                                         b            b 1
+
+Proof. Denote the subscript j as the index
+                                          ofthe coordinate.
+                d
+                            !2  d             d
+                                                       
+                                                             d
+                                                                    
+                                                                        d
+                                                                               
+          2 X
+       a              a                            1                     1         2 1
+                     √j
+                                    X         X             X         X
+      √    =                   ≤  a2j               =        a2j            = ∥a∥      .
+        b     j=1
+                    [  b] j         j=1       j=1
+                                                  b j       j=1        j=1
+                                                                           b j          b 1
+Note that the second step holds not because Cauchy-Schwarz Inequality but due to the fact that a2j ,
+             √
+bj > 0 (since b would implicitly assume so).
+Lemma 5. In Algorithm 4, for all the t ≥ 1 that fulfills vt = vt+1 , i.e., ∀t such that t ̸∈ Tv , if we let
+                                                   βm
+                                       γ≤         p2          ,
+                                            2V1 L G2∞ +ϵ
+
+
+                                                         21
+Published as a conference paper at ICLR 2023
+
+
+the following bound holds,
+      X        γ
+            p        E∥∇f (xt )∥2
+           4  G 2 +ϵ
+     t̸∈Tv      ∞
+                                                              p
+       X                           227γ 3 L2 V12 (1+ω)3 G2∞ d G2∞ +ϵ(T −m) Lγ 2 σ 2 V1 (T −m)
+   ≤         E[f (yt )−f (yt+1 )]+                                        +                   .
+                                               β22m (1−β1 )2 (1−ω)4              2nβ2m
+     t̸∈Tv
+
+
+
+Proof. Recall the auxiliary sequence
+                                                     γmt           γδt
+                                 yt = x t −             √      −√         ,
+                                               (1−β1 ) vt +ϵ       vt +ϵ
+For all the steps t ≥ 0 that fulfills vt+1 = vt , we obtain
+
+                                    γ         mt+1         mt               δt+1        δt
+     yt+1 −yt =xt+1 −xt −                  √           −√         −γ √               −√
+                                 1−β1         vt+1 +ϵ      vt +ϵ           vt+1 +ϵ      vt +ϵ
+                          mt                γ
+                =−γ √            −           √       (β1 mt +(1−β1 )g t −mt −(1−β1 )(δt −δt+1 ))
+                          vt +ϵ (1−β1 ) vt +ϵ
+                        γgt
+                =− √           .
+                        vt +ϵ
+From Assumption 1, we have
+        Ef (yt+1 )−Ef (yt )
+                                    L                2
+     ≤E⟨∇f (yt ),yt+1 −yt ⟩+ E∥yt+1 −yt ∥
+                                    2
+                                                           2
+                                         Lγ 2
+
+                             gt                     gt
+     =−γE ∇f (yt ), √                 +       E √
+                            vt +ϵ         2        vt +ϵ
+                                            2              2
+                          ∇f (xt )       Lγ         gt
+     =−γE ∇f (yt ), √                  +      E √
+                             vt +ϵ        2         vt +ϵ
+                                                                                                2
+                                                                               Lγ 2
+
+                          ∇f (xt )                                ∇f (xt )                gt
+     =−γE ∇f (xt ), √                  +γE ∇f (xt )−∇f (yt ), √              +       E √
+                             vt +ϵ                                 vt +ϵ         2       vt +ϵ
+                                                                                   2            2
+                          ∇f (xt )             ∇f (xt )−∇f (yt )               Lγ         gt
+     =−γE ∇f (xt ), √                  +γE          √            ,∇f (xt ) +         E √
+                             vt +ϵ                     vt +ϵ                     2       vt +ϵ
+                         2                              2                                          2
+          γE∥∇f (xt )∥       γ     ∇f (xt )−∇f (yt )         γη              2   Lγ 2       gt
+     ≤−     p             + E           √                 + E∥∇f (xt )∥ +             E √           ,
+               G2∞ +ϵ       2η            vt +ϵ               2                   2         vt +ϵ
+where in the last step we use Lemma 2 and the fact that for any a,b and constant η > 0,
+                                               η           1
+                                      ⟨a,b⟩ ≤ ∥a∥2 + ∥b∥2 .
+                                               2          2η
+         p
+Set η = ( G2∞ +ϵ)−1 , with Assumption 1 and Lemma 4,
+    Ef (yt+1 )−Ef (yt )
+                     2
+                                 p                                             2
+      γE∥∇f (xt )∥       γL2 V1 G2∞ +ϵ                 2    Lγ 2       gt
+ ≤− p                  +                  E∥x  t −y t ∥  +       E  √
+         2 G2∞ +ϵ              2β2m                          2        vt +ϵ
+                     2      2
+                                 p                                           2                    2
+      γE∥∇f (xt )∥       γL V1 G∞ +ϵ2              γmt              γδt          Lγ 2       gt
+ =− p                  +                  E             √        + √           +      E  √
+         2 G2∞ +ϵ              2β2m           (1−β1 ) vt +ϵ          vt +ϵ        2         vt +ϵ
+                     2     3 2
+                                  p
+                                      2                   2     3 2
+                                                                       p
+                                                                           2                   2
+      γE∥∇f (xt )∥       γ L V1 G∞ +ϵ            mt            γ L V1 G∞ +ϵ             δt
+ ≤− p                  +                   E   √            +                    E    √
+         2 G2∞ +ϵ           β2m (1−β1 )2         vt +ϵ                β2m               vt +ϵ
+                          2
+        Lγ 2     gt
+    +        E √
+         2       vt +ϵ
+               2
+                             p                          p
+   γE∥∇f (xt )∥    γ 3 L2 V12 G2∞ +ϵ       2  γ 3 L2 V12 G2∞ +ϵ       2  Lγ 2 V1       2
+ ≤− p            +      2m           E∥mt ∥ +           2m      E∥δt ∥ +         E∥gt ∥ ,
+        2
+    2 G∞ +ϵ           β2 (1−β1 ) 2                    β2                  2β2m
+
+
+                                                   22
+Published as a conference paper at ICLR 2023
+
+
+where in the last step we apply Lemma 2 and 4. Using the bound on the error from Lemma 1, Lemma 3
+and the assumption on the stochastic gradient, we obtain
+                             !
+           γ         Lγ 2 V1                2
+       p           −     m     E∥∇f (xt )∥
+     2 G∞ +ϵ2         2β 2
+                                     p                                 p
+                           γ 3 L2 V12 G2∞ +ϵ             2   γ 3 L2 V12 G2∞ +ϵ         2   Lγ 2 σ 2 V1
+≤E[f (yt )−f (yt+1 )]+                          E∥m   t ∥  +                   E∥δ  t ∥  +
+                              β22m (1−β1 )2                          β22m                   2nβ2m
+                                                         p                                        p
+                           195γ 3 L2 V12 (1+ω)3 G2∞ d G2∞ +ϵ 32γ 3 L2 V12 ω(1+ω)3 G2∞ d G2∞ +ϵ
+≤E[f (yt )−f (yt+1 )]+                                               +
+                                   β22m (1−β1 )2 (1−ω)4                          β22m (1−ω)4
+     Lγ 2 σ 2 V1
+  +
+        2nβ2m
+                                                         p
+                           227γ 3 L2 V12 (1+ω)3 G2∞ d G2∞ +ϵ Lγ 2 σ 2 V1
+≤E[f (yt )−f (yt+1 )]+                                               +         .
+                                   β22m (1−β1 )2 (1−ω)4                 2nβ2m
+Based on the learning rate bound
+                                                        βm
+                                           γ≤           p2         ,
+                                                 2V1 L G2∞ +ϵ
+and summing over all the reuse steps, we obtain
+      X          γ
+             p         E∥∇f (xt )∥2
+           4   G  2 +ϵ
+     t̸∈Tv        ∞
+                                                                 p
+      X                            227γ 3 L2 V12 (1+ω)3 G2∞ d G2∞ +ϵ(T −m) Lγ 2 σ 2 V1 (T −m)
+  ≤        E[f (yt )−f (yt+1 )]+                                                  +                    .
+                                               β22m (1−β1 )2 (1−ω)4                        2nβ2m
+     t̸∈Tv
+That completes the proof.
+
+Lemma 6. In Algorithm 4, for all the t ≥ 0 that fulfills vt ̸= vt+1 , i.e. t ∈ Tv , if the learning rate fulfills
+                                                      1
+                                              γ<
+                                                    125
+, the following bound holds                                                               !
+                                                                                               σ2
+
+  X         γ                2
+                                X                                34γ            γ                     2
+        p         E∥∇f (xt )∥ ≤      E[f (yt )−f (yt+1 )]+              + p                 ·     +G∞ d m
+       4 G2∞ +ϵ                                                   L        4 G2∞ +ϵ             n
+t∈Tv                                t∈Tv
+
+                                      32γ(1+β1 )2 (1+ω)3 V1 G2∞ dmL
+                                  +                                 .
+                                           β2m (1−β1 )2 (1−ω)4
+
+Proof. For all the steps t that fulfills vt ̸= vt+1 ,
+
+                                     γ         mt+1          mt              δt        δt+1
+      yt+1 −yt =xt+1 −xt −                   √           − √          +γ   √       −√
+                                  1−β1         vt+1 +ϵ       vt +ϵ           vt +ϵ     vt+1 +ϵ
+
+                          mt            γ         mt+1         mt               δt        δt+1
+                 =−γ   √         −             √           − √         +γ   √        −√
+                          vt +ϵ 1−β1              vt+1 +ϵ      vt +ϵ           vt +ϵ      vt+1 +ϵ
+
+                       γβ1       m            γ       mt+1             δt        δt+1
+                 =−           √ t −                 √         +γ √          −√             .
+                      1−β1 vt +ϵ 1−β1 vt+1 +ϵ                         vt +ϵ      vt+1 +ϵ
+Based on the smoothness assumption, for constant η > 0 that will be assigned later,
+        Ef (yt+1 )−Ef (yt )
+                                    L                  2
+      ≤E⟨∇f (yt ),yt+1 −yt ⟩+ E∥yt+1 −yt ∥
+                                     2
+   γη<1 ηγ                     L
+                          2                         2
+     ≤      E∥∇f (yt )∥ + E∥yt+1 −yt ∥
+        2L                    ηγ
+        ηγ                2                       2   L                2
+      ≤ E∥∇f (xt )∥ +ηγLE∥yt −xt ∥ + E∥yt+1 −yt ∥
+         L                                            ηγ
+        ηγ                     2    ηγ          2                   2    L              2
+      ≤ E∥∇f (xt )−gt ∥ + E∥gt ∥ +ηγLE∥yt −xt ∥ + E∥yt+1 −yt ∥
+         L                           L                                  ηγ
+
+                                                       23
+Published as a conference paper at ICLR 2023
+
+
+             n                     2        n          2
+        ηγ X                   (i)     ηγ X        (i)                 2 L            2
+       ≤ 2
+               E  ∇f  (x t )−g t     +        E gt       +ηγLE∥yt −xt ∥ + E∥yt+1 −yt ∥
+       n L i=1                         nL i=1                            ηγ
+       ηγ σ 2
+
+                   2                        2   L                2
+     ≤         +G∞ d +ηγLE∥yt −xt ∥ + E∥yt+1 −yt ∥ .
+        L n                                     ηγ
+Now we can bound the last two terms as follows, note that
+                                                               2
+                            2            γmt             γδt
+               E∥yt −xt ∥ =E                √       +√
+                                   (1−β1 ) vt +ϵ         vt +ϵ
+                                                             2                     2
+                                    2γ 2         mt                     δt
+                                   ≤         E √          +2γ 2 E √
+                                  (1−β1 )2       vt +ϵ                 vt +ϵ
+                                     2γ 2 V1           2   2γ 2 V1        2
+                                ≤          2  m E∥mt ∥ + m E∥δt ∥
+                                  (1−β1 ) β2                β2
+                                  390γ 2 (1+ω)3 V1 G2∞ d 64γ 2 ω(1+ω)3 V1 G2∞ d
+                                ≤ m                      +
+                                   β2 (1−β1 )2 (1−ω)4              β2m (1−ω)4
+                                  454γ 2 (1+ω)3 V1 G2∞ d
+                                ≤ m                      ,
+                                   β2 (1−β1 )2 (1−ω)4
+where in the last step we apply Lemma 1. On the other hand,
+                   2
+   E∥yt+1 −yt ∥
+                                                                          2
+        γβ1      mt         γ     mt+1             δt         δt+1
+ =E           √        +        √          −γ √          −√
+       1−β1 vt +ϵ 1−β1 vt+1 +ϵ                    vt +ϵ      vt+1 +ϵ
+                                                                          2
+        γβ1      m          γ     mt+1             δt         δt+1
+ ≤E           √ t +             √          −γ √          −√
+       1−β1 vt +ϵ 1−β1 vt+1 +ϵ                    vt +ϵ      vt+1 +ϵ
+                               2                            2                     2                          2
+      4γ 2 β12         mt             4γ 2           mt+1                      δt                   δt+1
+  ≤             E   √            +             E √               +4γ 2 E √              +4γ 2 E √
+    (1−β1 )2           vt +ϵ       (1−β1 )2          vt+1 +ϵ                  vt +ϵ                vt+1 +ϵ
+      4γ 2 β12 V1             2      4γ 2 V1                2   4γ 2 V1        2   4γ 2 V1         2
+ ≤                  E∥m    t ∥  +                E∥m   t+1 ∥  +         E∥δ t ∥  +         E∥δt+1 ∥
+    (1−β1 )2 β2m                  (1−β1 )2 β2m                    β2m               β2m
+    780γ 2 (1+β12 )V1 (1+ω)3 G2∞ d 256γ 2 V1 ω(1+ω)3 G2∞ d
+ ≤                                        +
+           β2m (1−β1 )2 (1−ω)4                     β2m (1−ω)4
+             2       2             3 2
+    1036γ (1+β1 )V1 (1+ω) G∞ d
+ ≤                                          ,
+           β2m (1−β1 )2 (1−ω)4
+where we again apply Lemma 1 and Lemma 3. Put everything together,
+            Ef (yt+1 )−Ef (yt )
+            ηγ σ 2
+
+                                                      2    L                 2
+         ≤            +G2∞ d +ηγLE∥yt −xt ∥ + E∥yt+1 −yt ∥
+             L n                                          ηγ
+            ηγ σ 2                  454ηγ 3 (1+ω)3 V1 G2∞ dL 1036γ(1+β12 )V1 (1+ω)3 G2∞ dL
+
+         ≤            +G2∞ d +                                    +
+             L n                      β2m (1−β1 )2 (1−ω)4                  ηβ2m (1−β1 )2 (1−ω)4
+                  2
+                                                  1036 γ(1+β1 )2 (1+ω)3 V1 G2∞ dL
+
+            ηγ σ
+         ≤            +G2∞ d + 454ηγ 2 +
+             L n                                    η          β2m (1−β1 )2 (1−ω)4
+                                      1
+Set η = 34, and considering γ < 125       , we get
+                                        34γ σ 2                  32γ(1+β1 )2 (1+ω)3 V1 G2∞ dL
+
+                                                        2
+               Ef (yt+1 )−Ef (yt ) ≤                +G∞ d +                                        .
+                                           L     n                     β2m (1−β1 )2 (1−ω)4
+Summing over all the update steps, we obtain
+                                         34γ σ 2 m                     32γ(1+β1 )2 (1+ω)3 V1 G2∞ dmL
+           X
+     0≤         E[f (yt )−f (yt+1 )]+                  +G2∞ dm +                                         .
+                                            L      n                          β2m (1−β1 )2 (1−ω)4
+          t∈Tv
+Adding √ γ2                                  2
+                     P
+         4 G∞ +ϵ        t∈Tv E∥∇f (xt )∥ on both sides, and note that
+                          X                       X                      2
+                                                                             X           2
+                                E∥∇f (xt )∥2 =        E∥∇f (xt )−gt ∥ +           E∥gt ∥
+                        t∈Tv                  t∈Tv                       t∈Tv
+
+
+                                                      24
+Published as a conference paper at ICLR 2023
+
+
+                                                   σ2 m
+                                               ≤        +G2∞ dm,
+                                                    n
+we finally obtain
+                                                                        !
+                                                                           σ2
+
+  X        γ                 2
+                                X                         34γ     γ
+       p          E∥∇f (xt )∥ ≤     E[f (yt )−f (yt+1 )]+     + p        ·    +G2∞ d m
+      4 G2∞ +ϵ                                             L   4 G2∞ +ϵ    n
+ t∈Tv                          t∈Tv
+
+                                       32γ(1+β1 )2 (1+ω)3 V1 G2∞ dmL
+                                   +                                 .
+                                            β2m (1−β1 )2 (1−ω)4
+That completes the proof.
+
+Lemma 7. Under Assumption 4, for any t ≥ 0, it holds that
+                                               2
+                                       E∥δt ∥ ≤ 4∆2 .
+
+Proof. Based on the definition of the compression error, we obtain
+                                               n            2
+                                      2     1 X (i)
+                               E∥δt ∥ =E         δ −δ t
+                                            n i=1 t
+                                                                      n     2
+                                                        2       1 X (i)
+                                            ≤2E δ t         +2E      δ
+                                                                n i=1 t
+                                                                  n         2
+                                                        2      1X       (i)
+                                            ≤2E δ t         +2       E δt
+                                                               n i=1
+                                            ≤4∆2 .
+That completes the proof.
+
+Lemma 8. In Algorithm 1, for any t ≥ 0, the momentum term is uniformly bounded by the following:
+                                         (i)
+                                             2  3G2 d+24∆2
+                                   E mt        ≤ ∞            ,
+                                                  (1−β1 )2
+                                       (i)
+                                             2  3G2 d+24∆2
+                                E mt+ 1 ≤ ∞                   ,
+                                           2      (1−β1 )2
+                                             2  3G2 d+24∆2
+                                    E∥m̃t ∥ ≤ ∞               ,
+                                                  (1−β1 )2
+                                             2  3G2 d+24∆2
+                                E m̃t+ 21 ≤ ∞                 .
+                                                  (1−β1 )2
+
+Proof. We prove this lemma via induction. Note that when t = 0, the inequality trivially holds due to
+initialization at 0 and Jensen Inequality. Now suppose the inequality holds up to step t ≥ 0, then for t+1,
+if t ∈ Tu , then
+                         2
+                   (i)
+           E mt+1
+                         2
+               ut+ 21
+        =E
+               t−k
+                                   2
+               ũt+ 12 +δt −δt+1
+        =E
+                         t−k
+               Pt                          2
+                   j=k+1 m̃j +δt −δt+1
+        =E
+                       t−k
+               Pt                           Pj−1 j−h−1                          2
+                          j−k
+                j=k+1   β 1   m̃ k +(1−β 1 ) h=k β1   gh +δt −δt+1
+        =E
+                                               t−k
+
+
+                                                        25
+Published as a conference paper at ICLR 2023
+
+
+                                                                                                                    2
+                         t                                        t    j−1
+            1 X j−k     1−β1 X X j−h−1
+        =E     β1 m̃k +         β1     gh +(δt −δt+1 )
+           t−k           t−k
+                     j=k+1                                   j=k+1h=k
+                                                            2                                                                      2
+                                     t                                                                 t     j−1
+    ∀η>0          1 X j−k                                                 1−β1 X X j−h−1
+        ≤ (1+η)E     β1 m̃k                                     +(1+1/η)E         β1     gh +(δt −δt+1 )
+                 t−k                                                       t−k
+                                   j=k+1                                                           j=k+1h=k
+                   t                                                                     t j−1
+            1+η    X                          2         3(1+1/η)(1−β1 )                  X X                                   2
+        ≤                E β1j−k m̃k              +                                                        β1j−h−1 gh E∥gh ∥
+            t−k                                              t−k
+                  j=k+1                                                                 j=k+1h=k
+                                         2                                   2
+            +3(1+1/η)E∥δt ∥ +3(1+1/η)E∥δt+1 ∥
+η=1/β1 −1            3G2∞ d+24∆2
+    ≤       (1+η)β12 ·                 +3(1+1/η)G2∞ d+24(1+1/η)∆2
+                          (1−β1 )2
+             3G2 d+24∆2 3G2∞ d+24∆2
+       =β1 · ∞                  +
+                (1−β1 )2             (1−β1 )2
+         3G2 d+24∆2
+       = ∞                  .
+            (1−β1 )2
+On the other hand, if t ̸∈ Tu , then
+                                    2                       2                                                 2
+                             (i)                  (i)                            (i)                   (i)
+                   E mt+1                =E mt+ 1               = E β1 mt +(1−β1 )gt
+                                                        2
+
+                                                            (i)
+                                                                  2     3G2∞ d+24∆2          (i)
+                                                                                                   2
+                                         ≤β1 E β1 mt                  +(1−β1 )E gt     .               ≤
+                                                                          (1−β1 )2
+For all the t+ 12 case, the inequality holds trivially due to Jensen Inequality. Finally, all the ˜· bound
+can also be obtained via Jensen Inequality. And that completes the proof.
+
+Lemma 9. In Algorithm 1, for all the t such that t ̸∈ Tv , it holds that if we set learning rate
+                                    (                         p          )
+                                              β2m            2 G2∞ +ϵ
+                           γ ≤ min           p             ,                ,
+                                        4V1 L G2∞ +ϵ             L
+then,
+          X γE∥∇f (x̃t )∥2
+                p
+         t̸∈Tv
+               4 G2∞ +ϵ
+            X                     36γ 3 H 2 V1 (3G2∞ d+25∆2 )L2 (1+L)(G2∞ +ϵ+1)(T −m)
+        ≤       Ef (ỹt )−Ef (ỹt+1 )+                           p
+                                                        m (1−β )4 G2 +ϵ
+         t̸∈Tv
+                                                     β 2      1    ∞
+                                                                p
+            Lγ 2 V1 σ 2 (T −m) 48γ 3 V1 (H +1)2 (3G2∞ d+24∆2 ) G2∞ +ϵ(T −m)
+         +                    +                                              .
+                   nβ2m                            β2m (1−β1 )4
+
+Proof. Since when t ̸∈ Tv , it can either belongs to Tu or not. We first prove the case for t ∈ Tu . From
+the definition of the auxiliary sequence, we obtain,
+
+                                     γ        m̃t+1         m̃t          γδt+1       γδt
+      ỹt+1 − ỹt =x̃t+1 − x̃t −            √         −√            − √          −√
+                                  1−β1        vt+1 +ϵ       vt +ϵ        vt+1 +ϵ     vt +ϵ
+                                          γ                           1
+                  =x̃t+1 − x̃t −           √       (m̃t+1 − m̃t )− √       (γδt+1 −γδt )
+                                  (1−β1 ) vt +ϵ                      vt +ϵ
+                                          γ
+                  =x̃t+ 12 − x̃t −          √        m̃t+ 12 − m̃t
+                                   (1−β1 ) vt +ϵ
+                                               γ                               1
+                    + x̃t+1 − x̃t+ 12 −         √         m̃t+1 − m̃t+ 21 − √       (γδt+1 −γδt )
+                                        (1−β1 ) vt +ϵ                         vt +ϵ
+                      |                                       {z                                  }
+                                                                                       =qt
+                       γ m̃t        γ
+                   =− √      −       √      (β1 m̃t +(1−β1 )g̃t − m̃t )+qt
+                        vt +ϵ (1−β1 ) vt +ϵ
+
+                                                                        26
+Published as a conference paper at ICLR 2023
+
+
+                    γ g̃t
+                =− √      +qt .
+                     v+ϵ
+
+From Assumption 1, we have
+                                                 L               2
+Ef (ỹt+1 )−Ef (ỹt ) ≤E⟨∇f (ỹt ),ỹt+1 − ỹt ⟩+ E∥ỹt+1 − ỹt ∥
+                                                 2
+                                                                   2
+                                           g̃t                g̃t                                  2
+                      =−γE ∇f (ỹt ), √            +Lγ 2 E √         −γE⟨∇f (ỹt ),qt ⟩+Lγ 2 E∥qt ∥ .
+                                          vt +ϵ              vt +ϵ |      {z         } | {z }
+                       |            {z           } |       {z      }      A3                 A4
+                                           A1                               A2
+
+We now bound A1 to A4 separately. Note that from Lemma 8, the momentum term can be uniformly
+bounded by a constant. For brevity of the derivation, we use M to denote such constant bound, and
+fit in its value at the end of the proof.
+For A1 ,
+  A1
+
+                   g̃t
+=−γE ∇f (ỹt ), √
+                  vt +ϵ
+
+                1
+                  Pn            (i) +
+                      i=1 ∇f xt
+    *
+                n
+=−γE ∇f (ỹt ),        √
+                         vt +ϵ
+
+                                             1
+                                               Pn          (i)
+                                                    ∇f           −∇f (x̃t )
+                                 *                                          +
+
+                ∇f (x̃t )
+
+                                             n  i=1      x t
+=−γE ∇f (x̃t ), √           −γE ∇f (x̃t ),             √
+                  vt +ϵ                                  vt +ϵ
+
+                                                                   1
+                                                                     Pn              (i)
+                                                                            ∇f             −∇f (x̃t )
+                                            *                                                         +
+
+                            ∇f (x̃t )
+
+                                                                   n    i=1        x t
+ −γE ∇f (ỹt )−∇f (x̃t ), √             −γE ∇f (ỹt )−∇f (x̃t ),              √
+                              vt +ϵ                                                vt +ϵ
+                                                                                     2
+                                                 1
+                                                   Pn            (i)
+  γE∥∇f (x̃t )∥
+                2
+                     γη1                   γ    n    i=1 ∇f    x t     −∇f  (x̃ t )       γη1
+                                       2                                                                  2
+≤− p              +       E∥∇f (x̃t )∥ +      E             √                          +      E∥∇f (x̃t )∥
+      G2∞ +ϵ           2                  2η1                  vt +ϵ                       2
+                                                                                                         2
+                                                                       1
+                                                                         Pn           (i)
+    γ     ∇f (ỹt )−∇f (x̃t )
+                              2
+                                  γη1                            γ     n    i=1 ∇f xt −∇f (x̃t )
+                                                            2
+ +     E       √                +     E∥∇f (ỹt )−∇f (x̃t )∥ +      E             √
+   2η1            vt +ϵ            2                           2η1                  vt +ϵ
+                      !                         n
+                                       γV1 L2 X                      γV1 L2 γη1 L2
+
+         γ                                                     2
+                                   2                  (i)                                             2
+≤− p           −γη1 E∥∇f (x̃t )∥ + m               E xt − x̃t +              +           E∥ỹt − x̃t ∥ ,
+       G2∞ +ϵ                          β2 η1 n i=1                   2β2m η1     2
+
+where in the last step we use Assumption 1, Lemma 2 and Lemma 4. For the second term, denote
+the last sync step before t is k, then we have:
+                        2                                             2
+               (i)                   (i)        (i)
+           E xt − x̃t       =E xt −xk −(x̃t − x̃k )
+                                                       2
+                                      (i)        (i)                         2
+                            ≤2E xt −xk                     +2E∥x̃t − x̃k ∥
+                                                             2                                  2
+                                  t−1     (i)                                     n t−1   (i)
+                               2
+                                  X    mj                                1 XX mj
+                            ≤2γ E     √                          +2γ 2 E       √
+                                        vt +ϵ                            n i=1   vt +ϵ                        (5)
+                                       j=k                                          j=k
+
+                                             (i)                      2                             (i)   2
+                                     t−1                                               n t−1
+                                 2
+                                     X    mj                                  2     1 XX        mj
+                            ≤2γ (t−k) E  √                                +2γ (t−k)          E √
+                                           vt +ϵ                                    n i=1        vt +ϵ
+                                                j=k                                         j=k
+
+                              4γ 2 H 2 V1 M
+                            ≤               ,
+                                   β2m
+
+                                                                 27
+Published as a conference paper at ICLR 2023
+
+
+                                                                                                     (i)
+where the first step holds because Lemma 4, Lemma 2, and the fact that at the sync step k, x̃k = xk .
+For the third term, we have
+                                                                            2
+                                      2       γ m̃t              γδt
+                          E∥ỹt − x̃t ∥ =E       √         +√
+                                        (1−β1 ) vt +ϵ            vt +ϵ
+                                        2γ 2 V1              2    2V1          2
+                                  ≤ m             2
+                                                    E∥m̃t ∥ + m E∥γδt ∥
+                                    β2 (1−β1 )                    β2
+                                                                                                     (6)
+                             Lemma 7 2γ 2 V1 M         2γ 2 V1
+                                ≤     m           2
+                                                     + m ·4∆2
+                                    β2 (1−β1 )          β2
+                                         2
+                                      2γ V1 M          8γ 2 V1 ∆2
+                                  ≤ m                +             ,
+                                    β2 (1−β1 )    2       β2m
+where we again apply the Lemma 2 and Lemma 4. Then we can get
+                                  !                               n
+                       γ                           2   γV1 L2 X          (i)
+                                                                                     2
+         A1 ≤− p             −γη1 E∥∇f (x̃t )∥ + m                   E xt − x̃t
+                      G2∞ +ϵ                           β2 η1 n i=1
+                   γV1 L2 γη1 L2
+
+                                                  2
+               +           +        E∥ỹt − x̃t ∥
+                   2β2m η1     2
+                                  !
+                       γ                           2   4γ 3 H 2 V12 L2 M
+            ≤− p             −γη1 E∥∇f (x̃t )∥ +
+                        2
+                      G∞ +ϵ                                  β2m η1
+                   γV1 L2 γη1 L2          2γ 2 V1 M       8γ 2 V1 ∆2
+
+               +           +        ·                   +
+                   2β2m η1     2        β2m (1−β1 )2           β2m
+                                  !
+                       γ                           2   4γ 3 H 2 V12 L2 M        γ 3 V12 M L2
+            ≤− p             −γη1 E∥∇f (x̃t )∥ +                         +
+                      G2∞ +ϵ                                 β2m η1          η1 β22m (1−β1 )2
+                  γ 3 η1 V1 M L2 4γ 3 V12 ∆2 L2 4γ 3 η1 V1 ∆2 L2
+                    +           +               +                .
+                  β2m (1−β1 )2      η1 β22m            β2m
+where in the second step we reuse Equation (5). Next we can bound A2 as follows
+                                  2
+                          g̃t
+        A2 =Lγ 2 E √
+                          vt +ϵ
+                        n             2
+             Lγ 2 V1 1 X (i)
+            ≤ m E         g
+              β2     n i=1 t
+                                       n                2
+              Lγ 2 V1 σ 2 Lγ 2 V1   1 X   (i)
+            ≤            +        E       ∇f xt
+               nβ2m        β2m      n i=1
+                                        n                           2
+              Lγ 2 V1 σ 2 2Lγ 2 V1   1 X   (i)                              2Lγ 2 V1             2
+            ≤            +         E       ∇f xt −∇f (x̃t )             +            E∥∇f (x̃t )∥
+               nβ2m         β2m      n i=1                                    β2m
+                                          n
+                Lγ 2 V1 σ 2 2Lγ 2 V1 L2 X      (i)
+                                                       2 2Lγ 2 V1              2
+            ≤         m    +      m         E xt − x̃t +     m    E∥∇f (x̃t )∥
+                 nβ2          nβ2       i=1
+                                                           β 2
+
+               Lγ 2 V1 σ 2 8γ 3 V12 H 2 M L3 2Lγ 2 V1               2
+            ≤             +                 +           E∥∇f (x̃t )∥ ,
+                 nβ2m             β2m           β2m
+where in the sixth step we reuse Equation (5). For A3 ,
+             A3 =−γE⟨∇f (ỹt ),qt ⟩
+                =−γE⟨∇f (x̃t ),qt ⟩−γE⟨∇f (ỹt )−∇f (x̃t ),qt ⟩
+            ∀η2 >0 γη                 γη2                             γ
+                     2                2                          2            2
+                ≤        E∥∇f (x̃t )∥ +    E∥∇f (ỹt )−∇f (x̃t )∥ + E∥qt ∥
+                    2                  2                              η2
+                                      γη2 L2      2γ 2 V1 M     8γ 2 V1 ∆2
+
+                   γη2             2                                           γ     2
+                 ≤     E∥∇f (x̃t )∥ +        ·    m         2
+                                                              +       m      + E∥qt ∥
+                    2                    2       β2 (1−β1 )        β2          η2
+
+                                                  28
+Published as a conference paper at ICLR 2023
+
+
+                   γη2             2   γ 3 η2 V1 M L2 4γ 3 η2 V1 ∆2 L2 γ             2
+                 ≤     E∥∇f (x̃t )∥ + m              +                  + E∥qt ∥ ,
+                     2                 β2 (1−β1 )2           β2m          η2
+where in the last step we reuse Equation (6). Combine the bound of A1 to A4 , we obtain
+           Ef (ỹt+1 )−Ef (ỹt )
+                                       !
+                     γ             γη2                2  4γ 3 H 2 V12 L2 M      γ 3 V12 M L2
+         ≤− p              −γη1 −         E∥∇f (x̃t )∥ +         m         +
+                   G2∞ +ϵ            2                         β2 η1         η1 β22m (1−β1 )2
+             γ 3 η1 V1 M L2 4γ 3 V12 ∆2 L2
+           +                +
+              β2m (1−β1 )2        η1 β22m
+             4γ 3 η1 V1 ∆2 L2 Lγ 2 V1 σ 2 8γ 3 V12 H 2 M L3 2Lγ 2 V1                     2
+           +                  +           +                     +          E∥∇f (x̃t )∥
+                     β2m           nβ2m             β2m              β2m
+             γ 3 η2 V1 M L2 4γ 3 η2 V1 ∆2 L2
+
+                                                    γ       2          2
+           + m              +                 +       +Lγ E∥qt ∥ .
+              β2 (1−β1 )2            β2m           η2
+We set the two constants η1 ,η2 as
+                                                      1
+                                          η1 = p
+                                                 4 G2∞ +ϵ
+                                                      1
+                                          η2 = p             ,
+                                                 2 G2∞ +ϵ
+then we have,
+      Ef (ỹt+1 )−Ef (ỹt )
+                                   !
+                γ              γη2                2   4γ 3 H 2 V12 L2 M       γ 3 V12 M L2
+    ≤− p               −γη1 −         E∥∇f (x̃t )∥ +                     +
+             G2∞ +ϵ             2                           β2m η1         η1 β22m (1−β1 )2
+         γ 3 η1 V1 M L2 4γ 3 V12 ∆2 L2
+      +                    +
+          β2m (1−β1 )2          η1 β22m
+             3           2 2
+         4γ η1 V1 ∆ L          Lγ 2 V1 σ 2 8γ 3 V12 H 2 M L3 2Lγ 2 V1                     2
+       +                     +             +                   +             E∥∇f (x̃t )∥
+                 β2m             nβ2m               β2m              β2m
+         γ 3 η2 V1 M L2 4γ 3 η2 V1 ∆2 L2
+
+                                                    γ       2           2
+       + m                 +                  +       +Lγ E∥qt ∥
+          β2 (1−β1 )2              β2m             η2
+                                      !
+                  γ          2Lγ 2 V1                  2   36γ 3 H 2 V1 (M +∆2 )L2 (1+L)(G2∞ +ϵ+1)
+    ≤− p                   −     m       E∥∇f (x̃t )∥ +                              p
+            2 G2∞ +ϵ           β2                                       β2m (1−β1 )2 G2∞ +ϵ
+         Lγ 2 V1 σ 2   p 2
+                                                         2
+       +        m      + 2γ G∞ +ϵ+Lγ 2 E∥qt ∥ .
+            nβ2
+Finally, we need to bound the norm of qt . If we denote the last sync step was k steps before t, then,
+                                      γ                             γδ −γδ
+                                                                           t+1     t
+      qt =x̃t+1 − x̃t+ 12 −            √          m̃t+1 − m̃t+ 21 − √
+                              (1−β1 ) vt +ϵ                                  vt +ϵ
+                                                            γ                              γδ −γδ
+                                                                                             t+1     t
+         =x̃t+1 − x̃t−k+1 + x̃t−k+1 − x̃t+ 12 −               √           m̃t+1 − m̃t+ 21 − √
+                                                     (1−β1 ) vt +ϵ                             vt +ϵ
+                                               
+               γ ũt+ 12         t
+                                         γ m̃         γ m̃t+1 − m̃t+ 12
+                                       √ j −
+                                X
+         =− √             −                                     √
+                 vt +ϵ                    vt +ϵ         (1−β1 ) vt +ϵ
+                             j=t−k+1
+                                                                               
+                                                                      t
+                         γ                                          X
+         =−               √      m̃t+1 − m̃t+ 1 +2(1−β1 )                  m̃j ,
+               (1−β1 ) vt +ϵ                       2
+                                                            j=t−k+1
+
+based on which we obtain
+                                                                               2
+                                                                      t
+             2             γ                                          X
+      E∥qt ∥ =E             √      m̃t+1 − m̃t+ 1 +2(1−β1 )               m̃j 
+                     (1−β1 ) vt +ϵ               2
+                                                                  j=t−k+1
+
+
+
+                                                   29
+Published as a conference paper at ICLR 2023
+
+
+
+                                                                                                          
+                                                                                       t
+                     γ 2 V1   3E∥m̃t+1 ∥2 +3E m̃t+ 1
+                                                                  2                    X               2
+                 ≤ m                                                  +12(1−β1 )2 k           E∥m̃j ∥ 
+                  β2 (1−β1 )2                       2
+                                                                                      j=t−k+1
+                        2             2
+                12γ V1 (H +1) M
+                 ≤                   .
+                   β2m (1−β1 )2
+Put everything together, and let γ fulfills
+                                        (                                )
+                                                                 p
+                                              βm        2         G2∞ +ϵ
+                                 γ ≤ min      p2      ,                    ,
+                                         4V1 L G2∞ +ϵ              L
+we finally obtain
+             Ef (ỹt+1 )−Ef (ỹt )
+                                2
+                  γE∥∇f (x̃t )∥      36γ 3 H 2 V1 (M +∆2 )L2 (1+L)(G2∞ +ϵ+1) Lγ 2 V1 σ 2
+              ≤−                   +                                              +
+                                                                                      nβ2m
+                     p                                       p
+                   4 G∞ +ϵ 2                     β2m (1−β1 )2 G2∞ +ϵ
+                                       p
+                  48γ 3 V1 (H +1)2 M G2∞ +ϵ
+                +                                  .
+                            β2m (1−β1 )2
+To this end, we have provided bound to all the sync steps t with (t ̸∈ Tv and t ∈ Tu ). For all the t with
+(t ̸∈ Tv and t ̸∈ Tu ), they can be seen as a special case of qt = 0. Since A3 +A4 > 0, this bound will
+continue to hold for them, so that to sum over all the t with t ̸∈ Tv , we obtain
+           X γE∥∇f (x̃t )∥2
+                   p
+          t̸∈Tv
+                  4 G2∞ +ϵ
+           X                    36γ 3 H 2 V1 (3G2∞ d+25∆2 )L2 (1+L)(G2∞ +ϵ+1)(T −m)
+       ≤        Ef (ỹt )−Ef (ỹt+1 )+                         p
+       t̸∈Tv
+                                                   β2m (1−β1 )4 G2∞ +ϵ
+                                                              p
+          Lγ 2 V1 σ 2 (T −m) 48γ 3 V1 (H +1)2 (3G2∞ d+24∆2 ) G2∞ +ϵ(T −m)
+       +                    +                                              ,
+                 nβ2m                            β2m (1−β1 )4
+where we replace M with Lemma 8. That completes the proof.
+Lemma 10. In Algorithm 1, For all the t ≥ 0 that fulfills vt ̸= vt+1 , i.e. t ∈ Tv , if the learning rate fulfills
+                                                      1
+                                                γ<
+                                                      6
+, the following bound holds
+       X γE∥∇f (x̃t )∥2
+              p
+      t∈Tv
+            4 G2∞ +ϵ
+      X                               2γσ 2 m 106γH 2 V1 (M +∆2 )mL     γσ 2 m   γG2∞ dm
+  ≤          Ef (ỹt )−Ef (ỹt+1 )+          +      m               +          +         .
+                                                   β2 (1−β1 )2
+                                                                        p        p
+                                        nL                            4n G2∞ +ϵ 4 G2∞ +ϵ
+      t∈Tv
+
+
+Proof. From the definition of the auxiliary
+                                          sequence, we obtain,
+                                    γ        m̃t+1       m̃t       γδt+1        γδt
+        ỹt+1 − ỹt =x̃t+1 − x̃t −         √         −√         − √          −√         .
+                                   1−β1      vt+1 +ϵ     vt +ϵ      vt+1 +ϵ     vt +ϵ
+Based on Assumption 1,
+    Ef (ỹt+1 )−Ef (ỹt )
+                               L               2
+  ≤E⟨∇f (ỹt ),ỹt+1 − ỹt ⟩+ E∥ỹt+1 − ỹt ∥
+                                2
+γη<1 ηγ                   L
+                      2                    2
+ ≤      E∥∇f (ỹt )∥ + E∥ỹt+1 − ỹt ∥
+     2L                   ηγ
+     ηγ               2                  2    L              2
+  ≤ E∥∇f (x̃t )∥ +ηγLE∥ỹt − x̃t ∥ + E∥ỹt+1 − ỹt ∥
+     L                                       ηγ
+                            n             2             n              n      2
+     2ηγ                 1 X   (i)            2ηγ    1 X   (i)   1 X (i)                          2
+  ≤       E ∇f (x̃t )−         ∇f xt        +     E        ∇f xt −        gt    +ηγLE∥ỹt − x̃t ∥
+      L                 n i=1                   L    n i=1          n i=1
+          L                 2
+      +      E∥ỹt+1 − ỹt ∥
+          ηγ
+
+                                                       30
+Published as a conference paper at ICLR 2023
+
+
+               n
+       2ηγL X          (i)
+                           2   2ηγσ 2                  2 L               2
+   ≤           E x̃t −xt     +        +ηγLE∥ỹt − x̃t ∥ + E∥ỹt+1 − ỹt ∥ .
+         n i=1                  nL                       ηγ
+We now bound the three norm terms separately. From Equation (5), we obtain for the first term,
+                                            (i)
+                                                    2    4γ 2 H 2 V1 M
+                                      E xt − x̃t ≤                       ,
+                                                              β2m
+where we again use M to denote the constant bound from Lemma 8 for brevity. On the other hand,
+based on a similar derivation to Equation (6), we obtain
+                                              2    2γ 2 V1 M       8γ 2 V1 ∆2
+                                 E∥ỹt − x̃t ∥ ≤ m             +              .
+                                                 β2 (1−β1 )2          β2m
+Finally, for the last norm, it’s possible that the update towards t+1 step contains synchronization on
+the buffer. So that we need to discuss the two cases separately. First, for all the t ∈ Tu , denote the last
+sync step before t is k, then we have
+                         2
+       E∥ỹt+1 − ỹt ∥
+                                                                                       2
+                              γ              m̃t+1      m̃t        γδt+1      γδt
+   =E x̃t+1 − x̃t −                         √         −√        − √         −√
+                             1−β1             vt+1 +ϵ    vt +ϵ      vt+1 +ϵ    vt +ϵ
+                                                                                                                        2
+                                    2
+                                                                 2                         2         7γ 2    m̃t+1
+   ≤7E∥x̃t+1 − x̃t−k+1 ∥ +7E x̃t−k+1 − x̃t+ 12                       +7E x̃t+ 21 − x̃t         +          E √
+                                                                                                    1−β1      vt+1 +ϵ
+                                        2                   2                    2
+            7γ 2    m̃t                          γδt+1               γδt
+       +         E √                        +7E √               +7E √
+           1−β1      vt +ϵ                        vt+1 +ϵ             vt +ϵ
+                                                                                            2                           2
+                                    2
+                                                                 2            m̃t                    7γ 2    m̃t+1
+   ≤7E∥x̃t+1 − x̃t−k+1 ∥ +7E x̃t−k+1 − x̃t+ 12                       +7γ 2 E √                  +         E √
+                                                                               vt +ϵ                1−β1      vt+1 +ϵ
+                                        2                   2                    2
+       7γ 2      m̃t             γδt+1           γδt
+       +    E √           +7E √          +7E √
+      1−β1       vt +ϵ           vt+1 +ϵ         vt +ϵ
+        Pt                         2     Pt                                          2                        2
+           j=t−k+1 γ m̃j +δt −δt+1        j=t−k+1 γ m̃j                                           m̃t
+   ≤7E           √                   +7E    √                                            +7γ 2 E √
+                    vk +ϵ                     vk +ϵ                                                vt +ϵ
+                                            2                        2                          2                 2
+         7γ 2          m̃t+1           7γ 2        m̃t                γδt+1               γδt
+       +          E √               +        E √            +7E √                +7E √
+        1−β1           vt+1 +ϵ        1−β1         vt +ϵ              v t+1 +ϵ            vt +ϵ
+     105γ 2 H 2 V1 (M +∆2 )
+   ≤                             ,
+             β2m (1−β1 )2
+where in the last step we use Lemma 7, 8 and 4. It is straightforward to verify that this bound also
+holds for t ̸∈ Tu (since there will be no noise from the sync step). Combine the three norm term bounds,
+we obtain
+       Ef (ỹt+1 )−Ef (ỹt )
+                  n
+        2ηγL X                 (i)
+                                   2   2ηγσ 2                     2    L               2
+     ≤               E x̃t −xt       +        +ηγLE∥ỹt − x̃t ∥ + E∥ỹt+1 − ỹt ∥
+          n i=1                         nL                             ηγ
+        8ηγ 3 H 2 V1 M L 2ηγσ 2                  2γ 2 V1 M      8γ 2 V1 ∆2      105γH 2 V1 (M +∆2 )L
+
+     =                      +         +ηγL                   +                +
+                 β2m            nL             β2m (1−β1 )2         β2m             ηβ2m (1−β1 )2
+                2         3 2                     2           2
+        2ηγσ         18ηγ H V1 M L 105γH V1 (M +∆ )L
+     ≤            +                    +
+          nL           β2m (1−β1 )2           ηβ2m (1−β1 )2
+        2γσ 2 106γH 2 V1 (M +∆2 )L
+     ≤          +                           ,
+         nL              β2m (1−β1 )2
+where in the last step we set η = 1 and use the requirement that γ < 1/6. Summing over all the t ∈ Tv ,
+we get
+                         X                           2γσ 2 m 106γH 2 V1 (M +∆2 )mL
+                    0≤       Ef (ỹt )−Ef (ỹt+1 )+          +                             .
+                                                       nL               β2m (1−β1 )2
+                             t∈Tv
+
+
+
+                                                                31
+Published as a conference paper at ICLR 2023
+
+
+Adding √ γ2                                 2
+                       P
+         4     G∞ +ϵ    t∈Tv E∥∇f (x̃t )∥     on both sides, and note that
+                           X                      X                    2
+                                                                           X        2
+                                  E∥∇f (x̃t )∥2 =    E∥∇f (x̃t )− g̃t ∥ +    E∥g̃t ∥
+                           t∈Tv                  t∈Tv                    t∈Tv
+                                                     2
+                                                    σ m
+                                                ≤       +G2∞ dm.
+                                                     n
+We finally obtain
+     X γE∥∇f (x̃t )∥2
+            p
+    t∈Tv
+           4 G2∞ +ϵ
+      X                                2γσ 2 m 106γH 2 V1 (M +∆2 )mL     γσ 2 m   γG2∞ dm
+  ≤          Ef (ỹt )−Ef (ỹt+1 )+           +                      +          +         .
+                                                    β2m (1−β1 )2
+                                                                         p        p
+                                         nL                            4n G2∞ +ϵ 4 G2∞ +ϵ
+      t∈Tv
+That completes the proof.
+
+
+                                                         32

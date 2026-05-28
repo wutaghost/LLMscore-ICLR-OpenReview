@@ -1,0 +1,1290 @@
+Published as a conference paper at ICLR 2025
+
+
+SOAP: I MPROVING AND S TABILIZING S HAMPOO US -
+ING A DAM FOR L ANGUAGE M ODELING
+
+ Nikhil Vyas∗                 Depen Morwani∗           Rosie Zhao†               Itai Shapira†
+ Harvard University           Harvard University       Harvard University        Harvard University
+
+ David Brandfonbrener                                                            Lucas Janson
+ Kempner Institute at Harvard University                                         Harvard University
+
+ Sham Kakade
+ Kempner Institute at Harvard University
+
+
+
+                                             A BSTRACT
+            There is growing evidence of the effectiveness of Shampoo, a higher-order pre-
+            conditioning method, over Adam in deep learning optimization tasks. How-
+            ever, Shampoo’s drawbacks include additional hyperparameters and computa-
+            tional overhead when compared to Adam, which only updates running averages
+            of first- and second-moment quantities. This work establishes a formal connec-
+            tion between Shampoo (implemented with the 1/2 power) and Adafactor — a
+            memory-efficient approximation of Adam — showing that Shampoo is equivalent
+            to running Adafactor in the eigenbasis of Shampoo’s preconditioner. This insight
+            leads to the design of a simpler and computationally efficient algorithm: ShampoO
+            with Adam in the Preconditioner’s eigenbasis (SOAP). With regards to improving
+            Shampoo’s computational efficiency, the most straightforward approach would be
+            to simply compute Shampoo’s eigendecomposition less frequently. Unfortunately,
+            as our empirical results show, this leads to performance degradation that worsens
+            with this frequency. SOAP mitigates this degradation by continually updating the
+            running average of the second moment, just as Adam does, but in the current
+            (slowly changing) coordinate basis. Furthermore, since SOAP is equivalent to
+            running Adam in a rotated space, it introduces only one additional hyperparam-
+            eter (the preconditioning frequency) compared to Adam. We evaluate SOAP on
+            language model pre-training, with experiments on 360m and 660m sized models.
+            In the large batch regime, SOAP reduces the number of iterations by over 40% and
+            wall clock time by over 35% compared to AdamW, with approximately 20% im-
+            provements in both metrics compared to Shampoo. An implementation of SOAP
+            is available at https://github.com/nikhilvyas/SOAP.
+
+
+1       I NTRODUCTION
+With ever-increasing costs of LLM training, optimization efficiency has become a central question
+in the field of deep learning. Several recent works have tackled this challenge by addressing both
+the memory (Zhao et al., 2024a; Wang et al., 2024) and compute (Anil et al., 2020) footprint of
+optimizers. In Algoperf (Dahl et al., 2023), a recent optimization efficiency benchmark, Sham-
+poo (Gupta et al., 2018a), a second-order algorithm, outperformed all other submissions, including
+Adam (Kingma & Ba, 2015), reducing wall-clock time by 28% (MLCommons, 2024). Higher-
+order preconditioning has also been applied in large-scale training runs, such as Gemini-1.5 Flash
+(Gemini Team, 2024).
+The success of Shampoo has drawn increasing attention from the deep learning community. Several
+works have explored ways to scale Shampoo by improving its memory and compute efficiency
+    ∗
+        Equal contribution. Correspondence to nikhil@g.harvard.edu.
+    †
+        Equal contribution.
+
+
+                                                   1
+Published as a conference paper at ICLR 2025
+
+
+(Wang et al., 2024; Anil et al., 2020; Shi et al., 2023). Other research (Morwani et al., 2024) has
+examined the theoretical foundations of Shampoo and proposed minor adjustments (such as using
+power 1/2 rather than 1/4) that align with prior empirical findings (Anil et al., 2020). Moreover,
+Morwani et al. (2024) also showed that Shampoo with the aforementioned modifications is close to
+the optimal Kronecker approximation of the Adagrad (Duchi et al., 2011b) optimizer.
+Our first contribution is demonstrating that the variant of Shampoo proposed by Morwani et al.
+(2024) is equivalent1 to running Adafactor (Shazeer & Stern, 2018; Zhai et al., 2022) in the eigenba-
+sis provided by Shampoo’s preconditioner. This interpretation of Shampoo connects it to a broader
+family of methods (e.g. (George et al., 2018)) that design second-order algorithms by running a first-
+order method in the eigenbasis provided by a second-order method. Building on this insight, we can
+explore a broader design space for combining first and second order methods. Many of our design
+choices are a synthesis of conceptual ideas from prior works of George et al. (2018); Anil et al.
+(2020); Morwani et al. (2024) as well as implementation ideas from works of Wang et al. (2024);
+Zhao et al. (2024a).
+Explicitly, we study SOAP (ShampoO with Adam in the Preconditioner’s eigenbasis) an algorithm
+that runs AdamW in the eigenbasis provided by Shampoo. Our main contributions are as follows:
+
+       • We make a formal connection between the Shampoo and the Adafactor algorithm. This
+         insight leads us to consider the SOAP algorithm, which runs AdamW in the preconditioned
+         space provided by Shampoo.
+       • SOAP outperforms both Shampoo and Adam in language model pre-training tasks with
+         model sizes 360m and 660m, even after extensive hyperparameter tuning of Shampoo.
+       • SOAP reduces the number of hyperparameters compared to Shampoo, resulting in only one
+         additional hyperparameter compared to AdamW: preconditioning frequency.
+       • SOAP demonstrates greater robustness to large preconditioning frequency compared to
+         Shampoo on language model pre-training tasks.
+
+We should also note that while similar algorithmic variants have been discussed in the literature (e.g.
+see the appendix of Anil et al. (2020)), we are the first to systematically evaluate it.
+Organization: In Section 3, we discuss related works. In Section 4, we start by showing an equiv-
+alence between Shampoo (with exponent 1/2) and running Adafactor in the eigenspace given by
+Shampoo, then with this equivalence as the starting point we describe SOAP. In Section 5, we pro-
+vide our experimental methodology and in Section 6, we compare the performance of AdamW,
+Shampoo and SOAP on language modeling tasks. In Appendices B.2 and B.3 we discuss the the
+space and time complexity of SOAP and how it can be improved. In Appendix C we show that
+efficiency benefits of SOAP over AdamW are maintained for longer duration runs where #tokens =
+100 × model size.
+
+2    N OTATION AND BACKGROUND
+We denote the weight matrix of a neural network layer by W ∈ Rm×n , and the corresponding
+gradient by G ∈ Rm×n . At a given time step t, these are denoted as Wt and Gt , respectively. For a
+batch of inputs at time t, denoted by Bt , the loss and its gradient evaluated at Wt are represented as
+ϕBt (Wt ) and ∇W ϕBt (Wt ), respectively.
+Adagrad (Duchi et al., 2011b) is an online learning second-order algorithm that maintains a precon-
+ditioner H ∈ Rmn×mn . If the vectorized gradient at time t is denoted by gt (i.e., gt = vec(Gt ) ∈
+Rmn ), then the update of the preconditioner and the vectorized weights wt ∈ Rmn with learning
+rate η is given by
+
+                                                                            −1/2
+                             Ht = Ht−1 + gt gt⊤ ;       wt = wt−1 − ηHt            gt
+Adam (Kingma & Ba, 2015), a widely used first-order optimization algorithm in deep learning is a
+diagonal approximation of Adagrad. It maintains an exponential moving average of the gradients
+   1
+     Given this connection, the results of Morwani et al. (2024) can be interpreted as showing that the eigenbasis
+provided by Shampoo’s preconditioner is close to the “optimal” basis for running Adafactor.
+
+
+                                                        2
+Published as a conference paper at ICLR 2025
+
+
+                        660m, 2m batch size                           660m, 2m batch size
+                    Preconditioning Frequency=10                  Preconditioning Frequency=10                                    360m, 2m batch size
+             3.2                                            3.2
+                                                                                                                       2.94
+             3.1                                            3.1
+                                                                                                                       2.92
+             3.0                                            3.0                                                        2.90
+
+
+                                                                                                     Final Test Loss
+Train Loss
+
+
+             2.9                                            2.9                                                        2.88
+
+             2.8                                            2.8                                                        2.86
+
+             2.7                                            2.7                                                        2.84
+
+                                                                                                                       2.82
+             2.6                                            2.6
+                        1600        3200      4800   6400            0.25     0.5      0.75   1.0                             1     3         10       32     100
+                               Training Steps                       Wall Time (scaled by AdamW)                                   Preconditioning Frequency
+                                                 AdamW       Shampoo         SOAP          SOAP (shorter LR schedule)
+
+Figure 1: Comparing performance of tuned runs for AdamW, Shampoo (using DistributedSham-
+poo (Shi et al., 2023) implementation) and SOAP. In left and middle figures, Shampoo and SOAP
+use a preconditioning frequency of 10. The ”shorter LR schedule” plot is where we tuned the cosine
+decay so as to achieve the same terminal performance as AdamW. There we observe a ≥ 40% re-
+duction in the number of iterations and a ≥ 35% reduction in wall clock time compared to AdamW,
+and approximately a 20% reduction in both metrics compared to Shampoo. In the right figure we
+ablate preconditioning frequency and observe a slower degradation of performance of SOAP as
+compared to Shampoo. See Section 6 for a discussion of experimental results and ablation of batch
+size and Section 5 for experimental methodology.
+
+
+Gt (denoted as Mt ) and of element-wise squared gradients G2t (denoted as Vt ) for a given weight
+matrix W . Its update rule with learning rate η is given by
+                                                          Mt
+                                       Wt ← Wt−1 − η √ ,
+                                                            Vt
+where the division is performed element-wise.
+Adafactor (Shazeer & Stern, 2018; Zhai et al., 2022), a variant of Adam, replaces Vt with its best
+rank-1 approximation Vt′ to reduce memory usage. While the original Adafactor paper (Shazeer &
+Stern, 2018) proposed additional modifications, such as changes to the learning rate schedule, we
+focus on the version of Adafactor proposed in recent works (Zhai et al., 2022; Zhao et al., 2024c),
+whose update with learning rate η is given by
+                                                       Mt
+                                      Wt ← Wt−1 − η p ′ .
+                                                         Vt
+
+Shampoo (Gupta et al., 2018b) is a second-order optimization algorithm that approximates Adagrad
+and maintains two preconditioners, Lt ∈ Rm×m and Rt ∈ Rn×n , for a given weight matrix W ∈
+Rm×n . The updates for the preconditioners and the weights with learning rate η are as follows:
+                                                                                                                                  −1/4          −1/4
+                     Lt ← Lt−1 + Gt GTt ;                Rt ← Rt−1 + GTt Gt ;             Wt ← Wt−1 − ηLt                                Gt Rt         .
+
+In practice, Shampoo is implemented with several other modifications such as layerwise learning
+rate grafting and exponents other than −1/4. We will use the DistributedShampoo (Shi et al., 2023)
+implementation which has these variations available as hyperparameters.
+
+3                  R ELATED W ORK
+We begin by discussing works that are closely related, including George et al. (2018); Anil et al.
+(2020) and Zhao et al. (2024a). Subsequently, we cover extended related works.
+KFAC (Martens & Grosse, 2015) is a well-known second-order optimization algorithm designed
+for neural networks. E-KFAC (George et al., 2018) builds upon KFAC in a manner analogous to our
+
+
+                                                                              3
+Published as a conference paper at ICLR 2025
+
+
+extension of Shampoo, introducing a diagonal preconditioner that is updated between KFAC inver-
+sion steps. However, E-KFAC’s algorithm is not identical to running Adam in KFAC’s eigenbasis,
+as the diagonal preconditioner is not Adam.
+Anil et al. (2020) introduced several algorithmic and numerical improvements to develop a practical
+and scalable version of Shampoo (Gupta et al., 2018b). Notably, they empirically found that using an
+exponent of 1/2 outperforms the original exponent of 1/4 in Shampoo. Of particular interest to our
+work is Appendix B of Anil et al. (2020), where, inspired by E-KFAC, they describe an algorithm
+that is essentially equivalent to SOAP for 2D layers. However, no experiments were provided, and
+the authors claimed that unpublished experiments showed no empirical improvement over Shampoo.
+This discrepancy between our findings may be due to some of the implementation details of SOAP.
+GaLore (Zhao et al., 2024a) was recently proposed as a method to reduce Adam’s memory footprint
+by maintaining momentum in a low-rank subspace derived from the singular value decomposition
+(SVD) of the gradients. Their algorithm’s full-rank version bears similarity to ours, with some
+notable distinctions. Firstly, their projection subspace is determined by the SVD of the current
+gradient, while we maintain an exponential moving average of GGT and GT G. Secondly, we retain
+momentum in the original space and project it onto the preconditioned space, whereas they maintain
+it in the preconditioned space and do not rotate it each time the preconditioned space is updated.
+In Appendix D, we study GaLore’s performance and find that our modifications are necessary for
+improving upon Shampoo. Moreover, their method only projects one side of a layer using the
+eigenbasis while using the identity basis on the other side. We examine the impact of one-sided
+projection for SOAP in Appendix B.1.
+Diagonal Preconditioning based Optimizers: Other than AdamW, there are other optimizers
+which involve diagonal preconditoning such as Lion (Chen et al., 2023), Sophia (Liu et al., 2024),
+and Adafactor (Shazeer & Stern, 2018). Recent works of Kaddour et al. (2023); Zhao et al. (2024c)
+showed that these optimizers perform comparably to AdamW for LLM pretraining but do not sur-
+pass it. This suggests the need to explore non-diagonal preconditioners. We discuss prior works on
+non-diagonal preconditioners below.
+Second-Order Optimization: Research on second-order optimization in deep learning is generally
+divided into two categories: Hessian-free methods and methods that estimate the Hessian.
+Hessian-Free Methods: Hessian-free approaches (Martens, 2010; Martens & Grosse, 2015) op-
+timize without explicitly computing the Hessian matrix, instead employing iterative techniques to
+approximate the Newton step. Other recent works (Li, 2018; 2024; Pooladzandi & Li, 2024) have
+focused on designing iterative preconditioners to improve the convergence specifically for stochastic
+optimization algorithms.
+Hessian Estimation Methods: These methods maintain an efficient approximation of the Hessian
+for neural networks. KFAC (Martens & Grosse, 2015) and Shampoo (Gupta et al., 2018b) are two
+widely recognized methods in this area.
+KFAC (Martens & Grosse, 2015) was one of the first approaches to go beyond diagonal precondi-
+tioners in neural networks, demonstrating that a layer-wise Kronecker-factored preconditioner ap-
+proximates the layer-wise Hessian in multi-layer perceptrons (MLPs). Subsequent works (Martens
+et al., 2018; Osawa et al., 2019) extended KFAC to other architectures. Recent research (George
+et al., 2018; Gao et al., 2021) has further improved trace and diagonal estimates for KFAC. Efforts
+to scale up KFAC (Ba et al., 2017; Puiu, 2022; 2023; Eschenhagen et al., 2023) have focused on
+making the inversion step more efficient or enhancing distributed implementations.
+Shampoo (Gupta et al., 2018b), another second-order optimization algorithm, is motivated by the
+online learning algorithm Adagrad (Duchi et al., 2011a). Shampoo also employs a layer-wise
+Kronecker-factored preconditioner. A recent distributed implementation of Shampoo (Shi et al.,
+2023) won an optimization efficiency benchmark (Dahl et al., 2023), highlighting the practical util-
+ity of second-order methods in deep learning. Few recent works (Duvvuri et al., 2024; Morwani
+et al., 2024) have provided theoretical advancements on top of Shampoo. Other works (Anil et al.,
+2020; Peirson et al., 2022; Lin et al., 2024; Wang et al., 2024) have proposed various strategies to
+improve Shampoo’s scalability. We defer a comparison of SOAP with these methods to future work.
+
+
+                                                 4
+Published as a conference paper at ICLR 2025
+
+
+4     A LGORITHM
+
+4.1    T HEORY
+
+We begin by describing an equivalence between Shampoo and running Adafactor in the eigenbasis
+of the Shampoo preconditioner. For simplicity we omit momentum but the equivalence also holds
+with momentum. For this equivalence we use Shampoo with the following modifications from the
+original Shampoo optimizer (Gupta et al., 2018b):
+
+       1. We use power 1/2 instead of power 1/4. This was already recommended in practical
+          implementations (Anil et al., 2020; Shi et al., 2023) and a theoretical connection between
+          optimal Kronecker approximation of Adagrad (Duchi et al., 2011b) preconditioner and
+          Shampoo with power 1/2 was established in Morwani et al. (2024).
+       2. We also use the scalar correction to per layer learning rates described in Ren & Goldfarb
+          (2021); Morwani et al. (2024).
+       3. Instead of the running average of L and R across time steps, we use dataset averages.
+
+With these changes in place (first occurrence of these changes is highlighted in red in the algorithm
+below) we formally define the two algorithms whose equivalence we show in Algorithms 1 and 2.
+
+Algorithm 1 Single step of idealized Shampoo with power 1/2.
+ 1: Sample batch Bt .
+ 2: Gt ∈ Rm×n ← −∇W ϕBt (Wt )
+ 3: L ← EB [GB GT B ] {Where the expectation is over a random batch B.}
+ 4: R ← EB [GT B B]
+                G
+ 5: Ĥ ← L ⊗ R/Trace(L)
+ 6: Wt ← Wt−1 − η Ĥ −1/2 Gt = Wt−1 − ηL−1/2 Gt R−1/2 /Trace(L)−1/2
+
+
+
+Algorithm 2 Single step of idealized Adafactor in Shampoo’s eigenspace.
+ 1: Sample batch Bt .
+ 2: Gt ∈ Rm×n ← −∇W ϕBt (Wt )
+ 3: L ← EB [GB GT    B]
+                 T
+ 4: R ← EB [GB GB ]
+ 5: QL ← Eigenvectors(L)
+ 6: QR ← Eigenvectors(R)
+ 7: G′t ← QT L Gt QR
+ 8: {Idealized version of code for Adafactor taking G′t to be the gradient}
+ 9: G′Bt ← QT  L GBt QR
+10: A = EB [G′B ⊙ G′B ]1m where G′B = QT   L GB QR
+11: C = 1⊤         ′     ′
+           n EB [GB ⊙ GB ]
+             T
+12: V̂t = AC
+          1⊤ A
+                {Elementwise division}
+            n
+                G′
+13: G′′
+     t ←
+         √ t         {Elementwise division and square root}
+            V̂t +ϵ
+14:   G′′′  T ′′
+       t ← QL Gt QR {Projecting back to original space}
+15:   Wt ← Wt−1 − ηG′′′
+                    t
+
+
+
+Claim 1. Algorithms 1 and 2 are equivalent.
+
+Proof. Consider Gt in the basis created after rotating by QL , QR i.e. G′t = QTL Gt QR . Let the
+eigenvalues of EBt [GBt GTBt ] and EBt [GTBt GBt ] be given by λ1 , ..., λm and µ1 , ..., µn respectively.
+Algorithm 1 scales the i, j coordinate by (λi µj /( i λi ))−1/2 , while Algorithm 2 scales them by
+                                                    P
+
+(Ai Cj /( i Ai ))−1/2 . We now show that Ai = λi , an analogous argument shows Cj = µj .
+         P
+
+
+                                                    5
+Published as a conference paper at ICLR 2025
+
+
+Algorithm 3 Single step of SOAP for a m × n layer. Per layer, we maintain four matrices:
+L ∈ Rm×m , R ∈ Rn×n and V, M ∈ Rm×n . For simplicity we ignore the initialization and other
+boundary effects such as bias correction. Hyperparameters: Learning rate η, betas = (β1 , β2 ), ep-
+silon ϵ, and preconditioning frequency f .
+An implementation of SOAP is available at https://anonymous.4open.science/
+status/SOAP-F93B.
+ 1: Sample batch Bt .
+ 2: G ∈ Rm×n ← −∇W ϕBt (Wt )
+ 3: G′ ← QT   L GQR
+ 4: M ← β1 M + (1 − β1 )G
+ 5: M ′ ← QT   L M QR
+ 6: {Now we “run” Adam on G′ }
+ 7: V ← β2 V + (1 − β2 )(G′ ⊙ G′ ) {Elementwise multiplication}
+                 ′
+ 8: N ′ ← √M        {Elementwise division and square root}
+                 V̂t +ϵ
+ 9: {Now that we have preconditioned by Adam in the rotated space, we go back to the original
+       space.}
+10: N ← QL N ′ QT   R
+11: W ← W − ηN
+12: {End of gradient step, we now update L and R and possibly also QL and QR . }
+13: L ← β2 L + (1 − β2 )GGT
+14: R ← β2 R + (1 − β2 )GT G
+15: if t % f == 0 then
+16:     QL ← Eigenvectors(L, QL )
+17:     QR ← Eigenvectors(R, QR )
+18: end if
+
+
+                          Ai = eTi EB [G′B ⊙ G′B ]1m
+                                    X
+                             = EB [ (G′B )2i,j ]
+                                     j
+                                   X
+                             = EB [ (uTi (GB )vj )2 ]       (Using definition of G′ )
+                                     j
+
+                             = EB [||uTi (GB )||2 ]         (vj form a basis)
+                             = EB [uTi GB GTB ui ]
+                             = λi                           (By definition of λi and ui )
+
+
+While these two algorithms are equivalent in their idealized forms, practical considerations reveal
+some differences. Firstly, the algorithms differ when using running averages instead of dataset
+averages. Secondly, and more significantly in practice, we do not invert or compute the eigenvector
+decomposition of L and R at every step. This means that the “adaptivity” of learning rates in
+Shampoo is limited2 to the updates of L and R. In contrast, with Adafactor in Shampoo’s eigenspace,
+the second moment estimates (i.e., A and C in Algorithm 2) can be updated at every step as they are
+computationally inexpensive. Additionally, instead of using Adafactor, we can opt3 for Adam, which
+offers more generality. Combining these insights leads to Algorithm 3 which can be interpreted as
+running Adam in Shampoo’s eigenspace.
+   2
+      We note that practical implementations of Shampoo use grafting which allows for learning rate adaptivity
+at every step, but this adaptivity is restricted to a single scalar per layer.
+    3
+      Though using AdamW over Adafactor only gives very small improvements in performance, see Figure 5
+and Appendix B.2. We also note that one can use any other diagonal preconditioner based optimizer in place
+of Adam, such as Lion (Chen et al., 2023), Sophia (Liu et al., 2024) or Schedule-Free AdamW (Defazio et al.,
+2024).
+
+
+                                                        6
+Published as a conference paper at ICLR 2025
+
+
+Algorithm 4 Eigenvectors function, implemented using power iteration and QR decomposi-
+tion. Inputs: PSD matrix P and estimate of eigenvectors Q. If the estimate was exact we would
+have P = QDQT where D is the diagonal matrix with eigenvalues.
+  1: S ← P Q
+  2: Q ← QR(S)
+
+
+
+We now describe some additional implementation details:
+
+      1. Algorithm 3 describes the behavior of the algorithm for 2D layers. Following Zhao et al.
+         (2024a), for 1D layers we run standard AdamW. This reduces the overhead as compared to
+         standard implementations of Shampoo which solve an eigenvector problem for 1D layers
+         too.
+      2. Following Wang et al. (2024), we compute eigenvectors of L (and R) using one step of
+         power method (Algorithm 4). This requires doing one matrix multiplication followed
+         by QR decomposition. QR decomposition is faster (Documentation, 2024) than standard
+         eigenvector decomposition in PyTorch. For the first iteration, eigenvectors are initialized
+         by doing a standard eigenvector decomposition.
+      3. For layers with huge dimensions such as the first and last layer in language modeling trans-
+         formers, maintaining the eigenvectors would be space and time prohibitive. For such di-
+         mensions we fix the rotation matrix (QL or QR ) to be identity. Note that if we fix both QL
+         and QR to be identity for a 2D layer, we would recover Adam.
+      4. Algorithm 3 omits bias correction and weight decay for simplicity, but these are used in
+         the actual implementation, identical to their use in AdamW.
+
+The main focus of the next sections will be to explore the empirical performance of this algorithm
+and its variations. In Appendices B.2 and B.3 we discuss the the space and time complexity of SOAP
+and how it can be improved.
+
+
+5   E XPERIMENTAL M ETHODOLOGY
+
+Hyperparameter tuning: We begin with hyperparameter values suggested by prior research for
+both AdamW and Distributed Shampoo (e.g., β2 = 0.95). Initially, we conduct a learning rate
+sweep to determine the optimal learning rate for each optimizer. Once the optimal learning rate is
+identified, we perform two-dimensional sweeps for each of the remaining hyperparameters, where
+we vary the selected hyperparameter alongside the learning rate. The purpose of these sweeps
+is to demonstrate that our default hyperparameter settings are near-optimal, disregarding potential
+interactions between two non-learning-rate hyperparameters. A detailed discussion of the hyperpa-
+rameter sweeps is provided in Appendix A.
+Throughput Measurement: We evaluate the throughput of each optimizer by measuring the num-
+ber of tokens processed per second. At present, we perform these measurements on a single H100
+GPU and utilize gradient accumulation to accommodate large batch sizes. While this approach
+may seem to disadvantage AdamW— as the overhead of Shampoo/SOAP is compared against mul-
+tiple gradient accumulation steps— it is important to note that the overhead of Shampoo/SOAP
+can be amortized across layers by distributing the updates across multiple GPUs. This technique
+is employed in the distributed implementation of Shampoo (Shi et al., 2023). A comprehensive
+comparison of distributed implementations of these algorithms is left to future work.
+Efficiency Benefits: Simply running SOAP for the same duration as Shampoo and AdamW cannot
+be directly used to calculate the efficiency benefit (in terms of training steps or wall-clock time) of
+using SOAP since we use a cosine schedule. Therefore, we run SOAP on .5, .625, .75 and .875
+fraction of the training data and fit a scaling law of the form a + bN −β through the final losses
+obtained, where N represents the number of training points and a, b, β are the parameters of the fit.
+We show these points and the corresponding scaling laws obtained in Figure 2. This scaling law is
+then used to calculate the efficiency benefit in terms of training steps and wallclock time as shown
+in Figure 2. Here, the horizontal lines represent the final losses of AdamW and Shampoo.
+
+
+                                                  7
+Published as a conference paper at ICLR 2025
+
+
+                                360m, 2m batch size                           660m, 2m batch size                          360m, 256k batch size
+                                                                   2.76                                          2.90
+                  2.94
+                                                                   2.74                                          2.88
+                  2.92
+                                                                   2.72                                          2.86
+                  2.90
+Final Test Loss
+
+
+                                                                                                                 2.84
+                  2.88                                             2.70
+
+                  2.86                                                                                           2.82
+                                                                   2.68
+                  2.84                                                                                           2.80
+                                                                   2.66
+                  2.82                                                                                           2.78
+                         0.5                0.75             1.0           0.565              0.8          1.0                        0.72      0.875 1.0
+                               Total Training Steps (scaled)                 Total Training Steps (scaled)                 Total Training Steps (scaled)
+
+                                                                   2.76                                          2.90
+                  2.94
+                                                                   2.74                                          2.88
+                  2.92
+                                                                                                                 2.86
+                  2.90                                             2.72
+Final Test Loss
+
+
+                                                                                                                 2.84
+                  2.88                                             2.70
+
+                  2.86                                                                                           2.82
+                                                                   2.68
+                  2.84                                                                                           2.80
+                                                                   2.66
+                  2.82                                                                                           2.78
+                         0.52             0.78          1.01.06             0.62            0.875 1.0 1.12                            0.83       1.0 1.11
+                           Total Wall Time (scaled by AdamW)              Total Wall Time (scaled by AdamW)             Total Wall Time (scaled by AdamW)
+
+                                                             AdamW            SOAP           Shampoo
+
+Figure 2: Precise efficiency benefits of SOAP over AdamW and Shampoo for 360m (at 256k and
+2m batch size) and 660m (at 2m batch size) model. For the precise methodology, refer to Section 5.
+
+
+
+6                   L ANGUAGE M ODELING E XPERIMENTS
+
+In this section we focus on empirically comparing AdamW, DistributedShampoo, and SOAP on
+language modeling tasks.
+
+
+6.1                      M EASURING E FFICIENCY B ENEFITS
+
+In Figure 1 (left and middle) and Figure 3 we show train loss curves for AdamW, Shampoo, and
+SOAP on 360m and 660m models with 2m token batch size and “chinchilla-optimal” i.e. 20x
+model size number of tokens. In these plots we observe that SOAP outperforms the other two
+optimizers. To directly calculate the efficiency benefit of SOAP, we also run SOAP with cosine
+decay for a shorter lr schedule, as shown in Figures 1 and 3. This allows us to approximate the
+following efficiency benefits (when batch size is set to 2m and preconditioning frequency to 10):
+≥ 40% reduction in the number of iterations and ≥ 35% reduction in wall clock time compared
+to AdamW; ≈ 20% reduction in iterations and wall clock time as compared to Shampoo. Precise
+efficiency benefit calculations are presented in Figure 2(left and middle). In Appendix C we show
+that efficiency benefits of SOAP over AdamW are maintained for longer duration runs where #tokens
+= 100 × model size.
+
+
+                                                                                     8
+Published as a conference paper at ICLR 2025
+
+
+                                             360m, 2m batch size, Preconditioning Frequency=10
+             3.4                                                         3.4
+
+             3.3                                                         3.3
+
+             3.2                                                         3.2
+Train Loss
+
+
+             3.1                                                         3.1
+
+             3.0                                                         3.0
+
+             2.9                                                         2.9
+
+             2.8                                                         2.8
+                          800          1600         2400         3200                   0.25            0.5           0.75   1.0
+                                  Training Steps                                              Wall Time (scaled by AdamW)
+                                     AdamW         Shampoo        SOAP         SOAP (shorter LR schedule)
+
+Figure 3: Comparing performance of tuned runs for AdamW, Shampoo (using DistributedSham-
+poo (Shi et al., 2023) implementation) and SOAP. Shampoo and SOAP use preconditioning fre-
+quency of 10. We observe a ≥ 40% reduction in the number of iterations and a ≥ 35% reduction in
+wall clock time compared to AdamW, and approximately a 20% reduction in both metrics compared
+to Shampoo. See Figure 1 for 660m results, Sections 6.2 and 6.3 for ablations of preconditioning
+frequency and batch size respectively, and Section 5 for detailed calculation of efficiency improve-
+ment and experimental methodology.
+
+
+6.2                E FFECT OF F REQUENCY OF F INDING E IGENVECTORS /I NVERSE
+
+In Figure 1 (right), we compare SOAP and Shampoo with respect to preconditioning frequency. We
+observe the following:
+
+                   • For all frequencies we tried from 1 to 100, both optimizers outperform AdamW.
+                   • At frequency 1, SOAP and Shampoo are quite close in performance.
+                   • At higher frequencies, the performance of both SOAP and Shampoo degrades but SOAP’s
+                     performance degrades significantly slower than Shampoo’s.
+
+
+6.3                SOAP I MPROVES THE C RITICAL BATCH S IZE
+
+When scaling up batch sizes, the ideal outcome is that doubling the batch size results in halving
+the number of training steps needed to achieve the same performance. The batch size at which this
+ideal scaling starts to break down is referred to by McCandlish et al. (2018) as the critical batch
+size. As models and datasets grow larger, it becomes increasingly important to develop optimizers
+that support larger critical batch sizes, thereby reducing the serial runtime of a training run. In this
+subsection, we compare the critical batch sizes of AdamW and SOAP. Relative to our baseline setup
+of a 2 million batch size, when we decrease the batch size by a factor of k, we increase the precon-
+ditioning frequency by the same factor. This ensures that the FLOPS and wall clock multiplicative
+overhead for the eigenvector decomposition steps remains consistent with the 2 million batch size
+setting.
+We start by training a 360 million parameter model with a batch size of 256k for a ”Chinchilla-
+optimal” number of tokens (20 times the model size) using AdamW, achieving a loss of 2.842.
+This value is set as the target loss for our comparisons. In Figure 4 (left), we show the number
+of steps AdamW and SOAP require to reach this target loss as we vary the batch size. SOAP
+consistently requires fewer steps across all batch sizes, with the multiplicative benefits becoming
+more pronounced at larger batch sizes. Additionally, we compare these results to the ideal scenario
+(dashed line) of linear scaling, where doubling the batch size halves the number of steps. SOAP
+more closely follows the linear scaling trend compared to AdamW, indicating that it has a higher
+critical batch size in this setup.
+
+
+                                                                   9
+Published as a conference paper at ICLR 2025
+
+
+                                                                          360m                                                     360m, 256k batch size
+                                                       Critical Batch Size for AdamW versus SOAP                                Preconditioning Frequency=80
+                                                                                                                        3.4
+                                         25000
+
+                                                                                                                        3.3
+Estimated Training Steps to Loss 2.842
+
+
+                                         12500                                                                          3.2
+
+
+                                                                                                           Train Loss
+                                                                                                                        3.1
+                                         6250
+                                                                                                                        3.0
+
+                                         3125                                                                           2.9
+
+                                                                                                                        2.8
+                                                 256              512                1024          2048                       5000    10000       15000   20000
+                                                                        Batch Size                                                      Training Steps
+                                                         AdamW          Shampoo             SOAP     SOAP (shorter LR schedule)        Linear Scaling     Real Scaling
+
+Figure 4: (left) Comparing the critical batch size of AdamW vs SOAP. We can see that SOAP im-
+proves the critical batch size, by being much closer to the ideal linear scaling with batch size as
+compared to AdamW. (right) Comparing performance of tuned runs for AdamW, Shampoo (using
+DistributedShampoo (Shi et al., 2023) implementation) and SOAP for token batch size of 256k.
+Shampoo and SOAP use preconditioning frequency of 80. We observe a ≥ 25% reduction in the
+number of iterations compared to AdamW, and approximately a 10% reduction compared to Sham-
+poo. See Figure 2 (right) for wall-clock time improvement and Section 5 for detailed calculation of
+efficiency improvement.
+
+
+In Figure 4 (right), we present the optimal runs for each optimizer (including Shampoo) at the
+smallest batch size we consider: 256k. SOAP outperforms both Shampoo and AdamW, reducing
+the number of iterations by 25% compared to AdamW, and by approximately 10% compared to
+Shampoo. Furthermore, in Figure 2 (right, bottom), we demonstrate that SOAP also achieves a
+wall-clock time improvement of ≥ 15% over AdamW and around 10% over Shampoo. We note
+that these results are a preliminary analysis for smaller batch size runs. Our approach of keeping
+the product of batch size and preconditioning frequency constant may not be optimal, and a better
+trade-off could likely be found. Furthermore, SOAP’s overhead could potentially be reduced by
+performing L and R updates in lower precision (instead of fp32). Finally, the diminished efficiency
+gains of second-order methods at smaller batch sizes are consistent with prior findings (Zhang et al.,
+2019; Ishikawa & Yokota, 2024).
+
+
+ 7                                         D ISCUSSION AND L IMITATIONS
+
+We study an optimizer called SOAP: ShampoO with Adam in the Preconditioner’s eigenbasis. We
+show that SOAP outperforms both AdamW and Shampoo in language modeling tasks and show that
+it is more robust to changes in preconditioning frequency than Shampoo. While we have explored
+many factors such as batch size (Section 6.3) and training duration (Appendix C) we acknowledge
+that our study focuses on a relatively small scale compared to recent LLMs Touvron et al. (2023)
+which are two orders of magnitude bigger. We hypothesize that our findings on the performance of
+SOAP would generalize to larger scales due to its theoretical foundation. SOAP’s robustness is also
+supported by the fact that SOAP is equivalent to running Adam in a rotated space, and Adam has
+proven to be effective across scale and tasks. However, this hypothesis remains to be validated.
+For future work, we aim to improve the design of SOAP further, particularly by exploring the use
+of lower precision for preconditioners and optimizing its distributed implementation. Additionally,
+we are interested in testing SOAP’s performance in other domains, such as vision, to evaluate its
+performance across different types of tasks.
+
+
+                                                                                                      10
+Published as a conference paper at ICLR 2025
+
+
+ACKNOWLEDGMENTS
+SK, DM, and RZ acknowledges support from the Office of Naval Research under award N0001422-
+1-2377 and the National Science Foundation Grant under award #IIS 2229881. This work has
+been made possible in part by a gift from the Chan Zuckerberg Initiative Foundation to estab-
+lish the Kempner Institute for the Study of Natural and Artificial Intelligence. NV, DM and
+RZ are supported by a Simons Investigator Fellowship, NSF grant DMS-2134157, DARPA grant
+W911NF2010021,and DOE grant DE-SC0022199. LJ acknowledges funding from the National
+Science Foundation DMS-2134157.
+
+
+                                               11
+Published as a conference paper at ICLR 2025
+
+
+R EFERENCES
+Rohan Anil, Vineet Gupta, Tomer Koren, Kevin Regan, and Yoram Singer. Scalable second order
+  optimization for deep learning. arXiv preprint arXiv:2002.09018, 2020.
+Jimmy Ba, Roger Grosse, and James Martens. Distributed second-order optimization using
+  kronecker-factored approximations. In International Conference on Learning Representations,
+  2017. URL https://openreview.net/forum?id=SkkTMpjex.
+Xiangning Chen, Chen Liang, Da Huang, Esteban Real, Kaiyuan Wang, Hieu Pham,
+  Xuanyi Dong, Thang Luong, Cho-Jui Hsieh, Yifeng Lu, and Quoc V. Le.           Sym-
+  bolic discovery of optimization algorithms.  In Alice Oh, Tristan Naumann, Amir
+  Globerson, Kate Saenko, Moritz Hardt, and Sergey Levine (eds.), Advances in Neu-
+  ral Information Processing Systems 36: Annual Conference on Neural Information Pro-
+  cessing Systems 2023, NeurIPS 2023, New Orleans, LA, USA, December 10 - 16,
+  2023, 2023. URL http://papers.nips.cc/paper_files/paper/2023/hash/
+  9a39b4925e35cf447ccba8757137d84f-Abstract-Conference.html.
+George E. Dahl, Frank Schneider, Zachary Nado, Naman Agarwal, Chandramouli Shama Sastry,
+  Philipp Hennig, Sourabh Medapati, Runa Eschenhagen, Priya Kasimbeg, Daniel Suo, Juhan
+  Bae, Justin Gilmer, Abel L. Peirson, Bilal Khan, Rohan Anil, Mike Rabbat, Shankar Krishnan,
+  Daniel Snider, Ehsan Amid, Kongtao Chen, Chris J. Maddison, Rakshith Vasudev, Michal Badura,
+  Ankush Garg, and Peter Mattson. Benchmarking neural network training algorithms, 2023.
+Aaron Defazio, Xingyu Yang, Harsh Mehta, Konstantin Mishchenko, Ahmed Khaled, and Ashok
+  Cutkosky. The road less scheduled. CoRR, abs/2405.15682, 2024. doi: 10.48550/ARXIV.2405.
+  15682. URL https://doi.org/10.48550/arXiv.2405.15682.
+Mostafa Dehghani, Josip Djolonga, Basil Mustafa, Piotr Padlewski, Jonathan Heek, Justin Gilmer,
+ Andreas Peter Steiner, Mathilde Caron, Robert Geirhos, Ibrahim Alabdulmohsin, et al. Scaling
+ vision transformers to 22 billion parameters. In International Conference on Machine Learning,
+ pp. 7480–7512. PMLR, 2023.
+Tim Dettmers, Mike Lewis, Sam Shleifer, and Luke Zettlemoyer. 8-bit optimizers via block-wise
+  quantization. In The Tenth International Conference on Learning Representations, ICLR 2022,
+  Virtual Event, April 25-29, 2022. OpenReview.net, 2022. URL https://openreview.net/
+  forum?id=shpkpVXzo3h.
+Documentation. torch.linalg.eigh documentation. https://web.archive.org/web/
+  20240519213242/https://pytorch.org/docs/stable/generated/torch.
+  linalg.eigh.html, 2024.
+John Duchi, Elad Hazan, and Yoram Singer. Adaptive subgradient methods for online learning and
+  stochastic optimization. Journal of Machine Learning Research, 12(61):2121–2159, 2011a. URL
+  http://jmlr.org/papers/v12/duchi11a.html.
+John C. Duchi, Elad Hazan, and Yoram Singer. Adaptive subgradient methods for online learning
+  and stochastic optimization. J. Mach. Learn. Res., 12:2121–2159, 2011b. doi: 10.5555/1953048.
+  2021068. URL https://dl.acm.org/doi/10.5555/1953048.2021068.
+Sai Surya Duvvuri, Fnu Devvrit, Rohan Anil, Cho-Jui Hsieh, and Inderjit S Dhillon. Combining axes
+  preconditioners through kronecker approximation for deep learning. In The Twelfth International
+  Conference on Learning Representations, 2024. URL https://openreview.net/forum?
+  id=8j9hz8DVi8.
+Runa Eschenhagen, Alexander Immer, Richard E Turner, Frank Schneider, and Philipp Hen-
+  nig. Kronecker-factored approximate curvature for modern neural network architectures. In
+  Thirty-seventh Conference on Neural Information Processing Systems, 2023. URL https:
+  //openreview.net/forum?id=Ex3oJEKS53.
+Kaixin Gao, Xiaolei Liu, Zhenghai Huang, Min Wang, Zidong Wang, Dachuan Xu, and Fan Yu. A
+  trace-restricted kronecker-factored approximation to natural gradient. Proceedings of the AAAI
+  Conference on Artificial Intelligence, 35(9):7519–7527, May 2021. doi: 10.1609/aaai.v35i9.
+  16921. URL https://ojs.aaai.org/index.php/AAAI/article/view/16921.
+
+
+                                               12
+Published as a conference paper at ICLR 2025
+
+
+Google Gemini Team. Gemini 1.5: Unlocking multimodal understanding across millions of to-
+  kens of context. https://storage.googleapis.com/deepmind-media/gemini/
+  gemini_v1_5_report.pdf, 2024. [Online; accessed 19-May-2024].
+Thomas George, César Laurent, Xavier Bouthillier, Nicolas Ballas, and Pascal Vincent. Fast approx-
+  imate natural gradient descent in a kronecker factored eigenbasis. In Samy Bengio, Hanna M.
+  Wallach, Hugo Larochelle, Kristen Grauman, Nicolò Cesa-Bianchi, and Roman Garnett (eds.),
+  Advances in Neural Information Processing Systems 31: Annual Conference on Neural Infor-
+  mation Processing Systems 2018, NeurIPS 2018, December 3-8, 2018, Montréal, Canada, pp.
+  9573–9583, 2018. URL https://proceedings.neurips.cc/paper/2018/hash/
+  48000647b315f6f00f913caa757a70b3-Abstract.html.
+Dirk Groeneveld, Iz Beltagy, Pete Walsh, Akshita Bhagia, Rodney Kinney, Oyvind Tafjord,
+  Ananya Harsh Jha, Hamish Ivison, Ian Magnusson, Yizhong Wang, et al. Olmo: Accelerating the
+  science of language models. arXiv preprint arXiv:2402.00838, 2024.
+Vineet Gupta, Tomer Koren, and Yoram Singer. Shampoo: Preconditioned stochastic tensor opti-
+  mization. In International Conference on Machine Learning, pp. 1842–1850. PMLR, 2018a.
+Vineet Gupta, Tomer Koren, and Yoram Singer. Shampoo: Preconditioned stochastic tensor opti-
+  mization. In Jennifer G. Dy and Andreas Krause (eds.), Proceedings of the 35th International
+  Conference on Machine Learning, ICML 2018, Stockholmsmässan, Stockholm, Sweden, July 10-
+  15, 2018, volume 80 of Proceedings of Machine Learning Research, pp. 1837–1845. PMLR,
+  2018b. URL http://proceedings.mlr.press/v80/gupta18a.html.
+Dan Hendrycks and Kevin Gimpel.           Gaussian error linear units (gelus).     arXiv preprint
+  arXiv:1606.08415, 2016.
+Jordan Hoffmann, Sebastian Borgeaud, Arthur Mensch, Elena Buchatskaya, Trevor Cai, Eliza
+  Rutherford, Diego de Las Casas, Lisa Anne Hendricks, Johannes Welbl, Aidan Clark, Tom Hen-
+  nigan, Eric Noland, Katie Millican, George van den Driessche, Bogdan Damoc, Aurelia Guy,
+  Simon Osindero, Karen Simonyan, Erich Elsen, Jack W. Rae, Oriol Vinyals, and Laurent Sifre.
+  Training compute-optimal large language models. CoRR, abs/2203.15556, 2022. doi: 10.48550/
+  ARXIV.2203.15556. URL https://doi.org/10.48550/arXiv.2203.15556.
+Satoki Ishikawa and Rio Yokota. When does second-order optimization speed up training? In The
+  Second Tiny Papers Track at ICLR 2024, 2024. URL https://openreview.net/forum?
+  id=NLrfEsSZNb.
+Jean Kaddour, Oscar Key, Piotr Nawrot, Pasquale Minervini, and Matt J. Kusner. No train no
+  gain: Revisiting efficient training algorithms for transformer-based language models. In Al-
+  ice Oh, Tristan Naumann, Amir Globerson, Kate Saenko, Moritz Hardt, and Sergey Levine
+  (eds.), Advances in Neural Information Processing Systems 36: Annual Conference on Neural
+  Information Processing Systems 2023, NeurIPS 2023, New Orleans, LA, USA, December 10 -
+  16, 2023, 2023. URL http://papers.nips.cc/paper_files/paper/2023/hash/
+  51f3d6252706100325ddc435ba0ade0e-Abstract-Conference.html.
+Diederik P. Kingma and Jimmy Ba. Adam: A method for stochastic optimization. In Yoshua
+  Bengio and Yann LeCun (eds.), 3rd International Conference on Learning Representations, ICLR
+  2015, San Diego, CA, USA, May 7-9, 2015, Conference Track Proceedings, 2015. URL http:
+  //arxiv.org/abs/1412.6980.
+Xi-Lin Li. Preconditioned stochastic gradient descent. IEEE Transactions on Neural Networks and
+  Learning Systems, 29(5):1454–1466, 2018. doi: 10.1109/TNNLS.2017.2672978.
+Xi-Lin Li. Stochastic hessian fittings with lie groups, 2024. URL https://arxiv.org/abs/
+  2402.11858.
+Wu Lin, Felix Dangel, Runa Eschenhagen, Juhan Bae, Richard E. Turner, and Alireza Makhzani.
+ Can we remove the square-root in adaptive gradient methods? A second-order perspective. In
+ Ruslan Salakhutdinov, Zico Kolter, Katherine Heller, Adrian Weller, Nuria Oliver, Jonathan Scar-
+ lett, and Felix Berkenkamp (eds.), Proceedings of the 41st International Conference on Machine
+ Learning, volume 235 of Proceedings of Machine Learning Research, pp. 29949–29973. PMLR,
+ 21–27 Jul 2024. URL https://proceedings.mlr.press/v235/lin24e.html.
+
+                                                13
+Published as a conference paper at ICLR 2025
+
+
+Hong Liu, Zhiyuan Li, David Leo Wright Hall, Percy Liang, and Tengyu Ma. Sophia: A scalable
+  stochastic second-order optimizer for language model pre-training. In The Twelfth International
+  Conference on Learning Representations, 2024. URL https://openreview.net/forum?
+  id=3xHDeA8Noi.
+Kai Lv, Hang Yan, Qipeng Guo, Haijun Lv, and Xipeng Qiu. Adalomo: Low-memory optimization
+  with adaptive learning rate. In Lun-Wei Ku, Andre Martins, and Vivek Srikumar (eds.), Findings
+  of the Association for Computational Linguistics, ACL 2024, Bangkok, Thailand and virtual meet-
+  ing, August 11-16, 2024, pp. 12486–12502. Association for Computational Linguistics, 2024a.
+  URL https://aclanthology.org/2024.findings-acl.742.
+Kai Lv, Yuqing Yang, Tengxiao Liu, Qipeng Guo, and Xipeng Qiu. Full parameter fine-tuning for
+  large language models with limited resources. In Lun-Wei Ku, Andre Martins, and Vivek Sriku-
+  mar (eds.), Proceedings of the 62nd Annual Meeting of the Association for Computational Lin-
+  guistics (Volume 1: Long Papers), ACL 2024, Bangkok, Thailand, August 11-16, 2024, pp. 8187–
+  8198. Association for Computational Linguistics, 2024b. URL https://aclanthology.
+  org/2024.acl-long.445.
+James Martens. Deep learning via hessian-free optimization. In Proceedings of the 27th Interna-
+  tional Conference on International Conference on Machine Learning, ICML’10, pp. 735–742,
+  Madison, WI, USA, 2010. Omnipress. ISBN 9781605589077.
+James Martens and Roger Grosse. Optimizing neural networks with kronecker-factored approxi-
+  mate curvature. In Francis Bach and David Blei (eds.), Proceedings of the 32nd International
+  Conference on Machine Learning, volume 37 of Proceedings of Machine Learning Research,
+  pp. 2408–2417, Lille, France, 07–09 Jul 2015. PMLR. URL https://proceedings.mlr.
+  press/v37/martens15.html.
+James Martens, Jimmy Ba, and Matt Johnson. Kronecker-factored curvature approximations for
+  recurrent neural networks. In International Conference on Learning Representations, 2018. URL
+  https://openreview.net/forum?id=HyMTkQZAb.
+Sam McCandlish, Jared Kaplan, Dario Amodei, and OpenAI Dota Team. An empirical model of
+  large-batch training. CoRR, abs/1812.06162, 2018. URL http://arxiv.org/abs/1812.
+  06162.
+MLCommons. Mlc algoperf benchmark competition. https://mlcommons.org/2024/08/
+ mlc-algoperf-benchmark-competition/, 2024. Accessed: 2024-10-01.
+Depen Morwani, Itai Shapira, Nikhil Vyas, Eran Malach, Sham Kakade, and Lucas Janson. A new
+  perspective on shampoo’s preconditioner. arXiv preprint arXiv:2406.17748, 2024.
+Kazuki Osawa, Yohei Tsuji, Yuichiro Ueno, Akira Naruse, Rio Yokota, and Satoshi Matsuoka.
+  Large-scale distributed second-order optimization using kronecker-factored approximate curva-
+  ture for deep convolutional neural networks. In 2019 IEEE/CVF Conference on Computer Vision
+  and Pattern Recognition (CVPR), pp. 12351–12359, 2019. doi: 10.1109/CVPR.2019.01264.
+Adam Paszke, Sam Gross, Francisco Massa, Adam Lerer, James Bradbury, Gregory Chanan, Trevor
+  Killeen, Zeming Lin, Natalia Gimelshein, Luca Antiga, et al. Pytorch: An imperative style, high-
+  performance deep learning library. Advances in neural information processing systems, 32, 2019.
+Abel Peirson, Ehsan Amid, Yatong Chen, Vladimir Feinberg, Manfred K Warmuth, and Rohan Anil.
+  Fishy: Layerwise fisher approximation for higher-order neural network optimization. In Has it
+  Trained Yet? NeurIPS 2022 Workshop, 2022. URL https://openreview.net/forum?
+  id=cScb-RrBQC.
+Omead Pooladzandi and Xi-Lin Li. Curvature-informed SGD via general purpose lie-group precon-
+ ditioners, 2024. URL https://openreview.net/forum?id=sawjxRnVpF.
+Tomer Porian, Mitchell Wortsman, Jenia Jitsev, Ludwig Schmidt, and Yair Carmon. Resolving
+  discrepancies in compute-optimal scaling of language models. CoRR, abs/2406.19146, 2024.
+  doi: 10.48550/ARXIV.2406.19146. URL https://doi.org/10.48550/arXiv.2406.
+  19146.
+
+
+                                               14
+Published as a conference paper at ICLR 2025
+
+
+Constantin Octavian Puiu. Randomized k-facs: Speeding up k-fac with randomized numerical linear
+  algebra. In Hujun Yin, David Camacho, and Peter Tino (eds.), Intelligent Data Engineering and
+  Automated Learning – IDEAL 2022, pp. 411–422, Cham, 2022. Springer International Publishing.
+  ISBN 978-3-031-21753-1.
+Constantin Octavian Puiu. Brand new k-facs: Speeding up k-fac with online decomposition updates,
+  2023. URL https://arxiv.org/abs/2210.08494.
+Colin Raffel, Noam Shazeer, Adam Roberts, Katherine Lee, Sharan Narang, Michael Matena, Yanqi
+  Zhou, Wei Li, and Peter J Liu. Exploring the limits of transfer learning with a unified text-to-text
+  transformer. Journal of machine learning research, 21(140):1–67, 2020.
+Yi Ren and Donald Goldfarb. Tensor normal training for deep learning models. In M. Ran-
+  zato, A. Beygelzimer, Y. Dauphin, P.S. Liang, and J. Wortman Vaughan (eds.), Advances in
+  Neural Information Processing Systems, volume 34, pp. 26040–26052. Curran Associates, Inc.,
+  2021. URL https://proceedings.neurips.cc/paper_files/paper/2021/
+  file/dae3312c4c6c7000a37ecfb7b0aeb0e4-Paper.pdf.
+Nikhil Sardana, Jacob Portes, Sasha Doubov, and Jonathan Frankle. Beyond chinchilla-optimal:
+  Accounting for inference in language model scaling laws. In Forty-first International Conference
+  on Machine Learning, ICML 2024, Vienna, Austria, July 21-27, 2024. OpenReview.net, 2024.
+  URL https://openreview.net/forum?id=0bmXrtTDUu.
+Noam Shazeer and Mitchell Stern. Adafactor: Adaptive learning rates with sublinear memory cost.
+  In Jennifer G. Dy and Andreas Krause (eds.), Proceedings of the 35th International Conference
+  on Machine Learning, ICML 2018, Stockholmsmässan, Stockholm, Sweden, July 10-15, 2018,
+  volume 80 of Proceedings of Machine Learning Research, pp. 4603–4611. PMLR, 2018. URL
+  http://proceedings.mlr.press/v80/shazeer18a.html.
+Hao-Jun Michael Shi, Tsung-Hsien Lee, Shintaro Iwasaki, Jose Gallego-Posada, Zhijing Li,
+  Kaushik Rangadurai, Dheevatsa Mudigere, and Michael Rabbat. A distributed data-parallel
+  pytorch implementation of the distributed shampoo optimizer for training neural networks at-
+  scale. CoRR, abs/2309.06497, 2023. doi: 10.48550/ARXIV.2309.06497. URL https:
+  //doi.org/10.48550/arXiv.2309.06497.
+Jianlin Su, Murtadha Ahmed, Yu Lu, Shengfeng Pan, Wen Bo, and Yunfeng Liu. Roformer: En-
+   hanced transformer with rotary position embedding. Neurocomputing, 568:127063, 2024.
+Hugo Touvron, Thibaut Lavril, Gautier Izacard, Xavier Martinet, Marie-Anne Lachaux, Timothée
+  Lacroix, Baptiste Rozière, Naman Goyal, Eric Hambro, Faisal Azhar, Aurélien Rodriguez, Ar-
+  mand Joulin, Edouard Grave, and Guillaume Lample. Llama: Open and efficient foundation
+  language models. CoRR, abs/2302.13971, 2023. doi: 10.48550/ARXIV.2302.13971. URL
+  https://doi.org/10.48550/arXiv.2302.13971.
+Nikhil Vyas, Depen Morwani, and Sham M. Kakade. Adamem: Memory efficient momentum
+  for adafactor. In 2nd Workshop on Advancing Neural Network Training: Computational Ef-
+  ficiency, Scalability, and Resource Optimization (WANT@ICML 2024), 2024. URL https:
+  //openreview.net/forum?id=fZqMVTz7K5.
+Sike Wang, Jia Li, Pan Zhou, and Hua Huang. 4-bit shampoo for memory-efficient network training.
+  CoRR, abs/2405.18144, 2024. doi: 10.48550/ARXIV.2405.18144. URL https://doi.org/
+  10.48550/arXiv.2405.18144.
+Mitchell Wortsman, Peter J Liu, Lechao Xiao, Katie E Everett, Alexander A Alemi, Ben Adlam,
+ John D Co-Reyes, Izzeddin Gur, Abhishek Kumar, Roman Novak, Jeffrey Pennington, Jascha
+ Sohl-Dickstein, Kelvin Xu, Jaehoon Lee, Justin Gilmer, and Simon Kornblith. Small-scale
+ proxies for large-scale transformer training instabilities. In The Twelfth International Confer-
+ ence on Learning Representations, 2024. URL https://openreview.net/forum?id=
+ d8w0pmvXbZ.
+Xiaohua Zhai, Alexander Kolesnikov, Neil Houlsby, and Lucas Beyer. Scaling vision transformers.
+  In IEEE/CVF Conference on Computer Vision and Pattern Recognition, CVPR 2022, New Or-
+  leans, LA, USA, June 18-24, 2022, pp. 1204–1213. IEEE, 2022. doi: 10.1109/CVPR52688.2022.
+  01179. URL https://doi.org/10.1109/CVPR52688.2022.01179.
+
+
+                                                 15
+Published as a conference paper at ICLR 2025
+
+
+Guodong Zhang, Lala Li, Zachary Nado, James Martens, Sushant Sachdeva, George E. Dahl,
+  Christopher J. Shallue, and Roger B. Grosse. Which algorithmic choices matter at which batch
+  sizes? insights from a noisy quadratic model. In Hanna M. Wallach, Hugo Larochelle, Alina
+  Beygelzimer, Florence d’Alché-Buc, Emily B. Fox, and Roman Garnett (eds.), Advances in
+  Neural Information Processing Systems 32: Annual Conference on Neural Information Pro-
+  cessing Systems 2019, NeurIPS 2019, December 8-14, 2019, Vancouver, BC, Canada, pp.
+  8194–8205, 2019. URL https://proceedings.neurips.cc/paper/2019/hash/
+  e0eacd983971634327ae1819ea8b6214-Abstract.html.
+Jiawei Zhao, Zhenyu Zhang, Beidi Chen, Zhangyang Wang, Anima Anandkumar, and Yuan-
+   dong Tian. Galore: Memory-efficient LLM training by gradient low-rank projection. CoRR,
+   abs/2403.03507, 2024a. doi: 10.48550/ARXIV.2403.03507. URL https://doi.org/10.
+   48550/arXiv.2403.03507.
+Jiawei Zhao, Zhenyu Zhang, Beidi Chen, Zhangyang Wang, Anima Anandkumar, and Yuandong
+   Tian. (code) galore: Memory-efficient LLM training by gradient low-rank projection. https:
+   //github.com/jiaweizzhao/GaLore, 2024b.
+Rosie Zhao, Depen Morwani, David Brandfonbrener, Nikhil Vyas, and Sham M. Kakade. Decon-
+  structing what makes a good optimizer for language models. CoRR, abs/2407.07972, 2024c.
+  doi: 10.48550/ARXIV.2407.07972. URL https://doi.org/10.48550/arXiv.2407.
+  07972.
+
+
+                                               16
+Published as a conference paper at ICLR 2025
+
+
+A     E XPERIMENTAL S ETUP
+
+Many aspects of our setup such as models are the same as in Zhao et al. (2024c). We will restate
+those details verbatim for completeness.
+We train language models on C4 tokenized with the T5 tokenizer (Raffel et al., 2020) and report
+results in terms of validation loss.
+
+Models. We start from the OLMo codebase (Groeneveld et al., 2024) and train decoder-only trans-
+former models of three sizes: 210m, 360m, and 660m, where the parameter count refers to non-
+embedding parameters. The models have widths of 1024, 1024, and 1408 and depths of 12, 24, 24.
+We used the 210m model to explore various ablations, most of our reported results are on 360m and
+660m. The MLP hidden dimension is 4x of the width. The activation function is GeLU (Hendrycks
+& Gimpel, 2016). We use RoPE positional encodings (Su et al., 2024). Attention heads are always
+dimension 64. We use PyTorch default LayerNorm. We use QK layer norm (Dehghani et al., 2023).
+Following Wortsman et al. (2024) we do not learn biases for the linear layers or LayerNorms. We
+train in mixed precision with bfloat16.
+
+Algorithms. We use the standard Pytorch implementation of AdamW (Paszke et al., 2019), the
+DistributedShampoo Shi et al. (2023) implementation of Shampoo. We implement ourselves SOAP
+and GaLore starting from an older version of Pytorch implementation of AdamW and the official
+GaLore implementation Zhao et al. (2024b).
+
+Default hyperparameters. We use β1 = 0.95, as we found it to outperform β1 = 0.9 in our
+sweeps for the 360m model. Following Wortsman et al. (2024) we use decoupled weight decay with
+coefficient 1e−4 and z-loss with coefficient 1e−4. We use the default value of ϵ = 1e−8 in AdamW
+(actual or when used for grafting), SOAP and GaLore. We use warmup followed by cosine decay as
+our scheduler. We start the warmup and end the cosine decay at 0.1x the maximum learning rate.
+
+Default hyperparameters for DistributedShampoo Shi et al. (2023) state that they find the op-
+timal exponent to be either −1/2 or −1.82/4 ≈ −1/2.2. Our preliminary findings were similar
+to this. Hence we set the default values of exponent to be −1/2.5 for both 1D and 2D parameters.
+We set ϵshampoo = 1e−12 and βshampoo = 0.95 based on our initial set of experiments on the 210m
+model.
+
+Default hyperparameters for GaLore GaLore introduces an additional hyperparameter called
+scale (α) since due to low rank updates the overall update magnitude decreases. Since we are
+running a full rank version of GaLore we set α = 1.
+
+Token counts. For all of our runs we use a sequence length of 1024. For all models (except in
+Section 6.3), we use a token batch size of 2048k ≈ 2m. We default to training models for the
+approximately “chinchilla optimal” (Hoffmann et al., 2022) number of tokens that is ≈20 times the
+number of parameters. Explicitly, this means for our default batch size of 2m, the 210m models are
+trained for 1600 steps or ≈ 3.3b tokens. The 360m models are trained for 3200 steps, the 660m
+models are trained for 6400 steps.
+
+A.1   S WEEPING OVER HYPERPARAMETERS
+
+AdamW, 2m batch size: Starting from the default hyperparameters above we do the following
+sweeps:
+
+      1. We sweep over learning rate in {.1, .0316, .01, . . . , 3.16e−4}.
+      2. (360m) We sweep over the cross product of best 3 learning rates and β1 ∈ {0.9, 0.95, 0.99}.
+      3. (360m) We sweep over the cross product of best 3 learning rates and β2 ∈ {0.9, 0.95, 0.99}.
+
+The last two of the sweeps did not yield any benefit for the 360m model with 2m batch size hence
+we only sweep over learning rate for the 660m model with 2m batch size.
+
+
+                                                  17
+Published as a conference paper at ICLR 2025
+
+
+DistributedShampoo, 2m batch size: Starting from the default hyperparameters above we do the
+following sweeps:
+      1. We sweep over learning rate in {.1, .0316, .01, . . . , 3.16e−4}.
+      2. (360m) We sweep over over the cross product of best 3 learning rates from above and
+         ϵshampoo ∈ {1e−11, 1e−12, 1e−13}.
+      3. (360m) We sweep over over the cross product of best 3 learning rates from above and
+         βshampoo ∈ {.9, .95, .975}.
+      4. Let e1 , e2 denote the exponents used in DistributedShampoo for 1D and 2D parameters
+         respectively. We also sweep over the cross product of best 3 learning rates from above and
+         (e1 , e2 ) in {(2, 2), (2.5, 2.5), (3, 3), (2, 4)}.
+These sweeps did not yield any significant improvement in performance (< .004) for the 360m
+model. Hence we only sweep over the learning rate for the 660m model.
+SOAP, 2m batch size: Starting from the default hyperparameters above we sweep over learning
+rate in {.1, .0316, .01, . . . , 3.16e−4}.
+AdamW, 256k batch size: For the 360m model with 256 batch size we start from the default
+hyperparameters and do the following sweeps:
+      1. We sweep over learning rate in {.1, .0316, .01, . . . , 3.16e−4}.
+      2. We sweep over the cross product of best 3 learning rates and β2 ∈ {0.95, 0.99}.
+In the second sweep we observe small improvements in performance by using β2 = .99, so our final
+numbers use β2 = .99. This (small) improvement in performance by using a larger β2 at smaller
+batch sizes was also observed by Porian et al. (2024); Zhao et al. (2024c).
+DistributedShampoo, 256k batch size: For the 360m model with 256 batch size we start from the
+default hyperparameters and do the following sweeps:
+      1. We sweep over learning rate in {.1, .0316, .01, . . . , 3.16e−4}.
+      2. We sweep over the cross product of best 3 learning rates and (β2 , βshampoo ) ∈
+         {(.95, .95), (.99, .99)}.
+In the second sweep we observe small improvements in performance by using β2 = βshampoo = .99,
+so our final numbers use β2 = βshampoo = .99.
+SOAP, 256k batch size: For the 360m model with 256 batch size we start from the default hyper-
+parameters and do the following sweeps:
+      1. We sweep over learning rate in {.1, .0316, .01, . . . , 3.16e−4}.
+      2. We sweep over the cross product of best 3 learning rates and β2 ∈ {.95, .99}.
+In the second sweep we observe small improvements in performance by using β2 = .99, so our final
+numbers use β2 = .99.
+Preconditioning frequency sweeps: For the preconditioning frequency experiments of SOAP and
+Shampoo ( Figure 1 (right)), for each frequency we do a learning rate sweep over the best 3 learning
+rates found at preconditioning frequency 10. Other hyperparameters are set to their optimal values
+obtained using the precondition frequency 10 sweeps.
+360m and 660m shorter runs: For each of the shorter runs of 360m and 660m models for the SOAP
+optimizer (Figure 2), we did learning rate sweep over the best 3 learning rates found for the standard
+length run. Other hyperparameters are set to their optimal values obtained using the standard length
+run.
+Warmup: The warmup duration for the 360m and 660m models were 600 and 1200 steps respec-
+tively. For the shorter runs (Figure 2), for 360m model, the warmup durations were 400, 400, 500
+and 525 steps for 0.5, 0.625, 0.75 and 0.875 runs respectively. For the 660m model, the warmup du-
+rations were 600, 750, 900 and 1050 steps for 0.5, 0.625, 0.75 and 0.875 runs respectively. For 360m
+model with 256k batch size (Section 6.3) we use a warmup for 4000 steps (total steps is 25000).
+
+
+                                                 18
+Published as a conference paper at ICLR 2025
+
+
+B              F URTHER E FFICIENCY I MPROVEMENTS
+In this section, we discuss space and time complexity of SOAP and provide an overview of potential
+avenues for further space and compute efficiency improvements in SOAP.
+
+B.1                O NE S IDED E IGENBASIS
+
+As described in Section 3, Zhao et al. (2024a) have an algorithm similar to ours. One of the differ-
+ences is that they only project the smaller side of the layer using the eigenbasis while using identity
+as the rotation matrix for the larger side i.e. if m < n we set QR = In in Algorithm 3 and if m > n
+we set QL = Im . Doing this leads to a reduction in space usage as well as reduction of optimizer
+time overhead, which is discussed in Appendices B.2.1 and B.3.1.
+In Figure 5, it is evident that the one-sided projection results in slightly reduced performance com-
+pared to the original SOAP optimizer. However, it still performs on par with, or marginally better
+than, Shampoo, while maintaining greater computational efficiency. Further investigation into the
+potential for these variants to surpass the computational efficiency of original SOAP optimizer is left
+for future work.
+
+                             360m, 2m batch size                                660m, 2m batch size
+                        Preconditioning Frequency = 10                     Preconditioning Frequency = 10
+             3.4                                                     3.2
+
+             3.3                                                     3.1
+
+             3.2                                                     3.0
+Train Loss
+
+
+             3.1                                                     2.9
+
+             3.0                                                     2.8
+
+             2.9                                                     2.7
+
+             2.8                                                     2.6
+                             1000            2000        3000                   2000            4000        6000
+                                    Train Steps                                        Train Steps
+                                      AdamW         SOAP                   SOAP (one-sided)
+                                      Shampoo       SOAP (factorized)      SOAP (factorized, one-sided)
+
+Figure 5: Performance of variants of SOAP which improve space usage or time overhead. 1. SOAP
+(factorized): Uses Adafactor instead of Adam in Shampoo’s eigenbasis and 2. SOAP (one-sided):
+Uses Q = I (i.e. no rotation) on the large side of weight matrix and 3. SOAP (factorized, one-
+sided): Combines both of these changes. We observe that while using Adafactor instead of Adam
+causes a negligible increase in loss, using the one-sided variant causes a larger increase. However,
+the one-sided variant also has much larger reduction in time and space overhead. For computational
+benefits of these variants see Appendices B.2 and B.3.
+
+
+B.2                S PACE USAGE OF SOAP
+
+For a m × n matrix where m > n we require
+                2m2 (for L, QL ) + 2n2 (for R, QR ) + 3mn (for gradient, M, V )
+space usage4 (beyond weights and activations), specifically for L, QL , R, QR , momentum (M ),
+AdamW’s second order estimate (V ), and the gradient. This is the same space usage as Distributed-
+Shampoo while AdamW uses 3mn.
+   4
+     One mn is for storing the gradients, this can be avoided (as long as there is no gradient accumulation) by
+applying gradients along with backprop (Lv et al., 2024b) but this is not implemented by default in standard
+deep learning frameworks such as PyTorch. Hence we will include this term in all of our calculations.
+
+
+                                                                19
+Published as a conference paper at ICLR 2025
+
+
+B.2.1    I MPROVING SPACE USAGE OF SOAP
+The most direct way to reduce memory is using low precision to store the L, R, QL , QR , V matri-
+ces, which is done by Dettmers et al. (2022); Wang et al. (2024). Orthogonal to the low precision
+approaches, there are two algorithmic approaches to improving the space usage of SOAP:
+
+        • Using Adafactor instead of Adam as the diagonal preconditioner after rotating by QL and
+          QR . This reduces the space usage by mn.
+        • Using one sided version of SOAP (Appendix B.1). This reduces space usage from 2m2 +
+          2n2 + 3mn to 2 min(m, n)2 + 3mn.
+        • Combining these approaches yields space usage of 2 min(m, n)2 + 2mn.
+
+For standard transformer architectures the last variant which combines the two approaches would
+yield less space usage overall compared to AdamW (which uses 3mn).
+We try these approaches in Figure 5. We observe that using Adafactor instead of AdamW yields
+very small reductions in performance while using one-sided preconditioner results in larger reduc-
+tions. Nonetheless even after combining these two approaches the resulting optimizer outperforms
+AdamW while having a smaller space requirement than AdamW. Regarding space usage we also
+note that Adafactor (with momentum added back) itself utilizes only 2mn space usage and has
+been shown to perform comparable to AdamW for ViT training (Zhai et al., 2022) and for language
+model training (Zhao et al., 2024c). Further space reduction beyond Adafactor has been studied
+in the Adalomo (Lv et al., 2024a), GaLore (Zhao et al., 2024a), and AdaMeM (Vyas et al., 2024)
+papers.
+
+B.3     T IME OVERHEAD OF SOAP
+
+There are two types of overhead of Shampoo and SOAP over AdamW: the overhead per step and
+the overhead when changing the preconditioner (or for SOAP, the preconditioner’s eigenbasis). Let
+us first analyze the first one. For SOAP per step for a layer of size m × n we have an overhead of
+m3 (updating L)+n3 (updating R)+(2m2 n+2mn2 ) (projecting and projecting back on both sides).
+
+We note that this is more than the overhead of Shampoo which is m3 + n3 + m2 n + n2 m. This
+can be observed in Figure 2 (bottom, right) but not in the other figures since there the second type
+of overhead is the dominant term.
+The second type of overhead is due to changing the preconditioner for Shampoo (or for SOAP, pre-
+conditioner’s eigenbasis i.e. QL and QR ). The DistributedShampoo (Shi et al., 2023) implementa-
+tion of Shampoo uses a direct call to torch.linalg.eigh for this. Following Wang et al. (2024)
+we use Algorithm 4 which uses power iteration based approach which calls torch.linalg.qr.
+We note that torch.linalg.qr is faster than torch.linalg.eigh (Documentation, 2024).
+In Figure 6 (right) we see that using power iteration based approach (torch.linalg.qr) per-
+forms as well as fresh eigenvector decomposition (torch.linalg.eigh).
+Effect of frequency on overhead: In Figure 6 (left), we observe that the overhead decreases
+as the preconditioning frequency increases, i.e., the frequency of invoking Algorithm 4. If the
+only additional computation occurred in Algorithm 4, we would expect the overhead to scale as
+1.0/(preconditioning frequency), approaching zero. However, empirical results (Figure 6 left) show
+that the overhead approaches an asymptote greater than zero. This is attributable to the additional
+matrix multiplications required to update L, update R, project the gradient, and reproject the gradi-
+ent (for each layer) in the optimizer. Currently, these operations are performed in float32; reducing
+the precision of these operations, as proposed in Wang et al. (2024), could lower this asymptote.
+
+B.3.1    I MPROVING TIME OVERHEAD OF SOAP
+The per step overhead of SOAP can be reduced by using low precision to store the L, R, QL , QR , V
+matrices (Dettmers et al., 2022; Wang et al., 2024), which in turn will speed up computation done
+using these matrices. This approach cannot be used for reducing the overhead for the preconditioner
+update in popular deep learning frameworks such as Pytorch since torch.linalg.qr does not
+
+
+                                                 20
+Published as a conference paper at ICLR 2025
+
+
+                                                    Frequency vs overhead
+                                       32
+                                                                                                          2.94
+
+                                       16
+
+    %overhead in training over AdamW
+                                                                                                          2.92
+
+                                                                                                          2.90
+
+
+                                                                                        Final Test Loss
+                                       8
+                                                                                                          2.88
+                                       4                                                                  2.86
+
+                                                                                                          2.84
+                                       2
+                                                                                                          2.82
+                                       1                                                                         1   3                  10              32      100
+                                            100                 101              102                                        Preconditioning Frequency
+                                                     Preconditioning Frequency
+                                                                                                                         AdamW                    SOAP (eigh)
+                                                                 SOAP                                                    SOAP (default, QR)       Shampoo
+
+
+Figure 6: (Left) Depicting the overhead of SOAP over AdamW as a function of precondition-
+ing frequency (Right) Comparing the performance of SOAP with torch.linalg.eigh for
+computing the eigenvectors with Algorithm 4, which uses torch.linalg.qr. Note that
+torch.linalg.qr is computationally more efficient than torch.linalg.eigh (as men-
+tioned in Documentation (2024)); however, both seem to have comparable performance throughout
+the preconditioning frequency spectrum.
+
+
+support precision lower than float32. Orthogonal to the low precision approach we can improve
+the per step time overhead of SOAP by the following algorithmic approaches:
+
+                                       • Using Adafactor instead of Adam (Appendix B.2) as the diagonal preconditioner after ro-
+                                         tating by QL and QR . In this version of SOAP the overhead can be improved by from
+                                         m3 +n3 +2m2 n+2n2 m to m3 +n3 +m2 n+n2 m+max(m, n)2 min(m, n)+min(m, n)3
+                                         by merging the project and project back steps for the smaller dimension.
+                                       • Using one sided version of SOAP (Appendix B.1). This reduces overhead from m3 + n3 +
+                                         2m2 n + 2n2 m to min(m, n)3 + 2 min(m, n)2 max(m, n).
+                                       • Combining these approaches yields an overhead of min(m, n)2 max(m, n)+2 min(m, n)3
+
+Using one-sided version also reduces the second type of overhead from a calls to
+torch.linalg.qr on a m×m and a n×n matrix to only a single call to min(m, n)×min(m, n)
+matrix.
+
+
+C            L ONGER D URATION RUN
+
+Chinchilla scaling laws (Hoffmann et al., 2022) suggest that it is compute optimal to use tokens
+which are approximately 20x the models size, which is what we have been using for our standard
+runs. But many recent LLMs such as the LLaMA (Touvron et al., 2023) series of models are trained
+on much larger token counts. This can be to take into account the computational cost during infer-
+ence (Sardana et al., 2024) or to create models which are usable or finetunable by downstream users.
+In Figure 7 we train a language model with AdamW on a 100x model size token count. We then
+train the same model with SOAP for 50x, 75x, and 100x token counts to approximate the efficiency
+benefits. We find efficiency benefits (> 40%) similar to those observed in Figure 2 for AdamW runs
+with 20x token counts.
+
+
+D              G A L ORE
+
+We tried GaLore for 210m model, and while it outperformed AdamW it performed worse than
+Shampoo. Hence we do not try GaLore for higher model sizes.
+Hyperparameter sweeps: We did the following sweeps:
+
+
+                                                                                       21
+Published as a conference paper at ICLR 2025
+
+
+                            360m, 2m batch size, long run with 33.5b tokens or 100x model size
+                                              Preconditioning Frequency=10
+             2.71                                                   2.71
+
+             2.70                                                   2.70
+
+             2.69                                                   2.69
+Train Loss
+
+
+             2.68                                                   2.68
+
+             2.67                                                   2.67
+
+             2.66                                                   2.66
+
+             2.65                                                   2.65
+                    0.5   0.6       0.7      0.8      0.9    1.0           0.5      0.6      0.7      0.8      0.9    1.0
+                           Total Training Steps (Scaled)                            Total Wall Time (Scaled by AdamW)
+                                                            AdamW            SOAP
+
+Figure 7: Total training steps (Left) and total wall clock time versus final test loss for long runs
+(#tokens = 5x “chinchilla” tokens = 100x model size).
+
+
+               1. We swept the cross product over learning rate (3.16e − 4, 1e − 3, 3.16e − 3, 1e − 2), precon-
+                  ditioning frequency (10, 50, 200), both sided and one sided versions. Frequency 200 had
+                  the best results matching the observation of Zhao et al. (2024a).
+               2. We did a cross product sweep over learning rate (3.16e − 4, 1e − 3, 3.16e − 3, 1e − 2), both
+                  sided and one sided versions with β2 = .99 instead of .95 and preconditioning frequency
+                  200.
+               3. We did a cross product sweep over learning rate (3.16e − 4, 1e − 3, 3.16e − 3, 1e − 2), both
+                  sided and one sided versions, preconditioning frequency (50, 200) with β1 = .9 instead of
+                  .95.
+
+The best performing run among all of these achieved a final loss of 3.12 while the best Shampoo run
+achieved a final loss of 3.10.
+
+
+                                                               22

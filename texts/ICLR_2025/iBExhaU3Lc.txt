@@ -1,0 +1,2223 @@
+Published as a conference paper at ICLR 2025
+
+
+A DAM - MINI : U SE F EWER L EARNING R ATES T O G AIN M ORE
+ Yushun Zhang∗13 , Congliang Chen∗13 , Ziniu Li13 , Tian Ding23 , Chenwei Wu4 ,
+ Diederik P. Kingma5 , Yinyu Ye16 , Zhi-Quan Luo13 , Ruoyu Sun†123
+ 1
+   The Chinese University of Hong Kong, Shenzhen, China;
+ 2
+   Shenzhen International Center for Industrial and Applied Mathematics;
+ 3
+   Shenzhen Research Institute of Big Data; 4 Duke University;
+ 5
+   Anthropic; 6 Stanford University
+
+
+
+                                             A BSTRACT
+           We propose Adam-mini, an optimizer that achieves on-par or better performance
+           than AdamW with 50% less memory footprint. Adam-mini      √ reduces memory by
+           cutting down the learning rate resources in Adam (i.e., 1/ v). By delving into the
+           Hessian structure of neural nets, we find Adam’s v might not function at its full
+           potential as effectively as we expected. We find that ≥ 99.9% of these learning
+           rates in v could be harmlessly removed if we (1) carefully partition the parameters
+           into blocks following our proposed principle on Hessian structure; (2) assign a
+           single but good learning rate to each parameter block. We then provide one simple
+           way to find good learning rates and propose Adam-mini. Empirically, we verify that
+           Adam-mini performs on par or better than AdamW on various language models
+           sized from 39M to 13B for pre-training, supervised fine-tuning, and RLHF. The
+           reduced memory footprint of Adam-mini also alleviates communication overheads
+           among GPUs, thereby increasing throughput. For instance, Adam-mini achieves
+           49.6% higher throughput than AdamW when pre-training Llama 2-7B on 2×
+           A800-80GB GPUs, which saves 33% wall-clock time for pre-training 1 .
+
+1        I NTRODUCTION
+Adam (Kingma & Ba, 2014) has become the de-facto optimizer for training large language models
+(LLMs) (e.g., (Vaswani et al., 2017; Achiam et al., 2023; Touvron et al., 2023; Team et al., 2023)).
+Despite its superior performance, Adam is expensive to use. Specifically, Adam requires the memory
+for its optimizer states: the first-order momentum m, and the second-order momentum v. These
+in total take at least 2× the memory of the model size 2 . This memory consumption has become
+a major burden in LLM training. For instance, to train a 7B model, Adam alone requires about 56
+GB for m and v, and with the gradients included, a total of 86 GB is needed. This is expensive even
+for cutting-edge graphics cards (e.g., A100-80GB). To support training, CPU-offload and optimizer
+state sharding (Rajbhandari et al., 2020) must be used in practice, which unfortunately increases the
+latency and slows down the training (Rajbhandari et al., 2021).
+It is intriguing to design effective optimizers that require less memory. First, it lowers the threshold
+of training LLMs and encourages participation from more diverse researchers, especially those with
+limited GPU resources. Second, it requires fewer GPUs to train a model with a desired size, leading
+to substantial savings in both cost and energy. Third, it can ease the burden of CPU offloading and
+model sharding, which in turn, can enhance the throughput and accelerate the training process.
+It is challenging to modify Adam without sacrificing its performance. One primary reason is that we
+still lack understanding of the role of Adam’s m and v (Zhang et al., 2020; Kunstner et al., 2023).
+It remains uncertain which components in Adam are indispensable for superior performance, and
+which components could be re-designed or improved. One notable attempt is Adafactor (Shazeer
+& Stern, 2018), which cuts down memory by low-rank factorization on v. However, we find that
+Adafactor is not easy to tune and often performs worse than Adam (see evidence in (Luo et al., 2023)
+and Section 3.4). One possible reason is that the current v in Adam is crucial and cannot be simplified.
+       ∗: Equal contribution. †: Correspondence author.
+     1
+       Our implementation of Adam-mini is available at https://github.com/zyushun/Adam-mini
+     2
+       We restate the update rules of Adam and AdamW (Loshchilov & Hutter, 2017) in Appendix E.1.
+
+
+                                                   1
+Published as a conference paper at ICLR 2025
+
+                                                    6.0
+                                                                                                   AdamW
+                                                    5.5                                            Adam-mini
+
+                                                    5.0
+                                                    4.5
+
+
+                                         Val Loss
+                                                    4.0
+                                                    3.5
+                                                    3.0
+                                                    2.5
+                                                           0.75   1.00   1.25      1.50     1.75   2.00    2.25
+                                                                         Tokens (billion)
+
+     (a) Memory (↓) and Throughput (↑)                    (b) Loss v.s. iteration                                      (c) Loss v.s. time
+Figure 1: Results for Llama 2-7B pre-training. (a) Adam-mini takes less memory and can reach higher
+throughput (# tokens per second). The throughput is tested on 2× A800-80GB GPUs. (b, c) Adam-mini
+performs on-par with AdamW, but takes 33% less time to process the same # tokens.
+
+This is possible as most existing Adam variants that attempt to modify v to varying extents have
+been reported to perform worse than Adam (Orabona, 2020). Another possible reason is that there
+is potential to cut down v, but Adafactor does not use the most suitable way: matrix factorization
+is a generic approach that could be applied broadly, but it does not leverage much problem-specific
+structure, thus it does not work well on specific neural-net tasks.
+In this work, we find it is possible to signifi-
+cantly reduce the usage of v. Currently, Adam
+assigns an individual learning rate for each pa-
+rameter, i.e., i-th parameter receives learning
+rate √ηvi , where vi is the i-th component of v.
+For a billion-parameter model, Adam requires
+billions of learning rates. We argue that it is
+possible to achieve on-par or better performance
+with much fewer learning rates. We first recall Figure 2: An illustration of Adam-mini. Adam-mini
+a classical result that the Hessian of neural nets assigns learning rates (lrs) by Hessian structure. It uses
+is near-block-diagonal with several dense princi- more lrs than SGD but fewer than Adam.
+ple sub-blocks (Collobert, 2004). We then find that, for each of these dense sub-blocks, there exists
+a single high-quality learning rate that outperforms Adam, provided that we have enough resources
+to search it out. Since the number of dense sub-blocks is much fewer than the number of parameters,
+our findings imply that it is possible to achieve good performance with much fewer learning rates.
+The remaining question is how to find them efficiently.
+We then propose a cheap and simple way to find good learning rates that are sufficient to perform
+on-par or better than Adam. We introduce the proposed design principle here: we first partition
+the gradient vector into B sub-vectors according to the dense Hessian sub-blocks, and call it gb for
+b ∈ {1, · · · , B}. For each gb , we calculate the quantity below.
+                        vb = (1 − β2 ) ∗ mean(gb ⊙ gb ) + β2 ∗ vb ,                                            b = 1, · · · B.
+                √
+We then use η/ vb as the learning rate for the parameters in the block associated with gb . Such
+design changes almost all Adam’s v to a negligible amount of scalars and thus reduces the memory.
+We call the corresponding method Adam-mini. We provide a simple illustration in Figure 2 and
+relegate the complete form later in Algorithm 2. We summarize our main contribution as follows.
+• New optimizer. We propose a new optimizer called Adam-mini. First, Adam-mini partitions
+  the model parameters based on the principle we established upon the Hessian structure. Then,
+  it chooses a single learning rate for each block using the average of Adam’s v in that block.
+  Adam-mini has the following advantages.
+     – Lightweightness: By design, Adam-mini largely reduces the number of learning rates used in
+       Adam. For mainstream LLMs, Adam-mini could cut down ≥ 99.9% proportion of Adam’s v,
+       which saves 50% of the memory cost of Adam.
+     – Effectiveness: Despite the memory cut down, we empirically verify that Adam-mini performs
+       on par or even better than AdamW on various language models sized from 39M to 13B,
+       including pre-training, supervised fine-tuning (SFT), and reinforcement learning from human
+       feedback (RLHF). Adam-mini also performs similarly to Adam on non-LLM tasks such as
+       training diffusion models, vision models, and graph neural networks.
+     – Efficiency: Adam-mini can reach higher throughput than AdamW. We observe that Adam-
+       mini reaches 49.6% higher throughput of AdamW when pre-training Llama 2-7B on 2×
+       A800-80GB, which saves 33.1% wall-clock time for pre-training. The efficiency comes from
+       two factors. First, Adam-mini does not introduce extra computation in per-step updates.
+
+
+                                                                         2
+Published as a conference paper at ICLR 2025
+
+
+       Second, the memory cut-down allows larger batch sizes per GPU, and at the same time, it
+       eases the burden of communication among GPUs, which is usually a major overhead.
+• Generic partition principle. A key component in Adam-mini is the strategy for parameter partition.
+  We propose to partition parameters based on the smallest dense sub-block in Hessian. This principle
+  can apply to generic problems with block diagonal Hessian: we find that more learning rates do not
+  necessarily bring extra gain for these problems. In particular, for the problem associated with each
+  dense sub-block, a single (but good) learning rate suffices to bring better performance.
+• Hessian structure and partition principle of Transformers. We empirically apply the above
+  principle to Transformers. We find that Transformer Hessian’s smallest dense blocks are: (1)
+  query, key by heads; (2) value, attn.proj and mlp by output neurons; (3) embed and
+  output by tokens. We emphasize that our Hessian-based partition principle is crucial, as naive or
+  default partitions (e.g. partitioning by layers) would cause training instability on LLMs.
+
+2       M ETHOD
+2.1       M OTIVATIONS AND O BSERVATIONS
+Now we discuss our observations that motivate the design of Adam-mini. 3 We start by investigating
+the role of Adam’s v and explore possibilities for improvement. In Adam, v provides an individual
+learning rate for each parameter, i.e., i-th parameter receives the learning rate √ηvi , where vi is the
+i-th component of v. Very recently, Zhang et al. (2024) pointed out that such design is crucial for
+modern architectures such as Transformers. This is because these models often exhibit Hessian-block
+heterogeneity, i.e., the Hessian of different parameter blocks have dramatically different eigenvalue
+distributions (We restate their findings in Appendix E.2). This phenomenon suggests that different
+parameter blocks need different learning rates. This can be provided by Adam’s v.
+The findings in (Zhang et al., 2024) suggest that it is necessary to use a different learning rate for
+each block. Nonetheless, Adam does much more than that: it assigns an individual learning rate not
+just for each block, but for each parameter. Note that the number of parameters is much larger than
+the number of blocks. This begs the question:
+                 (Q1) Is it necessary to use a customized learning rate for each parameter?
+                                       If not, how much can we save?
+                                   0                                                                0                                                           0
+                                                                                                                                                                                                                0.0035
+                                                                                   0.00200
+                                                                                                                                                    0.0025
+                                 5000                                              0.00175       5000                                                        5000                                               0.0030
+
+                                                                                   0.00150                                                          0.0020                                                      0.0025
+                                10000                                                            10000                                                       10000
+                                                                                   0.00125
+                                                                                                                                                    0.0015                                                      0.0020
+                                                                                   0.00100
+                                15000                                                            15000                                                       15000                                              0.0015
+                                                                                   0.00075                                                          0.0010
+                                                                                                                                                                                                                0.0010
+                                20000                                              0.00050       20000                                                       20000
+                                                                                                                                                    0.0005
+                                                                                   0.00025                                                                                                                      0.0005
+
+                                25000                                              0.00000       25000                                              0.0000   25000                                              0.0000
+                                        0   5000   10000   15000   20000   25000                         0   5000   10000   15000   20000   25000                    0   5000   10000   15000   20000   25000
+
+
+
+(a) Hessian of a MLP            (b) Hessian of a MLP                                             (c) Hessian of a MLP                                        (d) Hessian of a MLP
+(Collobert, 2004)               at initialization                                                at 50% step                                                 at 100% step
+Figure 3: The near-block-diagonal Hessian structure of neural nets. (a) is the Hessian of an MLP after 1
+training step reported in (Collobert, 2004). (b,c,d): the Hessians of a 1-hidden-layer MLP on CIFAR-100. The
+near-block-diagonal structure maintains throughout training, where each block corresponds to one neuron.
+
+To answer (Q1), we delve into the Hessian structures of neural networks. First, we recall an important
+(but often overlooked) result: the Hessian of neural nets is near-block-diagonal. This is an old result
+that has been reported for two decades; see (Collobert, 2004, Section 7). The authors also provided
+theoretical explanations. We restate their analysis in Appendix C. We now provide some case studies.
+Case study I: random quadratic problems. With the above observation in mind, we now explore
+(Q1) on generic optimization problems with block-diagonal Hessian. We consider the random
+quadratic minimization problem minw 12 w⊤ Hw where the Hessian H is a random positive definite
+(PD) matrix and is visualized in Figure 4 (a). We compare the coordinate-wise learning-rate method,
+i.e., Adam, with the single-learning-rate method, i.e., gradient descent (GD). We choose quadratic
+minimization because the optimal learning rate has a close form. We have the following findings.
+• (1): as shown in Figure 4 (a) and (b), Adam outperforms the optimal single-learning-rate method.
+  This is expected since Adam deploys different learning rates to different parameters.
+    3
+        All experimental details in Section 2 are shown in Appendix F.2.
+
+
+                                                                                             3
+Published as a conference paper at ICLR 2025
+                                                  101                                                                                                       101
+
+                                                  100                                                                                                       100
+
+                                                 10 1                                                                                                      10 1
+
+
+                             Log Gradient Morm
+
+
+                                                                                                                                       Log Gradient Morm
+                                                 10 2                                                                                                      10 2
+
+                                                 10 3                                                                                                      10 3
+
+                                                 10 4           Adam                                                                                       10 4
+                                                                Optimal single-learning-rate method                                                                                Adam
+                                                                Optimal blockwise-learning-rate method                                                                             Optimal single-learning-rate method
+                                                 10 5                                                                                                      10 5
+                                                        0   10000      20000       30000       40000     50000                                                    0   200   400               600     800         1000
+                                                                           Iteration                                                                                              Iteration
+
+
+        (a) Hessian matrix                                  (b) Total loss                                       (c) Dense sub-block                          (d) Sub-problem loss
+Figure 4: (a): The Hessian of a three-block random quadratic problem. (b): Training curves for the problem
+associated with the full Hessian in (a). The optimal single (blockwise) learning rate is chosen based on the
+full (blockwise) Hessian in (a). (c): The 1st dense Hessian sub-blocks in (a). (d): Training curves for the new
+problem associated with the Hessian in (c).
+
+• (2): as shown in Figure 4 (c) and (d), we consider a new problem whose Hessian is a dense
+  sub-block of (a). We consider the optimal single learning-rate method for this new problem and find
+  it outperforms Adam, even though Adam assigns much more learning rates. Similar phenomena
+  apply to all the three sub-blocks of (a).
+• (3): If we collect these optimal learning rates in (2) and apply them to a “blockwise” version of
+  GD, it would be faster than Adam on the original problem (the green line in Figure 4 (b)).
+In summary, for generic problems with block-diagonal Hessian, we find that more learning rates
+do not necessarily bring extra gain. In particular, for each dense sub-block, a single (but good)
+learning rate suffices to bring better performance than using tens or hundreds more.
+More discussions on case study I. Why would this happen? We provide one possible explanation
+from a linear algebra perspective. Adam can be viewed as a diagonal preconditioned method , i.e., at
+the t-th step:
+                                                                                  wt+1 = wt − ηt Dt mt ,                                                                                                                 (1)
+                       √
+ where Dt = Diag(1/ vt ) is a diagonal matrix, mt is the 1st-order momentum, wt and ηt are model
+parameters and learning rate. However, Adam may not be an optimal preconditioner and thus cannot
+effectively reduce the condition number of the dense sub-matrix. In the field of optimization, the
+effectiveness of a diagonal preconditioner D is often measured by “how much is κ(DH) reduced
+over κ(H)”, where H usually refers to the Hessian matrix and κ(·) is the condition number (smaller
+is better). Unfortunately, there is no guarantee of κ(DH) ≤ κ(H) and this inequality often requires
+strict assumptions on both D and H. For instance, κ(DH) would be small if H is close to diagonal
+and D is a cleverly designed compressor of H (Forsythe & Straus, 1955; Young, 1954; Sun & Ye,
+2021; Qu et al., 2022).
+Here, we numerically explore the effectiveness of Adam’s preconditioner within each dense Hessian
+sub-block. We generate a random dense PD matrix Hb ∈ Rd×d and use it as√a proxy for the dense
+Hessian sub-block of neural nets in Figure 3. We√ define DAdam = Diag(1/ v), where v = g ⊙ g,
+g = Hb x ∈ Rd , and each entry xi ∼ N (0, 1/ d) follows Xavier initialization. We explore the
+interplay between the following two metrics:
+                                                                P
+                                                                    |Hb,i,i |                                             κ(DAdam Hb )
+                                                            τ = Pi             ,                                     r=                ,                                                                                 (2)
+                                                                 i,j |Hb,i,j |                                              κ(Hb )
+ where τ ∈ [0, 1] is the “diagonal-over-off-diagonal ratio”, and we use it to measure how dense Hb is
+(Hb is pure diagonal when τ = 1). r ≥ 0 measures the effectiveness of Adam’s preconditioner DAdam
+when operating on the Hessian-block Hb (the smaller the better). We investigate the change of r when
+changing the structure of Hb , including changing τ , dimension d, and also κ(Hb ). We emphasize
+that for a fixed d or κ(Hb ), we change τ by only rotating the eigenvectors, but not changing the
+eigenvalues of Hb . This ensures τ is the only changing factor in the experiments.
+We summarize the key findings in Figure 5: for Hb with most dimension d and κ(Hb ), r decreases as
+τ → 1. That is, DAdam is effective when Hb is close to diagonal, and DAdam is not so effective when
+Hb is dense. This aligns with the convergence rates in Figure 4. It is intriguing to provide a lower
+bound on κ(DAdam Hb ) to ground the observation in Figure 5, and we are not aware of any existing
+lower bound of this kind. Note that it is rather difficult to characterize κ(DAdam H), partially because
+the extreme eigenvalues are neither sub-additive nor sub-multiplicative (Kittaneh, 2006). We leave it
+as an important but challenging future direction. To summarize, for the dense Hessian-blocks, it is
+possible to outperform Adam with only one good learning rate.
+Case study II: Transformers. The above analysis suggests there is room to cut down the number
+of learning rates. We also observe similar phenomena in Transformers. We consider a 4-layer
+Transformer and under the PyTorch default partition, and we randomly choose one parameter block as
+
+
+                                                                                                                 4
+Published as a conference paper at ICLR 2025
+                                              1.0                                                            5                                                                1.0                                                       20.0
+                                              0.9
+
+
+           Diagonal-over-off-diagonal Ratio
+                                                                                                                                                                              0.9                                                       17.5
+
+
+                                                                                                                                           Diagonal-over-off-diagonal Ratio
+                                                                                                             Ratio of Condition Number r
+
+
+                                                                                                                                                                                                                                          Ratio of Condition Number r
+                                              0.8                                                            4
+                                                                                                                                                                              0.8                                                       15.0
+                                              0.7                                                                                                                             0.7
+                                                                                                             3                                                                                                                          12.5
+                                              0.6                                                                                                                             0.6
+                                                                                                                                                                                                                                        10.0
+                                              0.5                                                                                                                             0.5
+                                                                                                             2
+                                              0.4                                                                                                                                                                                       7.5
+                                                                                                                                                                              0.4
+                                              0.3                                                                                                                             0.3                                                       5.0
+                                                                                                             1
+                                              0.2                                                                                                                             0.2                                                       2.5
+                                              0.1                                                                                                                             0.1
+                                                 10   20   30       40     50     60    70   80   90   100                                                                               200     400          600          800   1000
+                                                                          Dimension d                                                                                                          Condition Number (Hb)
+
+                      (a) r v.s. dimension d                     (b) r v.s. dimension κ(Hb )
+Figure 5: The effectiveness of Adam’s preconditioner DAdam on different matrix structures of Hb . (a): for most
+dimension d, r is large when τ is small ( r and τ are defined in Eq. (2)). This indicates that Adam might not be
+so effective when Hb is dense. We fix κ(Hb ) = 500 here. (b): We use the same setups as (a), except that we fix
+the dimension d = 50 and change the x-axis to κ(Hb ).
+
+the “left-out” block and change the coordinate-wise learning rate to a single-learning rate counter-part.
+We use Adam for the rest of the blocks. We grid-search the learning rate for the left-out block and
+apply the cosine decay schedule like the rest of the blocks. We report the best result and call this
+method “Adam (leave-one-out)”. Figure 6 shows that Adam (leave-one-out) can achieve similar or
+better performance than Adam. A similar phenomenon is also observed when we randomly leave out
+up to three blocks and search three learning rates. We do not explore the possibility of leaving more
+blocks out since the cost of grid search grows exponentially.
+To summarize this section, we find that it is possible to reach similar or better performance with
+much fewer learning rates than Adam. The remaining issue is how to find them without grid-search.
+In the next part, we propose a simple and effective method called Adam-mini, which could bring
+comparable or even better performance than Adam, but with 99.9% fewer learning rates.
+
+2.2    P ROPOSED M ETHOD : A DAM - MINI
+We now introduce Adam-mini. We will first state the “general principled form” of Adam-mini
+and then introduce the “the realization” of Adam-mini on specific architectures. In this section,
+we present the general form of Adam-mini in Algorithm 1. Following this general principled form,
+Adam-mini will have different realizations on different architectures, and the concrete example on
+Transformers is shown in Appendix B. As shown in Algorithm 1, Adam-mini contains two steps.
+Algorithm 1 Adam-mini (General form)                                                                                                                                                  Step 1 Partition the model parameters into
+ 1: Input weight-decay coefficient λ and                                                                                                                                              blocks by Hessian structure. We discuss Prin-
+      current step t                                                                                                                                                                  ciple 1 later in Section 2.3. For different
+ 2: Partition params into param_blocks                                                                                                                                                architectures, the principle will be realized
+      by Principle 1 in Section 2.3                                                                                                                                                   in different forms; see Algorithm 3: “Parti-
+ 3: for param in param_blocks do                                                                                                                                                      tion for non-Transformers”. and Algorithm
+ 4:   g = param.grad                                                                                                                                                                  3: “Partition for Transformers”.
+ 5:   param = param - ηt ∗ λ∗ param
+ 6:   m = (1 − β1 ) ∗ g + β1 ∗ m
+             m
+ 7:   m̂ = 1−β t
+                                                                                                                                                                                      Step 2. For each parameter block, we use
+                                                      1
+ 8:     v = (1 − β2 ) ∗ mean(g ⊙ g) + β2 ∗ v                                                                                                                                          a single learning rate. To efficiently choose
+               v
+ 9:     v̂ = 1−β t                                                                                                                                                                    a suitable learning rate in each block, Adam-
+                                                      2
+10:                          m̂
+      param = param - ηt * √v̂+ϵ                                                                                                                                                      mini simply replaces g⊙g in vanilla Adam by
+                                                                                                                                                                                      its mean value. We adopt the moving average
+11: end for
+                                                                                                                                                                                      on these mean values as in Adam.
+A simple example of Adam-mini. We use a simple example to illustrate the key design of Adam-
+mini. For a problem with 5 parameters w ∈ R5 , Adam and Adam-mini both perform w = w − u ⊙ m,
+where m is the 1st-order momentum and u has different forms as follows:
+                                                                          η   η   η   η   η
+
+• For Adam: uAdam =                                                      √ , √ , √ , √ , √
+                                                                          v1  v2  v3  v4  v5
+                                                                                                               .
+
+• For Adam-mini: suppose the partition is (1, 2, 3) and (4, 5) then
+                                                                η                                 η                                                                                      η                             η                                                η
+  umini = √                                                                       ,√                                               ,√                                                                   ,√                       ,√
+
+                                                                                                                                                                                                                                                                             .
+                                                      (v1 +v2 +v3 )/3                    (v1 +v2 +v3 )/3                                                                            (v1 +v2 +v3 )/3             (v4 +v5 )/2             (v4 +v5 )/2
+
+Note that the number of effective elements umini equals the number of blocks, which could be
+significantly smaller than that of uAdam , which equals the number of parameters. For LLMs, this will
+free ≥ 99.9% elements in v.
+
+                                                                                                                                           5
+Published as a conference paper at ICLR 2025
+                  0.7                                                                            0.7                                                                                                                                                                                                                 0.20
+                                                Adam                                                                          Adam                                             0.8                        Adam
+                                                Adam(leave-one-out) 1st trial                                                 Adam(leave-two-out) 1st trial                                               Adam(leave-three-out) 1st trial
+                                                Adam(leave-one-out) 2nd trial                                                 Adam(leave-two-out) 2nd trial                                               Adam(leave-three-out) 2nd trial                 Loss gap: loss(Adam(leave-one-out)) - loss(Adam)           0.15
+                  0.6                           Adam(leave-one-out) 3rd trial                    0.6                          Adam(leave-two-out) 3rd trial                    0.7                        Adam(leave-three-out) 3rd trial
+                                                Adam(leave-one-out) 4th trial                                                 Adam(leave-two-out) 4th trial                                               Adam(leave-three-out) 4th trial    layer_1   -0.1452   -0.0118   -0.0034    0.0434    -0.0433    -0.1081   0.10
+                                                Adam(leave-one-out) 5th trial                                                 Adam(leave-two-out) 5th trial                    0.6                        Adam(leave-three-out) 5th trial
+                  0.5                                                                            0.5
+
+
+  Training Loss
+
+
+                                                                                 Training Loss
+
+
+                                                                                                                                                               Training Loss
+                                                                                                                                                                                                                                                                                                                     0.05
+                                                                                                                                                                                                                                             layer_2   -0.0100   -0.0441   0.0333     -0.0408   -0.1738    -0.1806
+                                                                                                                                                                               0.5
+                  0.4                                                                            0.4                                                                                                                                                                                                                 0.00
+                                                                                                                                                                               0.4                                                           layer_3   -0.1244   -0.1023   -0.1647    -0.1687   -0.1468    -0.1808
+                                                                                                                                                                                                                                                                                                                      0.05
+                  0.3                                                                            0.3
+                                                                                                                                                                               0.3
+                                                                                                                                                                                                                                             layer_4   -0.0120   0.0136    -0.1804    -0.1805   -0.1416    -0.1808    0.10
+                  0.2                                                                            0.2                                                                           0.2
+                                                                                                                                                                                                                                                                                                                      0.15
+
+
+                                                                                                                                                                                                                                                         ery
+
+
+                                                                                                                                                                                                                                                                    y
+
+
+                                                                                                                                                                                                                                                                           lue
+
+
+
+                                                                                                                                                                                                                                                                                         roj
+
+
+                                                                                                                                                                                                                                                                                                   _fc
+
+
+
+                                                                                                                                                                                                                                                                                                                oj
+                        0    50   100      150       200        250        300                         0   50   100      150       200        250        300                         0   50   100      150       200        250        300
+
+
+                                                                                                                                                                                                                                                                 ke
+
+
+                                                                                                                                                                                                                                                                                                             _pr
+                                                                                                                                                                                                                                                                                      n.p
+
+
+                                                                                                                                                                                                                                                                                                mlp
+                                                                                                                                                                                                                                                                           va
+                                                                                                                                                                                                                                                       qu
+
+
+                                                                                                                                                                                                                                                                                                          mlp
+                                        Iteration                                                                     Iteration                                                                     Iteration
+
+
+                                                                                                                                                                                                                                                                                     att
+                                                                                                                                                                                                                                                                                                                      0.20
+
+
+
+  (a) Randomly leave one (b) Randomly leave two (c) Randomly leave three                                                                                                                                                                               (d) Performance gap
+  block out              blocks out             blocks out
+Figure 6: (a) (b) (c) Adam (leave-x-out) can reach a similar or better performance than Adam for all randomly
+picked left-out blocks. x = 1, 2, 3. (d) The performance gap between Adam and Adam (leave-one-out) for all
+possible blocks. We find Adam (leave-one-out) always performs on par with Adam, and for most blocks, Adam
+(leave-one-out) performs better. It seems possible to perform well with much fewer learning rates than Adam.
+2.3                         P RINCIPLE FOR THE PARTITION S TRATEGY
+We now discuss how to choose the parameter partition for Adam-mini. A straightforward way is to
+use PyTorch default partition. Unfortunately, we find that the PyTorch default partition does not work
+well on larger-scaled tasks. In particular, we find that Adam-mini encounters training instability on
+1B models (see Figure 7 (i)). We suspect this is because the default PyTorch partition did not fully
+capture the Hessian structure. We propose a general principle in Principle 1 below.
+Principle 1: We should partition parameters into blocks, such that each parameter block is associated
+                          with the smallest dense sub-block in Hessian.
+Principle 1 comes from the analysis in Section 2.1: it is possible to harmlessly reduce the number of
+Adam’s learning rates within each dense Hessian block. However, if the partition is too coarse and
+violates Principle 1, we might accidentally remove some crucial learning rates and oversimplify the
+problem, causing training failure. It is important to follow Principle 1 since it is necessary to use (at
+least) one distinct learning rate for each Hessian block (as evident in Appendix E.2).
+Does the PyTorch default partition follow Principle 1? To find out, we explore the Hessian of a small
+Transformer as in Figure 7. Under the default PyTorch partition, we compute the Hessian for each
+parameter block after 1 training step. We find four classes of Hessian sub-blocks.
+• Class 1: query and key. The Hessian of query and key have near-block-diagonal structures. .
+  The number of blocks equals the number of heads.
+• Class 2: attn.proj and MLPs. The Hessian of attn.proj and MLPs have block-diagonal
+  structures. The number of blocks equals the number of output neurons.
+• Class 3: value. For value, the structure of Hessian seems less clear. It seems to have the
+  hint of 16 diagonal blocks (16 is the number of output neurons), but the pattern is less obvious.
+  This Hessian structure is significantly different from that of query and key, although they all
+  consist of four heads. The Hessian entries of value are also about 106 larger than those of query
+  and key 4 . One possible reason is that value is positioned outside the softmax operator in the
+  self-attention design, while query and key are not.
+• Class 4: embed and output. For these two layers, the Hessian sub-block has a near-block-
+  diagonal structure and the number of blocks equals the number of tokens.
+Based on the above findings, we find that the PyTorch default partition is indeed not the best fit for
+Transformers. By Principle 1, query and key should be further partitioned by heads; value,
+attn.proj, and MLPs should be partitioned by output neurons; embed and output should be
+partitioned by tokens. As for value, the Hessian shows the hint of 16 diagonal blocks (where 16 is
+the number of output neurons), but the pattern is less clear. Our experiments show that “partition
+value by output neurons” works well in general, yet there are also some special cases where it is
+better to “treat value as a whole” (see discussions in Appendix D.6). By default, we will partition
+value by output neurons.
+We then introduce the resulting Algorithm 3: “Partition for Transformers” in Appendix B. As shown
+in Figure 7 (i). This strategy indeed stabilizes the training and boosts the performance.
+2.4 S OME C HARACTERISTICS OF A DAM - MINI AND D ISCUSSIONS
+Memory cut down. Adam-mini reduces the number of learning rates from the number of model
+parameters to the number of total number of blocks by our partition strategies. As a result, Adam-mini
+cuts down more than 99.9% of Adam’s v, which saves 50% of Adam’s memory.
+             4
+                   This might be one source of the heterogeneity of Hessian eigenvalues as reported by (Zhang et al., 2024).
+
+
+                                                                                                                                                               6
+Published as a conference paper at ICLR 2025
+                                                                                      1e 6               0                                                          1e 7
+                       0                                                                     1.2                                                                                        0
+                                                                                                                                                                           7                                                                                 0.06
+
+                   50                                                                        1.0     50                                                                    6         50                                                                      0.05
+
+                                                                                             0.8                                                                           5
+                   100                                                                              100                                                                                                                                                      0.04
+                                                                                                                                                                                 100
+                                                                                                                                                                           4
+                                                                                             0.6                                                                                                                                                             0.03
+                   150                                                                              150                                                                    3     150
+                                                                                             0.4                                                                                                                                                             0.02
+                                                                                                                                                                           2
+                   200                                                                              200                                                                          200
+                                                                                             0.2                                                                                                                                                             0.01
+                                                                                                                                                                           1
+                   250                                                                       0.0    250                                                                    0     250                                                                         0.00
+                           0        50          100         150     200         250                          0        50        100        150        200     250                             0        50           100         150     200      250
+
+                               (a) query (4 heads)                                                               (b) key (4 heads)                                                                (c) value (4 heads)
+          0                                                                             0.030            0                                                                                    0
+                                                                                                                                                                                                                                                                0.012
+                                                                                                                                                                       0.014
+          50                                                                            0.025
+                                                                                                    100                                                                                  100
+                                                                                                                                                                       0.012                                                                                    0.010
+                                                                                        0.020
+         100                                                                                        200                                                                0.010             200                                                                    0.008
+                                                                                        0.015                                                                          0.008
+                                                                                                                                                                                                                                                                0.006
+         150                                                                                        300                                                                                  300
+                                                                                                                                                                       0.006
+                                                                                        0.010                                                                                                                                                                   0.004
+         200                                                                                                                                                           0.004
+                                                                                                    400                                                                                  400
+                                                                                        0.005                                                                                                                                                                   0.002
+                                                                                                                                                                       0.002
+         250                                                                            0.000       500                                                                0.000             500                                                                    0.000
+               0               50         100         150         200     250                                0    100           200        300       400     500                                  0         100         200       300     400          500
+
+         (d) attn.proj (16 neurons) (e) mlp.fc_1 (32 neurons) (f) mlp.proj (16 neurons)
+               0                                                                                    0                                                                                        18
+                                                                                                                                                                       0.10                                        Adam-mini (PyTorch default partition)
+           20
+                                                                                         0.8                                                                                                 16                    AdamW
+                                                                                                   20                                                                                                              Adam-mini
+                                                                                                                                                                       0.08                  14
+           40                                                                            0.6       40
+                                                                                                                                                                                             12
+                                                                                                                                                                       0.06
+
+
+                                                                                                                                                                                Train loss
+           60                                                                                      60                                                                                        10
+                                                                                         0.4
+           80                                                                                      80                                                                  0.04                  8
+
+                                                                                                                                                                                             6
+          100                                                                            0.2       100                                                                 0.02
+                                                                                                                                                                                             4
+          120                                                                                      120
+                                                                                         0.0                                                                           0.00                  20       250         500     750     1000 1250     1500     1750   2000
+                   0           20        40      60         80     100    120                            0       20        40         60       80    100    120                                                                 Iteration
+
+                           (g) embed (8 tokens)                                                              (h) output (8 tokens)                                                                           (i) Llama 2-1B
+Figure 7: (a-h): The Hessian of different parameter blocks in a small Transformer at 1% training step. Here,
+neuron refers to the “output neuron". We find that these Hessian sub-blocks have near-block-diagonal structure
+and consists of smaller dense matrices. Different parameter blocks have different numbers of small dense
+matrices. (i) Training curves on Llama 2-1B. When using the PyTorch default partition, Adam-mini could suffer
+loss spikes. The spike disappears when we use the partition strategy in Algorithm 3.
+Table 1: Memory cost of AdamW v.s. Adam-mini. Table 2: Throughput (↑) test on 2× A800-80GB GPUs
+Calculation is based on float32, which is a standard for Llama 2-7B pre-training. ✗means out of memory.
+choice for optimizer states.                         GPU hours (↓) to pre-train Llama 2-7B with the optimal
+                                                     token amount by Chinchila’s law.
+     Model                                Optimizer                               Memory (GB)
+                                                                                                                                                 Optimizer                     bs_per_GPU                                 total_bs              Throughput (↑)
+  GPT-2-1.5B                               AdamW                                      12.48                                                      Adam-mini                          4                                       256                 5572.19 (↑ 49.6%)
+  GPT-2-1.5B                              Adam-mini                               6.24 (50% ↓)                                                    AdamW                             2                                       256                 ✗
+  Llama 2-1B                               AdamW                                       8.80                                                       AdamW                             1                                       256                 3725.59
+  Llama 2-1B                              Adam-mini                               4.40 (50% ↓)                                                      Optimizer                            # Tokens (B)                                   GPU hours (h) (↓)
+  Llama 2-7B                               AdamW                                      53.92                                                          AdamW                                    1                                         74.56
+  Llama 2-7B                              Adam-mini                               26.96 (50% ↓)                                                     Adam-mini                                 1                                         49.85 (↓ 33.1%)
+  Llama 3-8B                               AdamW                                      64.24                                                          AdamW                                    70                                        5219.16
+  Llama 3-8B                              Adam-mini                               32.12 (50% ↓)                                                     Adam-mini                                 70                                        3489.55 (↓ 33.1%)
+  Llama 2-13B                              AdamW                                      104.16                                                         AdamW                                   140                                        10438.32
+  Llama 2-13B                             Adam-mini                               52.08 (50% ↓)                                                     Adam-mini                                140                                        6979.10 (↓ 33.1%)
+
+Higher throughput. Adam-mini can reach a higher throughput than AdamW, especially under limited
+GPU resources. There are two reasons. First, Adam-mini does not introduce extra computation in
+its update rules. The averaging operation in Algorithm 1 incurs negligible cost and it significantly
+reduces the number of vector-square-root and vector-division operations in AdamW. Second, thanks
+to the memory cut-down, Adam-mini can support larger batch sizes per GPU. It also reduces the
+communication among GPUs, which is known to be a major overhead (Rajbhandari et al., 2021).
+We report evidence in Table 2. When pre-training Llama 2-7B on 2× A800-80GB GPUs, we find
+Adam-mini could reach 49.6% higher throughput than AdamW. This translates to 33.1% reduction
+of wall-clock time on processing the same amount of tokens for pre-training.
+Why using mean(v) as learning rates. Due to limited space, we move the discussions to Appendix C.
+Has room to improve. Adam-mini designs the learning rate for each dense Hessian sub-block using
+the average of Adam’s v in that block. Such a design achieves cheap computation, but it might not be
+
+
+                                                                                                                                           7
+Published as a conference paper at ICLR 2025
+                            6.0                                                                                              6.0
+                                                              AdamW                                                                                                                                                       AdamW-330M
+                            5.5                               Adam-mini                                                      5.5                                                                                          AdamW-1.5B
+                            5.0                               Adam-mini (PyTorch default partition)                          5.0                                                                                          Adam-mini-330M
+
+
+          Validation Loss
+
+
+                                                                                                           Validation Loss
+                                                              Adafactor                                                                                                                                                   Adam-mini-1.5B
+                            4.5                               SM3                                                            4.5
+                                                              LAMB
+                            4.0                                                                                              4.0
+                            3.5                                                                                              3.5
+                            3.0                                                                                              3.0
+                            2.50.0        2.5     5.0    7.5 10.0 12.5            15.0    17.5      20.0                     2.50.0       2.5                             5.0       7.5 10.0 12.5                         15.0     17.5   20.0
+                                                           Tokens (billion)                                                                                                           Tokens (billion)
+
+                                                      (a) GPT-2-125M                                                                      (b) GPT-2-330M and 1.5B
+Figure 8: For GPT-2 series pre-training, Adam-mini performs similarly to AdamW with 50% less memory,
+while other methods perform worse.
+optimal. We believe there is great room to improve the learning rate design. As shown in Figure 4,
+we can reach much faster convergence if we utilize more information in the dense block to design
+the learning rate (e.g., using eigenvalues of each block), However, such a design requires expensive
+computation. We leave it as an important future direction.
+
+3 E XPERIMENTS
+We now verify the efficacy of Adam-mini on two types of neural-net tasks: (1) LLM tasks including
+pre-training, supervised fine-tuning (SFT), and reinforcement learning from human feedback (RLHF).
+(2) Non-LLM tasks including vision, graph, and diffusion model training. Due to the limited space,
+we primarily focus on LLM tasks in this section, and we relegate the non-LLM tasks to Appendix
+D.5. All LLM experiments are conducted on four NVIDIA A800-80GB GPUs and the rest are
+conducted on four V100 GPUs. All the experimental details are explained in Appendix F.1.
+3.1 P RE - TRAINING
+Setups. We pre-train LLMs including GPT-2 series and Llama series. We train these models on
+mainstream English Corpus from scratch. In particular, We train GPT-2 (Radford et al., 2019) series
+(125M to 1.5B) on Openwebtext (Gokaslan et al., 2019). We train Llama series (20M to 13B)
+(Touvron et al., 2023) on C4 (Raffel et al., 2020). We compare Adam-mini with AdamW (Loshchilov
+& Hutter, 2017) as well as popular memory-efficient methods including Adafactor (Shazeer & Stern,
+2018), CAME (Luo et al., 2023), and SM3 (Anil et al., 2019). For Adafactor and SM3, we incorporate
+momentum with β1 = 0.9 to ensure a fair comparison with other methods. We tune the learning rate
+for all methods, using the same tuning budget for each, and report the best performance.
+GPT-2 series. Figure 8 shows the results for GPT-2 series pre-training. We find that Adam-mini
+performs similarly to AdamW with 50% less memory, while other methods perform worse. In Figure
+8 (a), we run Adam-mini (PyTorch default partition), which partition parameters by PyTorch default
+partition. We find that Adam-mini (PyTorch default partition) performs poorly. We stop the trial since
+it shows clear unstable behavior. In Figure 9, we further present the training loss curves. We find that
+the loss curves of Adam-mini closely resemble those of AdamW.
+                                  4.0
+                                                                                             AdamW-125M                                                                         Adafactor v.s. AdamW
+                                  3.8                                                        AdamW-330M
+                                                                                                                                                                    250         CAME v.s. AdamW
+                                                                                                                                                                                Adam-mini v.s. AdamW
+                                  3.6                                                        AdamW-1.5B                                                             200
+                                                                                             Adam-mini-125M
+                                                                                                                                          Model weight difference
+
+
+                                  3.4
+                     Train Loss
+
+
+                                                                                             Adam-mini-330M
+                                                                                                                                                                    150
+                                  3.2                                                        Adam-mini-1.5B
+                                  3.0                                                                                                                               100
+
+                                  2.8                                                                                                                               50
+                                  2.6
+                                    0.0         2.5     5.0       7.5 10.0 12.5              15.0      17.5                        20.0                              0
+                                                                                                                                                                                   1000        2000                3000          4000
+                                                                    Tokens (billion)                                                                                                                   Iteration
+
+                                                              (a) GPT-2 series                                                                                            (b) Trajectory comparison
+Figure 9: (a): The training loss curves of Adam-mini closely resemble those of AdamW. (b): The trajectory of
+Adam-mini stays close to the trajectory of AdamW (in terms of the ℓ-2 distance of model checkpoints).
+Llama series. Figure 10 shows the results for pre-training Llama series. We also train Llama 2-7B as
+shown in Figure 1 (c) in Section 1. We find that Adam-mini performs on par with AdamW, while
+other methods do not. Further, Adam-mini’s loss curves closely resemble the curves by AdamW.
+Trajectory comparison. On a small Transformer, Adam-mini generates similar trajectories to that of
+AdamW, while other methods cannot. This can be seen in Figure 9 (b) and the detailed description is
+in Appendix F. This might be because Adam-mini makes fewer modifications over AdamW.
+Sensitivity analysis. On GPT-2-125M pre-training task, we test the sensitivity of Adam-mini to
+hyperparameters. We report the validation loss after training with 2.5B tokens (by Chinchilla’s law).
+As shown in Figure 12 (c), Adam-mini seems not overly sensitive to hyperparameters.
+
+
+                                                                                                           8
+Published as a conference paper at ICLR 2025
+                                                                                                                                                                                                                                                             7.0
+                                                                                  8                                                                    AdamW                                                                                                                                                                                                                             AdamW-8B
+                                                                                                                                                       Adam-mini                                                                                             6.5                                                                                                                         AdamW-13B
+                                                                                                                                                       CAME
+                                                                                  7                                                                    Adafactor                                                                                             6.0                                                                                                                         Adam-mini-8B
+                                                                                                                                                       Adafactor-Zhai-version
+                                                                                                                                                                                                                                                             5.5                                                                                                                         Adam-mini-13B
+
+
+                                                                                                                                                                                                                                              Train loss
+                                                                                  6
+
+
+                                       Train loss
+                                                                                                                                                                                                                                                             5.0
+                                                                                  5                                                                                                                                                                          4.5
+                                                                                                                                                                                                                                                             4.0
+                                                                                  4
+                                                                                                                                                                                                                                                             3.5
+                                                                                  3                                                                                                                                                                          3.00                            2000                                         4000         6000                                  8000     10000
+                                                                                         0               2000                 4000         6000                         8000                     10000
+                                                                                                                                  Iteration                                                                                                                                                                                                   Iteration
+                                                                                                                    (a) Llama 2-1B                                                                                                                                                  (b) Llama 3-8B and Llama 2-13B
+Figure 10: (a, b): Loss curves of pre-training Llama series from 1B to 13B. Adam-mini performs on par
+or better than AdamW with 50% less memory, while other methods perform worse. Further, loss curves of
+Adam-mini closely resemble the curves by AdamW.
+3.2 S CALING L AWS OF A DAM - MINI
+We now show the efficacy of Adam-mini through scaling law experiments. We use C4 dataset to
+pre-train the Llama 2 architecture from 39M to 1B. For the model with size nparam , we train the
+model with about 20 ∗ nparam tokens, which is suggested to be the optimal amount by Chinchilla’s
+law (Hoffmann et al., 2022). The largest-scaled experiment we conducted is Llama 2-1B pre-training
+with 26.2B tokens, which takes about 170 GPU hours on 4× A800-80GB GPUs. The total running
+time for the scaling law experiments is about 300 GPU hours.
+                                                                                                                     Llama Series Pre-training (by Chinchilla's Law)                                                                                                                                                                                                 Llama Series Pre-training (by Chinchilla's Law)
+                           6 × 100                                                                                                                                                                                                                                                                                                                                                                      AdamW
+                                                                                                                                                                                                                                                                                                                                                             4 × 100                                    AdamW
+
+
+                                                                                                                                                                                                                                                                                                                               Final Validation loss (log)
+                                                                                                                                                                                                                                                                                                                                                                                                        Adam-mini
+                                                                                                                                                                                                                                                                                                                                                                                                        Adam-mini
+   Validation loss (log)
+
+
+                                                       AdamW-6e-4-39M
+                                                       AdamW-6e-4-67M                                                                                                                                                                                                                                                                                        3 × 100
+                           4 × 100                     AdamW-6e-4-102M
+                                                       AdamW-6e-4-162M
+                                                       AdamW-6e-4-271M
+                                                       AdamW-2e-4-1B
+                                                       Adam-mini-6e-4-39M
+                                                       Adam-mini-6e-4-67M
+                           3 × 100                     Adam-mini-6e-4-102M
+                                                       Adam-mini-6e-4-162M
+                                                       Adam-mini-6e-4-271M
+                                                       Adam-mini-2e-4-1B
+                                                                                                                                                                                                                                                                                                                                                             2 × 100 7
+                                1015                                                                       1016                                        1017                                1018                                                                     1019                                       1020                                                10                  108            109          1010
+                                                                                                                                                                 FLOPs (log)                                                                                                                                                                                                            Parameters (log)
+                                                                                                     (a) Scaling laws in terms of compute                                                                                                                                                                                                 (b) Scaling laws in terms of parameters
+Figure 11: (a, b): Scaling laws of Adam-mini. We pre-train Llama 2 architectures by Chinchilla’s law. For all
+models sized from 39M to 1B, Adam-mini’s loss curves are consistently similar to AdamW, but Adam-mini uses
+50% less memory. Further, as shown in (b), Adam-mini reaches a lower final loss than AdamW for all models.
+The fitted lines in (b) suggest that Adam-mini can be scaled up to larger models (if the scaling law holds).
+As shown in Figure 11, Adam-mini’s loss curves are consistently similar to AdamW. We also
+present the final validation perplexity and find that Adam-mini reaches a slightly lower perplexity
+than AdamW for all models (see Figure 11 (b), also see Table 4 in Appendix D). The fitted lines in
+Figure 11 (b) suggest that Adam-mini can be scaled up to larger models (if the scaling law holds).
+Another advantage of Adam-mini is its ability to reduce computational costs for scaling law
+experiments. Scaling law experiments are typically used to predict the optimal configurations for
+large-scale models by fitting the performance of smaller-scale proxy models. To accelerate the
+development of large-scale models, it is crucial to minimize costs during the fitting process (Hägele
+et al., 2024). Adam-mini achieves this by delivering the same scaling results while using significantly
+less memory and time cost (e.g., 33% less GPU hours, as shown in Figure 1).
+3.3 S UPERVISED F INE - TUNING AND RLHF
+We now test Adam-mini on SFT and RLHF. We use the Llama 2-7B pretrained model (Touvron et al.,
+2023) for our study. We use the ultrafeedback dataset and implement the RLHF workflow from
+(Ouyang et al., 2022). We use ReMax (Li et al., 2023), a memory-efficient alternative to PPO
+
+                                                                                                                                                                           $GDP:                                                                          $GDP:
+                                                                                                                                                                        $GDP PLQL                                                              $GDP PLQL
+
+
+                                          (YDOXDWLRQ 3HUSOH[LW\
+
+
+                                                                                                                                                                                                        (YDOXDWLRQ 5HZDUG
+
+
+                                                                                                                                  ,WHUDWLRQ                                                                                                                                          ,WHUDWLRQ
+
+
+                                                                                                                        (a) SFT                                                                                                                                                     (b) RLHF                                                                                    (c) Sensitivity analysis
+Figure 12: (a, b): SFT, and RLHF when aligning Llama 2-7B. Adam-mini reaches better performance (smaller
+perplexity, higher reward) than AdamW with 50% less memory. (c) Sensitivity analysis of Adam-mini on
+GPT-2-125M pre-training (by Chinchilla’s law). Adam-mini seems not overly sensitive to hyperparameters.
+
+                                                                                                                                                                                                                                                                                    9
+Published as a conference paper at ICLR 2025
+                         6.00                                                                                            Adam-mini-6e-4
+                                                                                                                    8    AdamW-6e-4
+                         5.75                                                                                            Adafactor-1e-4
+                                                                                                                         Adafactor-4e-4
+                                                                                                                         Adafactor-6e-4-1B
+                         5.50    Adam-mini-5e-3                                                                     7    Adafactor-1e-3-1B
+                                 Adafactor-1e-5                                                                          Adafactor-4e-3-1B
+
+
+                                                                                                  Validation loss
+                         5.25    Adafactor-5e-5                                                                          Adafactor-6e-3-1B
+
+
+       Validation loss
+                                 Adafactor-1e-4                                                                          Adafactor-1e-2-1B
+                                 Adafactor-5e-4                                                                     6    Adafactor-Zhai-version-1e-4
+                         5.00    Adafactor-1e-3                                                                          Adafactor-Zhai-version-4e-4
+                                 Adafactor-5e-3                                                                          Adafactor-Zhai-version-6e-4
+                         4.75    Adafactor-1e-2                                                                     5    Adafactor-Zhai-version-1e-3
+                                 Adafactor-Zhai-version-1e-5                                                             Adafactor-Zhai-version-4e-3
+                                 Adafactor-Zhai-version-5e-5                                                             Adafactor-Zhai-version-6e-3
+                         4.50    Adafactor-Zhai-version-1e-4                                                             Adafactor-Zhai-version-1e-2
+                                 Adafactor-Zhai-version-5e-4
+                                 Adafactor-Zhai-version-1e-3
+                                                                                                                    4
+                         4.25    Adafactor-Zhai-version-5e-3
+                                 Adafactor-Zhai-version-1e-2
+                         4.000    500       1000      1500       2000 2500   3000   3500   4000
+                                                                                                                    30         2000              4000         6000   8000   10000
+                                                               Iteration                                                                             Iteration
+
+               (a) Llama 2-20M                 (b) Llama 2-1B          (c) Throughput comparison
+Figure 13: (a, b): Training curves of Adafactor & Adafactor-Zhai-version on Llama 2-20M & Llama 2-1B
+pre-training. We find these two methods consistently underperform Adam-mini. (c): On Llama 2-1B, Adam-mini
+achieves 40% higher throughput than Adafactor (tested on 2× A800-80GB GPUs).
+
+(Schulman et al., 2017), to optimize the preference reward. As shown in Figure 12, Adam-mini
+performs on par or better than AdamW. Adam-mini also achieves better alignment performance on
+MT-Bench using GPT-4 as a judge. The results are shown later in Table 5 in Appendix D.4.
+
+3.4 D ETAILED C OMPARISON WITH A DAFACTOR
+We now carefully compare Adam-mini and the popular memory-efficient optimizer Adafactor.
+Besides the original Adafactor, we also consider a modified version in (Zhai et al., 2022), which we
+call “Adafactor-Zhai-version”. For both versions, we use momentum with β1 = 0.9.
+We first conduct learning rate grid-search on Llama 2-20M and train it following Chinchilla’s law.
+As shown in Figure 13 (a), we find that Adafactor-Zhai-version improves over the original version,
+but both versions of Adafactor are still consistently worse than Adam-mini. We further sweep over
+other hyperparameters including (1) β2 = 0.95; (2) ϵ = {10−30 , 10−16 , 10−8 , 10−6 }; (3) warm-up
+steps = {1%, 2%, 3%, 4%, 5%, 10%} total steps. The results are shown in Appendix D.7. We find
+that the change of hyperparameters does not significantly boost the performance of Adafactor, and
+both versions still underperform Adam-mini.
+We further sweep hyperparameters on Llama 2-1B. In contrast to the case of Llama 2-20M, we find
+that the Adafactor-Zhai-version now suffers from training instability and the original version performs
+better. Nevertheless, they still underperform Adam-mini. In Appendix D.8, we conduct a similar
+hyperparameter search for Lion (Chen et al., 2024b) and we find it also underperforms Adam-mini.
+About hyperparameter tuning. We acknowledge that it might be possible to improve these methods
+if we spend more resources on grid search (as claimed by a recent work (Zhao et al., 2024b)).
+However, based on our experience so far, it is not easy to tune these methods, and to our knowledge,
+there is no much open-source guidance. Recall that there are 9 tunable hyperparameters in
+Adafactor, so it is rather non-trivial to find the correct combination. In contrast, Adam-mini is much
+easier to use. In all our experiments, Adam-mini performs well using the same hyperparameters as
+AdamW (including learning rate, β1 , β2 , ϵ, etc.).
+Throughput comparison. Besides the performance comparison, we further find that Adafactor
+has a higher latency than Adam-mini (Figure 13 (c)). This is primarily due to two reasons. First,
+Adam-mini only requires computing the mean by rows of the weight matrix, whereas Adafactor
+needs to sum across both the rows and the columns. Second, the dimension of v in Adam-mini equals
+the output dimension or the number of heads, which is significantly smaller than the dimension
+of v in Adafactor, which equals the product of the input and output dimension. Note that similar
+latency issues also apply to other variants of Adafactors such as CAME. In contrast, Adam-mini saves
+computation when taking the square root of v. As such, Adam-mini reaches a higher throughput.
+Summary of Section 3. Finally, we summarize three key observations from all the experiments
+above. For all the models we tried, we observed that:
+1. Adam-mini performs on par with AdamW with 50% less memory.
+2. Adam-mini performs well using the same hyperparameters as AdamW.
+3. Adam-mini’s loss curves closely resemble those of AdamW.
+
+4    C ONCLUDING R EMARKS
+We proposed Adam-mini, an optimizer that saves 50% memory of Adam. We remark that there
+is great room to improve the design of Adam-mini: currently Adam-mini uses a simple and cost-
+effective way to design a learning rate for each dense Hessian sub-block, but it might not be an
+optimal way. We leave the development of stronger designs as a future direction.
+
+
+                                                                                                                                                       10
+Published as a conference paper at ICLR 2025
+
+
+ACKNOWLEDGEMENT
+Yushun Zhang would like to sincerely thank Less Wright, Andrew Gu, and other open-source
+contributors for their invaluable support in integrating Adam-mini into the mainstream codebases. The
+work of Ruoyu Sun was supported by NSFC (No. 12326608); Hetao Shenzhen-Hong Kong Science
+and Technology Innovation Cooperation Zone Project (No. HZQSWS-KCCYB-2024016), together
+with Tian Ding; University Development Fund UDF01001491, the Chinese University of Hong
+Kong, Shenzhen; Guangdong Provincial Key Laboratory of Mathematical Foundations for Artificial
+Intelligence (2023B1212010001). The work of Z.-Q. Luo was supported by the Guangdong Major
+Project of Basic and Applied Basic Research (No.2023B0303000001), the Guangdong Provincial Key
+Laboratory of Big Data Computing, and the National Key Research and Development Project under
+grant 2022YFA1003900. The work of Tian Ding is also supported by Internal Project of Shenzhen
+Research Institute of Big Data under Grant J00220240005.
+
+B ROADER I MPACT
+This work designs a new algorithm to reduce the training cost for LLMs. Our algorithm can help the
+community better train large AI models. However, it could be a potential threat if the AI models are
+used for illegal usage.
+
+R EFERENCES
+Josh Achiam, Steven Adler, Sandhini Agarwal, Lama Ahmad, Ilge Akkaya, Florencia Leoni Aleman,
+  Diogo Almeida, Janko Altenschmidt, Sam Altman, Shyamal Anadkat, et al. Gpt-4 technical report.
+  arXiv preprint arXiv:2303.08774, 2023.
+Kwangjun Ahn, Zhiyu Zhang, Yunbum Kook, and Yan Dai. Understanding adam optimizer via online
+ learning of updates: Adam is ftrl in disguise. In Forty-first International Conference on Machine
+ Learning.
+Rohan Anil, Vineet Gupta, Tomer Koren, and Yoram Singer. Memory efficient adaptive optimization.
+  Advances in Neural Information Processing Systems, 32, 2019.
+Anonymous authors. Deconstructing what makes a good optimizer for language models.
+  https://openreview.net/pdf?id=zfeso8ceqr, 2024.
+Pratik Chaudhari, Anna Choromanska, Stefano Soatto, Yann LeCun, Carlo Baldassi, Christian Borgs,
+  Jennifer Chayes, Levent Sagun, and Riccardo Zecchina. Entropy-sgd: Biasing gradient descent
+  into wide valleys. Journal of Statistical Mechanics: Theory and Experiment, 2019(12):124018,
+  2019.
+Junyu Chen, Han Cai, Junsong Chen, Enze Xie, Shang Yang, Haotian Tang, Muyang Li, Yao Lu, and
+  Song Han. Deep compression autoencoder for efficient high-resolution diffusion models. arXiv
+  preprint arXiv:2410.10733, 2024a.
+Tianqi Chen, Bing Xu, Chiyuan Zhang, and Carlos Guestrin. Training deep nets with sublinear
+  memory cost. arXiv preprint arXiv:1604.06174, 2016.
+Xiangning Chen, Chen Liang, Da Huang, Esteban Real, Kaiyuan Wang, Hieu Pham, Xuanyi Dong,
+  Thang Luong, Cho-Jui Hsieh, Yifeng Lu, et al. Symbolic discovery of optimization algorithms.
+  Advances in neural information processing systems, 36, 2024b.
+Ronan Collobert. Large scale machine learning. Technical report, Université de Paris VI, 2004.
+Ganqu Cui, Lifan Yuan, Ning Ding, Guanming Yao, Wei Zhu, Yuan Ni, Guotong Xie, Zhiyuan Liu,
+  and Maosong Sun. Ultrafeedback: Boosting language models with high-quality feedback, 2023.
+André Belotto Da Silva and Maxime Gazeau. A general system of differential equations to model
+  first-order adaptive algorithms. The Journal of Machine Learning Research, 21(1):5072–5113,
+  2020.
+
+
+                                                 11
+Published as a conference paper at ICLR 2025
+
+
+Rudrajit Das, Naman Agarwal, Sujay Sanghavi, and Inderjit S Dhillon. Towards quantifying the
+  preconditioning effect of adam. arXiv preprint arXiv:2402.07114, 2024.
+Yann N Dauphin, Atish Agarwala, and Hossein Mobahi. Neglected hessian component explains
+  mysteries in sharpness regularization. arXiv preprint arXiv:2401.10809, 2024.
+Aaron Defazio, Harsh Mehta, Konstantin Mishchenko, Ahmed Khaled, Ashok Cutkosky, et al. The
+  road less scheduled. arXiv preprint arXiv:2405.15682, 2024.
+Jia Deng, Wei Dong, Richard Socher, Li-Jia Li, Kai Li, and Li Fei-Fei. Imagenet: A large-scale
+   hierarchical image database. In 2009 IEEE conference on computer vision and pattern recognition,
+   pp. 248–255. Ieee, 2009.
+Tim Dettmers, Mike Lewis, Sam Shleifer, and Luke Zettlemoyer. 8-bit optimizers via block-wise
+  quantization. In International Conference on Learning Representations, 2021.
+John Duchi, Elad Hazan, and Yoram Singer. Adaptive subgradient methods for online learning and
+  stochastic optimization. Journal of machine learning research, 12(7), 2011.
+George E Forsythe and Ernst G Straus. On best conditioned matrices. Proceedings of the American
+  Mathematical Society, 6(3):340–345, 1955.
+Behrooz Ghorbani, Shankar Krishnan, and Ying Xiao. An investigation into neural net optimization
+  via hessian eigenvalue density. In International Conference on Machine Learning, pp. 2232–2241.
+  PMLR, 2019.
+Boris Ginsburg, Patrice Castonguay, Oleksii Hrinchuk, Oleksii Kuchaiev, Vitaly Lavrukhin, Ryan
+  Leary, Jason Li, Huyen Nguyen, Yang Zhang, and Jonathan M Cohen. Training deep networks
+  with stochastic gradient normalized by layerwise adaptive second moments. 2019.
+Aaron Gokaslan, Vanya Cohen, Ellie Pavlick, and Stefanie Tellex. Openwebtext corpus, 2019.
+Guy Gur-Ari, Daniel A Roberts, and Ethan Dyer. Gradient descent happens in a tiny subspace. arXiv
+  preprint arXiv:1812.04754, 2018.
+Alexander Hägele, Elie Bakouch, Atli Kosson, Loubna Ben Allal, Leandro Von Werra, and Martin
+  Jaggi. Scaling laws and compute-optimal training beyond fixed training durations. arXiv preprint
+  arXiv:2405.18392, 2024.
+Kaiming He, Xiangyu Zhang, Shaoqing Ren, and Jian Sun. Deep residual learning for image
+  recognition. In Proceedings of the IEEE conference on computer vision and pattern recognition,
+  pp. 770–778, 2016.
+Jonathan Ho, Ajay Jain, and Pieter Abbeel. Denoising diffusion probabilistic models. Advances in
+  neural information processing systems, 33:6840–6851, 2020.
+Jordan Hoffmann, Sebastian Borgeaud, Arthur Mensch, Elena Buchatskaya, Trevor Cai, Eliza
+  Rutherford, Diego de Las Casas, Lisa Anne Hendricks, Johannes Welbl, Aidan Clark, et al.
+  Training compute-optimal large language models. arXiv preprint arXiv:2203.15556, 2022.
+Edward J Hu, Yelong Shen, Phillip Wallis, Zeyuan Allen-Zhu, Yuanzhi Li, Shean Wang, Lu Wang,
+  and Weizhu Chen. Lora: Low-rank adaptation of large language models. arXiv preprint
+  arXiv:2106.09685, 2021.
+Adam Ibrahim, Benjamin Thérien, Kshitij Gupta, Mats L Richter, Quentin Anthony, Timothée Lesort,
+  Eugene Belilovsky, and Irina Rish. Simple and scalable strategies to continually pre-train large
+  language models. arXiv preprint arXiv:2403.08763, 2024.
+Kaiqi Jiang, Dhruv Malik, and Yuanzhi Li. How does adaptive optimization impact local neural
+  network geometry? Advances in Neural Information Processing Systems, 36, 2023.
+Diederik P Kingma and Jimmy Ba. Adam: A method for stochastic optimization. arXiv preprint
+  arXiv:1412.6980, 2014.
+
+
+                                                12
+Published as a conference paper at ICLR 2025
+
+
+Thomas N Kipf and Max Welling. Semi-supervised classification with graph convolutional networks.
+  In International Conference on Learning Representations, 2016.
+
+Fuad Kittaneh. Spectral radius inequalities for hilbert space operators. Proceedings of the American
+  Mathematical Society, pp. 385–390, 2006.
+
+Frederik Kunstner, Jacques Chen, Jonathan Wilder Lavington, and Mark Schmidt. Noise is not the
+  main factor behind the gap between sgd and adam on transformers, but sign descent might be.
+  arXiv preprint arXiv:2304.13960, 2023.
+
+Frederik Kunstner, Robin Yadav, Alan Milligan, Mark Schmidt, and Alberto Bietti. Heavy-tailed
+  class imbalance and why adam outperforms gradient descent on language models. arXiv preprint
+  arXiv:2402.19449, 2024.
+
+Bingrui Li, Jianfei Chen, and Jun Zhu. Memory efficient optimizers with 4-bit states. Advances in
+  Neural Information Processing Systems, 36, 2024.
+
+Ziniu Li, Tian Xu, Yushun Zhang, Yang Yu, Ruoyu Sun, and Zhi-Quan Luo. Remax: A simple, effec-
+  tive, and efficient method for aligning large language models. arXiv preprint arXiv:2310.10505,
+  2023.
+
+Zhenyu Liao and Michael W Mahoney. Hessian eigenspectra of more realistic nonlinear models.
+  Advances in Neural Information Processing Systems, 34:20104–20117, 2021.
+
+Hong Liu, Zhiyuan Li, David Hall, Percy Liang, and Tengyu Ma. Sophia: A scalable stochastic
+  second-order optimizer for language model pre-training. arXiv preprint arXiv:2305.14342, 2023.
+
+Yang Liu, Jeremy Bernstein, Markus Meister, and Yisong Yue. Learning by turning: Neural
+  architecture aware optimisation. In International Conference on Machine Learning, pp. 6748–
+  6758. PMLR, 2021a.
+
+Ze Liu, Yutong Lin, Yue Cao, Han Hu, Yixuan Wei, Zheng Zhang, Stephen Lin, and Baining Guo.
+  Swin transformer: Hierarchical vision transformer using shifted windows. In Proceedings of the
+  IEEE/CVF international conference on computer vision, pp. 10012–10022, 2021b.
+
+Ilya Loshchilov and Frank Hutter.      Decoupled weight decay regularization.       arXiv preprint
+   arXiv:1711.05101, 2017.
+
+Qijun Luo, Hengxu Yu, and Xiao Li. Badam: A memory efficient full parameter training method for
+  large language models. arXiv preprint arXiv:2404.02827, 2024.
+
+Yang Luo, Xiaozhe Ren, Zangwei Zheng, Zhuo Jiang, Xin Jiang, and Yang You. Came: Confidence-
+  guided adaptive memory efficient optimization. arXiv preprint arXiv:2307.02047, 2023.
+
+Kai Lv, Hang Yan, Qipeng Guo, Haijun Lv, and Xipeng Qiu. Adalomo: Low-memory optimization
+  with adaptive learning rate. arXiv preprint arXiv:2310.10195, 2023a.
+
+Kai Lv, Yuqing Yang, Tengxiao Liu, Qinghui Gao, Qipeng Guo, and Xipeng Qiu. Full parameter
+  fine-tuning for large language models with limited resources. arXiv preprint arXiv:2306.09782,
+  2023b.
+
+Sadhika Malladi, Tianyu Gao, Eshaan Nichani, Alex Damian, Jason D Lee, Danqi Chen, and Sanjeev
+  Arora. Fine-tuning language models with just forward passes. Advances in Neural Information
+  Processing Systems, 36:53038–53075, 2023.
+
+James Martens and Roger Grosse. Optimizing neural networks with kronecker-factored approximate
+  curvature. In International conference on machine learning, pp. 2408–2417. PMLR, 2015.
+
+Francesco Orabona.     Neural networks (maybe) evolved to make adam the best
+  optimizer.     2020.       URL https://parameterfree.com/2020/12/06/
+  neural-network-maybe-evolved-to-make-adam-the-best-optimizer/.
+
+
+                                                13
+Published as a conference paper at ICLR 2025
+
+
+Long Ouyang, Jeffrey Wu, Xu Jiang, Diogo Almeida, Carroll Wainwright, Pamela Mishkin, Chong
+  Zhang, Sandhini Agarwal, Katarina Slama, Alex Ray, et al. Training language models to follow
+  instructions with human feedback. Advances in neural information processing systems, 35:27730–
+  27744, 2022.
+Yan Pan and Yuanzhi Li. Toward understanding why adam converges faster than sgd for transformers.
+  arXiv preprint arXiv:2306.00204, 2023.
+Vardan Papyan. The full spectrum of deepnet hessians at scale: Dynamics with sgd training and
+  sample size. arXiv preprint arXiv:1811.07062, 2018.
+Vardan Papyan. Measurements of three-level hierarchical structure in the outliers in the spectrum of
+  deepnet hessians. arXiv preprint arXiv:1901.08244, 2019.
+Vardan Papyan. Traces of class/cross-class structure pervade deep learning spectra. The Journal of
+  Machine Learning Research, 21(1):10197–10260, 2020.
+Barak A Pearlmutter. Fast exact multiplication by the hessian. Neural computation, 6(1):147–160,
+  1994.
+William Peebles and Saining Xie. Scalable diffusion models with transformers. In Proceedings of
+ the IEEE/CVF International Conference on Computer Vision, pp. 4195–4205, 2023.
+Zhaonan Qu, Wenzhi Gao, Oliver Hinder, Yinyu Ye, and Zhengyuan Zhou. Optimal diagonal
+  preconditioning: Theory and practice. arXiv preprint arXiv:2209.00809, 2022.
+Alec Radford, Jeffrey Wu, Rewon Child, David Luan, Dario Amodei, Ilya Sutskever, et al. Language
+  models are unsupervised multitask learners. OpenAI blog, 1(8):9, 2019.
+Colin Raffel, Noam Shazeer, Adam Roberts, Katherine Lee, Sharan Narang, Michael Matena,
+  Yanqi Zhou, Wei Li, and Peter J. Liu. Exploring the limits of transfer learning with a unified
+  text-to-text transformer. Journal of Machine Learning Research, 21(140):1–67, 2020. URL
+  http://jmlr.org/papers/v21/20-074.html.
+Samyam Rajbhandari, Jeff Rasley, Olatunji Ruwase, and Yuxiong He. Zero: Memory optimizations
+  toward training trillion parameter models. In SC20: International Conference for High Performance
+  Computing, Networking, Storage and Analysis, pp. 1–16. IEEE, 2020.
+Samyam Rajbhandari, Olatunji Ruwase, Jeff Rasley, Shaden Smith, and Yuxiong He. Zero-infinity:
+  Breaking the gpu memory wall for extreme scale deep learning. In Proceedings of the international
+  conference for high performance computing, networking, storage and analysis, pp. 1–14, 2021.
+Nicolas Roux, Pierre-Antoine Manzagol, and Yoshua Bengio. Topmoumoute online natural gradient
+  algorithm. Advances in neural information processing systems, 20, 2007.
+Levent Sagun, Leon Bottou, and Yann LeCun. Eigenvalues of the hessian in deep learning: Singularity
+  and beyond. arXiv preprint arXiv:1611.07476, 2016.
+Levent Sagun, Utku Evci, V Ugur Guney, Yann Dauphin, and Leon Bottou. Empirical analysis of the
+  hessian of over-parametrized neural networks. arXiv preprint arXiv:1706.04454, 2017.
+Adepu Ravi Sankar, Yash Khasbage, Rahul Vigneswaran, and Vineeth N Balasubramanian. A deeper
+  look at the hessian eigenspectrum of deep neural networks and its applications to regularization. In
+  Proceedings of the AAAI Conference on Artificial Intelligence, volume 35, pp. 9481–9488, 2021.
+John Schulman, Filip Wolski, Prafulla Dhariwal, Alec Radford, and Oleg Klimov. Proximal policy
+  optimization algorithms. arXiv preprint arXiv:1707.06347, 2017.
+Noam Shazeer and Mitchell Stern. Adafactor: Adaptive learning rates with sublinear memory cost.
+  In International Conference on Machine Learning, pp. 4596–4604. PMLR, 2018.
+Naichen Shi, Dawei Li, Mingyi Hong, and Ruoyu Sun. Rmsprop converges with proper hyper-
+  parameter. In International Conference on Learning Representations, 2020.
+
+
+                                                 14
+Published as a conference paper at ICLR 2025
+
+
+Ruoyu Sun and Yinyu Ye. Worst-case complexity of cyclic coordinate descent: O (nˆ 2) o (n 2) gap
+  with randomized version. Mathematical Programming, 185:487–520, 2021.
+Gemini Team, Rohan Anil, Sebastian Borgeaud, Yonghui Wu, Jean-Baptiste Alayrac, Jiahui Yu, Radu
+  Soricut, Johan Schalkwyk, Andrew M Dai, Anja Hauth, et al. Gemini: a family of highly capable
+  multimodal models. arXiv preprint arXiv:2312.11805, 2023.
+Hugo Touvron, Louis Martin, Kevin Stone, Peter Albert, Amjad Almahairi, Yasmine Babaei, Nikolay
+  Bashlykov, Soumya Batra, Prajjwal Bhargava, Shruti Bhosale, et al. Llama 2: Open foundation
+  and fine-tuned chat models. arXiv preprint arXiv:2307.09288, 2023.
+Ashish Vaswani, Noam Shazeer, Niki Parmar, Jakob Uszkoreit, Llion Jones, Aidan N Gomez, Łukasz
+  Kaiser, and Illia Polosukhin. Attention is all you need. Advances in neural information processing
+  systems, 30, 2017.
+Petar Veličković, Guillem Cucurull, Arantxa Casanova, Adriana Romero, Pietro Lio, and Yoshua
+  Bengio. Graph attention networks. arXiv preprint arXiv:1710.10903, 2017.
+Petar Velickovic, Guillem Cucurull, Arantxa Casanova, Adriana Romero, Pietro Lio, Yoshua Bengio,
+  et al. Graph attention networks. stat, 1050(20):10–48550, 2017.
+Bohan Wang, Yushun Zhang, Huishuai Zhang, Qi Meng, Zhi-Ming Ma, Tie-Yan Liu, and Wei Chen.
+  Provable adaptivity in adam. arXiv preprint arXiv:2208.09900, 2022.
+Yikai Wu, Xingyu Zhu, Chenwei Wu, Annie Wang, and Rong Ge. Dissecting hessian: Understanding
+  common structure of hessian in neural networks. arXiv preprint arXiv:2010.04261, 2020.
+Xingyu Xie, Pan Zhou, Huan Li, Zhouchen Lin, and Shuicheng Yan. Adan: Adaptive nesterov
+  momentum algorithm for faster optimizing deep models. arXiv preprint arXiv:2208.06677, 2022.
+Zhewei Yao, Amir Gholami, Qi Lei, Kurt Keutzer, and Michael W Mahoney. Hessian-based analysis
+  of large batch training and robustness to adversaries. Advances in Neural Information Processing
+  Systems, 31, 2018.
+Zhewei Yao, Amir Gholami, Kurt Keutzer, and Michael W Mahoney. Pyhessian: Neural networks
+  through the lens of the hessian. In 2020 IEEE international conference on big data (Big data), pp.
+  581–590. IEEE, 2020.
+Yang You, Jing Li, Sashank Reddi, Jonathan Hseu, Sanjiv Kumar, Srinadh Bhojanapalli, Xiaodan
+  Song, James Demmel, Kurt Keutzer, and Cho-Jui Hsieh. Large batch optimization for deep
+  learning: Training bert in 76 minutes. arXiv preprint arXiv:1904.00962, 2019.
+David Young. Iterative methods for solving partial difference equations of elliptic type. Transactions
+  of the American Mathematical Society, 76(1):92–111, 1954.
+Xiaohua Zhai, Alexander Kolesnikov, Neil Houlsby, and Lucas Beyer. Scaling vision transformers.
+  In Proceedings of the IEEE/CVF conference on computer vision and pattern recognition, pp.
+  12104–12113, 2022.
+Guodong Zhang, Lala Li, Zachary Nado, James Martens, Sushant Sachdeva, George Dahl, Chris
+  Shallue, and Roger B Grosse. Which algorithmic choices matter at which batch sizes? insights
+  from a noisy quadratic model. Advances in neural information processing systems, 32, 2019a.
+Jingzhao Zhang, Tianxing He, Suvrit Sra, and Ali Jadbabaie. Why gradient clipping accelerates
+   training: A theoretical justification for adaptivity. arXiv preprint arXiv:1905.11881, 2019b.
+Jingzhao Zhang, Sai Praneeth Karimireddy, Andreas Veit, Seungyeon Kim, Sashank Reddi, Sanjiv
+   Kumar, and Suvrit Sra. Why are adaptive methods good for attention models? Advances in Neural
+   Information Processing Systems, 33:15383–15393, 2020.
+Yushun Zhang, Congliang Chen, Naichen Shi, Ruoyu Sun, and Zhi-Quan Luo. Adam can converge
+  without any modification on update rules. Advances in Neural Information Processing Systems, 35:
+  28386–28399, 2022.
+
+
+                                                 15
+Published as a conference paper at ICLR 2025
+
+
+Yushun Zhang, Congliang Chen, Tian Ding, Ziniu Li, Ruoyu Sun, and Zhi-Quan Luo. Why trans-
+  formers need adam: A hessian perspective. arXiv preprint arXiv:2402.16788, 2024.
+Jiawei Zhao, Zhenyu Zhang, Beidi Chen, Zhangyang Wang, Anima Anandkumar, and Yuandong
+   Tian. Galore: Memory-efficient llm training by gradient low-rank projection. arXiv preprint
+   arXiv:2403.03507, 2024a.
+Rosie Zhao, Depen Morwani, David Brandfonbrener, Nikhil Vyas, and Sham Kakade. Deconstructing
+  what makes a good optimizer for language models. arXiv preprint arXiv:2407.07972, 2024b.
+Lianmin Zheng, Wei-Lin Chiang, Ying Sheng, Siyuan Zhuang, Zhanghao Wu, Yonghao Zhuang,
+  Zi Lin, Zhuohan Li, Dacheng Li, Eric Xing, et al. Judging llm-as-a-judge with mt-bench and
+  chatbot arena. Advances in Neural Information Processing Systems, 36, 2024.
+Shuai Zheng and James T Kwok. Blockwise adaptivity: Faster training and better generalization in
+  deep learning. arXiv preprint arXiv:1905.09899, 2019.
+
+
+                                               16
+Published as a conference paper at ICLR 2025
+
+
+A    R ELATED WORKS
+
+Understanding of Adam. There is an active line of works trying to understand why Adam works
+well (Zhang et al., 2019b; Wu et al., 2020; Shi et al., 2020; Zhang et al., 2022; Wang et al., 2022; Pan
+& Li, 2023; Jiang et al., 2023; Kunstner et al., 2023; Zhang et al., 2024; Ahn et al.; Kunstner et al.,
+2024). In contrast to these works, we point out that Adam’s v might not function at its full potential
+as effectively as we expected: sometimes fewer learning rates can reach the same or better results
+(due to the dense Hessian sub-blocks). Our findings might motivate stronger optimizers that better fit
+the neural-net Hessian structure.
+Similarly to in our Section 2.1, a recent work (Das et al., 2024) also explores the effectiveness of
+Adam’s preconditioner DAdam from a linear algebra perspective. They focus on (a variant of) Adam
+and prove the following result: First, for diagonal dominant (DD) matrix Hb when the dimension d is
+less than κ1/3 , their modified version of Adam exhibits a faster convergence rate compared to gradient
+descent (GD); Second, for non-DD matrix, the constant terms in Adam’s upper bound can be much
+larger than that of GD. Their results take a valuable and important step towards understanding DAdam .
+However, these results cannot fully support our numerical findings in Figure 5. This is because they
+only provide an upper bound for the non-DD case, while we need a lower bound. We note that it is
+rather difficult to derive the desired lower bound, and we leave it as a future direction.
+On the Hessian of Neural Nets. Hessian matrix is crucial for the behaviors of gradient methods.
+There are several important attempts to study the Hessian of MLPs and CNNs (Collobert, 2004;
+Roux et al., 2007; Martens & Grosse, 2015; Sagun et al., 2016; 2017; Chaudhari et al., 2019; Papyan,
+2020; Wu et al., 2020; Liao & Mahoney, 2021; Papyan, 2018; 2019; Sankar et al., 2021; Gur-Ari
+et al., 2018; Yao et al., 2018; Zhang et al., 2019a; Ghorbani et al., 2019; Yao et al., 2020; Dauphin
+et al., 2024). Inspired by these works, we explore the Hessian structure of Transformers and connect
+it to the behaviors of Adam. We then find room to improve and propose to slim down Adam into
+Adam-mini.
+Lightweight optimizers for general tasks. There are several attempts to reduce the memory cost
+of Adam. Adafactor (Shazeer & Stern, 2018) and its variant CAME (Luo et al., 2023) conduct
+nonnegative low-rank factorization over Adam’s v. SM3 (Anil et al., 2019) is a lightweight version
+of AdaGrad (Duchi et al., 2011). SM3 chooses the learning rate of the i-th parameter by taking
+the minimal value in a certain candidate set, and each element in the candidate set is related to the
+maximal squared gradient under a predetermined cover. All these aforementioned methods could
+release almost all memory for v and save about 48% of Adam’s memory. However, we find that their
+performance degenerate in various experiments, while Adam-mini maintains as effective as AdamW
+(as shown in Section 3).
+After completing this work, we noticed two methods that share some of the ideas of Adam-mini:
+BAGM (Zheng & Kwok, 2019) and NovoGrad (Ginsburg et al., 2019). Both of them use block-wise
+or layer-wise adaptive learning rates to achieve robust performance and better generalization. We
+summarize their key differences with Adam-mini. BAGM partitions parameters to reach minimal-
+norm solutions and achieve provable robustness. In particular, their theory in Proposition 1 states that
+layer-by-layer parameter partition can lead to minimum ℓ-2 norm solutions. Aligning with the theory,
+they find that the PyTorch default partition (BAGM-B.1) indeed brings overall the best performance
+on both CIFAR-10 and ImageNet. Although the PyTorch default partition may have benefits on
+robustness, we find that it overlooks the Hessian structure and oversimplifies the training problem for
+Transformers (as we discussed in Section 2.3). As a result, the PyTorch default partition will lead
+to training instability in large-scale LLMs, and this is evident in our failed preliminary versions of
+Adam-mini in Figure 7 and 8. We then propose a new partition strategy Algorithm 3 which partition
+parameters by the smallest dense Hessian sub-blocks. For Transformers, Algorithm 3 uses different
+strategies for different building blocks (e.g., partition the embedding layer by tokens, and partition
+Query by heads) and we find that Algorithm 3 is necessary to stabilize the training.
+As for NovoGrad, it also uses a layer-wise learning rate design (by PyTorch default partition) and
+thus face the same training instability issues as BAGM. Further, NovoGrad introduces a different
+design to 1st-order momentum: instead of performing weighted-sum on the past gradients, it performs
+weighted-sum on “the current gradient divided by the 2nd-order momentum". Such design is largely
+different from AdamW and Adam-mini. It remain unclear whether this design can work on large-scale
+tasks like LLMs.
+
+
+                                                  17
+ Published as a conference paper at ICLR 2025
+
+
+ Besides algorithmic design, our work also provides new understandings of Adam, and particularly,
+ how Adam behaves on generic optimization problems with near-block-diagonal Hessian. We also
+ provide new findings on the Hessian structure of Transformers and provide new principles for
+ designing better algorithms.
+ Other orthogonal methods. The idea of Adam-mini can be orthogonally combined with various
+ existing methods. We list two most relevant examples here.
+1. GaLore (Zhao et al., 2024a) is a new memory-efficient optimizer for LLMs. Given a gradient
+   matrix g, GaLore calculates a low-rank gradient estimator ĝ and then calculates m and v based on
+   this ĝ. Adam-mini can potentially be combined with GaLore to reach further memory reduction on
+   v. The combined method, e.g., “GaLore-mini", can further reduce about 40% memory on GaLore
+   and about 81% on AdamW in total.5 Additionally, GaLore-mini can ease the offload burden and
+   enhance the throughput of GaLore, especially when training on customer-level GPUs with limited
+   memory.
+2. Sophia (Liu et al., 2023) is another recent diagonal preconditioned optimizer. Just as Adam, Sophia
+   requires memory for m and v. It is possible to combine Adam-mini and Sophia to get “Sophia-
+   mini", which saves up to 50% of memory in Sophia. Sophia-mini can also enhance throughput and
+   further speed up Sophia on wall-clock time as in Table 2.
+We list more potential combinations here. LoRA (Hu et al., 2021) is a memory-efficient method
+for SFT tasks. This method fine-tunes the model via additive low-rank adaptors and uses Adam to
+update these adaptors. Note that the Adam steps in LoRA can be replaced by Adam-mini. As a
+result, Adam-mini brings better performance (Figure 22). In parallel to our work, BAdam (Luo et al.,
+2024) conducts SFT in a block-coordinate-descent (BCD) fashion. This method requires repeated
+Adam steps to solve the sub-problem in BCD. Similarly as in LoRA, the Adam steps in BAdam
+can be replaced by Adam-mini to further reduce memory. Nero optimizer (Liu et al., 2021a) also
+cuts down the memory of Adam. It removes the 1st-order momentum and uses a neuron-specific
+projected gradient-style update. According to (Liu et al., 2021a), their design imposes constraints
+on weight matrices and has the advantage of “balanced excitation and inhibition". Such design can
+potentially be combined with Adam-mini to further boost performance. To save the memory cost
+for fine-tuning LLMs, MeZO (Malladi et al., 2023) uses zeroth-order methods to approximate the
+gradient information. It is possible to combine this idea with Adam-mini to further save memory
+for SFT. Adam-mini can also potentially be combined with other diagonal preconditioned methods
+(such as AdaGrad (Duchi et al., 2011) and Adan (Xie et al., 2022)) as well as recent schedule-free
+optimizers such as SchedulefreeAdamW (Defazio et al., 2024).
+There are several other tricks that ease GPU memory burden but are orthogonal to optimizer design.
+These tricks include gradient checkpointing (Chen et al., 2016), model offloading and sharding
+(Rajbhandari et al., 2020; 2021), quantization (Dettmers et al., 2021; Li et al., 2024), and fused update
+(Lv et al., 2023a;b). Adam-mini can be implemented upon these tricks.
+ Finally, we discuss another popular adaptive optimizer called LAMB (You et al., 2019) (see Algo-
+ rithm 7 in Appendix E.1). LAMB might be misunderstood as a similar optimizer to Adam-mini, but
+ actually, it is not. We emphasize that Adam-mini is significantly
+                                                               √ different from LAMB. First, LAMB
+ still keeps
+         √    the same coordinate-wise  learning-rate design 1/   v as in Adam. Second, in addition to
+ this 1/ v, LAMB re-scales the parameters in a layer-by-layer fashion. This re-scaling design is often
+ known as the “layer-wise learning rates", but to be precise,√ it is actually an additional “layer-wise
+ scaling" besides the “coordinate-wise learning rates 1/ v". As a result, LAMB does not save
+ memory over Adam and its overall design is quite different from Adam-mini. This is understandable
+ because LAMB is designed for large-batch training, not for memory saving. Numerically, we find
+ that LAMB performs worse than Adam-mini on GPT2 pre-training (Figure 10).
+
+
+     5
+       These results are calculated based on (Zhao et al., 2024a, Table 1). We consider Llama 2-7B and r = 1024
+ in GaLore.
+
+
+                                                      18
+Published as a conference paper at ICLR 2025
+
+
+B    T HE C OMPLETE F ORM OF A DAM - MINI
+
+We now present the specific realization of Adam-mini on Transformers and other architectures. To be
+precise, Algorithm 3 should be renamed as “Partition for CNNs, Diffusion models, and Graph Neural
+Networks", since we have only tested Algorithm 3 on these models. In the future, it is possible
+that we will have more complicated non-Transformer architectures on which Algorithm 3 fails. In
+those cases, we need to investigate the Hessian structure of these new architectures (like what we did
+for Transformers) and then develop the concrete partition algorithms following our Principle 1 in
+Section 2.2.
+
+Algorithm 2 Adam-mini in Pytorch style     Algorithm 3 Partition for Transformers
+ 1: Input weight-decay coefficient λ and    1: param_blocks = {}
+    current step t                          2: for name, param in parameters do
+ 2: Choose param_blocks from                3:   if ’embed’ or ’output’ in name then
+    Algorithm 3 or 3                        4:      Partition param by tokens
+ 3: for param in param_blocks do            5:      for i = 0...tokens-1 do
+ 4:   g = param.grad                        6:         param_blocks[name+i]=param[i]
+ 5:   param = param - ηt ∗ λ∗ param         7:      end for
+ 6:   m = (1 − β1 ) ∗ g + β1 ∗ m            8:   else if ’query’ or ’key’ in name then
+              m                                     Partition param by heads
+ 7:   m̂ = 1−β  t                           9:
+                1
+ 8:   v = (1 − β2 ) ∗ mean(g ⊙ g) + β2 ∗ v 10:      for i = 0...heads-1 do
+ 9:           v
+      v̂ = 1−β t                           11:         param_blocks[name+i]=param[i]
+                2
+                                m̂
+                                           12:      end  for
+10:   param = param - ηt * √v̂+ϵ           13:   else if ’value’, ’attn.proj’, or ’mlp’
+11: end for                                      in name then
+                                           14:      Partition param by output neurons
+                                           15:      for i = 0...output_neurons-1 do
+                                           16:         param_blocks[name+i]=param[i]
+Algorithm 3 Partition for non-Transformers 17:      end for
+ 1: param_blocks = {}                      18:   else
+ 2: for name, param in parameters do       19:      param_blocks[name]=param
+ 3:   param_blocks[name]=param 20:               end if
+ 4: end for                                21: end for
+ 5: return param_blocks                    22: return param_blocks
+
+
+
+C    M ORE D ISCUSSIONS
+
+Analysis in (Collobert, 2004). We now briefly restate the analysis in (Collobert, 2004) on “why
+does the Hessian of neural networks exihibts near-block-diagonal structure?". Consider a standard
+           learning problem: minimizing ℓ(f (θ, x), y) where ℓ(·, ·) is the Cross-Entropy (CE) loss,
+supervised P
+              n
+f (θ, x) = i=1 vi ϕ(wi⊤ x) is an 1-hidden-layer neural net with input x ∈ Rd , weight wi ∈ Rd ,
+vi ∈ R, and label y ∈ {0, 1}, then the off-diagonal-block Hessian elements would contain
+              ∂ 2 ℓ(f (θ, x), y)
+                                 = p(x) (1 − p(x))vi vj ϕ′ wi⊤ x ϕ′ wj⊤ x xx⊤   for i ̸= j,        (3)
+                   ∂wi ∂wj
+ where p(x) = 1/(1+exp(−yf (θ, x))) and ϕ′ (·) is the derivative of ϕ(·). Since the training objective
+is to maximize p(x), the term p(x) (1 − p(x)) will quickly shrink to zero. This term will push the
+Hessian to near-block-diagonal structure where each block corresponds to one output neuron. The
+authors report that this can happen just after 1 training step, as restated in Figure 3 (a). We also
+numerically reproduce this result on a small MLP on CIFAR-100 in Figure 3 (b,c,d), and show that
+the near-block-diagonal Hessian structure maintains along training.
+Finally, we note that this analysis is rather informal. We leave a more rigorous theoretical study is
+left for future work.
+Why using average v as learning rates. In Line 9 of Algorithm 1, we use the average of v in a
+block as the learning rate for that block. We choose such a design due to the following reasons.
+
+
+                                                 19
+Published as a conference paper at ICLR 2025
+
+
+• First: grid-search is too expensive. Optimal blockwise learning rates can be powerful (as evident
+  in Figure 6), but they are too expensive to search. Such a searching procedure is not scalable.
+• Second: average of v can be borrowed from Adam. Compared to searching all the learning rates
+  from scratch, it is much easier to "borrow" them from the current design of Adam. The average of
+  v is the most natural quantity to "borrow" and it performs the best among other candidates such as
+  the maximum of v (see the ablation studies in Appendix D.2). We find that the average of v helps
+  Adam-mini to be as effective as Adam (though not significantly surpassing it).
+• Third: average of v keeps us close to Adam. For neural nets, we find that the average of v is
+  a good representative for the whole v in the block, and can help Adam-mini keep close to Adam.
+  The reason comes from backpropagation (BP) rule: for one data sample, the gradient of the weight
+  matrix W ∈ Rd×d can be expressed as G := ∂W       ∂ℓ
+                                                        = ez ⊤ ∈ Rd×d , where e is certain BP error
+  vector and z is the input feature to the current weight. For all entries in the i-th row of G, they
+  all share the same BP error term ei , which is usually non-negligible when G ̸= 0. Therefore, G
+  usually has similar entries within a row (which associates with the same output neuron), and its
+  mean value can be a good representative of the whole row. As a result, we find that Adam-mini’s
+  trajectory closely resembles that of Adam (see the curves in Figure 8 and Figure 10). One resulting
+  advantage is that Adam-mini can maintain the scaling laws of LLMs trained by Adam, while
+  substantially saving the training cost (see evidence in Figure 11).
+
+
+D     M ORE E XPERIMENTAL R ESULTS
+
+D.1   M ORE R ESULTS FOR M OTIVATION
+
+In Section 2, we showed that “Adam’s v is redundant on dense Hessian subblock". We provide
+experiments on random quadratic functions to support the claim. Here, we conduct the following new
+experiments on a 1-layer Transformer. We will show that "using single learning rate per block" is
+also sufficient for Transformers.
+The following Exp 1 and 2 extend the random quadratic experiments in Figure 4 and 5 to Trans-
+formers.
+Exp 1: Adam’s learning rate is redundant on the dense Hessian subblock. We take some small
+dense blocks in the Hessian of 1-layer Transformer and denoted as H. We compare κ(H) and
+κ(DAdam H) as in the paper. We find Adam is not effective in reducing the kappa of these blocks,
+and many lrs in Adam can be redundant.
+
+Table 3: Comparison of κ(H) and κ(DAdam H) for the dense blocks in the Hessian of 1-layer
+Transformer.
+
+                       Hessian Block                   κ(H)     κ(DAdam H)
+                       1st head in Query               103.80     176.88
+                       1st head in Key                 103.46     213.82
+                       1st head in Value               165.66     332.76
+                       1st neuron in attn.proj          39.92      94.56
+                       1st neuron in MLP_fc1            22.04      70.92
+                       1st neuron in MLP_c_proj         63.85     236.71
+
+
+Exp 2: Single learning rate per block is sufficient. We conduct the "block-wise GD" and we
+grid-search the learning rate for each block. The result is shown in the following figure. We find that
+block-wise GD outperforms AdamW. This extends the setting from the random quadratic problem in
+Figure 4.
+Combining Exp 1 and 2, we can see that Adam is redundant on the dense Hessian subblocks (Exp 1),
+and a single lr for each block can work well (Exp 2). These experiments show that our conclusions
+on random quadratic problems can be extended to Transformers.
+
+
+                                                  20
+Published as a conference paper at ICLR 2025
+
+
+
+                                     1.8             Results on a 1-layer Transformer
+                                                                                        Adam
+                                                                                        Adam_mini
+                                     1.6                                                Blockwise_GD
+
+
+                   Validation Loss
+                                     1.4
+
+                                     1.2
+
+                                     1.00       20           40               60          80          100
+                                                                  Iteration
+Figure 14: On a 1-layer Transformer, we conduct the "blockwise GD" and we grid-search the learning
+rate for each block. We find that blockwise GD outperforms AdamW.
+
+D.2   A BLATION S TUDIES ON THE D ESIGN OF A DAM - MINI
+
+We here provide more reasons why we choose mean(v) as the blockwise learning rates. We
+conduct ablation studies on different choices of quantities that we can borrow from Adam, including
+2-norm(v), 1-norm(v), max(v), and min(v). we found that all these candidates perform worse
+than mean(v) in Adam-mini.
+                      5.0                Llama 2-20M Pre-training
+
+
+                                     4.8
+                   Validation loss
+
+
+                                     4.6
+
+                                     4.4
+                                             Adam-mini (1-norm(v))-5e-3
+                                             Adam-mini (2-norm(v))-5e-3
+                                     4.2     Adam-mini (max(v))-5e-3
+                                             Adam-mini (min(v))-5e-3
+                                             Adam-mini-5e-3
+                                     4.00   500 1000 1500 2000 2500                3000        3500   4000
+                                                                 Iteration
+Figure 15: Ablation studies on the design of Adam-mini. We find that mean(v) performs better than
+other candidates. The blue curve does not show because the algorithm diverges and the curve is out
+of range.
+
+D.3   M ORE R ESULTS ON THE S CALING L AW E XPERIMENTS
+
+The complete loss curves of Llama 2-1B. We here present the complete validation loss curve of
+Llama 2-1B, training on 20B tokens, which corresponds to the rightmost curve in the scaling law
+experiments in Figure 11 (a). We note that this is a complete pre-training run under the definition
+of Chinchila’s law (Hoffmann et al., 2022). We find that Adam-mini’s loss curves closely resemble
+those of AdamW.
+The final validation perplexity. In Table 4, we present the final validation perplexity for all models
+after training on the token amount suggested by Chinchilla’s law (Hoffmann et al., 2022). For all
+models from 39M to 1B, we find that Adam-mini reaches a lower validation perplexity than AdamW.
+
+D.4   GPT-4 EVALUATION SCORE OF SFT AND RLHF
+
+On the pre-trained Llama 2-7B (released by Meta (Touvron et al., 2023)), we run Adam-mini on
+downstream tasks including SFT and RLHF. We evaluate the alignment performance in terms of
+chat ability using the MT-Bench (Zheng et al., 2024), where GPT-4 assesses multi-turn chatting
+capabilities and assigns a score from 0 to 10 (higher is better). Our results, presented in Table 5,
+demonstrate that Adam-mini can outperform AdamW.
+
+
+                                                                   21
+Published as a conference paper at ICLR 2025
+
+
+
+                               4.5
+                                                                                    AdamW-2e-4-1B
+                                                                                    Adam-mini-2e-4-1B
+                               4.0
+
+
+                               3.5
+
+
+                    Val loss
+                               3.0
+
+
+                               2.5
+
+                                     0   25000 50000 75000 100000 125000 150000 175000 200000
+                                                           Iteration
+Figure 16: Loss curves of pre-training Llama 2-1B on 26B tokens. This is a complete pre-training
+run under the definition Chinchila’s law. We find that Adam-mini performs similarly to AdamW
+throughout the training, but with 50% less memory.
+Table 4: Final validation perplexity for all models pre-trained by Adam and Adam-mini. The token
+amount follows Chinchila’s law. After pre-training, Adam-mini reaches a lower validation perplexity
+than AdamW.
+
+             Model size                   39M        67M       102M          162M          271M             1B
+             Total tokens                1.02B      1.76B      2.67B         4.25B         7.10B          26.21B
+              AdamW                      40.795     29.319     24.670        20.360        17.178         12.452
+             Adam-mini                   40.407     29.014     24.192        20.172        17.035         12.372
+
+           Table 5: Averaged GPT-4 evaluation score (↑) of SFT and RLHF on the MT-Bench.
+                                     SFT (LoRA)                        SFT                              RLHF
+                       AdamW              Adam-mini        AdamW        Adam-mini            AdamW         Adam-mini
+         MT-Bench              4.23          4.41            5.37            5.40              5.54            5.68
+
+
+
+D.5    N ON -LLM TASKS
+
+We now evaluate Adam-mini on non-LLM tasks. Table 6 shows the results for the training of
+ResNet18(He et al., 2016), Swin-Transformer (Liu et al., 2021b), DiT-XL-2 (Peebles & Xie, 2023),
+DC-AE-Diffusion (Chen et al., 2024a) on ImageNet, DDPM diffusion model (Ho et al., 2020) on
+CelebA, a Graph Convolution Net (GCN) (Kipf & Welling, 2016), and a Graph Attention Net (GAT)
+(Veličković et al., 2017) on OGB-arxiv. The training curves are shown in Figure 17 and 18. We find
+the performance of Adam-mini to be comparable or better than AdamW, but with less memory.
+
+      Table 6: On popular non-LLM tasks, Adam-mini performs on par or better than AdamW.
+
+  Domain        Model                    Optimizer       Metric         25% steps      50% steps        75% steps     100% steps
+  Vision        DDPM                      AdamW       Train loss (↓)     0.0529        0.0497           0.0420        0.0394
+  Vision        DDPM                     Adam-mini    Train loss (↓)     0.0525        0.0495           0.0416        0.0388
+  Vision      ResNet18                    AdamW        Val acc (↑)       0.6149        0.6478           0.6613        0.6669
+  Vision      ResNet18                   Adam-mini     Val acc (↑)       0.6140        0.6501           0.6629        0.6667
+  Vision   Swin-Transformer               AdamW        Val acc (↑)       0.6290        0.6940           0.7180        0.7310
+  Vision   Swin-Transformer              Adam-mini     Val acc (↑)       0.6230        0.6960           0.7160        0.7300
+  Vision      DiT-XL-2                    AdamW       Train loss (↓)     0.1605        0.1696           0.1607        0.1431
+  Vision      DiT-XL-2                   Adam-mini    Train loss (↓)     0.1601        0.1693           0.1605        0.1430
+  Vision   DC-AE-Diffusion                AdamW       Train loss (↓)     0.2860        0.2820           0.2800        0.2780
+  Vision   DC-AE-Diffusion               Adam-mini    Train loss (↓)     0.2860        0.2830           0.2800        0.2780
+   Graph         GAT                      AdamW        Val acc(↑)        0.7277        0.7367           0.7399        0.7421
+   Graph         GAT                     Adam-mini     Val acc (↑)       0.7378        0.7394           0.7403        0.7429
+   Graph         GCN                      AdamW        Val acc (↑)       0.7347        0.7428           0.7379        0.7374
+   Graph         GCN                     Adam-mini     Val acc (↑)       0.7406        0.7427           0.7380        0.7423
+
+
+
+                                                               22
+Published as a conference paper at ICLR 2025
+
+
+In Table 7, we further evaluate the image quality from the model trained by Adam-mini. We find that
+the Adam-mini performs on par with AdamW.
+
+                                           Table 7: Evaluation scores: Adam-mini performs on par with AdamW.
+
+                                     Domain                Model                                                     Optimizer                                FID (↓)                             Inception Score (↑)
+                                     Vision                DiT-XL-2                                                  AdamW                                     91.83                                     12.38
+                                     Vision                DiT-XL-2                                                  Adam-mini                                 88.20                                     13.90
+                                     Vision                DC-AE-Diffusion                                           AdamW                                     34.72                                     41.79
+                                     Vision                DC-AE-Diffusion                                           Adam-mini                                 33.15                                     44.38
+
+
+                              0.8                Swin-Transformer                                                                                                                               0.55                DC-AE-Diffusion
+                                                                                                    0.300                   DiT-XL-2 (675M)
+                                                                                                                                                                                                                                  AdamW-2e-4
+                              0.7                                                                                                                           AdamW-1e-4                          0.50                              Adam-mini-2e-4
+                                                                                                    0.275                                                   Adam-mini-1e-4
+                              0.6
+        Validation Accuracy
+
+
+                                                                                                    0.250                                                                                       0.45
+
+
+                                                                                                                                                                                Training Loss
+                              0.5                                                      Train Loss
+                                                                                                    0.225
+                              0.4                                                                   0.200                                                                                       0.40
+                              0.3                                                                   0.175                                                                                       0.35
+                              0.2                                                                   0.150
+                                                                   AdamW-5e-4                                                                                                                   0.30
+                              0.1                                  Adam-mini-5e-4                   0.125
+                              0.00         20      40           60      80       100                0.1000                                                                                      0.250     25   50      75 100 125 150 175
+                                                                                                                  10000    20000       30000                 40000      50000
+                                                        Epoch                                                                  Iteration                                                                             Iterations (K)
+
+                                    (a) Swin-Transformer                                                             (b) DiT-XL-2                                                                  (c) DC-AE-Diffusion
+
+Figure 17: The training curves of Swin-Transformer, DiT-XL-2, and DC-AE-Diffusion. We find that
+Adam-mini performs on par with AdamW
+
+
+                                    0.7                          ResNet-18 on ImageNet                                                           0.070
+                                                                                                                                                                                                                                 AdamW
+                                                                                                                                                 0.065                                                                           Adam-mini
+                                    0.6
+              Validation Accuracy
+
+
+                                                                                                                                                 0.060
+                                                                                                                                 Training Loss
+
+
+                                    0.5                                                                                                          0.055
+                                    0.4                                                                                                          0.050
+                                                                                                                                                 0.045
+                                    0.3                                                                      AdamW-5e-3                          0.040
+                                                                                                             Adam-mini-5e-3
+                                    0.20    10      20          30      40   50                     60        70    80      90                   0.0350.0     0.5      1.0             1.5                2.0    2.5       3.0      3.5      4.0
+                                                                         Epoch                                                                                                                         Iteration                           1e6
+
+                                                           (a) ResNet-18                                                                                                     (b) DDPM
+
+Figure 18: The training curves of ResNet-18 and DDPM diffusion model. We find that Adam-mini
+performs on par with AdamW.
+
+
+D.6    M ORE D ISCUSSIONS ON THE PARTITION S TRATEGIES OF V A L U E
+
+As shown in Figure 7, the Hessian structure of value is less clear compared to other blocks: it
+shows the hint of 16 diagonal blocks (where 16 is the number of output neurons), but the pattern is
+not that clear. This gives rise to two potential partition strategies: (I) partition by output neuron; (II)
+treat as a whole. Numerically, we find that strategy (I) works well when the number of total training
+steps is large. This includes most of our experiments such as GPT-2 in Figure 8 (with more than
+50k total steps) and the scaling law experiments of Llama models in Figure 11 (e.g., Llama 2-1B is
+trained with more than 200k total steps). On the other hand, we find that strategy (II) works better
+when the number of total training steps is small. This includes our Llama experiments with 10k total
+steps in Figure 10.
+Based on these findings, we recommend using strategy (I) when the total number of training steps is
+large, and using strategy (II) if otherwise. Note that strategy (II) can be used simply by adding one
+line of code after creating the optimizer: optimizer.wv_names = {}.
+
+D.7    D ETAILED C OMPARISON WITH A DAFACTOR
+
+In this section, we conduct a more hyperparameter search for Adafactor on Llama 2-20M pre-training.
+We will focus on tuning Adafactor-Zhai-version since it performs better than the original Adafactor
+(see Figure 13). We consider the following three setups.
+
+
+                                                                                                                                 23
+Published as a conference paper at ICLR 2025
+
+
+• Setup 1: We change the default β2 = 0.999 to β2 = 0.95 and sweep over learning rates.
+• Setup 2: We use learning rate = 5e-3, β2 = 0.95 and sweep over warm-up step =
+  {1%, 2%, 3%, 4%, 5%, 10%} total steps.
+• Setup 3: We use learning rate = 5e-3, β2 = 0.95 and warm-up step = 1% total steps and sweep
+  over ϵ = {10−30 , 10−16 , 10−8 , 10−6 }.
+                  6.00                                                                                          6.00                                                                                            6.00
+                                                  Adam-mini-5e-3                                                                       Adam-mini-5e-3                                                                                    Adam-mini-5e-3
+                                                  Adafactor-Zhai-version(beta2=0.95)-1e-5                                              Adafactor-Zhai-version(beta2=0.95)-5e-3-warmup-40                                                 Adafactor-Zhai-version(beta2=0.95)-5e-3-eps-1e-30
+                  5.75                            Adafactor-Zhai-version(beta2=0.95)-5e-5                       5.75                   Adafactor-Zhai-version(beta2=0.95)-5e-3-warmup-80                        5.75                     Adafactor-Zhai-version(beta2=0.95)-5e-3-eps-1e-16
+                                                  Adafactor-Zhai-version(beta2=0.95)-1e-4                                              Adafactor-Zhai-version(beta2=0.95)-5e-3-warmup-120                                                Adafactor-Zhai-version(beta2=0.95)-5e-3-eps-1e-8
+                  5.50                            Adafactor-Zhai-version(beta2=0.95)-5e-4                       5.50                   Adafactor-Zhai-version(beta2=0.95)-5e-3-warmup-160                       5.50                     Adafactor-Zhai-version(beta2=0.95)-5e-3-eps-1e-6
+                                                  Adafactor-Zhai-version(beta2=0.95)-1e-3                                              Adafactor-Zhai-version(beta2=0.95)-5e-3-warmup-200
+                                                  Adafactor-Zhai-version(beta2=0.95)-5e-3                                              Adafactor-Zhai-version(beta2=0.95)-5e-3-warmup-400
+                  5.25                                                                                          5.25                                                                                            5.25
+Validation loss
+
+
+                                                                                              Validation loss
+
+
+                                                                                                                                                                                              Validation loss
+                                                  Adafactor-Zhai-version(beta2=0.95)-1e-2
+
+                  5.00                                                                                          5.00                                                                                            5.00
+                  4.75                                                                                          4.75                                                                                            4.75
+                  4.50                                                                                          4.50                                                                                            4.50
+                  4.25                                                                                          4.25                                                                                            4.25
+                  4.000   500    1000   1500     2000 2500        3000      3500       4000                     4.000   500    1000   1500     2000 2500           3000      3500      4000                     4.000   500    1000   1500     2000 2500           3000       3500      4000
+                                               Iteration                                                                                     Iteration                                                                                       Iteration
+
+                                (a) Llama 2-20M                                                                               (b) Llama 2-20M                                                                                 (c) Llama 2-20M
+
+Figure 19: The training curves of Adafactor-Zhai-version on Llama 2-20M pre-training. (a,b,c)
+corresponds to the aforementioned Setup 1, 2, 3, respectively. We find that Adafactor consistently
+underperforms Adam-mini.
+The results are shown in Figure 19. In all these cases, Adafactor-Zhai-version consistently underper-
+forms Adam-mini and the change of hyperparameters does not help much.
+
+D.8                       D ETAILED C OMPARISON WITH L ION
+
+We now conduct the hyperparameter grid search over Lion. We find that Lion is not easy to tune and
+we have not managed to make Lion work. We consider the following settings.
+Tuning strategies in (authors, 2024). authors (2024) carefully tune Lion on Llama models (150M,
+300M, 600M, 1.2B). We will adopt their optimal tuning strategies in (authors, 2024, Table 1) 6 . We
+here summarize their key messages.
+• Message 1: The optimal learning rate (lr) of Lion is usually 10 times smaller than AdamW.
+• Message 2: The magical number lr = 3.16e-4 works the best for most models (Llama 150M, 300M,
+  600M).
+• Message 3: β1 = {0.95, 0.9} perform similarly and perform significantly better than other β1
+  candidates including β1 = {0.99, 0.98, 0.8, 0.5, 0}.
+• Message 4: β2 = {0.99, 0.98, 0.95} perform similarly and perform significantly better than other
+  β2 candidates including β2 = {0.9999, 0.999, 0.995, 0.9, 0.8}.
+In the following, we will use the above messages to tune the hyperparameters of Lion.
+Architecture. We consider Llama 2-20M, which is the same architecture as the ones investigated in
+(authors, 2024), but with different model size. We also consider GPT-2-125M, which is a task that
+Lion is not tested before (neither in (authors, 2024) nor in other literatures to our knowledge).
+Our tuning strategies. Following the above Message 1 and 2 from (authors, 2024), we will use the
+following tuning strategies for Lion on Llama 2-20M and GPT-2-125M.
+• Learning rate for Llama 2-20M: The standard lr is 5e-3, so we try lr = [5e-4, 6e-4, 7e-4, 8e-4,
+  9e-4, 1e-3, 2e-3, 3e-3, 4e-3, 5e-3]. For completeness, we also investigate lr = [4e-4, 3.16e-4, 2e-4,
+  1e-4].
+• Learning rate for GPT-2-125M: The standard lr is 6e-4, so we try lr = [6e-5, 7e-5, 8e-5, 9e-5,
+  1e-4, 2e-4, 0.000316, 4e-4, 5e-4, 6e-4]
+As for (β1 , β2 ), we will use (β1 , β2 ) = (0.95, 0.98). We use these hyperparameters for two reasons.
+First, they are the optimal choice among other candidates by Message 3 and 4. Second, (β1 , β2 ) =
+   6
+     We would like to mention that (authors, 2024) is a concurrent work to us, and their tuning strategies in is not
+public available by the time we submitted this script.
+
+
+                                                                                                                                             24
+Published as a conference paper at ICLR 2025
+
+
+(0.95, 0.98) is recommended by the authors of Lion to be "helpful in mitigating instability during
+training" 7 .
+                         8.0                  Llama 2-20M Pre-training
+                                                                                Adam-mini-5e-3                     101                      GPT-2-125M Pre-training
+                         7.5                                                    Lion-5e-3
+                                                                                Lion-4e-3
+                                                                                Lion-3e-3                                  AdamW-6e-4
+                         7.0                                                    Lion-2e-3                                  Adam-mini-6e-4
+                                                                                Lion-1e-3                                  Lion-6e-4
+                         6.5                                                    Lion-9e-4                                  Lion-5e-4
+                                                                                                                6 × 100
+       Validation loss
+
+
+                                                                                Lion-8e-4
+
+
+                                                                                                   Train Loss
+                         6.0                                                    Lion-7e-4                                  Lion-4e-4
+                                                                                Lion-6e-4                                  Lion-3.16e-4
+                         5.5                                                    Lion-5e-4                                  Lion-2e-4
+                                                                                Lion-4e-4                                  Lion-1e-4
+                         5.0                                                    Lion-3.16e-4
+                                                                                Lion-2e-4                       4 × 100    Lion-9e-5
+                                                                                Lion-1e-4                                  Lion-8e-5
+                         4.5                                                                                               Lion-7e-5
+                         4.0
+                                                                                                                3 × 100    Lion-6e-5
+                                                                                                                           Lion-5e-5
+                         3.50    500   1000     1500     2000 2500       3000     3500      4000                     102                      103                     104
+                                                       Iteration                                                                                    Iteration
+                                        (a) Llama 2-20M                                                                                (b) GPT-2-125M
+
+Figure 20: The training curves of Lion on Llama 2-20M and GPT-2-125M pre-training. The
+hyperparameters are chosen under the optimal strategies by (authors, 2024). We find that Lion
+consistently underperforms Adam-mini on Llama 2-20M, and it encounters loss spikes on GPT-2-
+125M.
+The results are shown in Figure 20. After using the above tuning strategies, we find that Lion still
+underperforms Adam-mini and AdamW on Llama 2-20M and GPT-2-125M. In particular, Lion
+encounters loss spikes on GPT-2-125M for all the learning rate candidates above.
+We summarize our findings on Lion below.
+• First: worse performance. With all the effort above, we haven’t managed to make Lion work, and
+  we haven’t been able to reproduce (authors, 2024) on Llama 2-20M and GPT-2-125M (different
+  model size and architectures from (authors, 2024)). One possible reason is that Lion might work
+  under their specific setup (dataset, architecture, batch size, etc.), but the effectiveness is not easily
+  transferable.
+• Second: no general tuning guidance. We find that there are no general tuning strategies for Lion.
+  We emphasize that authors (2024) only focuses on Llama architectures, and their resulting tuning
+  strategy seems not robust and transferable to other architectures. In particular, their optimal strategy
+  on Llama causes loss spikes on GPT-2. To our knowledge, Table 1 in (authors, 2024) is the only
+  public tuning strategy for Lion, so it seems unclear how to tune Lion in general.
+  In contrast, Adam-mini is much easier to use. In all our experiments (a wide range of tasks and
+  models), Adam-mini performs on par with Adam using the same hyperparameters as AdamW
+  (including learning rate, β1 , β2 , ϵ, etc.). We believe that "easy adaptation of the hyperparameters"
+  can serve as one advantage of Adam-mini over Lion, apart from the performance superiority.
+• Third: Adam-mini is more principled and explainable. We emphasize that Lion is designed by
+  symbolic search, and its design principle is largely unclear. In contrast, the Design principle of
+  Adam-mini is much more understandable: we remove the redundant lrs in Adam according to the
+  Hessian structure. We believe Adam-mini is more "white-box" than Lion and more explainable to
+  users.
+
+D.9                       A DDITIONAL F INDINGS ON GPT-2-330M
+
+In Figure 21, we report some unexpected results on GPT-2-330M. When using the recommended
+learning rate 3e-4 by (Liu et al., 2023), we find that AdamW encounters loss spikes, while Adam-mini
+does not. The loss spike of AdamW can be mitigated by changing ϵ from 1e-8 to 1e-6. We have
+not fully understood the cause of the loss spike and how Adam-mini prevents it in this experiment.
+We are not sure whether such benefit of Adam-mini maintains on larger models. We leave more
+investigation as an interesting future direction.
+
+D.10                           C OMBINING WITH L O RA
+
+We note that Adam-mini can be combined with LoRA (Hu et al., 2021): we can change the Adam
+steps in LoRA by Adam-mini. The results are shown in Figure 22. We find that such changes with
+   7
+       https://github.com/lucidrains/lion-pytorch
+
+
+                                                                                                                  25
+Published as a conference paper at ICLR 2025
+
+
+                                                                                 8
+                                                                                                 AdamW-3e-4-eps-1e-6
+                                                                                 7               AdamW-3e-4-eps-1e-8
+                                                                                                 Adam-mini-3e-4-eps-1e-6
+
+
+                                 Validation Loss
+                                                                                 6               Adam-mini-3e-4-eps-1e-8
+
+                                                                                 5
+                                                                                 4
+                                                                                 3
+                                                                                     0                5            10         15                            20                       25
+                                                                                                                  Tokens (billion)
+Figure 21: On GPT-2-330M, AdamW encounters loss spikes, while Adam-mini does not. The loss
+spike of AdamW can be mitigated by changing ϵ from 1e-8 to 1e-6.
+
+
+boost performance. We grid-search learning rates for both methods and report the best performance.
+The detailed learning rate configuration is shown in Section F.
+
+                                                                                                                                                                $GDP:
+                                                                                                                                                                $GDP PLQL
+
+                                   (YDOXDWLRQ 3HUSOH[LW\
+
+
+                                                                                                                          ,WHUDWLRQ
+
+Figure 22: Training curves of SFT (LoRA). We find that LoRA performs better when replacing the
+Adam steps by Adam-mini.
+
+
+D.11    S AMPLE R ESPONSES FROM LLM S TRAINED BY A DAM - MINI
+
+The sample response in shown in Figure 23.
+
+  Prompt: Compose an engaging travel blog post about a recent trip to Hawaii, highlighting cultural
+  experiences and must-see attractions.
+  AdamW: Sure! Here’s a travel blog post about a recent trip to Hawaii: ...... Whether you’re interested in
+  history, nature, or simply soaking up the sun, Hawaii has something for everyone. Until next time, Aloha!
+  Adam-mini: Sure! Here’s a travel blog post about a recent trip to Hawaii: ...... I highly recommend
+  visiting this beautiful archipelago for a truly unforgettable adventure.
+  Prompt: Rewrite your previous response. Start every sentence with the letter A.
+  AdamW: A trip to Hawaii is a must-visit destination for any traveler, offering a variety of cultural experiences
+  and must-see attractions. From the Polynesian Cultural Center to the USS Arizona Memorial, and from
+  Lanikai Beach to the lively night markets, every corner of the islands reveals a new surprise and a new way
+  to connect with the spirit of Hawaii.
+  Adam-mini: A trip to Hawaii is a must-do for any travel enthusiast. A trip to the beautiful Hawaiian
+  Islands is a paradise on earth. A visit to Oahu is a great way to start your adventure. A helicopter tour of
+  the island is both educational and breathtaking. A visit to Maui is a must-see. A visit to Haleakala National
+  Park is a highlight of your trip. A visit to the Polynesian Cultural Center is a great way to learn about the
+  history and traditions of the islands. A traditional luau is a must-attend event. Overall, a trip to Hawaii is
+  an unforgettable experience.
+
+
+Figure 23: Response Sample of Llama 2-7B finedtuned by AdamW and Adam-mini to the #81 test
+question from the MT-Bench (Zheng et al., 2024) dataset. Since there is little information in the first
+round response, we omit the answers from the models.
+
+
+                                                                                                                          26
+Published as a conference paper at ICLR 2025
+
+
+E     S OME P RELIMINARY R ESULTS
+
+E.1   P RELIMINARIES ON A DAM , A DAM W AND LAMB
+
+We introduce Adam, AdamW, and LAMB in Algorithm 5, 6, and 7. These methods need to track m
+and v along the training. Both m and v are vectors of the same size as # model parameter.
+
+Algorithm 5 Adam in Pytorch style
+ 1: Let λ be the weight decay coefficient
+ 2: for param in parameter_blocks do
+ 3:   g = param.grad
+ 4:   if λ > 0 then
+ 5:      g = g + λ ∗ param
+ 6:   end if
+ 7:   param = param - ηt ∗ λ∗ g
+ 8:   m = (1 − β1 ) ∗ g + β1 ∗ m
+              m
+ 9:   m̂ = 1−β  t
+               1
+10:    v = (1 − β2 ) ∗ g ⊙ g + β2 ∗ v
+              v
+11:    v̂ = 1−β t
+               2
+                             m̂
+12:   param = param - ηt * √v̂+ϵ
+13: end for
+
+
+Algorithm 6 AdamW in Pytorch style
+ 1: Let λ be the weight decay coefficient
+ 2: for param in parameter_blocks do
+ 3:   g = param.grad
+ 4:   param = param - ηt ∗ λ∗ g
+ 5:   m = (1 − β1 ) ∗ g + β1 ∗ m
+              m
+ 6:   m̂ = 1−β  t
+               1
+ 7:    v = (1 − β2 ) ∗ g ⊙ g + β2 ∗ v
+              v
+ 8:    v̂ = 1−β t
+               2
+                             m̂
+ 9:   param = param - ηt * √v̂+ϵ
+10: end for
+
+
+Algorithm 7 LAMB in Pytorch style
+ 1: Let λ be the weight decay coefficient, let ϕ be a scaling function.
+ 2: for param in all_layers do
+ 3:   g = param.grad
+ 4:   param = param - ηt ∗ λ∗ g
+ 5:   m = (1 − β1 ) ∗ g + β1 ∗ m
+              m
+ 6:   m̂ = 1−β  t
+               1
+ 7:    v = (1 − β2 ) ∗ g ⊙ g + β2 ∗ v
+              v
+ 8:    v̂ = 1−β t
+               2
+             m̂
+ 9:    r = √v̂+ϵ
+                                 ϕ(∥param∥)
+10:   param = param - ηt * ∥r+λ∗param∥ * r
+11: end for
+
+
+E.2   P RELIMINARY RESULTS IN (Z HANG ET AL ., 2024)
+
+We here restate (Zhang et al., 2024, Figure 3). This figure shows that: for Transformers, different
+parameter blocks have different Hessian eigenvalue distributions, while for CNNs, the eigenvalue
+
+
+                                                 27
+Published as a conference paper at ICLR 2025
+
+
+distributions are similar among blocks. This suggests that Transformers need different learning rates
+for different blocks to handle the heterogeneity in eigenvalue distributions.
+
+
+                      (a) VGG16                                      (b) BERT
+
+Figure 24: Figure 3 in (Zhang et al., 2024). The eigenvalues distribution are similar among blocks for
+CNNs, while they differ significantly across blocks for Transformers. This indicates Transformers
+need different learning rates for different blocks to handle the heterogeneity in eigenvalues.
+
+
+F       E XPERIMENTAL D ETAILS
+
+F.1     T RAINING CONFIGURATIONS FOR S ECTION 3
+
+Unless mentioned otherwise, we choose the model configurations by their standard protocols. We
+choose the learning rates by the recommendation from open-source platforms if applicable. For
+instance, for GPT2 series, we use the recommended learning rates by (Liu et al., 2023), which are
+reported to be optimal by grid search. Unless mentioned otherwise, Adam-mini, Adafactor, CAME,
+SM3, and LAMB use the same learning rate as the recommended ones of AdamW. If there is no
+public recommended learning rate for AdamW, we tune the learning rate for all optimizers within the
+same computational budget and report the best performance. For other hyperparameters, we follow
+the recommendation from open-source platforms or by their default setting. For SM3 and Adafactor,
+we incorporate momentum with β1 = 0.9 to offer a fair comparison with other optimizers and the
+rest of the hyperparameters are set as default. The detailed configurations are explained as follows.
+
+GPT2 pre-training. We use the nanoGPT codebase8 to train GPT2 sized 125M (small), 330M
+(medium), and 1.5B (XL) on Openwebtext. For all models, we use seq_len = 1024, batch size
+= 480, weight decay coefficient λ = 0.1, ϵ = 1e-8, β1 = 0.9, β2 = 0.95. We use cosine-decay
+learning rate schedule with 2000 iterations of warm-up. For GPT2-small and medium, we use the
+recommended peak learning rate by (Liu et al., 2023), which are reported to be the optimal ones
+found by grid search. For GPT2-XL, we use the recommended peak learning rate by the Levanter9 .
+The chosen peak learning rates are 6e-4, 3e-4, 1e-4 for GPT2-small, medium, XL, respectively. The
+minimal learning rate is chosen as 3e-5, 6e-5, 1e-5 for these models.
+
+Llama pre-training. For all experiments on the Llama series (from 20M to 13B), we use the
+Torchtitan codebase10 and C4 dataset (Raffel et al., 2020). For all experiments, we use weight decay
+coefficient λ = 0.1, ϵ = 1e-8, β1 = 0.9, β2 = 0.95. For Llama 2-1B, Llama 3-8B, we use learning
+rate = 3e-4. For Llama 2-13B, we use learning rate = 1e-4. As for the learning rate schedule, we use
+warm-up step = 1% total step and use linear decay schedule after the warm-up (this is the default
+setting in the Torchtitan codebase). For Figure 10 (a) and all the experiments of Adafactor and Lion,
+we use seq_len = 512 and batch size = 128. For Figure 10 (b), we use seq_len = 2048 and
+batch size = 8. For Figure 10 (b), we shrink the batch size due to the limited hardware. For all the
+scaling law experiments, we use seq_len = 512 and batch size = 256. We summarize the detailed
+setups for the scaling law experiments in later paragraphs.
+
+    8
+     https://github.com/karpathy/nanoGPT/tree/master
+    9
+     https://github.com/stanford-crfm/levanter/blob/e183ec80ec5971b12d4a3fb08a160268de342670/
+config/gpt2_xl.yaml
+  10
+     https://github.com/pytorch/torchtitan
+
+
+                                                 28
+Published as a conference paper at ICLR 2025
+
+
+SFT and RLHF. We use the Llama 2-7B pretrained model (Touvron et al., 2023) for our study.
+We use the ultrafeedback dataset 11 . The implementation of SFT and RLHF code is based on
+the ReMax codebase12 . Specifically, we train a SFT model with 40% of the chosen data and train
+a reward model using the remaining 60%. Then, we apply the reinforcement learning algorithm
+ReMax (Li et al., 2023), a memory-efficient alternative to PPO (Schulman et al., 2017), to optimize
+the preference reward.
+We use DeepSpeed ZeRO-2 in our training. GPT-4 evaluation template in Table 5 is from the
+codebase13 . In the reward optimization stage, We use ReMax, a memory-efficient alternative to PPO.
+We use UltraFeedback dataset Cui et al. (2023) and use 40% data for SFT and 60% data for ReMax.
+      SFT. We use 80 samples in a batch and train the model for 3 epochs. For the full parameter
+tuning, we search the learning rate from {1e-6, 2e-6, 3e-6, 4e-6, 5e-6, 1e-5, 2e-5} based on validation
+loss, and we use 2e-6 with cosine annealing for both AdamW and Adam-mini. For LoRA, We apply
+LoRA for all layers except the embedding layer. The rank of LoRA is set to 128. After selecting
+the learning rate from the same set as the full parameter tuning, we use 2e-5 for both AdamW
+and Adam-mini when LoRA is applied. The weight decay coefficient is set to 0 as recommended
+by LlamaFactory14 . The rest of the hyperparameters of AdamW and Adam-mini are ϵ = 1e-8,
+β1 = 0.9, β2 = 0.95.
+     ReMax. We use 48 samples in a batch and train the model for 1 epoch. By searching the
+peak learning rate from {5e-7, 1e-6, 2e-6} based on validation reward, AdamW uses 1e-6 while
+Adam-mini selects 5e-7 as the peak learning rate. The weight decay coefficient is set to 0. The rest of
+the hyperparameters of AdamW and Adam-mini are ϵ = 1e-8, β1 = 0.9, β2 = 0.95.
+
+ResNet. We use the PyTorch official implementation codebase15 to train ResNet18 (He et al., 2016)
+on ImageNet (Deng et al., 2009). We use cosine-decay learning rate, epoch =90, β1 = 0.9, β2 =
+0.999, ϵ =1e-8. For ResNet18, we use batch size = 256, peak learning rate = 0.005. For ViT-base, we
+use batch size = 128, peak learning rate = 0.0001. These configurations are used for both Adam-mini
+and AdamW.
+
+DDPM. We use the codebase16 to train DDPM diffusion models (Ho et al., 2020). The image size
+is 64 and the training objective is to predict the noise as in (Ho et al., 2020). We use the default U-Net
+archiecture hyper-parameters and the dimension multiply in U-Net is (1, 2, 4, 8). We use the CelebA
+dataset17 and train the diffusion model with a learning rate 5 × 10−5 with cosine decay. The batch
+size is 128 and the training epoch is 50.
+
+Swin-Transformers. We use the official implementation18 of Swin-Transformers (Liu et al., 2021b)
+on ImageNet. All configurations as default. For both Adam-mini and AdamW, we use the default
+learning rate = 5e-4.
+
+DiT-XL-2. We use the official implementation19 of DiT-XL-2 (Peebles & Xie, 2023) on ImageNet.
+All configurations as default. For both Adam-mini and AdamW, we use the default learning rate =
+1e-4.
+
+DC-AE-Diffusion. We use the official implementation20 of DC-AE-Diffusion (Chen et al., 2024a)
+on ImageNet. All configurations as default. For both Adam-mini and AdamW, we use the default
+learning rate = 2e-4.
+  11
+     https://huggingface.co/datasets/argilla/ultrafeedback-binarized-preferences-cleaned
+  12
+     https://github.com/liziniu/ReMax
+  13
+     https://github.com/lm-sys/FastChat/tree/main/fastchat/llm_judge
+  14
+     https://github.com/hiyouga/LLaMA-Factory
+  15
+     https://github.com/pytorch/examples/blob/main/imagenet/main.py
+  16
+     https://github.com/lucidrains/denoising-diffusion-pytorch
+  17
+     https://cseweb.ucsd.edu/~weijian/static/datasets/celeba/
+  18
+     https://github.com/microsoft/Swin-Transformer
+  19
+     hhttps://github.com/facebookresearch/DiT
+  20
+     https://github.com/mit-han-lab/efficientvit/blob/master/applications/
+dc_ae/README.md
+
+
+                                                   29
+Published as a conference paper at ICLR 2025
+
+
+Graph Neural Networks. We use the DGL implementation21 of Graph Convolution Networks
+(GCN) (Kipf & Welling, 2016) and Graph Attention Networks (GAT) (Velickovic et al., 2017) for
+OGBN-arxiv22 dataset. All configurations as default. For both Adam-mini and AdamW, we use the
+default learning rate = 0.005 for GCN and the default learning rate = 0.002 for GAT.
+
+Scaling law experiments. We use the codebase Torchtitan23 to train Llama models of different
+sizes. All the model configurations are shown in Table 8 and all the training configurations are shown
+in Table 9. The experimental setups are inspired by (Hägele et al., 2024). In all experiments, we fix
+the warm-up steps to be 1% of the total steps, as suggested by (Ibrahim et al., 2024).
+                          Model Size     dmodel    nlayers   nheads   seq_len
+                               39M        384         8        6        512
+                               67M        512        10        8        512
+                              102M        640        12       10        512
+                              162M        768        16       12        512
+                              271M       1024        16       16        512
+                                 1B      2048        18       16        512
+
+                 Table 8: The model configurations in the scaling law experiments.
+
+         Model     LR      Batch size (# tokens)    Steps      Tokens    Token/Params Ratio
+          39M      6e-4           0.13M              7.8K       1.02B          26.15
+          67M      6e-4           0.13M             13.4K       1.76B          26.27
+         102M      6e-4           0.13M             20.4K       2.67B          26.17
+         162M      6e-4           0.13M             32.4K       4.25B          26.23
+         271M      6e-4           0.13M             54.2K       7.10B          26.21
+           1B      2e-4           0.13M             200K       26.21B          26.21
+
+                 Table 9: Training configurations for the scaling law experiments.
+
+Trajectory comparison in Figure 10 (c). We train a 8-layer Transformer sized 11M on Openwebtext
+and launch AdamW, Adam-mini, and other memory-efficient optimizers under the same random seed
+and same learning rate 1e-5. We save the model weights for every 250 iterations and compare their
+Euclidean distance to the weights along AdamW’s trajectory.
+
+F.2    D ETAILED S ETUP FOR OTHER E XPERIMENTS
+
+Configurations for Figure 3. We train a 1-hidden-layer MLP with 8 neurons on CIFAR-100. We use
+Adam with 1e-4 learning rate with Cosine decay schedule. We train the network with 128 batch size
+and 20 epochs (i.e., about 7900 total training steps). With the help of auto-differentiation framework,
+we calculate the Hessian with two passes of backpropagation (Pearlmutter, 1994) and the calculation
+is exact.
+
+Configurations for Figure 4. For each dense sub-block Hl , l = 1, 2, 3, we use random positive
+definite matrices. We fix the choose the eigenvalues of each Hl as follows: for l = 1, we independently
+sample from {1,2,3} for 30 times; for l = 2, we repeat this procedure for {99,100,101}; for l = 3,
+we repeat this procedure for {4998 ,4999, 5000}. For the single (blockwise) learning rate method,
+we use GD with optimal constant learning rate 2/(L + µ), where L, µ are the largest and smallest
+eigenvalue of the (blockwise) Hessian. We use Adam with β1 = 0. This helps us focus on the effect
+of coordinatewise learning rate in Adam. We also set β2 = 1 to the time-varying learning rate. This
+is necessary because, for any β2 < 1, Adam with constant learning rate will oscillate on quadratic
+functions. This is theoretically proved in (Da Silva & Gazeau, 2020, Proposition 12, Figure 1) and
+empirically observed in (Zhang et al., 2024, Section 3.3).
+  21
+     https://github.com/dmlc/dgl/tree/master/examples/pytorch/ogb/
+ogbn-arxiv
+  22
+     https://ogb.stanford.edu/docs/nodeprop/
+  23
+     https://github.com/pytorch/torchtitan
+
+
+                                                   30
+    Published as a conference paper at ICLR 2025
+
+
+    Configurations for Figure 5. To generate a positive definite matrix Hb , we first uniformly sample
+    d(d−1)
+        2   independent angles θi,j from the interval [− π2 , π2 ], where i < j. Starting with the identity
+    matrix, we perform a rotation of the i-th and j-th rows by the angle θi,j for each sampled pair. Through
+    d(d−1)
+        2   rotation operations, we obtain the orthogonal matrix Q. We define Λ = diag(κ, 1, . . . , 1), and
+    the matrix Hb is generated using the expression Hb = QΛQT . The python code for Hb generation is
+    listed as follows:
+1  def generate_Hb(theta, kappa, d):
+2      Q = np.eye(d)
+ 3     for i in range(d):
+ 4         for j in range(i+1,d):
+ 5             P = np.eye(d)
+ 6             P[i,i] = math.cos(theta[i,j])
+ 7             P[i,j] = math.sin(theta[i,j])
+ 8             P[j,i] = -math.sin(theta[i,j])
+ 9             P[j,j] = math.cos(theta[i,j])
+10             Q = P @ Q
+11     Lambda = np.eye(d)
+12     Lambda[0,0] = kappa
+13     return Q @ Lambda @ Q.transpose()
+
+    We note that as θ approaches 0, the diagonal-over-off-diagonal ratio of the matrix Q decreases. For
+                                                                                                         k
+    the sampled values of θ, we utilize Rθ to produce Hb with varying ratios, where R ∈ { 50               |k =
+    0, 1, . . . , 50}. For each matrix, we sample 100 initial points from the Xavier initialization distribution
+    to compute the resulting κ of Adam algorithm. For each pair of d and κ, we sample 40 different θ
+    values. By averaging the results obtained, we plot the Figure 5.
+
+    Configurations for Figure 7. We use the codebase24 . We enlarge the vocabulary size from 2 to
+    8, and we change the objective function to the standard pre-training objective function (i.e., predict
+    the next token). We consider a 1-layer Transfomer with n_emb = 16, n_head = 4, and the width (i.e.,
+    the number of output neurons) of mlp.fc_1 equals 32. The Hessian calculation follows the same
+    procedure as in Figure 3.
+    It is worth mentioning that the weight matrices might have different shapes depending on the different
+    codebases. For instance, the weight matrix W in one codebase might be implemented as W ⊤ in
+    another codebase (this can happen for the embedding layer), and the same W might also be stretched
+    into an one-dimensional vector (this can happen for all weight matrices). In these cases, some extra
+    re-ordering is needed. For all the Hessian calculations in Figure 7, we re-order the Hessian rows &
+    columns such that the block-diagonal structure is visible.
+
+    Throughput Comparison in Table 2. The results are tested on 2× A800-80GB GPUs. We did not
+    turn on CPU offload. We report the throughput from the summary file of the Wandb log.
+
+
+      24
+         https://colab.research.google.com/drive/1SiF0KZJp75rUeetKOWqpsA8clmHP6jMg?
+    usp=sharing
+
+
+                                                        31

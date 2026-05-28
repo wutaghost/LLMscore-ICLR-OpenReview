@@ -1,0 +1,2597 @@
+Published as a conference paper at ICLR 2025
+
+
+FASTER C ASCADES VIA S PECULATIVE D ECODING
+ Harikrishna Narasimhan1 , Wittawat Jitkrittum1 , Ankit Singh Rawat1
+ Seungyeon Kim2 , Neha Gupta3,† , Aditya Krishna Menon1 , Sanjiv Kumar1
+ 1
+   Google Research, 2 Google DeepMind, 3 Mistral AI
+ {hnarasimhan, wittawat, ankitsrawat, adityakmenon, sanjivk}@google.com
+
+
+                                              A BSTRACT
+
+            Cascades and speculative decoding are two common approaches to improving
+            language models’ inference efficiency. Both approaches interleave two models
+            of different sizes, but via fundamentally distinct mechanisms: cascades employ a
+            deferral rule that invokes the larger model only for “hard” inputs, while specula-
+            tive decoding uses speculative execution to primarily invoke the larger model in
+            parallel scoring mode. These mechanisms offer different benefits: cascades offer
+            compelling cost-quality trade-offs, often even outperforming the large model; spec-
+            ulative cascades offer impressive speed-ups, while guaranteeing quality-neutrality.
+            In this paper, we leverage the best of both these approaches by designing new spec-
+            ulative cascading techniques that implement their deferral rule through speculative
+            execution. We characterize the optimal deferral rule for our speculative cascades,
+            and employ a plug-in approximation to the optimal rule. Experiments with Gemma
+            and T5 models on a range of language benchmarks show that our approach yields
+            better cost-quality trade-offs than cascading and speculative decoding baselines.
+
+
+1    I NTRODUCTION
+Large language models (LLMs) have yielded significant advances in quality on a range of natural
+language processing tasks (Radford et al., 2018; Raffel et al., 2020; Brown et al., 2020; Black et al.,
+2022; Chowdhery et al., 2022; Anil & et al., 2023; Touvron et al., 2023; Team et al., 2023; et al.,
+2024b;a), at the cost of an increase in inference latency. This has sparked a growing body of literature
+on reducing LLMs’ inference costs without (overly) compromising on quality (Elbayad et al., 2020;
+Pope et al., 2022; Schuster et al., 2022; Leviathan et al., 2023; Chen et al., 2023a; Sheng et al., 2023;
+Sun et al., 2024). One such line of work involves constructing a family of models of various sizes
+(e.g., a small and large model), and suitably orchestrating amongst them to make a prediction. Two
+canonical instantiations of this strategy are model cascading (Wang et al., 2020; Mamou et al., 2022;
+Varshney & Baral, 2022; Khalili et al., 2022; Dohan et al., 2022; Chen et al., 2023b; Gupta et al.,
+2024; Ding et al., 2024) and speculative decoding (Stern et al., 2018; Chen et al., 2023a; Leviathan
+et al., 2023; Sun et al., 2024; Li et al., 2024a; Xia et al., 2024).
+While similar in spirit, cascades and speculative decoding are fundamentally different in details.
+Cascades employ a deferral rule to identify “hard” inputs, and only invoke larger models on such
+inputs. For example, in a two-model cascade, one first invokes the smaller model, and uses its
+associated probability of the generated output to decide whether to defer to the larger model. By
+contrast, speculative decoding uses a small model to draft a block of tokens via standard auto-
+regressive decoding, which are then verified in parallel by a large model. One then accepts all drafted
+tokens until the first “implausible” one, which is rolled back based on the larger LM’s prediction.
+Owing to their different mechanisms, both methods have complementary strengths. Cascades seek to
+output distributions that have the best quality for a given cost budget, sometimes even yielding better
+quality than the individual models they are constructed with (Jitkrittum et al., 2023; Kim et al., 2023)
+(§3). By contrast, speculative decoding is theoretically guaranteed to match the output distribution (or
+a close approximation thereof (Tran-Thien, 2023)), and is practically observed to provide impressive
+speed-ups (Stern et al., 2018; Chen et al., 2023a; Leviathan et al., 2023; Sun et al., 2024). Given their
+complementary nature, a natural question arises: can we leverage the best of both techniques?
+    †
+        Work done while working at Google.
+
+
+                                                    1
+ Published as a conference paper at ICLR 2025
+
+
+In this paper, we do so by designing new
+techniques for two-model cascades that im-
+plement their deferral rule in a speculative
+manner: we have the smaller model gener-
+ate drafts auto-regressively, and the larger
+model execute in parallel on the drafts to
+decide whether or not to defer on them. Figure 1: Speculative cascade inference between a
+We show that this speculative cascading ap- small and a large LM via a deferral rule.
+proach yields better cost-quality trade-offs
+than both standard cascades and speculative decoding. In detail, we make the following contributions:
+  (i) We introduce a general recipe for speculative execution, where we seek to mimic a general target
+      distribution that interleaves the drafter’s and verifier’s distributions. Lossy speculative sampling
+      (Tran-Thien, 2023) is a special case of this recipe for a particular target distribution (§4.1).
+ (ii) We show how common cascading rules, such as Chow’s rule (Chow, 1970) and confidence-
+      difference thresholding (Jitkrittum et al., 2023), can be implemented speculatively by plugging in
+      their target distribution into our framework. We refer to these as speculative cascades (§4.2).
+(iii) We characterize the theoretically optimal deferral rule for a speculative cascade, and design a
+      speculative cascading technique that implements a plug-in estimate to the optimal rule (§4.3,
+      Lemma 4, Table 1). We also present token-specific variants of our deferral rules (§5).
+(iv) Through experiments with Gemma (Team et al., 2024) and T5 models (Raffel et al., 2020) on
+      a range of benchmark language tasks including summarization, translation, reasoning, coding
+      and QA, we show that speculative cascades are able to provide better cost-quality trade-offs than
+      their sequential cascade and speculative decoding counterparts (§6).
+ Overall, we aim to develop a principled approach to trade-off quality and inference costs by inter-
+ leaving two models of different sizes, with promising empirical results. We hope to inspire future
+ research adapting the proposed ideas with ingredients underpinning the state-of-the-art in speculative
+ decoding (Cai et al., 2024; Li et al., 2024a;b; Chen et al., 2024).
+
+ 2    A TALE OF T WO E FFICIENT LM I NFERENCE S TRATEGIES
+ Let V denote a finite vocabulary of tokens, with V∗ denoting the set of all finite-length sequences
+ generated by this vocabulary. Let ∆V denote the set of all probability distributions over tokens
+ in V. Given an arbitrary length sequence x = x1 x2 . . . xL ∈ V∗ and index i ≤ L, we denote
+ x<i = x1 x2 . . . xi−1 . A language model (LM) is a probability distribution over V∗ . Let P denote
+ the data generating probability distribution over V∗ . This could be, for example, a distribution over
+ prompt-response pairs that the LM may encounter during deployment, or a distribution of sequences
+ used to pre-train the LM. We will measure the quality of an LM based on how closely it mimics P.
+ Suppose we are provided two LMs q and p, where p is the larger (more expensive) model. Our goal
+ is to design an inference strategy that selectively invokes q and p to trade-off between quality and
+ latency (which may be approximated by the fraction of times that p is invoked). We will denote by
+ q(xt |x<t ) the probability q associates to token xt ∈ V given prefix x<t ∈ Vt−1 , and by p(xt |x<t )
+ the same distribution from model p. Whenever it is clear from context, we will hide the conditioning
+ on prefix x<t , and use the shorthand qt (·) for q(·|x<t ) and pt (·) for p(·|x<t ).
+Cascades are an effective strategy to trade-off cost and quality by having the smaller model q handle
+the “easy” samples, and the larger model p handle the “hard” ones (Gupta et al., 2024; Yue et al.,
+2024). A common cascading approach is confidence thresholding or Chow’s rule (Chow, 1970;
+Jitkrittum et al., 2023), where we first run q on the input, and defer to p when q’s confidence for its
+generated response is sufficiently low. This strategy is typically implemented at the sequence-level,
+where for a given prefix x<m we invoke q, evaluate its maximum conditional probability over all
+responses, and check whether it falls below a threshold α ∈ [0, 1]:
+                                 max       q(xm . . . xm+n | x<m ) < 1 − α.                           (1)
+                              xm ...xm+n
+
+ If this holds, we defer to p to generate a new response; otherwise, we generate a response with q. One
+ may tune α to achieve a desired cost-quality trade-off. The literature also offers variants of Chow’s
+ rule that use a more nuanced aggregation of per-token uncertainties (Gupta et al., 2024).
+
+
+                                                     2
+Published as a conference paper at ICLR 2025
+
+
+Table 1: Target distributions associated with different inference algorithms, where α is a free
+parameter and β ≥ 1 − α depends on α, q and p. The last column indicates whether the execution is
+sequential (Algorithm 2), via an oracle (Algorithm 3), or speculative (Algorithm 5) (Leviathan et al.,
+2023). See (6) for details on δ. The third row presents a variant of the BiLD algorithm of Kim et al.
+(2023), where D(q, p) is a measure of discrepancy between q and p; the original algorithm differs in
+the use of a deterministic speculative decoding procedure with a dynamic draft window (see §B).
+Inference strategy                         Deferral decision δ(q, p)                    Target distribution π(u)        Execution
+SpecDecoding (Leviathan et al., 2023)      -                                            p(u)                            Speculative
+                                                                                                         p(u)
+Lossy SpecDecoding (Tran-Thien, 2023)      -                                            max{min{q(u), 1−α     }, p(u)
+                                                                                                                  β }   Speculative
+
+BiLD* variant (Kim et al., 2023)           1 D(q, p) > α                                (1 − δ) · q(u) + δ · p(u)       Speculative
+
+TokenCascade [Chow] (Chow, 1970)           1 maxv q(v) < 1 − α                          (1 − δ) · q(u) + δ · p(u)       Sequential
+
+Oracle [Diff] (Jitkrittum et al., 2023)    1 maxv q(v) < maxv p(v) − α                  (1 − δ) · q(u) + δ · p(u)       Oracle
+
+SpecCascade [Chow]                         1 maxv q(v) < 1 − α                          (1 − δ) · q(u) + δ · p(u)       Speculative
+
+SpecCascade [Diff]                         1 maxv q(v) < maxv p(v) − α                  (1 − δ) · q(u) + δ · p(u)       Speculative
+
+SpecCascade [OPT]                          1 maxv q(v) < maxv p(v) − α · DTV (p, q)     (1 − δ) · q(u) + δ · p(u)       Speculative
+
+
+Speculative decoding is an alternate strategy that applies token-level interleaving between q and p,
+seeking to provably match the larger model quality at a reduced inference cost (Stern et al., 2018;
+Leviathan et al., 2023). Given a prefix x<t , we draft γ draft tokens xt , . . . , xt+γ−1 via auto-regressive
+sampling from q, and verify if these tokens can be accepted by running p in parallel on the γ prefixes
+x<t , . . . , x<t+γ−1 . We then rollback to the first rejected token t + j ∗ (where j ∗ ∈ {0, 1, . . . , γ − 1}),
+replace xt+j ∗ with a new token, and repeat the process with prefix x<t+j ∗ +1 .
+During
+      the verification
+                          stage, a draft token xt+j generated by q is accepted with probability
+       pt+j (xt+j )
+min 1, qt+j (xt+j )   and  rejected otherwise, recalling the shorthand qt+j (·) = q(·|x<t+j ) and
+pt+j (·) = p(·|x<t+j ). A rejected token is then replaced by a new token sampled from a modi-
+fied distribution norm (max {0, pt+j (·) − qt+j (·)}) , where norm(·) denotes normalization to sum
+to 1. This sampling process is provably equivalent to sampling γ tokens auto-regressively from p for
+prefix x<t (Leviathan et al., 2023). We summarize this speculative sampling procedure in Algorithm
+1. Each invocation of this algorithm generates at most γ + 1 next tokens (and at least one) for a given
+prefix x<t . One may run this algorithm multiple times to generate a complete output sequence.
+In practice, one may employ a lossy variant (Tran-Thien, 2023) of the above sampling that allows
+some deviation  from verifier’s distribution
+                                             p. In this case, a draft token xt+j is accepted with
+                          t+j    p
+                                t+j   (x   )
+probability min 1, (1−α)·q    t+j (xt+j )
+                                           , where α ∈ [0, 1) is a strictness parameter, with higher values
+indicating greater deviation from    p.   Anrejected token may then o be replaced by a token sampled from
+                                                1
+the residual distribution norm max 0, β · pt+j (·) − qt+j (·) , where β ≥ 1 − α is a parameter
+that depends on α, q and p. A common heuristic is to simply set β = 1 (Zhou et al., 2024).
+
+3     C ASCADES M EET S PECULATIVE D ECODING
+Both cascades and speculative decoding interleave models of different sizes to reduce inference cost,
+but fundamentally differ in the mechanisms they use. As a step towards comparing the strengths and
+weaknesses of these approaches, we first describe how one may design a token-level cascade.
+
+3.1     WARM - UP : T OKEN - LEVEL CASCADES
+
+It is straightforward to extend the sequence-level Chow’s rule from §2 to form a token-level cascade
+between q and p. For a prefix x<t , we first compute the smaller model’s distribution qt (·), and
+check whether maxv∈V qt (v) is below a pre-chosen threshold. If so, we evaluate pt (·), and sample
+xt ∼ pt (·); otherwise, we sample xt ∼ qt (·).
+More generally, we may design a token-level deferral rule r : Vt−1 → {0, 1} that takes the prefix
+x<t as input and outputs a binary decision, with r(x<t ) = 1 indicating that we defer to p (i.e., draw
+a sample from p rather than q). For example, token-level Chow’s rule can be written as:
+                                     rChow (x<t ) = 1 ⇐⇒ maxv∈V qt (v) < 1 − α,                                                (2)
+
+
+                                                                  3
+Published as a conference paper at ICLR 2025
+
+
+where α is a threshold parameter; the higher the value, the lower is the frequency of deferral to p.
+One may also use other confidence measures than the maximum probability, such as the entropy
+of the small model’s probability distribution. We elaborate in §D.1 that the choice of confidence
+measure would depend on the evaluation metric of interest; Equation (2) is typically prescribed when
+the cascade’s quality is evaluated in terms of its accuracy against the data generating distribution on
+individual tokens, whereas entropy is prescribed when the metric of interest is the cross-entropy loss.
+
+3.2   O PTIMAL TOKEN - LEVEL CASCADE DEFERRAL
+
+While Chow’s rule (2) is easy to implement, it can be sub-optimal if the smaller model’s max-token
+probability is not reflective of which of the two models are better equipped to predict the next token
+for a given prefix (Jitkrittum et al., 2023). Given this, it is natural to ask what the optimal deferral
+rule r for a token-cascade looks like, and whether we can reasonably approximate this rule.
+For this, we must first specify an objective to minimize at each step t. Following the prior cascade
+literature (Jitkrittum et al., 2023; Gupta et al., 2024), a reasonable objective to minimize is the
+expected loss from the deferral rule against the data generating distribution P, with an added cost
+for deferring to the larger model. We state this below for a fixed prefix x<t , using as before the
+short-hand qt (·) for q(·|x<t ) and pt (·) for p(·|x<t ):
+                                         h                                                 i
+           Ldef (r; x<t ) = Ev∼P(·|x<t ) 1 − r(x<t ) · `(v, qt ) + r(x<t ) · `(v, pt ) + α ,      (3)
+
+for a cost penalty α ≥ 0 and loss function ` : V × ∆V → R+ . Common choices for ` include the 0-1
+loss `0-1 (v, qt ) = 1 (v 6= arg maxv0 qt (v 0 )) and the log loss `log (v, qt ) = − log (qt (v)) .
+Lemma 1 (Optimal deferral for token-level cascades (Jitkrittum et al., 2023)). The minimizer of (3)
+is of the form:
+             r∗ (x<t ) = 1    ⇐⇒      Ev∼P(·|x<t ) [`(v, qt )] > Ev∼P(·|x<t ) [`(v, pt )] + α.         (4)
+
+Intuitively, we compare the expected loss from q with the expected cost of invoking p, and decide
+to defer when the latter is smaller. We note here that this optimization problem is set up for a fixed
+prefix x<t . One may also consider the coupled optimization problem across all positions.
+Plug-in estimator for (4). The optimal rule in (4) requires computing expectations over the data
+generating distribution P(·|x>t ), which is not available during inference time. A common approach
+in the cascades literature is to replace the expected losses with the models’ confidence estimates
+(Jitkrittum et al., 2023). For example, when ` = `0-1 , it may be reasonable to use 1 − maxv qt (v) as
+an estimate of the expected 0-1 loss Ext ∼P(·|x<t ) [`0-1 (xt , qt )] and 1 − maxv pt (v) as an estimate of
+Ext ∼P(·|x<t ) [`0-1 (xt , pt )]. The extent to which these estimates are accurate depend on how well q and
+p are calibrated (Guo et al., 2017). The resulting plug-in estimator for (4) thresholds the difference of
+confidence estimates from both distributions:
+                      r̂Diff (x<t ) = 1   ⇐⇒     maxv qt (v) < maxv pt (v) − α.                    (5)
+                                                       P
+Similarly, when ` = `log , we may use the entropy − v qt (v) · log(qt (v)) from qt as an estimate of
+its expected log-loss, and similarly for pt (see § D).
+Remark 1 (Diff rule is not realizable with a token-level cascade). We cannot directly employ
+r̂Diff in a token-level cascade, as it needs the large model to be invoked at every step t. However, it
+serves as an oracle that allows to analyze the head-room available to improve upon Chow’s rule.
+
+3.3   C ONTRASTING TOKEN - LEVEL CASCADE AND SPECULATIVE DECODING TRADE - OFFS
+
+Token-level cascades and speculative decoding differ in the distribution over tokens they seek to
+mimic. Speculative decoding seeks to mimic the large model’s output distribution, and is usually
+used when one wants to match the quality of the large model. On the other hand, token-level cascades
+seek to output distributions that closely approximate the label distribution and potentially offer good
+cost-quality trade-offs, sometimes yielding better quality than even the large model.
+Cascades are useful when the draft model fares better than the verifier on some inputs, and one may
+want to retain the drafter’s predictions even when it disagrees with the verifier. Even in cases where
+
+
+                                                    4
+Published as a conference paper at ICLR 2025
+
+
+                                       WMT: Small Large                                                 XSum: Base Large
+                    18
+                                                                                     14
+                    17
+
+
+                                                                           ROUGE-2
+                                                                                     13
+
+
+             BLEU
+                    16
+                                                   Cascade [Chow]                    12                             Cascade [Chow]
+                    15                             Oracle [Diff]                                                    Oracle [Diff]
+                                                                                     11
+                         0.0     0.2      0.4   0.6     0.8      1.0                      0.0     0.2      0.4   0.6     0.8      1.0
+                         #large-model deferrals / #tokens generated                       #large-model deferrals / #tokens generated
+
+Figure 2: Plots of quality as a function of the number of deferrals to the larger model divided by
+the total number of generated tokens for cascades constructed from T5 models (under temperature
+sampling with T = 1). The left-most point represents the small model and the right-most represents
+the large model. We compare token-level cascades constructed with Chow’s rule (Chow) and an oracle
+deferral rule (Diff). While speculative decoding will match the quality of the large model (see dashed
+horizontal line), the oracle deferral rule yields significantly better quality on a range of deferral rates.
+
+both the drafter and verifier fare poorly on some inputs (e.g., due to label noise), one may want to
+ignore the disagreement between the drafter and verifier to avoid triggering unnecessary roll-backs.
+As a concrete example, we consider token-level cascades of T5 models (Raffel et al., 2020) of
+two different sizes finetuned on a WMT EN → DE translation Bojar et al. (2014) and an extreme
+summarization (XSum) task (Narayan et al., 2018). We construct these cascades using Chow’s rule
+in (2), and the Diff rule in (5), which as noted in Remark 1, serves as an oracle. In Figure 2, we plot
+quality as a function of fraction of samples deferred to the large model (number of deferrals divided
+by number of generated tokens), as we vary the cost parameter α. Recall that speculative decoding is
+guaranteed to match the quality of the large model. In contrast, the Diff rule based cascades yield a
+wide range of cost-quality trade-offs, often outperforming the large model. Even Chow’s rule, which
+is sub-optimal for cascading (Jitkrittum et al., 2023), outperforms the large model in a small region.
+As noted by Kim et al. (2023), this may be attributed to the ensembling effect in a cascade.
+However, compared to speculative decoding, token-level cascades may require a significantly larger
+number of deferrals to the large model to achieve the same quality. This is because token-level
+cascades are executed sequentially: whenever q defers, we execute p once to generate one next token
+for the prefix accumulated so far, and the control transfers back to q. In contrast, speculative decoding
+runs p in scoring mode to verify γ draft tokens from q in parallel. Moreover, the stochastic verification
+algorithm in speculative decoding often results in fewer tokens from q getting rejected compared to
+the deterministic deferral rules used in a cascade. These observations motivate a natural question:
+given their complementary strengths, how can we leverage the best of both these techniques?
+
+4     S PECULATIVE C ASCADES : L EVERAGING THE B EST OF B OTH W ORLDS
+In addressing the above question, we present our main contribution: speculative cascades, a principled
+approach to combining the better trade-offs token-level cascades offer with the faster execution of
+speculative decoding. Unlike token-level cascades, where the large model is called only when the
+small model defers, speculative cascades invoke the large model in parallel scoring mode after every
+γ draft tokens. Consequently, they have the added benefit of being able to implement deferral rules
+that are not realizable with a sequential cascade, and can thus potentially achieve lower latencies.
+
+4.1   S PECULATIVE DECODING WITH GENERAL TARGET DISTRIBUTIONS
+
+We begin by considering a generic version of speculative decoding that seeks to mimic a general target
+distribution derived from the drafter’s and verifier’s distributions. In the proposed sampling procedure
+outlined in Algorithm 4, we sample tokens auto-regressively as before from the drafter’s distribution.
+During the verification step, however, we do not compare the drafter’s token probabilities against the
+verifier’s distribution. Instead, we use a user-specified target distribution π = T(q, p) ∈ ∆V derived
+from the drafter’s and verifier’s distributions at position t, for some function T(·, ·) that is inexpensive
+to compute. We accept a draft token xt when q(xt ) ≤ π(xt ) and reject it otherwise with probability
+1 − π(x  t)
+     q(xt ) . Upon rejection, we re-sample from the residual distribution norm (max{0, π(·) − q(·)}).
+
+This general procedure not only encompasses standard speculative decoding (Leviathan et al., 2023)
+for T(q, p) = p, but also includes lossy speculative decoding (Tran-Thien, 2023) as a special case:
+
+
+                                                                       5
+Published as a conference paper at ICLR 2025
+
+
+Lemma 2. Algorithm 4 reduces to the lossy speculative sampling procedure in (Tran-Thien, 2023)
+                                                          p(v)
+with parameters α and β when T(q, p)(v) = max{min{q(v), 1−α    }, p(v)
+                                                                   β }.
+
+
+4.2   F ROM SEQUENTIAL TO SPECULATIVE CASCADES
+
+Equipped with Algorithm 4, we now propose new cascading techniques that implement their deferral
+rule in a speculative manner. Recall from §3.1 that a token-level cascade of two models q and p is
+defined by a deferral rule r : Vt−1 → {0, 1}. For a prefix x<t , the next-token distribution at position
+t modeled by this cascade can be written as:
+                            π(v) = (1 − r(x<t )) · qt (v) + r(x<t ) · pt (v).
+In fact, for all the deferral rules described in §2, the resulting distribution can be described by a target
+distribution function Tδ of the form:
+                          Tδ (q, p)(v) = (1 − δ(q, p)) · q(v) + δ(q, p) · p(v),                         (6)
+for some function δ : ∆V × ∆V → {0, 1} that maps distributions (q, p) to a binary decision.
+                                                                                            For
+example, to implement Chow’s rule, we may choose δ(q, p) = 1 maxv q(v) < 1 − α .
+Our proposal is to then invoke the speculative sampling procedure in Algorithm 4 with Tδ as the
+target distribution function. We outline this generic speculative cascading approach in Algorithm 5,
+and contrast it with the sequential execution of a deferral rule in Algorithm 2.
+Interestingly, as noted below, the Diff rule, which was not realizable with a token-level cascade, can
+be efficiently implemented with a speculative cascaded using δ(q, p) = 1 maxv q(v) < maxv p(v)−
+α . See Table 1 for a summary of different deferral rules and corresponding target distributions.
+Remark 2 (Diff rule is realizable with a speculative cascade). In a token-level cascade, the large
+model’s distribution p cannot be used at the time the deferral decision is made (see Remark 1), as
+this would defeat the purpose of the cascade. With a speculative cascade, however, we can employ
+rules such as Diff that depend on both q and p. This is because we run the large model p in parallel
+on drafts generated by the small model q, allowing us to compute both p(·) and q(·) on every prefix.
+So far we have considered deferral rules designed for use with (sequential) token-level cascades.
+In what follows, we derive the optimal deferral rule r for a speculative cascade, where we sample
+speculatively from a target distribution π = (1 − r(x<t )) · qt + r(x<t ) · pt using qt as the drafter.
+
+4.3   O PTIMAL SPECULATIVE CASCADE DEFERRAL
+
+We seek a deferral rule r : Vt−1 → {0, 1} that trades-off between quality and inference cost. As with
+§2, we measure quality in terms of the loss incurred against the data generating distribution. The
+inference cost, on the other hand, crucially depends on how frequently a draft token is rejected in the
+verification phase, triggering a rollback. To this end, we seek to minimize the expected loss from
+the deferral rule subject to a constraint on the resulting rejection rate. More specifically, (i) we show
+that the rejection rate can be computed using a simple closed-form expression (Lemma 3); (ii) we
+formulate a constrained optimization objective (7) and the corresponding the Lagrangian (8); (iii)
+we derive the optimal deferral rule that minimizes the Lagrangian (Lemma 4), approximate it with a
+plug-in rule (10), and provide a regret bound guarantee for the approximation (Lemma 5).
+Lemma 3. For a given prefix x<t , and target distribution π = (1 − r(x<t )) · qt + r(x<t ) · pt , the
+probability of a tokenPdrawn from draft distribution qt being rejected is equal to: r(x<t )·DTV (pt , qt ),
+where DTV (p, q) = v∈V max{0, p(v) − q(v)} is the TV distance between p and q.
+
+Intuitively, whenever r(x<t ) = 0, π(v) = qt (v), and therefore there is no rejection or roll-back;
+when r(x<t ) = 1, the rejection rate equals DTV (pt , qt ), per Leviathan et al. (2023).
+For a fixed prefix x<t , we formulate the goal of finding a solution to:
+                  h                                             i
+min Ev∼P(·|x<t ) 1 − r(x<t ) · `(v, qt ) + r(x<t ) · `(v, pt ) s.t. r(x<t ) · DTV (pt , qt ) ≤ B, (7)
+ r
+for some budget B > 0. Equivalently, one may minimize an unconstrained objective similar to (3),
+for suitable cost parameter α > 0 (see §D.5):
+
+ Lspec (r; x<t ) = Ev∼P(·|x<t ) 1 − r(x<t ) · `(v, qt ) + r(x<t ) · `(v, pt ) + α · DTV (pt , qt ) , (8)
+
+
+                                                     6
+Published as a conference paper at ICLR 2025
+
+
+Algorithm 1 SpecDecode                             Algorithm 4 GenSpecSample
+Input: Models q, p, Prefix x<t , Block size γ      Input: Models q, p, Target distr. T, Prefix x<t , Block size γ
+          .                                          // Sample γ tokens auto-regressively from q
+  T(q, p) = p
+Output: GenSpecSample(q, p, T, x<t , γ)              for j = 0 to γ − 1 do
+                                                                  .
+                                                         qt+j (·) = q(·|x<t+j ); xt+j ∼ qt+j (·)
+                                                     end for
+Algorithm 2 TokenCascade                             // Run p in parallel to score γ draft tokens
+                                                               .
+Input: Models q, p, Deferral logic δ, Prefix x<t     pt+j (·) = p(·|x<t+j ), ∀j ∈ [γ] ≡ {0, . . . , γ}
+          .
+  qt (·) = q(·|x<t )                                 πt+j = T(qt+j , pt+j )
+  if δ(qt , ∅) = 0 then                              // Find the earliest rejected draft token
+       Sample xt ∼ qt (·)                                        n
+                                                                     πt+j (xt+j )
+                                                                                  o
+  else                                               aj ∼ Ber min 1, qt+j (xt+j )
+                                                                                     , ∀j ∈ [γ − 1]; aγ = 0
+              .
+       pt (·) = p(·|x<t ); Sample xt ∼ pt (·)        j ∗ = min{j ∈ [γ] : aj = 0}
+  end if                                             // Sample a new token from residual distribution
+Output: xt                                           pres (·)
+                                                     (                                                              =
+                                                       norm(max {0, πt+j ∗ (·) − qt+j ∗ (·)}) if j ∗ < γ
+Algorithm 3 OracleCascade                              πt+γ (·)                               else
+Input: Models q, p, Deferral logic δ, Prefix x<t     Sample xt+j ∗ ∼ pres (·)
+         .                   .
+  qt (·) = q(·|x<t ); pt (·) = p(·|x<t )           Output: xt , . . . , xt+j ∗
+  if δ(qt , pt ) = 0 then
+       Sample xt ∼ qt (·)
+  else                                           Algorithm 5 SpecCascade
+       Sample xt ∼ pt (·)                        Input: Models q, p, Deferral logic δ, Prefix x<t , Block size γ
+  end if                                                     .
+                                                   Tδ (q, p) = (1 − δ(q, p)) · q + δ(q, p) · p
+Output: xt                                       Output: GenSpecSample(q, p, Tδ , x<t , γ)
+
+
+Contrasting (8) with the deferral risk in (3) for a token-level cascade, the difference is that the cost of
+deferring to the larger model is no longer a constant, but depends on the similarity between qt and
+pt , as measured by the total variation (TV) distance between them. Analgous to Lemma 1, we next
+derive the optimal deferral rule for (8), and then construct a feasible estimator for it.
+Lemma 4 (Optimal deferral for speculative cascades). The minimizer of (8) is of the form:
+      r∗ (x<t ) = 1     ⇐⇒       Ev∼P(·|x<t ) [`(v, qt )] > Ev∼P(·|x<t ) [`(v, pt )] + α · DTV (pt , qt ).    (9)
+
+When pt and qt are similar, the rejection rate for qt is low, and hence the deferral decision will depend
+largely on which of the two models yields a lower expected loss. When pt and qt are very different,
+the optimal decision is to defer to pt only when it yields a substantially lower loss than qt .
+Plug-in estimator for (9). The optimal rule requires estimating expectations with respect the data
+generating distribution P(·|x<t ). We employ similar plug-in estimators as the ones used with token-
+level cascades (§3.2). When ` = `0-1 , we replace the expected 0-1 loss with (one minus) the maximum
+probability from the model, giving us:
+                r̂OPT (x<t ) = 1    ⇐⇒      maxv qt (v) < maxv pt (v) − α · DTV (pt , qt ).                  (10)
+The efficacy of the plug-in estimator depends on how closely the individual models approximate the
+data generating distribution P(·|x<t ); this is formalized by the following regret bound:
+                                                                       .
+Lemma 5 (Regret bound for r̂OPT ). Suppose ` = `0-1 . Denote Pt (v) = P(v|x<t ). Then for fixed x<t :
+     Lspec (r̂OPT ; x<t ) − min Lspec (r; x<t ) ≤ max Pt (v) − qt (v) + max Pt (v) − pt (v) .
+                             r                         v∈V                         v∈V
+
+One can now run the speculative cascading procedure in Algorithm 5 using (10) as the deferral rule;
+the corresponding δ(·) is listed in Table 1. See §D.3 for a similar derivation for ` = `log .
+
+5    B EYOND C ASCADED D EFERRAL : T OKEN - SPECIFIC I NTERLEAVINGS
+The deferral rules we have seen so far in (5) and (10) decide between the drafter’s distribution qt (·)
+and the verifier’s distribution pt (·) by comparing their maximum token probabilities. A downside to
+
+
+                                                        7
+Published as a conference paper at ICLR 2025
+
+
+this cascaded form of deferral is that the specific draft token sampled xt ∼ qt (·) may not be the same
+as the token that maximizes maximize qt (·). Thus, even when xt is of poor quality, we may end up
+accepting it because qt happens to be more peaked than pt .
+Token-specific interleaving. To alleviate the above problem, we propose the use of token-specific
+deferral rules r : Vt−1 × V → {0, 1} that use both the prefix x<t and a candidate token v to provide
+a binary decision r(x<t , v) ∈ {0, 1}, with 0 indicating that the token is of acceptable quality. We
+may then construct a target distribution of the following form:
+                             πToken (v) = qt (v) · (1 − r(x<t , v)) + pt (v) · η,                      (11)
+                              0       0
+            P                                                                        P
+where η = v0 ∈V r(x<t , v )·qt (v ) is a normalizing term chosen to ensure that v∈V πToken (v) = 1.
+This target distribution closely mimics qt (·) on tokens that the deferral rule r deems to be of acceptable
+quality, and defers to pt (·) otherwise. One can modify the generic speculative sampling algorithm in
+Algorithm 4 to use πToken as the target distribution, as shown in Algorithm 6 in §E.
+To design the deferral rule r, we propose a heuristic variant of the Diff rule in equation 4 (in §E,
+we discuss deriving a similar variant of the OPT rule in equation 9). Specifically, we compare the
+probability that the draft token v is the incorrect next token to x<t according to the data-generating
+distribution P with the expected 0-1 loss that we would incur if we were to defer to the verifier pt :
+              r(x<t , v) = 1 ⇐⇒ 1 − P(v|x<t ) > Ev0 ∼P(·|x<t ) [`0-1 (v 0 , pt )] + α,              (12)
+for a cost parameter α. The following are some simple plug-in approximations to (12), where we
+approximate P(v|x<t ) with either qt (v) or pt (v), and the expected 0-1 loss using maxv0 pt (v 0 ):
+                     r̂TokenV1 (x<t , v) = 1   ⇐⇒   qt (v) < maxv0 pt (v 0 ) − α                      (13)
+                     r̂TokenV2 (x<t , v) = 1   ⇐⇒   pt (v) < maxv0 pt (v 0 ) − α                      (14)
+                     r̂TokenV3 (x<t , v) = 1   ⇐⇒   pt (v) < maxv0 pt (v 0 ) · (1 − α).               (15)
+where (15) uses a multiplicative plug-in approximation.
+The resulting target distributions have an intuitive form. For example, with (13):
+                                                                              0
+                                                                  P
+                     πTokenV1 (v) = qt (v) · 1 v ∈ Tα + pt (v) · v0 ∈T
+                                                                     / α qt (v ),                     (16)
+where Tα = {v ∈ V : qt (v) ≥ maxv0 pt (v ) − α} is the set of tokens deemed important. For these
+                                               0
+
+tokens, πTokenV1 approximates qt (·); for the rest, it is a re-scaled version of pt (·).
+Contrasting with lossy speculative sampling. Recall that lossy speculative sampling (Tran-Thien,
+2023) also seeks to mimic a token-specific interleaving of qt and pt , given by πLossy (v) =
+max{min{qt (v), p1−αt (v)
+                          }, ptβ(v) }, for trade-off parameters α, β (Lemma 2). However, in some settings,
+this choice of target distribution may severely limit the range of cost-quality trade-offs that can be
+achieved by varying α and β. For example, note that πLossy (v) = 0 whenever pt (v) = 0, making the
+trade-off parameters α and β irrelevant for such tokens. This can be particularly problematic when
+sampling with a small temperature or when applying top-P sampling, where qt and pt may not share
+the same support. In contrast, our proposed approach to token-specific deferral enables a wider range
+of trade-offs under both temperature and top-P sampling, by computing the deferral rule r in (11) on
+unscaled versions of qt and pt , while interleaving between scaled versions of qt and pt (see §C).
+In fact, in the extreme case of greedy decoding (sampling with temperature T = 0), πLossy simply
+degenerates to pt . For this special case, Leviathan et al. (2023) propose an alternate lossy version
+of speculative decoding with a deterministic rejection criterion similar to (15). Interestingly, our
+proposed TokenV3 approach reduces to this variant when T → 0 (see §C.4). Thus TokenV3 can be
+seen as a generic deferral rule that is applicable to both greedy and non-greedy decoding.
+
+6       E XPERIMENTAL RESULTS
+We compare our speculative cascading techniques with both sequential cascades and standard
+speculative decoding on a range of language benchmarks, including translation, reasoning, coding,
+QA, etc. We evaluate speculative cascades constructed from both the T5 v1.1 family of encoder-
+decoder models (Raffel et al., 2020), and Gemma v2 decoder-only models (Team et al., 2024).1
+    1
+        Illustrative colab notebook with Gemma models available at: https://github.com/google-research/
+google-research/tree/master/speculative_cascades.
+
+
+
+                                                    8
+ Published as a conference paper at ICLR 2025
+
+
+Table 2: Reduction in latency (T = 1, γ = 5) when matching the quality of the large model (cols
+2–7), and the best quality metric without exceeding the latency of the large model (cols 8–13). Quality
+is measured in terms of BLEU for WMT and ROUGE-2 for XSum and CNNDM. Rows 1–4 are the
+baselines; Rows 5–6 contain the proposed method with old deferral rules (§3); Rows 7–8 are with
+new deferral rules (§4). See §F.2–F.3 for results with varying temperatures and top-P sampling.
+                                Latency↓ when matching large model’s quality            Best quality without exceeding large model’s latency
+                               Small → Large                    Small → XL                   Small → Large                   Small → XL
+ Method                WMT       XSum     CNNDM         WMT      XSum     CNNDM      WMT       XSum    CNNDM        WMT       XSum     CNNDM
+ SeqCascade [Chow]     1.55×     0.84×     0.98×        2.46×    0.93×     0.94×     16.56     12.97     9.91       16.29     16.40     11.18
+ TokenCascade [Chow]   1.03×     0.93×     1.40×        1.46×    0.82×     1.51×     16.52     13.30    10.36       16.65     17.09     11.44
+ SpecDecode [Lossy]    1.61×     1.10×     1.57×        2.17×    1.28×     2.07×     17.26     13.90    10.43       16.94     17.36     11.53
+ BiLD∗                 1.34×     1.04×     1.38×        1.85×    1.28×     1.84×     16.49     13.81    10.14       15.90     17.35     11.35
+ SpecCascade [Chow]    1.43×     1.04×     1.41×        2.01×    1.28×     1.97×     17.76     13.82    10.28       16.35     17.36     11.39
+ SpecCascade [Diff]    1.79×     1.17×     1.75×        2.44×    1.30×     2.15×     18.04     14.00    10.64       18.07     17.37     11.67
+ SpecCascade [OPT]     1.95×     1.17×     1.80×        2.61×    1.34×       2.21×   18.33     14.10    10.86        18.09    17.48     11.85
+ SpecCascade [Token]   1.85×     1.18×     1.89×        2.50×    1.40×       1.89×   22.50     15.85    12.63        22.70    18.79     12.63
+
+
+Cascades versus SpecDecode evaluation. Our evaluation protocol is markedly different from the
+standard evaluation of speculative decoding algorithms, where the goal is to speed up inference with
+a large model while preserving its output distribution. In contrast, our focus is on trading-off quality
+for lower inference costs by interleaving two models of different sizes. We also do not claim to
+develop a new state-of-the-art method for fast LM inference. Furthermore, the speculative cascades
+we design build on the original speculative decoding algorithm Leviathan et al. (2023). While one
+could potentially also adapt our proposal to other recent variants of speculative decoding (Cai et al.,
+2024; Li et al., 2024a), these involve a wholly orthogonal suite of techniques to what we propose
+(such as architectural changes, allowing for multiple drafts, distillation, and so on; see §B).
+ Proposed methods and baselines. We evaluate our proposed speculative cascades with four deferral
+ rules: (i) Chow in (2), (ii) Diff in (5), (iii) OPT in (10), and (iv) the Token-specific rule in (15). Of
+ these, (i) and (ii) are existing deferral rules, while (iii) and (iv) are new rules we propose. We also
+ present results for the V1 and V2 variants of the token-specific rules in §F.7.
+We compare these with the following cascading and speculative decoding baselines:
+ (i) Sequence-level cascade (Jitkrittum et al., 2023; Gupta et al., 2024) based on sequence-level
+     Chow’s rule in (1) (SeqCascade [Chow]).
+(ii) Token-level cascade outlined in Algorithm 2, with token-level Chow’s rule in (2) used for deferral
+     (Chow, 1970; Gupta et al., 2022) (TokenCascade [Chow]).
+(iii) Lossy speculative decoding described in §2, with both β = 1 (Leviathan et al., 2023; Zhou et al.,
+      2024) (SpecDecode [Lossy]) and β tuned using the procedure in Tran-Thien (2023) (Lossy? ).
+(iv) Big-Little Decoder approach (Kim et al., 2023), with both the original deterministic rejection rule
+     (BiLD), and the stochastic rejection sampling variant of their method described in §B (BiLD∗ ).
+Fine-tuned T5 cascades. Our experiments on T5 models are based on the setup in Zhou et al. (2024);
+see §F.1 for details. We use T5-small (77M) as the small model, and either T5-large (800M) or
+T5-XL (3B) as the large model. In each case, we supervised fine-tune these models on three tasks:
+WMT EN→DE translation (Bojar et al., 2014), CNN/DM summarization (Hermann et al., 2015), and
+XSum abstractive summarization (Narayan et al., 2018). We use temperatures T = 0, 0.1, 0.5, 1.0,
+and block sizes γ = 3, 5, 7 (full results in §F). Following the protocol in Leviathan et al. (2023);
+Zhou et al. (2024), to measure latency, we evaluate the wall-clock decoding time with batch size 1.
+ In Table 2, we report for the each method, (i) the reduction in latency from T5 cascades when
+ matching the quality of the large model, and (ii) the best quality it can deliver without exceeding
+ the latency of the large model. SeqCascade and TokenCascade are often seen to fare poorly on
+ both quality and latency metrics, with the exception of WMT, where SeqCascade yields non-trivial
+ speed-ups. SpecCascade [Token] often yields the highest speed-up and the best quality metrics, with
+ OPT coming in second. The reason the Token-specific rule fares better than OPT and Diff is because
+ the latter compute their deferral decisions based on which of qt (·) and pt (·) is more peaked; this can
+ be a disadvantage when the sampled token is not close to the distribution mode, which is likely to
+ happen when applying temperature sampling with a high temperature.
+
+
+                                                                         9
+Published as a conference paper at ICLR 2025
+
+
+                 WMT 5-shot: 2B 27B (T = 1)                                          CNNDM 5-shot: 2B 27B (T = 1)                                              GSM8K 8-shot: 2B 27B (T = 1)
+                                                                            21
+       25                                                                                                                                           0.7
+                                                                            20
+
+
+                                                                                                                                      Exact Match
+                                                                  Rouge-L
+       20                                                                                                                                           0.6
+BLEU
+                                                                            19
+
+       15                        SpecDecode [Lossy]                         18                             SpecDecode [Lossy]                       0.5                               SpecDecode [Lossy]
+                                 SpecCascade [OPT]                                                         SpecCascade [OPT]                                                          SpecCascade [OPT]
+       10                        SpecCascade [Token]                        17                             SpecCascade [Token]                      0.4                               SpecCascade [Token]
+        0.00   0.05   0.10    0.15     0.20      0.25      0.30              0.00   0.05          0.10    0.15       0.20      0.25                   0.00   0.02     0.04     0.06    0.08     0.10   0.12
+                         Rejection rate                                                             Rejection rate                                                           Rejection rate
+                 WebQ 1-shot: 2B 27B (T = 1)                                        MBPP 3-shot: 2B 27B [PT] (T = 1)                                         NaturalQA 1-shot: 2B 27B (T = 1)
+                                                                                                                                             0.35
+     0.32
+                                                                           0.5
+                                                                                                                                             0.30
+     0.30
+                                                                           0.4
+                                                                                                                                             0.25
+
+
+                                                                  Pass@1
+     0.28
+F1
+
+
+                                                                                                                                      F1
+                                                                           0.3
+     0.26                                                                                                                                    0.20
+                                 SpecDecode [Lossy]                                                        SpecDecode [Lossy]                                                         SpecDecode [Lossy]
+                                 SpecCascade [OPT]                         0.2                             SpecCascade [OPT]                                                          SpecCascade [OPT]
+     0.24                        SpecCascade [Token]                                                       SpecCascade [Token]               0.15                                     SpecCascade [Token]
+        0.00   0.05    0.10     0.15      0.20          0.25                 0.00          0.05            0.10             0.15                      0.0           0.1         0.2           0.3       0.4
+                         Rejection rate                                                             Rejection rate                                                           Rejection rate
+
+Figure 3: Plots of quality vs. rejection rate for methods that interleave Gemma 2B with Gemma 27B
+(γ = 1). We use instruction-tuned models; for MBPP we report additional results with pre-trained
+models. See §F.7 for remaining plots, comparison to (13–14) and results on 2B → 9B cascades.
+
+We present plots of quality vs. latency for the different methods in Figure 4 in §F. In each case, we
+vary the trade-off parameter α, and plot the quality metric as a function of the relative latency to the
+large model. While methods that use speculative execution are considerably faster than sequential
+cascades (TokenCascade [Chow]), the latter offer better quality in the low-latency regimes. This
+is because unlike speculative approaches, which always call the large model after every γ steps,
+sequential cascades invoke the large model only when the small model defers. In §F.5–F.6, we present
+additional comparisons to SpecDecode [Lossy? ], and the original BiLD algorithm (Kim et al., 2023).
+We also report results with varying temperatures in §F.2, and with top-P sampling in §F.3. As the
+temperature or P becomes smaller, SpecDecode [Lossy] yields comparable quality as our methods,
+but is severely limited in the range of cost-quality trade-offs it offers (see discussion in §5). In
+contrast, SpecCascade [Token] offers a wider range of trade-off points even for low temperature or
+P values, and is able to match the quality of the larger model at lower latencies (see Table 5).
+Few-shot Gemma cascades. To evaluate the Gemma model cascades, we use few-shot prompting
+with 8 language benchmarks: WMT, CNN/DM, GSM8K, MBPP, SQuAD 2.0, WebQuestions,
+NaturalQA and TriviaQA; many of these feature in the SpecBench suite (Xia et al., 2024). Figure 3
+presents plots of quality vs. rejection rate with a 2B drafter and 27B verifier for γ = 1. For brevity,
+we only compare the methods that fare the best in the previous experiments. With the exception of
+TriviaQA, SpecCascade [Token] is able to both match the 27B’s quality at a lower rejection rate
+and yield the best overall quality, often better than 27B. Since all three methods use the exact same
+implementation but with different rejection criteria, we directly compare their rejection rates.
+Interestingly, the OPT rule is not as effective as it was with the T5 models. We attribute this to the
+differences in distributions between the two setups. With T5, the maximum token probability served
+as a good indicator of token accuracy for both q and p. With Gemma models, however, we expect the
+large model to have a closer alignment with the data generating distribution (due to it being several
+billion parameters apart from the smaller model), and hence using the large model probabilities to
+measure confidence for both the small and large model (15) yields better trade-offs than comparing
+the modes from the two model distributions. More generally, we expect SpecCascade to yield
+significant gains over SpecDecode when there exists a slice of data where the small model performs
+comparable to or better than the large model. The larger this slice, the larger is the improvement.
+Conclusions. We have proposed new speculative cascading techniques that use a combination of
+auto-regressive drafting and parallel verification to implement their deferral rule, and shown that they
+yield better cost-quality trade-offs than standard sequential cascades and speculative decoding. A
+limitation of our approach is that while it offers lower latency via parallel execution, it also incurs
+a higher total compute cost compared to sequential cascades. In the future, we wish to replace
+our plug-in estimators with a router model (Gupta et al., 2024) trained on ground-truth samples to
+approximate the optimal rule, and to extend our proposal to more than two models.
+
+
+                                                                                                         10
+Published as a conference paper at ICLR 2025
+
+
+Acknowledgements. We thank Ananda Theertha Suresh and Ziteng Sun for insightful discussions
+and for help implementing speculative cascades with Gemma models.
+
+
+R EFERENCES
+Rohan Anil and et al. PaLM 2 technical report, 2023.
+
+Jacob Austin, Augustus Odena, Maxwell Nye, Maarten Bosma, Henryk Michalewski, David Dohan,
+  Ellen Jiang, Carrie Cai, Michael Terry, Quoc Le, et al. Program synthesis with large language
+  models. arXiv preprint arXiv:2108.07732, 2021.
+
+Jonathan Berant, Andrew Chou, Roy Frostig, and Percy Liang. Semantic parsing on freebase from
+  question-answer pairs. In Proceedings of the 2013 conference on empirical methods in natural
+  language processing, pp. 1533–1544, 2013.
+
+Sidney Black, Stella Biderman, Eric Hallahan, Quentin Anthony, Leo Gao, Laurence Golding,
+  Horace He, Connor Leahy, Kyle McDonell, Jason Phang, Michael Pieler, Usvsn Sai Prashanth,
+  Shivanshu Purohit, Laria Reynolds, Jonathan Tow, Ben Wang, and Samuel Weinbach. GPT-NeoX-
+  20B: An open-source autoregressive language model. In Angela Fan, Suzana Ilic, Thomas Wolf,
+  and Matthias Gallé (eds.), Proceedings of BigScience Episode #5 – Workshop on Challenges
+  & Perspectives in Creating Large Language Models, pp. 95–136, virtual+Dublin, May 2022.
+  Association for Computational Linguistics. doi: 10.18653/v1/2022.bigscience-1.9. URL https:
+  //aclanthology.org/2022.bigscience-1.9.
+
+Ondřej Bojar, Christian Buck, Christian Federmann, Barry Haddow, Philipp Koehn, Johannes
+  Leveling, Christof Monz, Pavel Pecina, Matt Post, Herve Saint-Amand, et al. Findings of the 2014
+ workshop on statistical machine translation. In Proceedings of the ninth workshop on statistical
+  machine translation, pp. 12–58, 2014.
+
+Tom Brown, Benjamin Mann, Nick Ryder, Melanie Subbiah, Jared D Kaplan, Prafulla Dhariwal,
+  Arvind Neelakantan, Pranav Shyam, Girish Sastry, Amanda Askell, Sandhini Agarwal, Ariel
+  Herbert-Voss, Gretchen Krueger, Tom Henighan, Rewon Child, Aditya Ramesh, Daniel Ziegler,
+  Jeffrey Wu, Clemens Winter, Chris Hesse, Mark Chen, Eric Sigler, Mateusz Litwin, Scott Gray,
+  Benjamin Chess, Jack Clark, Christopher Berner, Sam McCandlish, Alec Radford, Ilya Sutskever,
+  and Dario Amodei. Language models are few-shot learners. In H. Larochelle, M. Ranzato,
+  R. Hadsell, M. F. Balcan, and H. Lin (eds.), Advances in Neural Information Processing Systems,
+  volume 33, pp. 1877–1901. Curran Associates, Inc., 2020.
+
+Tianle Cai, Yuhong Li, Zhengyang Geng, Hongwu Peng, Jason D Lee, Deming Chen, and Tri Dao.
+  Medusa: Simple LLM inference acceleration framework with multiple decoding heads. arXiv
+  preprint arXiv:2401.10774, 2024.
+
+Charlie Chen, Sebastian Borgeaud, Geoffrey Irving, Jean-Baptiste Lespiau, Laurent Sifre, and John
+  Jumper. Accelerating large language model decoding with speculative sampling. arXiv preprint
+  arXiv:2302.01318, 2023a.
+
+Lingjiao Chen, Matei Zaharia, and James Zou. FrugalGPT: How to use large language models while
+  reducing cost and improving performance, 2023b.
+
+Zhuoming Chen, Avner May, Ruslan Svirschevski, Yu-Hsun Huang, Max Ryabinin, Zhihao Jia, and
+  Beidi Chen. Sequoia: Scalable and robust speculative decoding. In The Thirty-eighth Annual
+  Conference on Neural Information Processing Systems, 2024. URL https://openreview.net/
+  forum?id=rk2L9YGDi2.
+
+Ziyi Chen, Xiaocong Yang, Jiacheng Lin, Chenkai Sun, Jie Huang, and Kevin Chen-Chuan Chang.
+  Cascade speculative drafting for even faster LLM inference. arXiv preprint arXiv:2312.11462,
+  2023c.
+
+C Chow. On optimum recognition error and reject tradeoff. IEEE Transactions on information theory,
+  16(1):41–46, 1970.
+
+
+                                               11
+Published as a conference paper at ICLR 2025
+
+
+Aakanksha Chowdhery, Sharan Narang, Jacob Devlin, Maarten Bosma, Gaurav Mishra, Adam
+  Roberts, Paul Barham, Hyung Won Chung, Charles Sutton, Sebastian Gehrmann, Parker Schuh,
+  Kensen Shi, Sasha Tsvyashchenko, Joshua Maynez, Abhishek Rao, Parker Barnes, Yi Tay, Noam
+  Shazeer, Vinodkumar Prabhakaran, Emily Reif, Nan Du, Ben Hutchinson, Reiner Pope, James
+  Bradbury, Jacob Austin, Michael Isard, Guy Gur-Ari, Pengcheng Yin, Toju Duke, Anselm Lev-
+  skaya, Sanjay Ghemawat, Sunipa Dev, Henryk Michalewski, Xavier Garcia, Vedant Misra, Kevin
+  Robinson, Liam Fedus, Denny Zhou, Daphne Ippolito, David Luan, Hyeontaek Lim, Barret Zoph,
+  Alexander Spiridonov, Ryan Sepassi, David Dohan, Shivani Agrawal, Mark Omernick, Andrew M.
+  Dai, Thanumalayan Sankaranarayana Pillai, Marie Pellat, Aitor Lewkowycz, Erica Moreira, Rewon
+  Child, Oleksandr Polozov, Katherine Lee, Zongwei Zhou, Xuezhi Wang, Brennan Saeta, Mark
+  Diaz, Orhan Firat, Michele Catasta, Jason Wei, Kathy Meier-Hellstern, Douglas Eck, Jeff Dean,
+  Slav Petrov, and Noah Fiedel. PaLM: Scaling language modeling with pathways, 2022.
+Karl Cobbe, Vineet Kosaraju, Mohammad Bavarian, Mark Chen, Heewoo Jun, Lukasz Kaiser,
+  Matthias Plappert, Jerry Tworek, Jacob Hilton, Reiichiro Nakano, et al. Training verifiers to solve
+  math word problems. arXiv preprint arXiv:2110.14168, 2021.
+Dujian Ding, Ankur Mallick, Chi Wang, Robert Sim, Subhabrata Mukherjee, Victor Rühle, Laks
+ V. S. Lakshmanan, and Ahmed Hassan Awadallah. Hybrid LLM: Cost-efficient and quality-aware
+  query routing. In The Twelfth International Conference on Learning Representations, 2024. URL
+  https://openreview.net/forum?id=02f3mUtqnM.
+
+David Dohan, Winnie Xu, Aitor Lewkowycz, Jacob Austin, David Bieber, Raphael Gontijo Lopes,
+ Yuhuai Wu, Henryk Michalewski, Rif A. Saurous, Jascha Sohl-dickstein, Kevin Murphy, and
+  Charles Sutton. Language model cascades, 2022. URL https://arxiv.org/abs/2207.10342.
+Maha Elbayad, Jiatao Gu, Edouard Grave, and Michael Auli. Depth-adaptive transformer. In
+ International Conference on Learning Representations, 2020. URL https://openreview.net/
+ forum?id=SJg7KhVKPH.
+
+Mostafa Elhoushi, Akshat Shrivastava, Diana Liskovich, Basil Hosmer, Bram Wasti, Liangzhen Lai,
+ Anas Mahmoud, Bilge Acun, Saurabh Agarwal, Ahmed Roman, et al. Layer skip: Enabling early
+ exit inference and self-speculative decoding. arXiv preprint arXiv:2404.16710, 2024.
+DeepSeek-AI et al. Deepseek-v2: A strong, economical, and efficient mixture-of-experts language
+  model, 2024a. URL https://arxiv.org/abs/2405.04434.
+Grattafiori et al. The Llama 3 herd of models, 2024b. URL https://arxiv.org/abs/2407.21783.
+Chuan Guo, Geoff Pleiss, Yu Sun, and Kilian Q. Weinberger. On calibration of modern neural
+  networks. In Proceedings of the 34th International Conference on Machine Learning - Volume 70,
+  ICML’17, pp. 1321–1330. JMLR.org, 2017.
+Neha Gupta, Jamie Smith, Ben Adlam, and Zelda E Mariet. Ensembles of classifiers: a bias-variance
+  perspective. Transactions of Machine Learning Research, 2022. URL https://openreview.net/
+  forum?id=lIOQFVncY9.
+
+Neha Gupta, Harikrishna Narasimhan, Wittawat Jitkrittum, Ankit Singh Rawat, Aditya Krishna
+  Menon, and Sanjiv Kumar. Language model cascades: Token-level uncertainty and beyond. In The
+ Twelfth International Conference on Learning Representations, 2024. URL https://openreview.
+  net/forum?id=KgaBScZ4VI.
+
+Karl Moritz Hermann, Tomas Kocisky, Edward Grefenstette, Lasse Espeholt, Will Kay, Mustafa
+  Suleyman, and Phil Blunsom. Teaching machines to read and comprehend. Advances in neural
+  information processing systems, 28, 2015.
+Coleman Hooper, Sehoon Kim, Hiva Mohammadzadeh, Hasan Genc, Kurt Keutzer, Amir Gholami,
+  and Sophia Shao. Speed: Speculative pipelined execution for efficient decoding. arXiv preprint
+  arXiv:2310.12072, 2023.
+Wittawat Jitkrittum, Neha Gupta, Aditya K Menon, Harikrishna Narasimhan, Ankit Rawat, and Sanjiv
+ Kumar. When does confidence-based cascade deferral suffice? Advances in Neural Information
+ Processing Systems, 36, 2023.
+
+
+                                                12
+Published as a conference paper at ICLR 2025
+
+
+Mandar Joshi, Eunsol Choi, Daniel Weld, and Luke Zettlemoyer. TriviaQA: A large scale distantly
+ supervised challenge dataset for reading comprehension. In Proceedings of the 55th Annual
+ Meeting of the Association for Computational Linguistics (Volume 1: Long Papers), pp. 1601–
+ 1611, Vancouver, Canada, July 2017. Association for Computational Linguistics. doi: 10.18653/
+ v1/P17-1147. URL https://aclanthology.org/P17-1147.
+Leila Khalili, Yao You, and John Bohannon. Babybear: Cheap inference triage for expensive language
+  models, 2022. URL https://arxiv.org/abs/2205.11747.
+Sehoon Kim, Karttikeya Mangalam, Suhong Moon, Jitendra Malik, Michael W Mahoney, Amir
+  Gholami, and Kurt Keutzer. Speculative decoding with big little decoder. In Thirty-seventh
+  Conference on Neural Information Processing Systems, 2023.
+Taehyeon Kim, Ananda Theertha Suresh, Kishore Papineni, Michael Riley, Sanjiv Kumar, and Adrian
+  Benton. Towards fast inference: Exploring and improving blockwise parallel drafts. arXiv preprint
+  arXiv:2404.09221, 2024.
+Tom Kwiatkowski, Jennimaria Palomaki, Olivia Redfield, Michael Collins, Ankur Parikh, Chris
+  Alberti, Danielle Epstein, Illia Polosukhin, Jacob Devlin, Kenton Lee, Kristina Toutanova, Llion
+  Jones, Matthew Kelcey, Ming-Wei Chang, Andrew M. Dai, Jakob Uszkoreit, Quoc Le, and Slav
+  Petrov. Natural questions: A benchmark for question answering research. Transactions of the
+  Association for Computational Linguistics, 7:452–466, 2019. doi: 10.1162/tacl_a_00276. URL
+  https://aclanthology.org/Q19-1026.
+
+Yaniv Leviathan, Matan Kalman, and Yossi Matias. Fast inference from transformers via speculative
+  decoding. In Andreas Krause, Emma Brunskill, Kyunghyun Cho, Barbara Engelhardt, Sivan
+  Sabato, and Jonathan Scarlett (eds.), Proceedings of the 40th International Conference on Machine
+  Learning, volume 202 of Proceedings of Machine Learning Research, pp. 19274–19286. PMLR,
+  23–29 Jul 2023. URL https://proceedings.mlr.press/v202/leviathan23a.html.
+Yuhui Li, Fangyun Wei, Chao Zhang, and Hongyang Zhang. EAGLE: Speculative sampling requires
+  rethinking feature uncertainty. In International Conference on Machine Learning, 2024a.
+Yuhui Li, Fangyun Wei, Chao Zhang, and Hongyang Zhang. EAGLE-2: Faster inference of language
+  models with dynamic draft trees. In Empirical Methods in Natural Language Processing, 2024b.
+Fangcheng Liu, Yehui Tang, Zhenhua Liu, Yunsheng Ni, Kai Han, and Yunhe Wang. Kangaroo:
+  Lossless self-speculative decoding via double early exiting. arXiv preprint arXiv:2404.18911,
+  2024.
+Jonathan Mamou, Oren Pereg, Moshe Wasserblat, and Roy Schwartz. TangoBERT: Reducing
+  inference cost by using cascaded architecture, 2022. URL http://arxiv.org/abs/2204.06271.
+Xupeng Miao, Gabriele Oliaro, Zhihao Zhang, Xinhao Cheng, Zeyu Wang, Zhengxin Zhang, Rae
+ Ying Yee Wong, Alan Zhu, Lijie Yang, Xiaoxiang Shi, et al. Specinfer: Accelerating large
+  language model serving with tree-based speculative inference and verification. In Proceedings of
+  the 29th ACM International Conference on Architectural Support for Programming Languages
+  and Operating Systems, Volume 3, pp. 932–949, 2024.
+Giovanni Monea, Armand Joulin, and Edouard Grave. Pass: Parallel speculative sampling. arXiv
+  preprint arXiv:2311.13581, 2023.
+Shashi Narayan, Shay B Cohen, and Mirella Lapata. Don’t give me the details, just the summary!
+  topic-aware convolutional neural networks for extreme summarization. In Proceedings of the 2018
+  Conference on Empirical Methods in Natural Language Processing, pp. 1797–1807, 2018.
+Reiner Pope, Sholto Douglas, Aakanksha Chowdhery, Jacob Devlin, James Bradbury, Anselm
+  Levskaya, Jonathan Heek, Kefan Xiao, Shivani Agrawal, and Jeff Dean. Efficiently scaling
+  transformer inference, 2022.
+Alec Radford, Karthik Narasimhan, Tim Salimans, Ilya Sutskever, et al. Improving lan-
+  guage understanding by generative pre-training. https://cdn.openai.com/research-covers/
+  language-unsupervised/language_understanding_paper.pdf, 2018.
+
+
+                                                13
+Published as a conference paper at ICLR 2025
+
+
+Colin Raffel, Noam Shazeer, Adam Roberts, Katherine Lee, Sharan Narang, Michael Matena, Yanqi
+  Zhou, Wei Li, and Peter J. Liu. Exploring the limits of transfer learning with a unified text-to-text
+  transformer. J. Mach. Learn. Res., 21:140:1–140:67, 2020. URL http://jmlr.org/papers/v21/
+  20-074.html.
+
+Pranav Rajpurkar, Jian Zhang, Konstantin Lopyrev, and Percy Liang. SQuAD: 100,000+ questions
+  for machine comprehension of text. In Proceedings of the 2016 Conference on Empirical Methods
+  in Natural Language Processing, pp. 2383–2392, Austin, Texas, November 2016. Association
+  for Computational Linguistics. doi: 10.18653/v1/D16-1264. URL https://aclanthology.org/
+  D16-1264.
+
+Tal Schuster, Adam Fisch, Jai Gupta, Mostafa Dehghani, Dara Bahri, Vinh Q. Tran, Yi Tay, and
+  Donald Metzler. Confident adaptive language modeling. In Alice H. Oh, Alekh Agarwal, Danielle
+  Belgrave, and Kyunghyun Cho (eds.), Advances in Neural Information Processing Systems, 2022.
+  URL https://openreview.net/forum?id=uLYc4L3C81A.
+Ying Sheng, Lianmin Zheng, Binhang Yuan, Zhuohan Li, Max Ryabinin, Beidi Chen, Percy Liang,
+  Christopher Re, Ion Stoica, and Ce Zhang. FlexGen: High-throughput generative inference of
+  large language models with a single GPU. In Andreas Krause, Emma Brunskill, Kyunghyun
+  Cho, Barbara Engelhardt, Sivan Sabato, and Jonathan Scarlett (eds.), Proceedings of the 40th
+  International Conference on Machine Learning, volume 202 of Proceedings of Machine Learning
+  Research, pp. 31094–31116. PMLR, 23–29 Jul 2023. URL https://proceedings.mlr.press/
+  v202/sheng23a.html.
+
+Benjamin Spector and Chris Re. Accelerating LLM inference with staged speculative decoding.
+  arXiv preprint arXiv:2308.04623, 2023.
+Mitchell Stern, Noam Shazeer, and Jakob Uszkoreit. Blockwise parallel decoding for deep autore-
+ gressive models. CoRR, abs/1811.03115, 2018. URL http://arxiv.org/abs/1811.03115.
+Ziteng Sun, Ananda Theertha Suresh, Jae Hun Ro, Ahmad Beirami, Himanshu Jain, and Felix
+  Yu. Spectr: Fast speculative decoding via optimal transport. Advances in Neural Information
+  Processing Systems, 36, 2024.
+Gemini Team, Rohan Anil, and et al. Gemini: A family of highly capable multimodal models, 2023.
+Gemma Team, Morgane Riviere, Shreya Pathak, Pier Giuseppe Sessa, Cassidy Hardin, Surya
+  Bhupatiraju, Léonard Hussenot, Thomas Mesnard, Bobak Shahriari, Alexandre Ramé, et al.
+  Gemma 2: Improving open language models at a practical size. arXiv preprint arXiv:2408.00118,
+  2024.
+Hugo Touvron, Thibaut Lavril, Gautier Izacard, Xavier Martinet, Marie-Anne Lachaux, Timothée
+  Lacroix, Baptiste Rozière, Naman Goyal, Eric Hambro, Faisal Azhar, Aurelien Rodriguez, Armand
+ Joulin, Edouard Grave, and Guillaume Lample. Llama: Open and efficient foundation language
+  models, 2023.
+Vivien Tran-Thien. An optimal lossy variant of speculative decoding, 2023. URL https:
+  //vivien000.github.io...   Unsupervised Thoughts (Blog). URL: https://github.com/
+  vivien000/mentored_decoding.
+
+Neeraj Varshney and Chitta Baral. Model cascading: Towards jointly improving efficiency and
+  accuracy of nlp systems. arXiv preprint arXiv:2210.05528, 2022.
+Siqi Wang, Hailong Yang, Xuezhu Wang, Tongxuan Liu, Pengbo Wang, Xuning Liang, Kejie Ma,
+  Tianyu Feng, Xin You, Yongjun Bao, et al. Minions: Accelerating large language model inference
+  with adaptive and collective speculative decoding. arXiv preprint arXiv:2402.15678, 2024.
+Xiaofang Wang, Dan Kondratyuk, Eric Christiansen, Kris M Kitani, Yair Alon, and Elad Eban.
+  Wisdom of committees: An overlooked approach to faster and more accurate models. arXiv
+  preprint arXiv:2012.01988, 2020.
+Heming Xia, Zhe Yang, Qingxiu Dong, Peiyi Wang, Yongqi Li, Tao Ge, Tianyu Liu, Wenjie Li, and
+  Zhifang Sui. Unlocking efficiency in large language model inference: A comprehensive survey of
+  speculative decoding, 2024.
+
+
+                                                 14
+Published as a conference paper at ICLR 2025
+
+
+Murong Yue, Jie Zhao, Min Zhang, Liang Du, and Ziyu Yao. Large language model cascades
+ with mixture of thought representations for cost-efficient reasoning. In The Twelfth International
+ Conference on Learning Representations, 2024. URL https://openreview.net/forum?id=
+ 6okaSfANzh.
+
+Jun Zhang, Jue Wang, Huan Li, Lidan Shou, Ke Chen, Gang Chen, and Sharad Mehrotra. Draft &
+  verify: Lossless large language model acceleration via self-speculative decoding. arXiv preprint
+  arXiv:2309.08168, 2023.
+Yongchao Zhou, Kaifeng Lyu, Ankit Singh Rawat, Aditya Krishna Menon, Afshin Rostamizadeh, San-
+  jiv Kumar, Jean-François Kagy, and Rishabh Agarwal. Distillspec: Improving speculative decoding
+  via knowledge distillation. In The Twelfth International Conference on Learning Representations,
+  2024. URL https://openreview.net/forum?id=rsY6J3ZaTF.
+
+
+                                                15
+Published as a conference paper at ICLR 2025
+
+
+Appendix
+Table of Contents
+     A Proofs                                                                                      17
+       A.1 Proof of Lemma 1 . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .      17
+       A.2 Proof of Lemma 2 . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .      17
+       A.3 Proof of Lemma 3 . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .      18
+       A.4 Proof of Lemma 4 . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .      18
+       A.5 Proof of Lemma 5 . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .      19
+
+     B Further related work                                                                        21
+
+     C Contrasting Speculative Cascades and Lossy Speculative Sampling under Different
+       Sampling Schemes                                                                     22
+       C.1 Speculative cascades under temperature sampling and top-P sampling . . . . . . 22
+       C.2 Contrasting with lossy speculative sampling under temperature sampling . . . . 22
+       C.3 Contrasting with lossy speculative sampling under top-P sampling . . . . . . . . 23
+       C.4 Lossy speculative greedy decoding variant by Leviathan et al. (2023) . . . . . . 24
+
+     D Optimal Deferral: Additional Discussion                                                     25
+       D.1 Derivation of Chow’s rule . . . . . . . . . . . . . . . . . . . . . . . . . . . . .     25
+       D.2 Optimal sequential deferral when ` = `log . . . . . . . . . . . . . . . . . . . .       25
+       D.3 Optimal speculative deferral when ` = `log . . . . . . . . . . . . . . . . . . . .      25
+       D.4 Optimal speculative deferral for greedy decoding . . . . . . . . . . . . . . . . .      26
+       D.5 Equivalence between (7) and (8) . . . . . . . . . . . . . . . . . . . . . . . . . .     27
+
+     E Token-specific Speculative Cascade                                                          28
+
+     F Additional Experimental Details                                                             29
+       F.1 Experimental setup and hyper-parameters . . . . . . . . . . . . . . . . . . . . .       29
+       F.2 Comparisons under varying temperatures and greedy decoding . . . . . . . . . .          32
+       F.3 Comparisons under top-P sampling . . . . . . . . . . . . . . . . . . . . . . . .        33
+       F.4 Comparisons under different block sizes γ . . . . . . . . . . . . . . . . . . . .       33
+       F.5 Big Little Decoder (BiLD) variants . . . . . . . . . . . . . . . . . . . . . . . .      33
+       F.6 Lossy speculative decoding variants . . . . . . . . . . . . . . . . . . . . . . . .     36
+       F.7 Token-specific deferral rule variants . . . . . . . . . . . . . . . . . . . . . . . .   37
+
+     G Limitations                                                                                 39
+
+
+                                                    16
+Published as a conference paper at ICLR 2025
+
+
+A      P ROOFS
+
+A.1     P ROOF OF L EMMA 1
+
+Proof. Expanding the loss in (3), we have:
+  Ldef (r; x<t )
+
+    = 1 − r(x<t ) · Ext ∼P(·|x<t ) [`(xt , qt )] + r(x<t ) · Ext ∼P(·|x<t ) [`(xt , pt )] + α
+
+    = r(x<t ) · Ext ∼P(·|x<t ) [`(xt , pt )] + α − Ext ∼P(·|x<t ) [`(xt , qt )] + Ext ∼P(·|x<t ) [`(xt , qt )] .
+
+This objective is minimized by a deferral rule r : Vt−1 → {0, 1} that minimizes, for each prefix x<t ,
+the term within the parenthesis. Therefore the minimizer r∗ (x<t ) = 1 whenever the term within the
+parenthesis is negative:
+                        Ext ∼P(·|x<t ) [`(xt , pt )] + α − Ext ∼P(·|x<t ) [`(xt , qt )] < 0,
+and r∗ (x<t ) = 0 otherwise. Re-arranging the terms completes the proof.
+
+A.2     P ROOF OF L EMMA 2
+
+Proof. The proof follows straight-forwardly from the results in (Tran-Thien, 2023). Recall from §2
+that the lossy speculative decoding procedure of (Tran-Thien, 2023) accepts a draft token x with
+probability:
+                                                     p(x)
+                                κ(x) = min 1,                     ,                           (17)
+                                                (1 − α) · q(x)
+and replaces a rejected draft token with a token sampled from the residual distribution:
+
+                                                      1
+                          pres (x) = norm max 0, · p(x) − q(x)            ,                                  (18)
+                                                      β
+for parameters α ∈ [0, 1) and β ≥ 1 − α.
+We need to show that running Algorithm 4 with the target distribution:
+
+                                                      p(x)       p(x)
+                          π(x) = max min q(x),                 ,
+                                                     1−α          β
+results in the same acceptance probability (17) and residual distribution (18).
+The acceptance probability for a draft token x when running Algorithm 4 on π is given by:
+
+                                                      π(x)
+                                    κπ (x) = min 1,          .
+                                                      q(x)
+The corresponding residual distribution is given by:
+                                 pπres (x) = norm (max {0, π(x) − q(x)}) .
+
+We consider three possible cases:
+                  1
+Case (i): q(x) > 1−α · p(x) ≥ β1 · p(x). In this case, π(x) = 1−α
+                                                               1
+                                                                  · p(x). As a result:
+
+                                                   p(x)
+                          κπ (x) = min 1,                      = κ(x);
+                                              (1 − α) · q(x)
+
+                                                1
+                     pπres (x) = norm  max 0,       · p(x) − q(x)
+                                              1−α
+
+                                                  1
+                              = 0 = norm max 0, · p(x) − q(x)        = pres (x).
+                                                  β
+
+
+                                                        17
+Published as a conference paper at ICLR 2025
+
+
+            1
+Case (ii): 1−α · p(x) ≥ β1 · p(x) > q(x). In this case, π(x) = β1 · p(x). As a result:
+
+               π                  p(x)                           p(x)
+              κ (x) = min 1,                = 1 = min 1,                      = κ(x);
+                                 β · q(x)                   (1 − α) · q(x)
+
+                                             1
+                      pπres (x) = norm max 0, · p(x) − q(x)    = pres (x).
+                                             β
+              1
+Case (iii): 1−α  · p(x) ≥ q(x) ≥ β1 · p(x). In this case, π(x) = q(x). As a result:
+
+                              π                         p(x)
+                             κ (x) = 1 = min 1,                      = κ(x);
+                                                   (1 − α) · q(x)
+
+                     π                               1
+                    pres (x) = 0 = norm max 0, · p(x) − q(x)               = pres (x).
+                                                     β
+In all three cases, the acceptance probabilities and residual distributions are identical.
+
+A.3   P ROOF OF L EMMA 3
+
+Proof. Under a target distribution πt , the probability of a draft token drawn from qt being is rejected
+is given by (Leviathan et al., 2023):
+
+                                              X                           πt (v)
+                    rejection probability =       qt (v) · 1 − min 1,
+                                                                           qt (v)
+                                              v∈V
+                                                  X
+                                           =1−         min {qt (v), πt (v)}
+                                                         v∈V
+                                                   X                X
+                                               =         πt (v) −         min {qt (v), πt (v)}
+                                                   v∈V              v∈V
+                                                   X
+                                               =         max {0, πt (v) − qt (v)} .
+                                                   v∈V
+
+Expanding πt , the rejection probability becomes:
+                                X
+      rejection probability =       max {0, (1 − r(x<t )) · qt (v) + r(x<t ) · pt (v) − qt (v)}
+                                   v∈V
+
+When r(x<t ) = 1, we have:
+                           X
+   rejection probability =   min {0, pt (v) − qt (v)} = DTV (pt , qt ) = r(x<t ) · DTV (pt , qt ).
+                               v∈V
+
+When r(x<t ) = 0, we have:
+                            rejection probability = 0 = r(x<t ) · DTV (pt , qt ),
+as desired.
+
+A.4   P ROOF OF L EMMA 4
+
+Proof. Expanding the deferral risk in (8), we have:
+
+  Lspec (r; x<t ) = r(x<t ) · Ext ∼P(·|x<t ) [`(xt , pt )] + α · DTV (pt , qt ) − Ext ∼P(·|x<t ) [`(xt , qt )]
+                                                                                + Ext ∼P(·|x<t ) [`(xt , qt )] .
+This objective is minimized by a deferral rule r : Vt−1 → {0, 1} that minimizes, for each prefix x<t ,
+the term within the parenthesis. Therefore the minimizer r∗ (x<t ) = 1 whenever the term within the
+parenthesis is negative:
+               Ext ∼P(·|x<t ) [`(xt , pt )] + α · DTV (pt , qt ) − Ext ∼P(·|x<t ) [`(xt , qt )] < 0,
+and r∗ (x<t ) = 0 otherwise. Re-arranging the terms completes the proof.
+
+
+                                                         18
+Published as a conference paper at ICLR 2025
+
+
+A.5    P ROOF OF L EMMA 5
+
+For a fixed prefix x<t , we can write the deferral risk in (8) as:
+
+Lspec (r; x<t ) = r(x<t ) · Ext ∼P(·|x<t ) [`(xt , pt )] + α · DTV (pt , qt ) − Ext ∼P(·|x<t ) [`(xt , qt )] + C,
+
+where C is a term independent of the deferral rule r. Let r∗ : Vt−1 → {0, 1} denote the optimal
+deferral rule that minimizes Lspec for any prefix x<t . We then have:
+Lspec (r̂OPT ; x<t ) − Lspec (r∗ ; x<t )
+ = (r̂OPT (x<t ) − r∗ (x<t )) · Ext ∼P(·|x<t ) [`(xt , pt )] + α · DTV (pt , qt ) − Ext ∼P(·|x<t ) [`(xt , qt )] .
+
+
+Adding and subtracting maxv∈V qt (v) − maxv∈V pt (v) to the term within the second parenthesis,
+we get:
+   Lspec (r̂OPT ; x<t ) − Lspec (r∗ ; x<t )
+
+   = (r̂OPT (x<t ) − r∗ (x<t )) · max qt (v) + α · DTV (pt , qt ) − max pt (v)
+                                      v∈V                              v∈V
+
+      + (r̂OPT (x<t ) − r∗ (x<t )) · Ext ∼P(·|x<t ) [`(xt , pt )] − Ext ∼P(·|x<t ) [`(xt , qt )]
+
+                                                                      − max qt (v) + max pt (v)
+                                                                         v∈V         v∈V
+
+    = (r̂OPT (x<t ) − r∗ (x<t )) · max qt (v) + α · DTV (pt , qt ) − max pt (v)
+                                    v∈V                                v∈V
+
+      + (r̂OPT (x<t ) − r∗ (x<t )) · Ext ∼P(·|x<t ) [`(xt , pt )] − 1 + max pt (v)
+                                                                        v∈V
+
+      + (r̂OPT (x<t ) − r∗ (x<t )) · 1 − max qt (v) − Ext ∼P(·|x<t ) [`(xt , qt )]
+                                           v∈V
+
+    ≤ (r̂OPT (x<t ) − r∗ (x<t )) · max qt (v) + α · DTV (pt , qt ) − max pt (v)
+                                        v∈V                               v∈V
+
+
+       + |r̂OPT (x<t ) − r∗ (x<t )| · Ext ∼P(·|x<t ) [`(xt , pt )] − 1 + max pt (v)
+                                                                          v∈V
+
+
+      + |r̂OPT (x<t ) − r∗ (x<t )| · 1 − max qt (v) − Ext ∼P(·|x<t ) [`(xt , qt )]
+                                         v∈V
+
+    ≤ (r̂OPT (x<t ) − r∗ (x<t )) · max qt (v) + α · DTV (pt , qt ) − max pt (v)
+                                    v∈V                              v∈V
+      |                                   {z                                       }
+                                              term1
+
+       + Ext ∼P(·|x<t ) [`(xt , pt )] − 1 + max pt (v) + 1 − max qt (v) − Ext ∼P(·|x<t ) [`(xt , qt )]
+                                            v∈V              v∈V
+        |                       {z                    } |                  {z                         }
+                                term2                                               term3
+                                                                                                             (19)
+where we have used the fact that |r̂OPT (x<t ) − r∗ (x<t )| ≤ 1.
+We bound each term separately. For the first term, consider two cases: (i) maxv∈V qt (v) + α ·
+DTV (pt , qt ) − maxv∈V pt (v) ≤ 0 and (ii) maxv∈V qt (v) + α · DTV (pt , qt ) − maxv∈V pt (v) > 0.
+When (i) holds, r̂OPT (x<t ) = 1; so irrespective of whether r∗ (x<t ) is 0 or 1,
+                        term1 ≤ max pt (v) + α · DTV (pt , qt ) − max qt (v) ≤ 0
+                                   v∈V                                   v∈V
+
+                                                                     ∗
+When (ii) holds, r̂OPT (x<t ) = 0; so irrespective of whether r (x<t ) is 0 or 1,
+
+                    term1 ≤ − max pt (v) + α · DTV (pt , qt ) − max qt (v) < 0.
+                                    v∈V                                  v∈V
+
+
+
+                                                       19
+Published as a conference paper at ICLR 2025
+
+
+Thus we have:
+                                               term1 ≤ 0.                                (20)
+
+We next move to the second term. Since ` = `0-1 , we have:
+
+                term2 = Ext ∼P(·|x<t ) [`(xt , pt )] − 1 + max pt (v)
+                                                           v∈V
+
+                      = Ext ∼P(·|x<t ) 1 xt 6= arg max pt (v) − 1 + max pt (v)
+                                                     v∈V                    v∈V
+
+                                        X
+                     = max pt (v) −            P(xt |x<t ) · 1 xt = arg max pt (v)
+                         v∈V                                          v∈V
+                                       xt ∈V
+
+Let v ∗ ∈ arg maxv∈V pt (v). Then:
+                    term2 = |pt (v ∗ ) − P(v ∗ |x<t )| ≤ max |pt (v) − P(v|x<t )| .      (21)
+                                                         v∈V
+
+
+Similarly, we can show that:
+                                 term3 ≤ max |qt (v) − P(v|x<t )| .                      (22)
+                                           v∈V
+
+
+Substituting (20)–(22) in (19) completes the proof.
+
+
+                                                   20
+Published as a conference paper at ICLR 2025
+
+
+ Inference strategy                        Deferral decision δ(q, p)                       Target distribution π(u)        Execution
+ SpecDecoding Leviathan et al. (2023)      -                                               p(u)                            Speculative
+                                                                                                            q(u)
+ Lossy SpecDecoding (Tran-Thien, 2023)     -                                               max{min{p(u), 1−α     }, q(u)
+                                                                                                                     β }   Speculative
+
+ BiLD* (Kim et al., 2023)                  1 D(q, p) > α                                   (1 − δ) · q(u) + δ · p(u)       Speculative
+
+ Cascade [Chow] (Chow, 1970)               1 maxv∈V q(v) < 1 − α                           (1 − δ) · q(u) + δ · p(u)       Sequential
+
+ Cascade [ChowLog]                         1 entropy(q) > α                                (1 − δ) · q(u) + δ · p(u)       Sequential
+
+ Oracle [Diff] (Jitkrittum et al., 2023)   1 maxv∈V q(v) < maxv∈V p(v) − α                 (1 − δ) · q(u) + δ · p(u)       Oracle
+
+ Oracle [DiffLog]                          1 entropy(p) < entropy(q) − α                   (1 − δ) · q(u) + δ · p(u)       Oracle
+
+ SpecCascade [Chow]                        1 maxv∈V q(v) < 1 − α                           (1 − δ) · q(u) + δ · p(u)       Speculative
+
+ SpecCascade [ChowLog]                     1 entropy(q) > α                                (1 − δ) · q(u) + δ · p(u)       Speculative
+
+ SpecCascade [Diff01]                      1 maxv∈V q(v) < maxv∈V p(v) − α                 (1 − δ) · q(u) + δ · p(u)       Speculative
+
+ SpecCascade [DiffLog]                     1 entropy(p) < entropy(q) − α                   (1 − δ) · q(u) + δ · p(u)       Speculative
+
+ SpecCascade [OPT01]                       1 maxv∈V q(v) < maxv∈V p(v) − α · DTV (p, q)    (1 − δ) · q(u) + δ · p(u)       Speculative
+
+ SpecCascade [OPTLog]                      1 entropy(p) < entropy(q) − α · DTV (p, q)      (1 − δ) · q(u) + δ · p(u)       Speculative
+
+
+Table 3: Target distributions associated with different inference algorithms, where α is a free
+parameter and β ≥ 1 − α is a parameter dependent on q, p and α. The last column indicates whether
+the execution is sequential (Algorithm 2), via an oracle (Algorithm 3), or speculative (Algorithm
+5) (Leviathan et al., 2023). The third row presents a variant of the BiLD algorithm of Kim et al.
+(2023), where D(q, p) is a measure of discrepancy between q and p; the original algorithm differs
+from (Leviathan et al., 2023) in the use of a deterministic speculative decoding procedure with a
+dynamic draft window (see §B).
+
+
+B      F URTHER RELATED WORK
+Several works have studied improving the drafting process in speculative decoding; these include
+having the drafter and verifier share their backbone (Stern et al., 2018; Kim et al., 2024; Cai et al.,
+2024; Monea et al., 2023; Hooper et al., 2023; Zhang et al., 2023; Elhoushi et al., 2024; Liu et al.,
+2024), using multiple small draft models (Chen et al., 2023c; Wang et al., 2024), using tree-structured
+draft batches (Spector & Re, 2023; Miao et al., 2024), distilling the drafter with the verifier (Zhou
+et al., 2024), and leveraging multiple sampled drafts (Sun et al., 2024; Chen et al., 2024).
+The work that is most closely related to our specific proposal is the Big Little Decoder (BiLD) (Kim
+et al., 2023), which can be seen as another lossy variant of speculative decoding (Leviathan et al.,
+2023; Tran-Thien, 2023; Zhou et al., 2024). BiLD has two phases: a fallback phase, during which the
+drafter q is run auto-regressively until its maximum predicted probability is sufficiently low; and a
+rollback phase, during which the verifier p is run in parallel on the prefixes generated by q and rolls
+back to the point where D(q, p) > α, for a metric D that measures discrepancy and threshold α. The
+fallback phase implements Chow’s deferral rule in (2), and allows for the draft window size to vary
+dynamically based on an estimate of how likely the draft tokens will be accepted; the rollback phase
+can be seen as a deterministic variant of the rejection sampling algorithm of Leviathan et al. (2023).
+An advantage of BiLD over the rejection sampling algorithm in (Leviathan et al., 2023) is the use
+of Chow’s rule to vary the draft window size. However, the final target distribution it seeks to
+mimic, TBiLD (q, p)(v) = 1(D(q, p) ≤ α) · q(v) + 1(D(q, p) > α) · p(v), is an approximation to p;
+specifically, the target distribution π = TBiLD (q, p) is chosen to satisfy D(π, p) ≤ α. Hence, in cases
+where q deviates substantially from p, BiLD would choose p as the target distribution, even when q
+offers better quality on a prefix (where quality can be measured using a suitable loss function). In
+contrast, our proposed approach in §4 uses speculative decoding to approximate target distributions
+that seek to optimally cascade between q and p. In our experiments, we compare the efficacy of using
+TBiLD as the target distribution with the target distributions we propose in this paper (see Table 3).
+
+
+                                                                       21
+Published as a conference paper at ICLR 2025
+
+
+C     C ONTRASTING S PECULATIVE C ASCADES AND L OSSY S PECULATIVE
+      S AMPLING UNDER D IFFERENT S AMPLING S CHEMES
+We contrast how speculative cascades and lossy speculative sampling behave under temperature
+sampling, top-P sampling and greedy decoding.
+
+C.1   S PECULATIVE CASCADES UNDER TEMPERATURE SAMPLING AND TOP -P SAMPLING
+
+When implementing speculative cascades with temperature sampling and top-P sampling, we com-
+pute the deferral rule on the original distributions p and q, but use the deferral decisions to interleave
+the temperature-scaled (or top-P truncated) versions of p and q.
+For the cascaded deferral rules in Table 1, with the exception of OPT, we construct the target
+distribution in (6) as follows:
+                       π̃t (v) = (1 − δ(qt , pt )) · S(qt )(v) + δ(qt , pt ) · S(p)(v),              (23)
+where S : ∆V → ∆V denotes a transformation of the distribution such as temperature scaling or
+top-P truncation, and δ : ∆V × ∆V → {0, 1} denotes the deferral rule. One may run Algorithm 5
+with π̃t as the target distribution, and S(qt ) and S(pt ) as the drafter and verifier distributions.
+In the case of the OPT rule, we would formulate the constrained problem in (7) to use the TV distance
+between the distributions S(qt ) and S(pt ) to measure the rejection rate. The optimal deferral rule in
+Lemma 4 would now use DTV (S(pt ), S(qt )) instead of DTV (pt , qt ). To construct a plug-in estimator
+to this optimal rule, we still prescribe using the unscaled probabilities qt and pt to estimate the
+expected loss, giving us, for ` = `0-1 :
+             δ(pt , qt ) = 1   ⇐⇒      max qt (v) < max pt (v) − α · DTV (S(pt ), S(qt )).
+                                         v                v
+
+For the token-specific deferral rules in §5, we compute the target distribution in (16) as follows:
+                        πToken (v) = S(qt )(v) · (1 − r(x<t , v)) + S(pt )(v) · η,
+where    the deferral rule r(x<t , v 0 ) is computed on unscaled distributions qt and pt , and η =
+                   0            0
+P
+   v 0 ∈V r(x<t , v ) · S(qt )(v ) is a normalizing term. For example, for the TokenV3 deferral rule
+in (15), we compute the target distribution as:
+                                                                  X
+                                                                       S(qt )(v 0 ),
+
+                        π(v) = S(qt )(v) · 1 v ∈ Tα + S(pt )(v) ·
+                                                                       v 0 ∈T
+                                                                           / α
+
+where Tα = {v ∈ V : pt (v) ≥ maxv0 pt (v ) · (1 − α)} is the set of top-ranked tokens by the original
+                                               0
+
+(unscaled) distribution pt .
+
+C.2   C ONTRASTING WITH LOSSY SPECULATIVE SAMPLING UNDER TEMPERATURE SAMPLING
+
+When implementing lossy speculative decoding under temperature sampling, following Leviathan
+et al. (2023); Zhou et al. (2024); Tran-Thien (2023), we compute the acceptance criterion and the
+residual distribution using temperature-scaled drafter and verifier distributions. Specifically, we
+accept a draft token v with probability:
+
+                                                S(pt )(v)
+                                   min 1,                         .
+                                            (1 − α) · S(qt )(v)
+Upon rejection, we replace the token by a new token sampled from a residual distribution again
+constructed from temperature-scaled distributions:
+
+                                            1
+                         norm max 0, · S(pt )(·) − S(qt )(·)            ,
+                                            β
+                                                                              P
+where β ≥ 1 − α is a parameter that depends on α, qt and pt , and is such that v∈V πLossy (v) = 1.
+The resulting target distribution that the method samples from takes the form:
+
+                                                        S(pt )(v)     S(pt )(v)
+                    πLossy (v) = max min S(qt )(v),                 ,             .
+                                                          1−α            β
+
+                                                     22
+Published as a conference paper at ICLR 2025
+
+
+This choice of target distribution may severely limit the range of cost-quality trade-offs that can be
+achieved by varying α and β. For example, observe that
+
+                                 S(pt )(v) = 0 =⇒ πLossy (v) = 0,
+
+and so the the trade-off parameters α and β are not effective on tokens for which S(pt )(v) = 0.
+This problem is exacerbated when sampling with temperature 0 (i.e., greedy decoding) where
+πLossy (v) becomes identical to pt , making α and β irrelevant.
+Lemma 6. When sampling with temperature 0 (i.e., greedy decoding), πLossy (v) = S0 (pt ).
+
+
+Proof. Applying temperature sampling with temperature 0 to a distribution p is equivalent to sampling
+from a transformed distribution S0 (p), where S0 (p) assigns a probability of 1 to arg maxv p(v). When
+S0 (pt )(v) = 0, we have that:
+
+                           πLossy (v) = max {min {S0 (qt )(v), 0} , 0} = 0.
+       P
+Since v πLossy (v) = 1, it turns out that: πLossy (v) = 1 whenever S0 (pt )(v) = 1. Thus:
+πLossy (v) = S0 (pt ).
+
+
+In contrast, because both our cascaded deferral rule and the token-specific deferral rules work with
+unscaled distributions, they provide meaningful trade-offs under temperature sampling, including
+when sampling with temperature 0.
+
+C.3   C ONTRASTING WITH LOSSY SPECULATIVE SAMPLING UNDER TOP -P SAMPLING
+
+When implementing lossy speculative sampling under top-P sampling, we accept a draft token v
+with probability:
+
+                                           SP (pt )(v)
+                             min 1,                            ,
+                                       (1 − α) · SP (qt )(v)
+where SP (p) truncates the distribution p to only retain the top-P fraction of tokens (i.e. smallest
+subset of tokens whose cumulative probability exceeds P ).
+Notice that as P gets smaller, SP (p) assigns zero probabilities to a majority of tokens. As a result for
+most draft token candidates v, the above criterion evaluates to 0, and the trade-off parameter α has
+no effect on those tokens. Hence as P → 0, the trade-off parameter α becomes vacuous, and thus
+lossy speculative decoding fails to offer meaningful trade-offs. In fact, mirroring Lemma 6, lossy
+speculative decoding becomes identical to standard loss-less speculative decoding when P → 0.
+A speculative cascade does not suffer from the same issue as it uses the trade-off parameter α not
+as a scaling parameter in the acceptance criterion, but to construct a new target distribution that is
+amenable to a higher acceptance rate even under top-P sampling. For example, with the TokenV3
+deferral rule in (15), a draft token v is accepted with probability:
+
+                                                  SP (πt (v))
+                                          min 1,                 ,
+                                                   SP (qt (v))
+where πt is a new target distribution defined using the trade-off parameter α that interleaves between
+pt and qt as follows:
+                                                                     X
+                                                                         SP (qt )(v 0 ),
+
+                  πt (v) = SP (qt )(v) · 1 v ∈ Tα + SP (pt )(v) ·
+                                                                    v 0 ∈T
+                                                                        / α
+
+where Tα = {v ∈ V : pt (v) ≥ maxv0 pt (v 0 ) · (1 − α)} is the set of top ranked tokens by the original
+untruncated distribution pt (·). Since the top-ranked tokens Tα are computed using the untruncated
+distribution, varying the trade-off parameter α still produces meaningful cost-quality trade-offs when
+speculatively sampling from πt (v).
+
+
+                                                   23
+Published as a conference paper at ICLR 2025
+
+
+Table 4: Acceptance criterion for different speculative inference strategies under non-greedy and
+greedy decoding. Rows 2 and 3 indicates that under 0 temperature, speculative cascade with the
+TokenV3 deferral rule has an identical acceptance criterion as SpecDecode [Lossy, Greedy]; see
+Lemma 7.
+
+ Method                       Ref.                                             Acceptance Criterion
+                                                                      T >0                               T =0
+                                                                  n               o
+ SpecDecode [Lossy]           Leviathan et al. (2023)                    S(p(v))
+                                                             min 1, (1−α)·S(q(v))               1(v = arg maxv0 p(v 0 ))
+ SpecDecode [Lossy, Greedy]   Leviathan et al. (2023)      n           o-                     p(v) ≥ (1 − α) · maxv0 p(v 0 )
+ SpecCascade [TokenV3]        This paper                min 1, S(π(v))
+                                                               S(q(v)) , where π is in (16)   p(v) ≥ (1 − α) · maxv0 p(v 0 )
+
+
+
+C.4    L OSSY SPECULATIVE GREEDY DECODING VARIANT BY L EVIATHAN ET AL . (2023)
+
+For the special case of greedy decoding, Leviathan et al. (2023) propose an alternate lossy variant of
+speculative decoding (Appendix A.5 in their paper), where a draft token v is accepted deterministically
+whenever pt (v) ≥ (1 − α) · maxv0 pt (v 0 ); when the token is rejected, it is replaced with a new token
+sampled from pt (·). We will refer to this variant as SpecDecode [Lossy, Greedy].
+We now show that the proposed speculative cascades with the TokenV3 deferral rule (15) is identical
+to SpecDecode [Lossy, Greedy] when sampling with temperature 0.
+Lemma 7. For any fixed trade-off parameter α ∈ [0, 1], SpecCascade [TokenV3] is identical to
+SpecDecode [Lossy, Greedy] when sampling with temperature 0.
+
+
+Proof. Let S0 (p) denote a temperature-scaled one-hot version of distribution p which places all its
+mass on the mode of p. Let p̃t = S0 (pt ) and q̃t = S0 (qt ). With the TokenV3 rule, the acceptance
+criterion is computed against the target distribution in (16) with trade-off parameter α.
+                                                                  X
+                                                                       q̃t (v 0 ),
+
+                        πt (v) = q̃t (v) · 1 v ∈ Tα + p̃t (v) ·
+                                                                             v 0 ∈T
+                                                                                 / α
+
+where Tα = {v ∈ V : pt (v) ≥ maxv0 pt (v 0 ) · (1 − α)} is the set of top ranked tokens by the original
+(unscaled) distribution pt (·).
+Under greedy decoding, the draft token is given by v ∗ = arg maxv0 qt (v). We consider two cases: (i)
+v ∗ ∈ Tα and (ii) v ∗ ∈
+                      / Tα .
+In the first case, we have πt (v ∗ ) = q̃t (v ∗ ). As a result, a draft token v is accepted with probability:
+                                      S0 (q̃t (v ∗ ))                q̃t (v ∗ )
+
+                           min 1,                       = min 1,                  = 1.
+                                      S0 (qt (v ∗ ))                 q̃t (v ∗ )
+
+In the second case, it is clear that the draft token v ∗ is not the maximizer of pt (·). Furthermore,
+πt (v ∗ ) = p̃t (v ∗ ). As a result, the draft token v ∗ is rejected since the acceptance probability for the
+token becomes:
+                              S0 (p̃t (v ∗ ))              p̃t (v ∗ )
+
+                                                                                        0
+                   min 1,                       = min   1,              = min   1,              = 0.
+                              S0 (qt (v ∗ ))               q̃t (v ∗ )              q̃t (v ∗ )
+It is then replaced with a token sampled from:
+ norm (max {0, S0 (p̃t (·)) − S0 (qt (·))}) = norm (max {0, p̃t (·) − q̃t (·)}) = norm (p̃t (·)) = p̃t (·),
+which would produce the token maximizing pt (·).
+In both cases, the sampling procedure is identical to that of SpecDecode [Lossy, Greedy].
+
+Table 4 summarizes the acceptance criteria for different speculative inference strategies under
+temperature sampling and what they reduce to under greedy decoding.
+
+
+                                                          24
+Published as a conference paper at ICLR 2025
+
+
+D      O PTIMAL D EFERRAL : A DDITIONAL D ISCUSSION
+We provide additional discussion for the deferral rules derived in §3 and §4.
+
+D.1     D ERIVATION OF C HOW ’ S RULE
+
+We show below that Chow’s rule is a plug-in estimator to the optimal solution to the following
+objective
+                                            h                                       i
+             Lrej (r; x<t ) = Ext ∼P(·|x<t ) 1 − r(x<t ) · `(xt , qt ) + r(x<t ) · α ,     (24)
+
+where the deferral rule is penalized with a constant penalty α ∈ [0, 1] for choosing to defer to the
+large model.
+Following the same steps as Lemma 1, it is easy to show:
+Lemma 8. The minimizer of (24) is of the form:
+                            r∗ (x<t ) = 1   ⇐⇒       Ext ∼P(·|x<t ) [`(xt , qt )] > α.                        (25)
+
+If ` = `0-1 , one may employ a plug-in estimator to (25) by replacing the expected 0-1 loss on qt with
+1 − maxv∈V qt (v), giving us r̂Chow (x<t ) in (2). If ` = `log , one may replace the expected log loss on
+qt with the entropy of qt , giving us:
+
+                          r̂ChowLog (x<t ) = 1 ⇐⇒ entropy q(·|x<t ) > α,                             (26)
+                        P
+where entropy(q) = − v∈V q(v) · log(q(v)).
+
+D.2     O PTIMAL SEQUENTIAL DEFERRAL WHEN ` = `log
+
+Recall that the optimal deferral rule for a sequential cascade in Lemma 1 takes the form:
+            r∗ (x<t ) = 1     ⇐⇒     Ext ∼P(·|x<t ) [`(xt , qt )] > Ext ∼P(·|x<t ) [`(xt , pt )] + α.
+                                               P
+When ` = `log , we may use the entropy − v∈V qt (v) · log(qt (v)) from qt as an estimate of its
+expected log-loss, and similarly for pt , giving us the plug-in estimator:
+                                 P                              P
+   r̂DiffLog (x<t ) = 1 ⇐⇒          v∈V qt (v) · log(qt (v)) <     v∈V pt (v) · log(pt (v)) − α. (27)
+
+D.3     O PTIMAL SPECULATIVE DEFERRAL WHEN ` = `log
+
+Recall that the optimal deferral rule for a speculative cascade in Lemma 4 takes the form:
+      r∗ (x<t ) = 1   ⇐⇒      Ext ∼P(·|x<t ) [`(xt , qt )] > Ext ∼P(·|x<t ) [`(xt , pt )] + α · DTV (pt , qt ).
+When ` = `log , one may construct a plug-in estimator for the above rule by replacing the expected
+log loss with the entropy from the distribution:
+                            P                            P
+ r̂OPTLog (x<t ) = 1 ⇐⇒       v∈V qt (v) · log(qt (v)) <   v∈V pt (v) · log(pt (v)) − α · DTV (pt , qt ).
+                                                                                                    (28)
+Lemma 9 (Regret bound for r̂OPTLog ). Suppose ` = `log . Suppose for a fixed x<t , | log(qt (v))| ≤ Bq
+and | log(pt (v))| ≤ Bp , ∀v ∈ V, for some Bq , Bp > 0. Then:
+                                              P                              P
+Lspec (rOPT ; x<t )−min Lspec (r; x<t ) ≤ Bq · v∈V P(v|x<t )−qt (v) + Bp · v∈V P(v|x<t )−pt (v) .
+                       r
+
+
+Proof. The proof follows similar steps to that for Lemma 5, except in bounding the resulting term2
+and term3 for the log loss. In this case,
+                                                                  X
+                      term2 = Ext ∼P(·|x<t ) [log(pt (xt ))] −          pt (v) · log(pt (v))
+                                                                  v∈V
+
+
+                                                       25
+Published as a conference paper at ICLR 2025
+
+
+                                  X                                     X
+                           =            P(v|x<t ) · log(pt (v)) −            pt (v) · log(pt (v))
+                                  v∈V                                  v∈V
+                               X                      X
+                           ≤            P(v|x<t ) −         pt (v) · log(pt (v))
+                               v∈V                    v∈V
+                                        X                   X
+                           ≤ Bp ·             P(v|x<t ) −         pt (v) .
+                                        v∈V                 v∈V
+
+Similarly,
+                                         X                      X
+                           term3 ≤             P(v|x<t ) −            qt (v) · log(qt (v))
+                                         v∈V                    v∈V
+                                               X                      X
+                                    ≤ Bq ·           P(v|x<t ) −            qt (v) .
+                                               v∈V                    v∈V
+
+Plugging these bounds into the equivalent of (19) in Lemma 5 for the log-loss completes the proof.
+
+D.4     O PTIMAL SPECULATIVE DEFERRAL FOR GREEDY DECODING
+
+When applying speculative cascades with greedy decoding, we shall see that both the optimal deferral
+rule OPT (10) is equivalent to the Diff deferral rule (5).
+As detailed in §C.1, when implementing a speculative cascade with temperature-scaled distributions
+q̃t (v) ∝ qt (v)1/T and p̃t (v) ∝ pt (v)1/T respectively, for a temperature parameter T > 0, the Diff
+and OPT deferral rules are computed as:
+                      r̂Diff (x<t ) = 1        ⇐⇒     maxv qt (v) < maxv pt (v) − α,
+and
+               r̃OPT (x<t ) = 1     ⇐⇒         maxv qt (v) < maxv pt (v) − α · DTV (p̃t , q̃t ).
+
+One may run Algorithm 5 with either rDiff or r̂OPT as the deferral rule, and the temperature-scaled q̃t
+as the drafter distribution and p̃t as the verifier distribution.
+Lemma 10. When T → 0, running Algorithm 5 with r̃OPT as the deferral rule and q̃t and p̃t as the
+drafter and verifier distributions, is equivalent to running it with r̂Diff as the deferral rule and q̃t and
+p̃t as the drafter and verifier distributions.
+
+Proof. When T → 0, note that q̃t and p̃t are one-hot encodings of arg maxv∈V qt (v) and
+arg maxv∈V pt (v) respectively. As a result,
+
+                      DTV (q̃t , p̃t ) = 1 arg max qt (v) 6= arg max pt (v) .
+                                                     v∈V                     v∈V
+
+When running Algorithm 5 with r̃OPT as the deferral rule, we will accept a draft token v with
+probability:
+
+                               (1 − δOPT (qt , pt )) · q̃t (v) + δOPT (qt , pt ) · p̃t (v)
+             κOPT (v) = min 1,                                                               ,
+                                                         q̃t (v)
+where
+
+      δOPT (q, p) = 1 max q(v) < max p(v) − α · 1 arg max q(v) 6= arg max p(v)   .
+                           v∈V                 v∈V                          v∈V               v∈V
+
+When running Algorithm 5 with r̃Diff as the deferral rule, we will accept a draft token v with
+probability:
+
+                                (1 − δDiff (qt , pt )) · q̃t (v) + δDiff (qt , pt ) · p̃t (v)
+             κDiff (v) = min 1,                                                                 ,
+                                                           q̃t (v)
+
+                                                           26
+Published as a conference paper at ICLR 2025
+
+
+where
+                            δDiff (q, p) = 1 max q(v) < max p(v) − α .
+                                                  v∈V              v∈V
+
+We consider two cases:
+(i) If arg maxv∈V qt (v) = arg maxv∈V pt (v), then q̃t = p̃t , and irrespective of the outcome of
+δOPT (qt , pt ) or δDiff (qt , pt ), we have that κOPT (v) = κDiff (v). Furthermore, the token gets accepted
+in both cases.
+(ii) If arg maxv∈V qt (v) 6= arg maxv∈V pt (v), then
+
+  κOPT (v) = 1 − δOPT (qt , pt ) = 1 max q(v) ≥ max p(v) − α = 1 − δDiff (q, p) = κDiff (v).
+                                            v∈V              v∈V
+
+
+In this case, when the draft token gets rejected, with deferral rule r̃OPT , we will sample a new token
+from the residual distribution:
+           pOPT (v) ∝ min{0, (1 − δOPT (qt , pt )) · q̃t (v) + δOPT (qt , pt ) · p̃t (v) − q̃t (v)}
+                    = δOPT (qt , pt ) · min{0, p̃t (v) − q̃t (v)}
+When a token gets rejected with deferral rule r̃Diff , we will sample a new token from the residual
+distribution:
+                            pDiff (v) ∝ δDiff (qt , pt ) · min{0, p̃t (v) − q̃t (v)}.
+
+Since arg maxv∈V qt (v) 6= arg maxv∈V pt (v),
+pOPT (v) ∝ δOPT (qt , pt ) · min{0, p̃t (v) − q̃t (v)} = δDiff (qt , pt ) · min{0, p̃t (v) − q̃t (v)} ∝ pDiff (v).
+Thus both the acceptance probability and the residual distributions for r̂OPT are the same as the one
+we would have used had we run Algorithm 5 with r̂Diff as the deferral rule.
+
+D.5     E QUIVALENCE BETWEEN (7) AND (8)
+
+Since the prefix x<t is fixed in (7), the constrained optimization we seek to solve is of essentially of
+the following form:
+                              min (1 − r) · c0 + r · c1 s.t. r · c2 ≤ B,
+                               r∈{0,1}
+
+for some coefficients c0 , c1 , c2 > 0. Since r is a binary variable, we may formulate an equivalent
+unconstrained problem with the same minimizer:
+                                    min (1 − r) · c0 + r · c1 + α · r · c2 ,
+                                  r∈{0,1}
+
+where we choose α = 0 when c2 ≤ B and choose an α > c12 ·(c0 −c1 ) otherwise. This unconstrained
+optimization problem is of the form in (8).
+
+
+                                                        27
+Published as a conference paper at ICLR 2025
+
+
+E    T OKEN - SPECIFIC S PECULATIVE C ASCADE
+We provide a modification of Algorithm 5 to accommodate the token-specific deferral rules in §5.
+
+Algorithm 6 TokenSpecCascade
+Input: Models q, p, Token-specific deferral rule r, Prefix
+                                                     P x<t , Block size γ
+                   .
+  TToken (q, p)(v) = q(v) · (1 − r(x<t , v)) + p(v) · v0 ∈V r(x<t , v 0 ) · q(v 0 )
+Output: GenSpecSample(q, p, TToken , x<t , γ)
+
+
+Optimal token-specific deferral. Similar to §4.3, we may consider deriving the optimal token-
+specific deferral rule. We start by formulating a similar optimization objective as §4.3. For a fixed
+prefix x<t , this would look like:
+                                                    h             i
+                                   min Ev∼P(·|x<t ) `(v, πToken )                                (29)
+                                         r
+                                             s.t. DTV (πToken , qt ) ≤ B,
+                    .
+                 = (1 − r(x<t , v)) · qt (v) + η · pt (v) is the target distribution resulting from the
+where πToken (v) P
+choice of r, η = v0 ∈V r(x<t , v 0 ) · qt (v 0 ) is a normalization term, and B > 0 is a budget parameter.
+However, unlike §4.3, the above constrained optimization problem does not directly lend itself to
+a simple closed-form solution. In some highly simplistic special cases, we may be able to derive a
+trivial solution. For example, suppose ` = `0-1 , and the mode of qt coincides with that of P(·|x<t ),
+i.e., arg maxv∈V qt (v) = arg maxv∈V P(v|x<t ); then the optimal token-specific rule is given by
+r(x<t , v) = 0, for all v ∈ V.
+Under more realistic cases, we may not be able to derive a solution as simple as the OPT rule in (10).
+Therefore, in our experiments, we employ the three heuristic rules in equations 13–15, which are
+motivated by the form of the simpler Diff rule in (5).
+
+
+                                                        28
+Published as a conference paper at ICLR 2025
+
+
+           27.0
+                    WMT: Small Large (T=0.5)                                  WMT: Small Large (T=1)
+                                                                     22                                                              SpecDecode [Lossy]
+           26.5                                                                                                                      SpecCascade [OPT]
+                                                                                                                                     SpecCascade [Token]
+           26.0                                                      20                                                              SpecCascade [Diff]
+           25.5                                                                                                                      SpecCascade [Chow]
+ BLEU
+
+
+                                                           BLEU
+                                                                     18                                                              TokenCascade [Chow]
+           25.0                                                                                                                      BiLD*
+           24.5                                                      16
+           24.0
+                                                                     14
+                   0.50    0.55    0.60      0.65   0.70               0.4         0.5          0.6         0.7          0.8
+                          Relative latency                                               Relative latency
+
+           15.5    CNNDM: Small Large (T=0.5)                                CNNDM: Small Large (T=1)
+                                                                                                                                     SpecDecode [Lossy]
+           15.0                                                      12                                                              SpecCascade [OPT]
+                                                                                                                                     SpecCascade [Token]
+           14.5                                                                                                                      SpecCascade [Diff]
+                                                                     11
+ ROUGE-2
+
+
+                                                           ROUGE-2
+           14.0                                                                                                                      SpecCascade [Chow]
+                                                                     10                                                              TokenCascade [Chow]
+           13.5                                                                                                                      BiLD*
+           13.0                                                       9
+           12.5
+                                                                      8
+                  0.45 0.50 0.55 0.60 0.65 0.70                               0.5           0.6         0.7             0.8
+                            Relative latency                                             Relative latency
+
+                  XSum: Small Large (T=0.5)                                  XSum: Small Large (T=1)
+                                                                     16                                                              SpecDecode [Lossy]
+          18                                                                                                                         SpecCascade [OPT]
+                                                                     14                                                              SpecCascade [Token]
+                                                                                                                                     SpecCascade [Diff]
+ROUGE-2
+
+
+                                                           ROUGE-2
+
+
+          16                                                                                                                         SpecCascade [Chow]
+                                                                     12                                                              TokenCascade [Chow]
+                                                                                                                                     BiLD*
+          14                                                         10
+
+                                                                      8
+                  0.6     0.7      0.8       0.9    1.0                      0.6          0.7         0.8         0.9          1.0
+                          Relative latency                                               Relative latency
+
+Figure 4: Plots of quality vs. latency for T5 models with temperatures T = 0.5 and T = 1, and
+block size γ = 5. Each method interleaves T5-small with T5-large. We include speculative cascades
+with the Chow, Diff, OPT and TokenV3 (referred to as Token) deferral rules, and compare it with three
+baselines: SpecDecode [Lossy], TokenCascade [Chow] and BiLD∗ . The x-axis tracks the latency
+relative to that of calling the large model on all inputs. The horizontal dotted line denotes the quality
+of the large model.
+
+
+F           A DDITIONAL E XPERIMENTAL D ETAILS
+We provide additional details about our experimental setup and additional experimental results.
+
+F.1            E XPERIMENTAL SETUP AND HYPER - PARAMETERS
+
+We first elaborate on our experimental setup and the hyper-parameters used.
+T5 datasets. For the WMT English to German translation task (Bojar et al., 2014), we use a
+validation sample of size 3,000 provided with the dataset. We set the maximum input length to 80
+and the maximum output length to 80. For the Extreme Summarization (XSum) task (Narayan et al.,
+2018), we use a validation sample of size 11,305, and set the maximum input length to 1,024 and
+the maximum output length to 64. For the CNN/Daily Mail summarization task (Hermann et al.,
+2015), we use a validation sample of size 13368, and set the maximum input length to 2,048 and the
+maximum output length to 128. Following (Zhou et al., 2024), we use ROUGE-2 as the evaluation
+metric for the summarization tasks.
+We note that Kim et al. (2023) report ROUGE-L metrics for CNN/DM, which generally tend to
+evaluate to higher values than ROUGE-2. Furthermore, most of their experimental results are with
+
+
+                                                                             29
+Published as a conference paper at ICLR 2025
+
+
+                                        WMT: Small Large (T=0)                                                                            XSum: Small Large (T = 0)
+              27.50
+                                                                                                                 19
+              27.25
+              27.00                                                                                              18
+              26.75
+
+
+                                                                                                       ROUGE-2
+       BLEU                                                                                                      17
+              26.50
+              26.25                                                                                              16                       SpecDecode [Lossy, Greedy] / SpecCascade [Token]
+                                                                                                                                          SpecCascade [Diff]
+              26.00                                                                                              15                       SpecCascade [Chow]
+              25.75                                                                                                                       TokenCascade [Chow]
+                                                                                                                 14                       BiLD*
+              25.50
+                      0.425   0.450   0.475   0.500         0.525     0.550      0.575    0.600                   0.50      0.55    0.60      0.65     0.70    0.75     0.80     0.85    0.90
+                                              Relative latency                                                                                   Relative latency
+
+                                                                                     CNNDM: Small Large (T=0)
+
+                                                            15.5
+
+                                                            15.0
+                                                  ROUGE-2
+
+                                                            14.5
+
+                                                            14.0                    SpecDecode [Lossy, Greedy] / SpecCascade [Token]
+                                                                                    SpecCascade [Diff]
+                                                                                    SpecCascade [Chow]
+                                                            13.5                    TokenCascade [Chow]
+                                                                                    BiLD*
+                                                               0.40       0.45           0.50        0.55                0.60      0.65         0.70
+                                                                                                Relative latency
+
+Figure 5: Plots of quality vs. latency for T5 models with greedy decoding (T = 0) with block size
+γ = 5. Each method interleaves T5-small with T5-large. The x-axis tracks the latency relative to that
+of calling the large model on all inputs. The horizontal dotted line denotes the quality of the large
+model. SpecDecode [Lossy, Greedy] is the greedy version of lossy speculative decoding proposed
+in Leviathan et al. (2023). SpecCascade [Token] uses the TokenV3 deferral rule in (15). As noted in
+§C.4, when T → 0, SpecDecode [TokenV3] is identical to SpecDecode [Lossy, Greedy].
+
+
+
+greedy decoding (T = 0), and hence, the ROUGE-L evaluation metrics they report in their paper tend
+to be higher for the same T5 models when compared to our numbers for ROUGE-2 with temperature
+sampling.
+Gemma datasets. In addition to the WMT EN→DE translation and the CNN/DM summarization
+datasets, we use the GSM8K (Cobbe et al., 2021) math reasoning dataset, the MBPP (Austin
+et al., 2021) Python programming dataset, and four question-answering datasets: Natural Questions
+(Kwiatkowski et al., 2019), TriviaQA (Joshi et al., 2017), WebQuestions (Berant et al., 2013) and
+the Stanford Question-Answering Dataset (SQuAD) 2.0 (Rajpurkar et al., 2016). In each case, we
+sample 1,000 prompts for evaluation. We employ few-shot inference, and set the maximum output
+length to 80 for WMT, to 128 for CNN/DM, to 320 for GSM8K and MBPP, and to 5 for all the
+question-answering datasets.
+Models. We construct cascades from T5 v1.1 family of encoder-decoder models (Raffel et al., 2020),
+of different sizes T5-small (77M), T5-base (250M), T5-large (800M) and T5-XL (3B).2 We follow
+the protocol in (Zhou et al., 2024): we initialize with the public checkpoints, pre-train them further
+for 100K steps, and supervise finetune the pre-trained models on the three respective tasks. We
+finetune them for a maximum of 250K steps on WMT, a maximum of 100K steps on XSum and a
+maximum of 200K steps on CNNDM.
+We construct the Gemma cascades from instruction-tuned decoder-only v2 models. For MBPP alone
+we additionally experiment with pre-trained models. We use a 2B drafter, and either a 9B verifier or
+a 27B verifier (Team et al., 2024).
+Run-time evaluation. For each dataset, we evaluate the quality metrics on the entire validation set.
+For the run-time analysis in the T5 experiments, we adopt the protocol followed in Leviathan et al.
+(2023); Zhou et al. (2024). We randomly sample 500 examples from the validation set, and calculate
+the wall-clock time taken for decoding with a batch size of 1. We repeat this for three trials and report
+the average running time. All methods are run on the same TPUv4 device.
+
+
+   2
+       The pre-trained checkpoints we use are available here.
+
+
+                                                                                                   30
+Published as a conference paper at ICLR 2025
+
+
+                        WMT: Small Large (T=1)                               27.0
+                                                                                      WMT: Small Large (T=0.5)                                      WMT: Small Large (T=0.1)
+          22           SpecDecode [Lossy]                                                                                                  27.5
+                       SpecCascade [OPT]                                     26.5
+          20           SpecCascade [Token]                                   26.0                                                          27.0
+                                                                             25.5
+BLEU
+
+
+                                                                   BLEU
+
+
+                                                                                                                                 BLEU
+          18                                                                                                                               26.5
+                                                                             25.0
+                                                                                                        SpecDecode [Lossy]                                        SpecDecode [Lossy]
+          16                                                                 24.5                       SpecCascade [OPT]                                         SpecCascade [OPT]
+                                                                                                                                           26.0
+                                                                             24.0                       SpecCascade [Token]                                       SpecCascade [Token]
+          14
+               0.45 0.50 0.55 0.60 0.65 0.70 0.75 0.80                              0.50    0.55        0.60     0.65     0.70                    0.50    0.55     0.60       0.65   0.70
+                              Relative latency                                              Relative latency                                              Relative latency
+
+                       XSum: Small Large (T=1.0)                                      XSum: Small Large (T=0.5)                                     XSum: Small Large (T=0.1)
+          16                                                                 19
+                                                                             18                                                            19
+          14                                                                                                                               18
+                                                                             17
+ROUGE-2
+
+
+                                                                   ROUGE-2
+
+
+                                                                                                                                 ROUGE-2
+          12                                                                 16                                                            17
+                                                                             15                                                            16
+          10                           SpecDecode [Lossy]                    14                          SpecDecode [Lossy]                                         SpecDecode [Lossy]
+                                       SpecCascade [OPT]                                                 SpecCascade [OPT]                 15                       SpecCascade [OPT]
+                                       SpecCascade [Token]                   13                          SpecCascade [Token]                                        SpecCascade [Token]
+                                                                                                                                           14
+                 0.6         0.7       0.8       0.9         1.0              0.55 0.60 0.65 0.70 0.75 0.80 0.85 0.90 0.95                  0.55 0.60 0.65 0.70 0.75 0.80 0.85 0.90 0.95
+                              Relative latency                                              Relative latency                                               Relative latency
+
+                    CNNDM: Small Large (T=1)                                         CNNDM: Small Large (T=0.5)                                    CNNDM: Small Large (T=0.1)
+                       SpecDecode [Lossy]
+          12           SpecCascade [OPT]                                     15.0                                                          15.5
+                       SpecCascade [Token]                                   14.5
+          11                                                                                                                               15.0
+ROUGE-2
+
+
+                                                                   ROUGE-2
+
+
+                                                                                                                                 ROUGE-2
+                                                                             14.0
+          10                                                                                                                               14.5
+                                                                             13.5
+                                                                                                        SpecDecode [Lossy]                 14.0                   SpecDecode [Lossy]
+           9                                                                 13.0                       SpecCascade [OPT]                                         SpecCascade [OPT]
+                                                                                                        SpecCascade [Token]                13.5                   SpecCascade [Token]
+           8                                                                 12.5
+           0.40 0.45 0.50 0.55 0.60 0.65 0.70 0.75                              0.40 0.45 0.50 0.55 0.60 0.65 0.70 0.75                       0.40 0.45 0.50 0.55 0.60 0.65 0.70
+                             Relative latency                                               Relative latency                                              Relative latency
+
+
+Figure 6: Plots of quality vs. latency for T5 models with varying temperatures. Each method
+interleaves T5-small with T5-large. The x-axis tracks the latency relative to that of calling the
+large model on all inputs. The horizontal dotted line denotes the quality of the large model. As the
+temperature decreases, SpecDecode [Lossy] produces fewer unique trade-off points as its acceptance
+criterion is less susceptible to changes in the trade-off parameter α. In contrast, SpecCascade
+[Token], which uses the TokenV3 deferral rule, offers a wider range of trade-off points; here the
+trade-off parameter is not used to construct a traded-off target distribution, and does not feature as a
+scaling term in the acceptance criterion.
+
+
+T5 hyper-parameters. For the T5 experiments, unless otherwise specified, we set the block-size γ
+to 5 for all methods that use speculative execution. For the token-level cascades, we allow the small
+model to predict for a maximum of 10 tokens (similar to (Kim et al., 2023)), before invoking the
+large model. This was needed, as otherwise, the small model would predict a long sequence, and
+when it eventually defers to the large model, the large model is bottle-necked by the pre-filling of the
+long prefix accumulated by the small model. We vary the trade-off parameter α to vary the latency
+and plot quality as a function of latency.
+Gemma inference. When implementing speculative cascades and speculative decoding with Gemma
+models, we use block-size γ = 1. In this case, for each prefix x<t , we have the drafter generate one
+draft token xt for the next step. We then invoke the verifier with the same prefix, and either accept
+the draft token xt , or reject and replace it with the verifier’s prediction. We repeat this process to
+generate the entire response.
+BiLD baseline. For the BiLD method, we adopt the same discrepancy metric D as (Kim et al., 2023)
+for greedy decoding:
+
+
+                                                        D(q, p) = − log p arg max q(v)   ,
+                                                                                                               v∈V
+
+
+                                                                                                   31
+Published as a conference paper at ICLR 2025
+
+
+                  WMT: Small Large (P=0.8)                                          WMT: Small Large (P=0.5)                                     WMT: Small Large (P=0.1)
+                                                                                                                                       27.5
+       25                                                            27.0
+       24                                                                                                                              27.0
+                                                                     26.5
+BLEU
+
+
+                                                           BLEU
+
+
+                                                                                                                              BLEU
+       23                                                            26.0                                                              26.5
+       22                                                            25.5
+                                 SpecDecode [Lossy]                                                SpecDecode [Lossy]                  26.0                  SpecDecode [Lossy]
+       21                        SpecCascade [Token]                 25.0                          SpecCascade [Token]                                       SpecCascade [Token]
+        0.45     0.50   0.55   0.60   0.65   0.70   0.75                    0.50       0.55    0.60         0.65     0.70                     0.50   0.55     0.60       0.65   0.70
+                         Relative latency                                                Relative latency                                             Relative latency
+
+                 CNNDM: Small Large (P=0.8)                                        CNNDM: Small Large (P=0.5)                                  CNNDM: Small Large (P=0.1)
+                                                                     15.5
+           14                                                                                                                         15.5
+                                                                     15.0
+                                                                     14.5                                                             15.0
+ ROUGE-2
+
+
+                                                           ROUGE-2
+
+
+                                                                                                                            ROUGE-2
+           13
+                                                                     14.0                                                             14.5
+           12                                                        13.5                                                             14.0
+                                 SpecDecode [Lossy]                                                SpecDecode [Lossy]                                       SpecDecode [Lossy]
+                                 SpecCascade [Token]                 13.0                          SpecCascade [Token]                13.5                  SpecCascade [Token]
+           11
+            0.40 0.45 0.50 0.55 0.60 0.65 0.70 0.75                     0.40 0.45 0.50 0.55 0.60 0.65 0.70 0.75                          0.40 0.45 0.50 0.55 0.60 0.65 0.70 0.75
+                          Relative latency                                               Relative latency                                             Relative latency
+
+
+Figure 7: Plots of quality vs. latency for T5 models under Top-P sampling with varying values of
+P . Each method interleaves T5-small with T5-large. The x-axis tracks the latency relative to that of
+calling the large model on all inputs. The horizontal dotted line denotes the quality of the large model.
+As P becomes smaller, SpecDecode [Lossy] is able to produce fewer unique trade-off points as the
+scaling by the trade-off parameter α is less effective in its acceptance criterion (§C.3). SpecCascade
+[Token], which uses the TokenV3 deferral rule in (15), does not suffer from the same issue; here the
+trade-off parameter does not feature as a scaling term in the acceptance criterion.
+
+
+and pick the value of the threshold α on this metric from the range [0, 10]. For temperature sampling
+with a non-zero temperature, we use the following natural analogue to the above D:
+                                                           X
+                      D(q, p) = −Ev∼q [log(p(v))] = −          q(v) · log(p(v)).
+                                                                                                            v∈V
+
+In §F.5, we present comparisons between different implementations of this method.
+Lossy speculative decoding. See §F.6 for details.
+
+F.2             C OMPARISONS UNDER VARYING TEMPERATURES AND GREEDY DECODING
+
+In Figures 5 and 6, we provide additional plots of quality vs. latency for different inference strategies
+under greedy decoding (T = 0) and temperature sampling (T = 0.1, 0.5, 1.0) respectively.
+As expected, we see from the greedy decoding results in Figure 5 that all methods yield better quality
+metrics compared to their performance under temperature sampling. In this case, the proposed
+SpecCascade [TokenV3] is equivalent to the lossy variant of speculative decoding proposed by
+Leviathan et al. (2023) for greedy decoding, which we refer to as SpecDecode [Lossy, Greedy].
+See §C.4 for the discussion of this equivalence. Similarly, as noted in §D.4, with greedy decoding,
+the OPT deferral rule coincides with the Diff deferral rule.
+In the temperature sampling results in Figure 6, we compare the lossy speculative sampling proposed
+by Leviathan et al. (2023) for temperature sampling (SpecDecode [Lossy]) with two of our proposed
+methods: speculative cascades with the OPT and TokenV3 (referred to as Token) deferral rules. We can
+see that SpecCascade [Lossy] generates fewer unique trade-off points as temperature T gets smaller.
+As noted in §C.1, this is because its acceptance criterion is less susceptible to changes in trade-off
+parameter α when S(pt ) is peaked. In contrast, our proposed SpecCascade [Token] approach yields
+a wider range of trade-off points; here the trade-off parameter is not used to construct a traded-off
+target distribution, and does not feature as a scaling term in the acceptance criterion.
+The reason the Token-specific rule fares better than OPT is because the latter computes its deferral
+decisions based on which of qt (·) and pt (·) is more peaked; this can be a disadvantage when the
+
+
+                                                                                              32
+Published as a conference paper at ICLR 2025
+
+
+Table 5: Reduction in latency (T = 1, γ = 5) when matching the quality of the large model, and the
+best quality metric without exceeding the latency of the large model. We use T5-small and T5-large
+as the small and large models respectively. Quality is measured in terms of the BLEU for WMT
+and ROUGE-2 for CNNDM. We apply Top-P sampling with varying values of P . The proposed
+SpecCascade [Token] method uses the TokenV3 deferral rule in (15).
+                                Latency↓ when matching large model’s quality                Best quality without exceeding large model’s latency
+                           P = 0.1              P = 0.5                P = 0.8          P = 0.1                  P = 0.5                 P = 0.8
+ Method                WMT     CNNDM       WMT      CNNDM         WMT      CNNDM    WMT      CNNDM          WMT      CNNDM          WMT      CNNDM
+ SpecDecode [Lossy]    1.55×    1.48×      1.64×     1.63×        1.69×     1.75×   27.35     15.72         27.10     15.27         23.98     13.61
+ SpecCascade [Token]   1.74×    1.61×      1.73×     1.65×        1.71×     1.79×   27.49     15.79         27.30     15.46         25.64     14.38
+
+
+sampled token is not be close the distribution mode, which is likely to happen with higher temperatures.
+With lower temperatures, however, the sampled token is likely to be close the distribution mode, and
+as a result, the advantage that the Token-specific rule has over OPT diminishes.
+
+F.3       C OMPARISONS UNDER TOP -P SAMPLING
+
+We compare speculative cascades with the TokenV3 deferral rule (SpecCascade [Token]) with
+SpecDecode [Lossy] under top-P sampling. As discussed in §C.3, when implementing SpecCascade
+[Token], the TokenV3 deferral rule in (15) is applied to the original drafter and verifier distributions;
+we use the deferral decision to then interleave top-P truncated versions of these distributions. In
+Table 5, we report the results of our evaluation for varying P , while fixing the temperature T = 1
+and γ = 5.
+It is for the smallest value of P that our proposal offers the largest gains in speed-up over SpecDecode
+[Lossy]. Unsurprisingly, the smaller the value of P , the better are the quality metrics, with both
+methods being almost quality neutral for P = 0.1.
+As we elaborate in §C.3, as P becomes smaller, the trade-off parameter α in lossy speculative
+sampling becomes less effective, with the method becoming identical to standard loss-less speculative
+decoding when P → 0. In contrast, our proposed SpecCascade [Token] approach does not suffer
+from the same issue as it uses the trade-off parameter α not as a scaling parameter in the acceptance
+criterion, but to construct a new target distribution that is amenable to a higher acceptance rate even
+under top-P sampling. Therefore we are able to tune α to get a wider range of operating points and
+match the quality of the larger model at a lower latency.
+For example, in Figure 7, lossy speculative decoding with P = 0.1 is able to offer only three unique
+trade-off points (despite sweeping through a fine-grained grid on α from 10−6 to 1); in contrast
+SpecCascade [Token] is able to offer a wider range of trade-off points.
+
+
+F.4       C OMPARISONS UNDER DIFFERENT BLOCK SIZES γ
+
+In Figure 8, we present latency-quality trade-off plots for T5 cascades under different block sizes γ.
+In each case, we find that the proposed speculative cascading techniques outperform lossy speculative
+decoding across different latency values. Furthermore, higher values of γ are seen to yield a wider
+range of trade-offs, with lower quality operating points shifting to the left, and better quality operating
+points shifting to the right. For example, with XSum, SpecDecode [Lossy] with γ = 3 matches the
+small model’s quality at 0.64 relative latency, and matches the large model’s quality at 0.85 relative
+latency; with γ = 7, it matches the small model’s quality at an even lower latency, but practically
+provides no speed-up when matching the larger model’s quality. The reason a larger block size can
+hurt speed-up at the higher quality regime is because it can result in frequent rollbacks, thus defeating
+the purpose of using speculative execution.
+
+F.5       B IG L ITTLE D ECODER (B I LD) VARIANTS
+
+In our experiments in the main text (§6), we compared against a version of the Big Little Decoder
+method (Kim et al., 2023) that applied Algorithm 4 to the target distribution TBiLD the authors seek
+to mimic (§B). We now show that this version performs similarly to the original BiLD algorithm in
+(Kim et al., 2023).
+
+
+                                                                           33
+Published as a conference paper at ICLR 2025
+
+
+                          WMT: Small Large ( = 3)                                                  WMT: Small Large ( = 5)                                             WMT: Small Large ( = 7)
+          22
+                         SpecDecode [Lossy]                                      22           SpecDecode [Lossy]                                          22          SpecDecode [Lossy]
+                         SpecCascade [OPT]                                                    SpecCascade [OPT]                                                       SpecCascade [OPT]
+          20             SpecCascade [Token]                                                  SpecCascade [Token]                                                     SpecCascade [Token]
+BLEU                                                                             20                                                                       20
+
+
+                                                                       BLEU
+
+
+                                                                                                                                                BLEU
+          18                                                                     18                                                                       18
+          16                                                                     16                                                                       16
+
+          14                                                                     14                                                                       14
+               0.55        0.60      0.65      0.70    0.75    0.80                   0.45 0.50 0.55 0.60 0.65 0.70 0.75 0.80                               0.4        0.5     0.6     0.7        0.8     0.9
+                                   Relative latency                                                        Relative latency                                                  Relative latency
+
+                         XSum: Small Large ( = 3)                                              XSum: Small Large ( = 5)                                                XSum: Small Large ( = 7)
+                                                                                 16                                                                       16          SpecDecode [Lossy]
+                                                                                                                                                                      SpecCascade [OPT]
+          14                                                                     14                                                                       14          SpecCascade [Token]
+ROUGE-2
+
+
+                                                                       ROUGE-2
+
+
+                                                                                                                                                ROUGE-2
+          12                                                                     12                                                                       12
+                                             SpecDecode [Lossy]                  10                                SpecDecode [Lossy]                     10
+          10                                 SpecCascade [OPT]                                                     SpecCascade [OPT]
+                                             SpecCascade [Token]                                                   SpecCascade [Token]
+                                                                                                                                                           8
+                  0.65      0.70      0.75      0.80    0.85    0.90                   0.6           0.7          0.8         0.9         1.0                        0.6     0.7     0.8        0.9     1.0
+                                  Relative latency                                                     Relative latency                                                      Relative latency
+
+                         CNNDM: Small Large ( = 3)                                            CNNDM: Small Large ( = 5)                                               CNNDM: Small Large ( = 7)
+          12                                                                     12                                                                       12
+          11                                                                     11                                                                       11
+ROUGE-2
+
+
+                                                                       ROUGE-2
+
+
+                                                                                                                                                ROUGE-2
+          10                                                                     10                                                                       10
+                                              SpecDecode [Lossy]                                                    SpecDecode [Lossy]                                                 SpecDecode [Lossy]
+           9                                  SpecCascade [OPT]                   9                                 SpecCascade [OPT]                      9                           SpecCascade [OPT]
+                                              SpecCascade [Token]                                                   SpecCascade [Token]                                                SpecCascade [Token]
+                                                                                  8
+           0.50     0.55      0.60     0.65     0.70    0.75   0.80                          0.5           0.6          0.7         0.8                        0.4     0.5     0.6      0.7       0.8     0.9
+                                   Relative latency                                                        Relative latency                                                  Relative latency
+
+
+Figure 8: Plots of quality vs. latency for T5 models with with varying block sizes γ. Each method
+interleaves T5-small with T5-large. The x-axis tracks the latency relative to that of calling the large
+model on all inputs. The horizontal dotted line denotes the quality of the large model.
+
+
+A key difference to the original algorithm in (Kim et al., 2023) is the use of the fallback phase, where
+the drafter is run until its maximum predicted probability maxv∈V q(v) < 1 − αf , for a threshold
+αf ∈ [0, 1] (or until a maximum block size of 10 is reached), and the use of a deterministic rollback
+policy where the verifier rejects a draft token whenever D(q, p) > α. In our implementation, we
+adopt the speculative sampling algorithm from (Leviathan et al., 2023): we do not have the fallback
+policy and replace the determinisic rollback policy with the rejection sampling in Algorithm 4.
+Figure 9 (top) compares the original version of BiLD with the version we use in §6. We interleave
+between a T5-small and T5-large model on WMT, using greedy decoding (T = 0) for inference. As
+prescribed by the authors (Kim et al., 2023), we use the following discrepancy metric for greedy
+decoding:
+
+                                D(q, p) = log p arg max q(v) .
+                                                                                                                        v∈V
+
+We compare our implementation (BiLD∗ ), where we set the block size to 5 (same as our proposed
+speculative cascading approaches), with the original BiLD for different choices of maximum block
+size γ and different fallback thresholds αf . For both methods, we vary the threshold α on D(q, p) to
+vary the latency and plot the resulting BLEU score.
+A higher fallback threshold αf results in larger draft generation windows; this gives an advantage
+in the low latency regime, where most of the draft tokens are accepted. As a result, BiLD [γ =
+10, α = 0.9] yields the lowest latencies, but also yields lower quality. A low fallback threshold results
+in very small draft generation windows, and consequently, in higher latencies. This is why BiLD
+[γ = 5, α = 0.1] is the slowest but yields high quality metrics.
+Our implementation BiLD∗ is seen to perform comparable to the best parameter choices for the
+original BiLD algorithm in Figure 9.
+
+
+                                                                                                              34
+Published as a conference paper at ICLR 2025
+
+
+                                                                 WMT: Small Large (T=0)
+                                                                                                                                          BiLD*
+                                                                                                                                          BiLD ( = 5, f = 0.1)
+                                             27.0                                                                                         BiLD ( = 5, f = 0.3)
+                                                                                                                                          BiLD ( = 5, f = 0.5)
+                                             26.5                                                                                         BiLD ( = 5, f = 0.7)
+
+
+                                      BLEU
+                                                                                                                                          BiLD ( = 5, f = 0.9)
+                                                                                                                                          BiLD ( = 10, f = 0.1)
+                                             26.0                                                                                         BiLD ( = 10, f = 0.3)
+                                                                                                                                          BiLD ( = 10, f = 0.5)
+                                             25.5                                                                                         BiLD ( = 10, f = 0.7)
+                                                      0.40           0.45       0.50      0.55         0.60            0.65               BiLD ( = 10, f = 0.9)
+                                                                            Relative latency
+
+                                     WMT: Small Large (T=1)                                                                              XSum: Small Large (T=1)
+                                                                                                                  14                    SpecDecode [Lossy]
+                   17.0                                                                                                                 SpecCascade [Lossy ]
+                                                                                                                  13
+                   16.5
+                                                                                                                  12
+
+
+                                                                                                        ROUGE-2
+                   16.0
+            BLEU
+
+
+                                                                                                                  11
+                   15.5
+                                                                                                                  10
+                   15.0                                     SpecDecode [Lossy]
+                                                            SpecCascade [Lossy ]                                       9
+                   14.5
+                      0.00             0.05              0.10                0.15             0.20                         0.00           0.05           0.10       0.15        0.20
+                                    Fraction of calls to larger model                                                                   Fraction of calls to larger model
+
+Figure 9: Top: Plots of quality vs. latency comparing BiLD∗ with the original BiLD algorithm
+in Kim et al. (2023) with varying maximum draft window size γ and fallback confidence threshold
+αf . Bottom: Comparison of lossy speculative decoding with β = 1 [Lossy] and β tuned using the
+procedure in (Tran-Thien, 2023) [Lossy? ].
+
+                                     WMT: Small Large (T=1)                                                                                      XSum: Small Large (T=1)
+                     SpecDecode [Lossy]                                                                           16
+           22        SpecCascade [OPT]                                                                            15
+           21        SpecCascade [TokenV3]
+                     SpecCascade [TokenV2]                                                                        14
+           20        SpecCascade [TokenV1]                                                                        13
+                                                                                                        ROUGE-2
+
+
+           19
+    BLEU
+
+
+           18                                                                                                     12
+           17                                                                                                     11                                                        SpecDecode [Lossy]
+                                                                                                                                                                            SpecCascade [OPT]
+           16                                                                                                     10                                                        SpecCascade [TokenV3]
+           15                                                                                                      9                                                        SpecCascade [TokenV2]
+                                                                                                                                                                            SpecCascade [TokenV1]
+           14
+            0.40    0.45     0.50     0.55     0.60       0.65       0.70     0.75     0.80    0.85                               0.6              0.7             0.8            0.9               1.0
+                                             Relative latency                                                                                            Relative latency
+
+                                                                                        CNNDM: Small Large (T=1)
+
+                                                                12
+
+                                                                11
+                                                      ROUGE-2
+
+
+                                                                10
+                                                                                                                              SpecDecode [Lossy]
+                                                                                                                              SpecCascade [OPT]
+                                                                 9                                                            SpecCascade [TokenV3]
+                                                                                                                              SpecCascade [TokenV2]
+                                                                                                                              SpecCascade [TokenV1]
+                                                                 8
+                                                                     0.45     0.50     0.55     0.60     0.65              0.70    0.75     0.80     0.85
+                                                                                                Relative latency
+
+
+Figure 10: Plots of quality vs. latency for T5 models with all three token-specific speculative
+cascade deferral rules in equations 13–15. Each method interleaves a T5 small and a T5 large
+model. The x-axis tracks the latency relative to that of calling the large model on all inputs. The
+horizontal dotted line denotes the quality of the large model.
+
+
+It is worth noting that while we view TBiLD as the target distribution that the algorithm in (Kim
+et al., 2023) seeks to mimic, the presence of the fallback phase could mean that on some inputs a
+output response is generated without the verification (or rollback) phase being invoked. In such cases,
+the output response will come solely from drafter if it turns out that it contains tokens for which
+D(qt , pt ) > α.
+
+
+                                                                                                      35
+Published as a conference paper at ICLR 2025
+
+
+                                        WMT 5-shot: 2B 27B (T = 1)                                                                               CNNDM 5-shot: 2B 27B (T = 1)
+                    27.5                                                                                                  21
+                    25.0
+                    22.5                                                                                                  20
+
+                    20.0
+
+
+                                                                                                                Rouge-L
+      BLEU                                                                                                                19
+                    17.5
+                                                                     SpecDecode [Lossy]                                                                                     SpecDecode [Lossy]
+                    15.0                                             SpecCascade [OPT]                                    18                                                SpecCascade [OPT]
+                                                                     SpecCascade [TokenV3]                                                                                  SpecCascade [TokenV3]
+                    12.5                                             SpecCascade [TokenV2]                                                                                  SpecCascade [TokenV2]
+                    10.0                                             SpecCascade [TokenV1]                                17                                                SpecCascade [TokenV1]
+                       0.00    0.05        0.10           0.15          0.20          0.25          0.30                   0.00          0.05         0.10           0.15       0.20           0.25
+                                                   Rejection rate                                                                                            Rejection rate
+
+                                        GSM8K 8-shot: 2B 27B (T = 1)                                                                             SQuAD 1-shot: 2B 27B (T = 1)
+                    0.75                                                                                           0.54
+                    0.70
+                                                                                                                   0.52
+                    0.65
+      Exact Match
+
+
+                    0.60
+
+
+                                                                                                            F1
+                                                                                                                   0.50
+                    0.55                                             SpecDecode [Lossy]                                                                                     SpecDecode [Lossy]
+                    0.50                                             SpecCascade [OPT]                                                                                      SpecCascade [OPT]
+                                                                     SpecCascade [TokenV3]                         0.48                                                     SpecCascade [TokenV3]
+                    0.45                                             SpecCascade [TokenV2]                                                                                  SpecCascade [TokenV2]
+                    0.40                                             SpecCascade [TokenV1]                                                                                  SpecCascade [TokenV1]
+                                                                                                                   0.46
+                       0.00   0.02       0.04          0.06      0.08          0.10      0.12                         0.00           0.05            0.10            0.15      0.20           0.25
+                                                   Rejection rate                                                                                            Rejection rate
+
+                                        WebQ 1-shot: 2B 27B (T = 1)                                                                             NaturalQA 1-shot: 2B 27B (T = 1)
+                                                                                                                   0.35
+                    0.32
+                                                                                                                   0.30
+                    0.30
+                                                                                                                   0.25
+                    0.28
+      F1
+
+
+                                                                                                            F1
+
+
+                                                                     SpecDecode [Lossy]                            0.20
+                                                                                                                                                                            SpecDecode [Lossy]
+                    0.26                                             SpecCascade [OPT]                                                                                      SpecCascade [OPT]
+                                                                     SpecCascade [TokenV3]                                                                                  SpecCascade [TokenV3]
+                    0.24                                             SpecCascade [TokenV2]                         0.15                                                     SpecCascade [TokenV2]
+                                                                     SpecCascade [TokenV1]                                                                                  SpecCascade [TokenV1]
+                       0.00     0.05            0.10          0.15             0.20          0.25                          0.00   0.05      0.10     0.15     0.20     0.25   0.30     0.35     0.40
+                                                   Rejection rate                                                                                            Rejection rate
+
+                                       MBPP 3-shot: 2B 27B [IT] (T = 1)                                                                         TriviaQA 1-shot: 2B 27B (T = 1)
+                    0.65
+                    0.60                                                                                           0.55
+
+                    0.55
+                                                                                                                   0.50
+      Pass@1
+
+
+                    0.50
+                                                                                                            F1
+
+
+                    0.45                                             SpecDecode [Lossy]                            0.45                                                     SpecDecode [Lossy]
+                                                                     SpecCascade [OPT]                                                                                      SpecCascade [OPT]
+                    0.40                                             SpecCascade [TokenV3]                                                                                  SpecCascade [TokenV3]
+                                                                     SpecCascade [TokenV2]                         0.40                                                     SpecCascade [TokenV2]
+                    0.35
+                                                                     SpecCascade [TokenV1]                                                                                  SpecCascade [TokenV1]
+                    0.30
+                       0.00   0.02       0.04          0.06      0.08          0.10     0.12                              0.000 0.025 0.050 0.075 0.100 0.125 0.150 0.175 0.200
+                                                   Rejection rate                                                                                            Rejection rate
+
+
+Figure 11: Plots of quality vs. rejection rate for Gemma models with all three token-specific
+speculative cascade deferral rules in equations 13–15. Each method interleaves a Gemma 2B
+drafter with a Gemma 27B verifier. The horizontal dotted line denotes the quality of the large model.
+We include all three token-specific speculative cascade deferral rules in equations 13–15.
+
+
+F.6        L OSSY SPECULATIVE DECODING VARIANTS
+
+In our experiments in the main text (§6), we compared against the lossy speculative decoding (Tran-
+Thien, 2023; Zhou et al., 2024) described in §2, with the parameter β set to 1. We now present
+results for this method with β tuned according to the procedure in Tran-Thien (2023), and show that
+choosing β = 1 fares at least as well as tuning β.
+The goal in Tran-Thien (2023) is to choose α and β so as to maximize the acceptance rate for the
+draft token, while ensuring that the KL divergence between the resulting target distribution and p
+is within an allowable limit R. The authors prescribe specifying R, and for each prefix, tuning α
+and β to solve the resulting constrained optimization problem. To be consistent with the rest of
+our experimental setup, we vary α to vary the draft acceptance rate (note that each choice of α
+corresponds to a particular KL divergence to p), and tune β ≥ 1 − α to satisfy the following condition
+
+
+                                                                                                           36
+Published as a conference paper at ICLR 2025
+
+
+                                       WMT 5-shot: 2B 9B (T = 1)                                                                      GSM8K 8-shot: 2B 9B (T = 1)
+             27.5                                                                                                 0.75
+             25.0                                                                                                 0.70
+             22.5                                                                                                 0.65
+
+
+                                                                                                    Exact Match
+             20.0                                                                                                 0.60
+      BLEU
+             17.5                                                                                                 0.55
+                                                                  SpecDecode [Lossy]                                                                              SpecDecode [Lossy]
+             15.0                                                 SpecCascade [OPT]                               0.50                                            SpecCascade [OPT]
+                                                                  SpecCascade [TokenV3]                                                                           SpecCascade [TokenV3]
+             12.5                                                 SpecCascade [TokenV2]                           0.45                                            SpecCascade [TokenV2]
+             10.0                                                 SpecCascade [TokenV1]                           0.40                                            SpecCascade [TokenV1]
+                0.00          0.05           0.10           0.15              0.20          0.25                     0.00   0.02       0.04        0.06          0.08           0.10          0.12
+                                                   Rejection rate                                                                                Rejection rate
+
+                                     SQuAD 2.0 1-shot: 2B 9B (T = 1)                                                               WebQuestions 1-shot: 2B 9B (T = 1)
+                                                                                                                  0.30
+             0.60
+                                                                                                                  0.29
+             0.58
+                                                                                                                  0.28
+             0.56
+                                                                                                                  0.27
+             0.54
+      F1
+
+
+                                                                                                    F1
+             0.52                                                                                                 0.26
+                                                                  SpecDecode [Lossy]                                                                              SpecDecode [Lossy]
+             0.50                                                 SpecCascade [OPT]                               0.25                                            SpecCascade [OPT]
+                                                                  SpecCascade [TokenV3]                                                                           SpecCascade [TokenV3]
+             0.48                                                 SpecCascade [TokenV2]                           0.24                                            SpecCascade [TokenV2]
+             0.46
+                                                                  SpecCascade [TokenV1]                                                                           SpecCascade [TokenV1]
+                                                                                                                  0.23
+                0.00   0.05          0.10     0.15       0.20          0.25      0.30     0.35                       0.00    0.05         0.10            0.15           0.20            0.25
+                                                   Rejection rate                                                                                Rejection rate
+
+                                     NaturalQA 1-shot: 2B 9B (T = 1)                                                                  TriviaQA 1-shot: 2B 9B (T = 1)
+             0.28                                                                                          0.525
+             0.26                                                                                          0.500
+             0.24
+                                                                                                           0.475
+             0.22
+                                                                                                           0.450
+      F1
+
+
+                                                                                                    F1
+
+
+             0.20
+             0.18
+                                                                  SpecDecode [Lossy]                       0.425                                                  SpecDecode [Lossy]
+                                                                  SpecCascade [OPT]                                                                               SpecCascade [OPT]
+             0.16                                                 SpecCascade [TokenV3]                    0.400                                                  SpecCascade [TokenV3]
+             0.14                                                 SpecCascade [TokenV2]                                                                           SpecCascade [TokenV2]
+                                                                  SpecCascade [TokenV1]                    0.375                                                  SpecCascade [TokenV1]
+             0.12
+                0.00   0.05     0.10        0.15     0.20       0.25      0.30     0.35    0.40                      0.00      0.05              0.10             0.15                 0.20
+                                                   Rejection rate                                                                                Rejection rate
+
+
+Figure 12: Plots of quality vs. rejection rate with Gemma 2B → 9B speculative cascades. Each
+method interleaves a Gemma 2B drafter with a Gemma 9B verifier. The horizontal dotted line denotes
+the quality of the large model. We include all three token-specific speculative cascade deferral
+rules in equations 13–15.
+
+
+outlined in Tran-Thien (2023):
+                                            X
+                   X                 p(v)            p(v)
+                       max 0, q(v) −       =  max 0,      − q(v)
+                                     1−α              β
+                                       v∈V                                                                v∈V
+
+
+We pick β using a grid-search over 1000 values between α and 10.
+Since this tuning procedure, in turn, can add to the method’s latency, for a fair comparison, we plot
+quality as a function of the fraction of calls to the large model (rejection rate), instead of relative
+latency. In Figure 9 (bottom), we plot these trade-off curves for loss speculative decoding with β = 1
+(Lossy) and for speculative decoding with β tuned using the above procedure (Lossy? ). We compare
+performances on WMT and XSum, and in each case, interleave a T5-small model with a T5-large
+model.
+In both cases, setting β = 1 provides trade-offs comparable to or better than using a tuned value
+of β. The reason using a tuned value of β fares worse than setting β = 1 might be because we are
+measuring quality in terms of BLEU or ROUGE-2, which is different from the KL divergence to p
+objective that the tuning procedure in Tran-Thien (2023) seeks to optimize.
+
+F.7    T OKEN - SPECIFIC DEFERRAL RULE VARIANTS
+
+In Figure 10, we present latency-quality trade-off plots for cascades constructed from a T5-small
+and a T5-large model. We include in these comparisons, all three token-specific deferral rules in
+
+
+                                                                                                   37
+Published as a conference paper at ICLR 2025
+
+
+(13)–(15). In Figure 11, we present trade-off plots for cascades constructed from Gemma 2B and
+Gemma 27B models with all three token-specific rules, and in Figure 12, we include similar plots for
+cascades constructed from Gemma 2B and Gemma 9B models. We note that the trends with the 2B
+→ 9B are similar to those seen with the 2B → 27B cascades.
+With the T5 models, the results are mixed, with the V1 and V2 variants sometime surpassing the V3
+variant (which is the variant we included in the main experiments results in §6). Interestingly, with
+the Gemma models, the V3 variant is seen to outperform the others for most rejection rates, with the
+exception of the 2B→27B cascade on SQuAD 2.0, where the V2 variant is better.
+The reason for the V3 variant outperforming the V1 and V2 variants on the Gemma models could be
+due to the fact that it uses the larger model’s distribution pt (·) to measure confidence for both the
+drafter and verifier tokens (see LHS and RHS in (13)). We expect this to be particularly helpful when
+there is a larger gap in sizes between q and p, and the larger model’s distribution is better aligned with
+the data-generating distribution compared to the smaller model. Furthermore, as per the discussion in
+§5, the multiplicative form of the rule (15) results in a target distribution with an intuitive form: it
+seeks to mimic qt (·) on the top-α ranked tokens by pt (·) and uses a re-scaled version of pt (·) for the
+other tokens:
+                                                                      X
+                                                                            qt (v 0 ),
+
+                        πTokenV3 (v) = qt (v) · 1 v ∈ Tα + pt (v) ·
+                                                                     v 0 ∈T
+                                                                         / α
+
+where Tα = {v ∈ V : pt (v) ≥ maxv0 pt (v 0 ) · (1 − α)}.
+
+
+                                                   38
+Published as a conference paper at ICLR 2025
+
+
+G    L IMITATIONS
+One of the limitations of our proposal is the use of plug-in estimators to approximate the optimal rule
+(9). While these approximations are effective in practice, they rely on the individual models being
+calibrated. An alternative to the use of plug-in estimators is to use a router model explicitly trained
+to mimic the optimal rule using a validation sample drawn from P (Gupta et al., 2024). Another
+limitation is that the optimization objectives we seek to minimize are local objectives that seek to
+make the best deferral decision at the current position t. In doing so, they ignore the downstream
+effects of choosing a particular model in the current step. Devising a global deferral objective
+that takes downstream errors into account would be an interesting direction for future work. More
+broadly, our paper seeks to improve cost-quality trade-offs in LM inference. It is important that such
+improvements do not unfairly advantage one slice of the data or a subset of the population, at the cost
+of others. Ensuring that the trade-off gains that our approach offers is equitable across different slices
+of the data is another important direction for the future.
+
+
+                                                   39

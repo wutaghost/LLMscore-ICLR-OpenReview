@@ -1,0 +1,1570 @@
+Under review as a conference paper at ICLR 2024
+
+
+T-S TITCH :             ACCELERATING S AMPLING IN P RE -
+TRAINED             D IFFUSION M ODELS WITH T RAJECTORY
+S TITCHING
+ Anonymous authors
+ Paper under double-blind review
+
+
+
+                                            A BSTRACT
+         Diffusion probabilistic models (DPMs) achieve great success in generating high-
+         quality data such as images and videos. However, sampling from DPMs at in-
+         ference time is often expensive for high-quality generation and typically requires
+         hundreds of steps with a large network model. In this paper, we introduce sam-
+         pling Trajectory Stitching (T-Stitch), a simple yet efficient technique to improve
+         the generation efficiency with little or no loss in the generation quality. Instead
+         of solely using a large DPM for the entire sampling trajectory, T-Stitch first lever-
+         ages a smaller DPM in the initial steps as a cheap drop-in replacement of the
+         larger DPM and switches to the larger DPM at a later stage. The key reason why
+         T-Stitch works is that different diffusion models learn similar encodings under
+         the same training data distribution. While smaller models are not as effective in
+         refining high-frequency details in later denoising steps, they are still capable of
+         generating good global structures in the early steps. Thus, smaller models can
+         be used in early steps to reduce the computational cost. Notably, T-Stitch does
+         not need any further training and uses only pretrained models. Thus, it can be
+         easily combined with other fast sampling techniques to obtain further efficiency
+         gains across different architectures and samplers. On DiT-XL, for example, 40%
+         of the early timesteps can be safely replaced with a 10x faster DiT-S without per-
+         formance drop on class-conditional ImageNet generation. By allocating different
+         fractions of small and large DPMs along the sampling trajectory, we can achieve
+         flexible speed and quality trade-offs. We further show that our method can also
+         be used as a drop-in technique to not only accelerate the popular pretrained sta-
+         ble diffusion (SD) models but also improve the prompt alignment of stylized SD
+         models from the public model zoo.
+
+
+1   I NTRODUCTION
+Diffusion probabilistic models (DPMs) (Ho et al., 2020) have demonstrated remarkable success in
+generating high-quality data among various real-world applications, such as text-to-image genera-
+tion (Rombach et al., 2022), audio synthesis (Kong et al., 2021) and 3D generation (Poole et al.,
+2023), etc. Achieving high generation quality, however, is expensive due to the need to sample from
+a large DPM, typically involving hundreds of denoising steps, each of which requires a high com-
+putational cost. For example, even with a high-performance RTX 3090, generating 8 images with
+DiT-XL (Peebles & Xie, 2022) takes 16.5 seconds with 100 denoising steps, which is ∼ 10× slower
+than its smaller counterpart DiT-S (1.7s) with a lower generation quality.
+Recent works tackle the inference efficiency issue by speeding up the sampling of DPMs in two
+ways: (1) reducing the computational costs per step or (2) reducing the number of sampling steps.
+The former approach can be done by model compression through quantization (Li et al., 2023) and
+pruning (Fang et al., 2023), or by redesigning lightweight model architectures (Yang et al., 2023; Lee
+et al., 2023). The second approach reduces the number of steps either by distilling multiple denoising
+steps into fewer ones (Salimans & Ho, 2022; Song et al., 2023; Zheng et al., 2023) or by improving
+the differential equation solver (Song et al., 2021a; Lu et al., 2022; Zheng et al., 2023). While both
+directions can improve the efficiency of large DPMs, they assume that the computational cost of
+each denoising step remains the same, and a single model is used throughout the process. However,
+
+
+                                                  1
+Under review as a conference paper at ICLR 2024
+
+
+      40
+                                                                                                                                     33.46
+      30                                                                                                                  30.11
+                                                                                                                 25.44
+FID   20                                                                                            18.04
+                                                                             10.06        12.46
+      10          9.20    9.17           8.99   9.03             8.95
+                   0%     10%            20%    30%              40%         50%           60%      70%          80%      90%         100%
+                                                                   #DiT-S Steps / Total Steps
+
+
+                  16.5s   15.3s      13.9s      12.5s        11.0s           9.4s         7.9s      6.4s         4.8s     3.3s       1.7s
+
+
+Figure 1: Top: FID comparison on class-conditional ImageNet when progressively stitching more
+DiT-S steps at the beginning and fewer DiT-XL steps in the end, based on DDIM 100 timesteps and
+a classifier-free guidance scale of 1.5. FID is calculated by sampling 5000 images. Bottom: One
+example of stitching more DiT-S steps to achieve faster sampling, where the time cost is measured
+by generating 8 images on one RTX 3090 in seconds (s).
+           3.1s                   2.6s                    1.9s                         3.1s                    2.6s                 1.9s
+
+
+ Ghibli Diffusion            40% T-Stitch               Small SD                InkPunk Diffusion          40% T-Stitch           Small SD
+
+ A ghibli style princess with golden hair in New York City                      A photo of a white cat on a tropical beach, nvinkpunk style
+
+
+Figure 2: By directly adopting a small SD in the model zoo, T-Stitch naturally interpolates the
+speed, style, and image contents with a large styled SD, which also potentially improves the prompt
+alignment, e.g., “New York City” and “tropical beach” in the above examples.
+
+we observe that different steps in the denoising process exhibit quite distinct characteristics, and
+using the same model throughout is a suboptimal strategy for efficiency.
+Our Approach. In this work, we propose Trajectory Stitching (T-Stitch), a simple yet effective
+strategy to improve DPMs’ efficiency that complements existing efficient sampling methods by dy-
+namically allocating computation to different denoising steps. Our core idea is to apply DPMs of
+different sizes at different denoising steps instead of using the same model at all steps, as in pre-
+vious works. We show that by first applying a smaller DPM in the early denoising steps followed
+by switching to a larger DPM in the later denoising steps, we can reduce the overall computational
+costs without sacrificing the generation quality. Figure 1 shows an example of our approach using
+two DiT models (DiT-S and DiT-XL), where DiT-S is computationally much cheaper than DiT-XL.
+With the increase in the percentage of steps from DiT-S instead of DiT-XL in our T-stitch, we can
+keep increasing the inference speed. In our experiments, we find that there is no degradation of the
+generation quality (in FID), even when the first 40% of steps are using DiT-S, leading to around
+1.5× lossless speedup.
+Our method is based on two key insights: (1) Recent work suggests a common latent space across
+different DPMs trained on the same data distribution (Song et al., 2021b; Roeder et al., 2021). Thus,
+different DPMs tend to share similar sampling trajectories, which makes it possible to stitch across
+different model sizes and even architectures. (2) From the frequency perspective, the denoising
+process focuses on generating low-frequency components at the early steps while the later steps
+target the high-frequency signals (Yang et al., 2023). Although the small models are not as effective
+for high-frequency details, they can still generate a good global structure at the beginning.
+With comprehensive experiments, we demonstrate that T-Stitch substantially speeds up large DPMs
+without much loss of generation quality. This observation is consistent across a spectrum of ar-
+chitectures and diffusion model samplers. This also implies that T-Stitch can be directly applied
+to widely used large DPMs without any re-training (e.g., Stable Diffusion (SD) (Rombach et al.,
+2022)). Figure 2 shows the results of speeding up stylized Stable Diffusion with a relatively smaller
+pretrained SD model (Kim et al., 2023). Surprisingly, we find that T-Stitch not only improves speed
+
+
+                                                                            2
+Under review as a conference paper at ICLR 2024
+
+
+but also improves prompt alignment for stylized models. This is possibly because the fine-tuning
+process of stylized models (e.g., ghibli, inkpunk) degrades their prompt alignment. T-Stitch im-
+proves both efficiency and generation quality here by combining small SD models to complement
+the prompt alignment for large SD models specialized in stylizing the image.
+Note that T-Stitch is complementary to existing fast sampling approaches. The part of the trajectory
+that is taken by the large DPM can still be sped up by reducing the number of steps taken by it, or by
+reducing its computational cost with compression techniques. In addition, while T-Stitch can already
+effectively improve the quality-efficiency trade-offs without any overhead of re-training, we show
+that the generation quality of T-Stitch can be further improved when we fine-tune the stitched DPMs
+given a trajectory schedule (Section A.12). By fine-tuning the large DPM only on the timesteps
+that it is applied, the large DPM can better specialize in providing high-frequency details and further
+improve generation quality. Furthermore, we show that the training-free Pareto frontier generated by
+T-Stitch improves quality-efficiency trade-offs to training-based methods designed for interpolating
+between neural network models via model stitching (Pan et al., 2023a;b). Note that T-Stitch is not
+limited to only two model sizes, and is also applicable to different DPM architectures.
+We summarize our main contributions as follows:
+• We propose T-Stitch, a simple yet highly effective approach for improving the inference speed
+  of DPMs, by applying a small DPM at early denoising steps while a large DPM at later steps.
+  Without retraining, we achieve better speed and quality trade-offs than individual large DPMs and
+  even non-trivial lossless speedups.
+• We conduct extensive experiments to demonstrate that our method is generally applicable to differ-
+  ent model architectures and samplers, and is complementary to existing fast sampling techniques.
+• Notably, without any re-training overhead, T-Stitch not only accelerates Stable Diffusion models
+  that are widely used in practical applications but also improves the prompt alignment of stylized
+  SD models for text-to-image generation.
+
+
+2   R ELATED W ORKS
+
+Efficient diffusion models. Despite the success, DPMs suffer from the slow sampling speed (Rom-
+bach et al., 2022; Ho et al., 2020) due to hundreds of timesteps and the large denoiser (e.g., U-Net).
+To expedite the sampling process, some efforts have been made by directly utilizing network com-
+pression techniques to diffusion models, such as pruning (Fang et al., 2023) and quantization (Shang
+et al., 2023; Li et al., 2023). On the other hand, many works seek for reducing sampling steps, which
+can be achieved by distillation (Salimans & Ho, 2022; Zheng et al., 2023; Song et al., 2023), im-
+plicit sampler (Song et al., 2021a), improved differential equation (DE) solvers (Lu et al., 2022;
+Song et al., 2021b; Jolicoeur-Martineau et al., 2021; Liu et al., 2022). Another line of work also
+considers accelerating sampling by parallel sampling. For example, Zheng et al. (2023) proposed to
+utilize operator learning to simultaneously predict all steps. Shih et al. (2023) proposed ParaDiGMS
+to compute the drift at multiple timesteps in parallel. As a complementary technique to the above
+methods, our proposed trajectory stitching accelerates large DPM sampling by leveraging pretrained
+small DPMs at early denoising steps, while leaving sufficient space for large DPMs at later steps.
+Multiple experts in diffusion models. Previous observations have revealed that the synthesis be-
+havior in DPMs can change at different timesteps (Balaji et al., 2022; Yang et al., 2023), which has
+inspired some works to propose an ensemble of experts at different timesteps for better performance.
+For example, Balaji et al. (2022) trained an ensemble of expert denoisers at different denoising in-
+tervals. However, allocating multiple large denoisers linearly increases the model parameters and
+does not reduce the computational cost. Yang et al. (2023) proposed a lite latent diffusion model
+(i.e., LDM) which incorporates a gating mechanism for the wavelet transform in the denoiser to con-
+trol the frequency dynamics at different steps, which can be regarded as an ensemble of frequency
+experts. Following the same spirit, Lee et al. (2023) allocated different small denoisers at different
+denoising intervals to specialize on their respective frequency ranges. Nevertheless, most existing
+works adopt the same-sized model over all timesteps, which barely consider the speed and quality
+trade-offs between different-sized models. In contrast, we explore a flexible trade-off between small
+and large DPMs and reveal that the early denoising steps can be sufficiently handled by a much
+efficient small DPM.
+
+
+                                                  3
+Under review as a conference paper at ICLR 2024
+
+
+Stitchable neural networks. Stitchable neural networks (SN-Net) (Pan et al., 2023a) is motivated
+by the idea of model stitching (Lenc & Vedaldi, 2015; Bansal et al., 2021; Csiszárik et al., 2021; Yang
+et al., 2022), where the pretrained models of different scales within a pretrained model family can
+be splitted and stitched together with simple stitching layers (i.e., 1 × 1 convs) without a significant
+performance drop. Based on the insight, SN-Net inserts a few stitching layers among models of
+different sizes and applies joint training to obtain numerous networks (i.e., stitches) with different
+speed-performance trade-offs. The following work of SN-Netv2 (Pan et al., 2023b) enlarges its
+space and demonstrates its effectiveness on downstream dense prediction tasks. In this work, we
+compare our technique with SN-Netv2 to show the advantage of trajectory stitching over model
+stitching in terms of the speed and quality trade-offs in DPMs. Our T-Stitch is a better, simpler and
+more general solution.
+
+
+3     M ETHOD
+
+3.1   P RELIMINARY
+
+Diffusion models. We consider the class of score-based diffusion models in a continuous time (Song
+et al., 2021b) and following the presentation from Karras et al. (2022). Let pdata (x0 ) denote the data
+distribution and σ(t) : [0, 1] → R+ is a user-specified noise level schedule, where t ∈ {0, ..., T } and
+σ(t − 1) < σ(t). Let p(x; σ) denote the distribution of noised samples by injecting σ 2 -variance
+Gaussian noise. Starting with a high-variance Gaussian noise xT , diffusion models gradually de-
+noise xT into less noisy samples {xT −1 , xT −2 , ..., x0 }, where xt ∼ p(xt ; σ(t)). Furthermore, this
+iterative process can be done by solving the probability flow ordinary differential equation (ODE) if
+knowing the score ∇x log pt (x), namely the gradient of the log probability density with respect to
+data,
+                                dx = −σ̂(t)σ(t)∇x log p(x; σ(t)) dt,                                (1)
+where σ̂(t) denote the time derivative of σ(t). Essentially, diffusion models aim to learn a model for
+the score function, which can be reparameterized as
+                                ∇x log pt (x) ≈ (Dθ (x; σ) − x)/σ 2 ,                               (2)
+where Dθ (x; σ) is the learnable
+                                    denoiser. Given a noisy data point x0 + n and a conditioning signal
+c, where n ∼ N 0, σ 2 I , the denoiser aim to predict the clean data x0 . In practice, the mode is
+trained by minimizing the loss of denoising score matching,
+                   E(x0 ,c)∼pdata (x0 ,c),(σ,n)∼p(σ,n) λσ ∥Dθ (x0 + n; σ, c) − x0 ∥22 ,
+
+                                                                                                    (3)
+
+where λσ : R+ → R+ is a weighting function (Ho et al., 2020), p(σ, n) = p(σ) N n; 0, σ 2 , and
+p(σ) is a distribution over noise levels σ.
+This work focuses on the denoisers D in diffusion models. In common practice, they are typically
+large parameterized neural networks with different architectures that consume high FLOPs at each
+timestep. In the following, we use “denoiser” or “model” interchangeably to refer to this network.
+We begin with the pretrained DiT model family to explore the advantage of trajectory stitching on
+efficiency gain. Then we show our method is a general technique for other architectures, such as
+U-Net (Rombach et al., 2022) and U-ViT (Bao et al., 2023).
+Classifier-free guidance. Unlike classifier-based denoisers (Dhariwal & Nichol, 2021) that require
+an additional network to provide conditioning guidance, classifier-free guidance (Ho & Salimans,
+2022) is a technique that jointly trains a conditional model and an unconditional model in one net-
+work by replacing the conditioning signal with a null embedding. During sample generation, it
+adopts a guidance scale s ≥ 0 to guide the sample to be more aligned with the conditioning signal
+by jointly considering the predictions from both conditional and unconditional models,
+                           Ds (x; σ, c) = (1 + s)D(x; σ, c) − sD(x; σ).                             (4)
+Recent works have demonstrated that classifier-free guidance provides a clear improvement in gen-
+eration quality. In this work, we consider the diffusion models that are trained with classifier-free
+guidance due to their popularity.
+
+
+                                                   4
+Under review as a conference paper at ICLR 2024
+
+
+
+                                      DiT-XL/S                                                     DiT-XL/B                                                       DiT-B/S
+                    1.00                                                         1.00                                                       1.00
+
+
+Cosine Similarity
+
+
+                                                             Cosine Similarity
+
+
+                                                                                                                        Cosine Similarity
+                    0.80                                                         0.80                                                       0.80
+
+                    0.60                                                         0.60                                                       0.60
+
+                    0.40                                                         0.40                                                       0.40
+                           100   75     50       25      0                              100   75       50     25    0                              100     75        50      25   0
+                                  Denoising steps                                              Denoising steps                                                 Denoising steps
+
+
+Figure 3: Similarity comparison of latent embeddings at different denoising steps between different
+DiT models. Results are averaged over 32 images.
+
+                                                    Small DPM                                                       Large DPM
+
+
+                                        t=T                                        t=0                        t=T                                        t=0
+
+
+                                                       !                                                                        !
+
+
+      10%                                        20%                                               30%                                         …                     80%
+
+
+
+Figure 4: Framework of Trajectory Stitching (T-Stitch): Based on pretrained small and large
+DPMs, we can leverage the more efficient small DPM with different percentages at the early de-
+noising sampling steps to achieve different speed-quality trade-offs.
+
+3.2                    T RAJECTORY S TITCHING
+
+Why can different pretrained DPMs be directly stitched along the sampling trajectory? First of
+all, DPMs from the same model family usually takes the latent noise inputs and outputs of the same
+shape, (e.g., 4×32×32 in DiTs). There is no dimension mismatch when applying different DPMs at
+different denoising steps. More importantly, as pointed out in (Song et al., 2021b), different DPMs
+that are trained on the same dataset often learn similar latent embeddings. We observe that this is
+especially true for the latent noises at early denoising sampling steps, as shown in Figure 3, where
+the cosine similarities between the output latent noises from different DiT models reach almost
+100% at early steps. This motivates us to propose Trajectory Stitching (T-Stitch), a novel step-level
+stitching strategy that leverages a pretrained small model at the beginning to accelerate the sampling
+speed of large diffusion models.
+Principle of model selection. Figure 4 shows the framework of our proposed T-Stitch for different
+speed-quality tradeoffs. In principle, the fast speed or worst generation quality we can achieve is
+roughly bounded by the smallest model in the trajectory, whereas the slowest speed or best genera-
+tion quality is determined by the largest denoiser. Thus, given a large diffusion model that we want
+to speed up, we select a small model that is 1) clearly faster, 2) sufficiently optimized, and 3) trained
+on the same dataset as the large model or at least they have learned similar data distributions (e.g.,
+pretrained or finetuned stable diffusion models).
+Pairwise model allocation. By default, T-Stitch adopts a pairwise denoisers in the sampling trajec-
+tory as it performs very well in practice. Specifically, we first define a denoising interval as a range
+of sampling steps in the trajectory, and the fraction of it over the total number of steps T is denoted
+as r, where r ∈ [0, 1]. Next, we treat the model allocation as a compute budget allocation problem.
+From Figure 3, we observe that the latent similarity between different scaled denoisers keeps de-
+creasing when T flows to 0. To this end, our allocation strategy adopts a small denoiser as a cheap
+replacement at the initial intervals then applies the large denoiser at the later intervals. In particular,
+suppose we have a small denoiser D1 and a large denoiser D2 . Then we let D1 take the first ⌊r1 T ⌉
+steps and D2 takes the last ⌊r2 T ⌉ steps, where ⌊·⌉ denotes a rounding operation and r2 = 1 − r1 .
+By increasing r1 , we naturally interpolate the compute budget between the small and large denoiser
+and thus obtain flexible quality and efficiency trade-offs. For example, in Figure 1, the configuration
+r1 = 0.5 uniquely defines a trade-off where it achieves 10.06 FID and 1.76× speedup.
+
+
+                                                                                                   5
+Under review as a conference paper at ICLR 2024
+
+
+                                DiT-XL/S                                                     DiT-XL/B                                                        DiT-B/S
+      30                                                               12                                                                30
+FID                                                                    11
+
+
+                                                                 FID
+
+
+                                                                                                                                   FID
+      20
+                                                                       10                                                                20
+
+      10                                                               9
+           0.00         0.25         0.50     0.75      1.00                0.00      0.25     0.50                 0.75   1.00               0.00    0.25     0.50     0.75     1.00
+                   Fraction of Smaller Net                                         Fraction of Smaller Net                                           Fraction of Smaller Net
+
+Figure 5: T-Stitch of two model combinations: DiT-XL/S, DiT-XL/B and DiT-B/S. We adopt DDIM
+100 timesteps with a classifier-free guidance scale of 1.5.
+                                                                                                                   250
+      30
+
+
+                                                                                                 Inception Score
+                                                                                                                   200
+FID
+
+
+      20                                                                                                           150
+
+                                                                                                                   100
+      10
+                                                                                                                    50
+                  2.5          5.0      7.5      10.0     12.5     15.0        17.5                                        2.5    5.0         7.5    10.0    12.5      15.0    17.5
+                                            Time Cost (s)                                                                                      Time Cost (s)
+
+
+Figure 6: T-Stitch based on three models: DiT-S, DiT-B and DiT-XL. We adopt DDIM 100 timesteps
+with a classifier-free guidance scale of 1.5. We highlight the Pareto frontier in lines.
+
+More denoisers for more trade-offs. Note that T-Stitch is not limited to the pairwise setting. In
+fact, we can adopt more denoisers in the sampling trajectory to obtain more speed and quality trade-
+offs and a better Pareto frontier. For example, by using a medium sized denoiser in the intermediate
+interval, we can change the fractions of each denoiser to obtain more configurations. In practice,
+given a compute budget such as time cost, we can efficiently find a few configurations that satisfy
+this constraint via a pre-computed lookup table, as discussed in Section A.1.
+Remark. Compared to existing multi-experts DPMs, T-Stitch directly applies models of different
+sizes in a pretrained model family. Thus, given a compute budget, we consider how to allocate dif-
+ferent resources across different steps while benefiting from training-free. Furthermore, the recently
+proposed speculative decoding (Leviathan et al., 2023) shares a similar motivation with us, i.e.,
+leveraging a small model to speed up large language model sampling. However, this technique is
+specifically designed for autoregressive models, whereas it is not straightforward to apply the same
+sampling strategy to diffusion models. On the other hand, our method utilizes the DPM’s property
+and achieves effective speedup.
+
+4          E XPERIMENTS
+In this section, we first show the effectiveness of T-Stitch based on DiT (Peebles & Xie, 2022) as it
+provides a convenient model family. Then we extend into U-Net and Stable Diffusion models. Last,
+we ablate our technique with different sampling steps, and samplers to demonstrate that T-Stitch is
+generally applicable in many scenarios.
+
+4.1          D I T E XPERIMENTS
+
+Implementation details. Following DiT, we conduct the class-conditional ImageNet experiments
+based on pretrained DiT-S/B/XL under 256×256 images and patch size of 2. A detailed comparison
+of the pretrained models is shown in Table 3. As T-Stitch is training-free, for two-model setting,
+we directly allocate the models into the sampling trajectory under our allocation strategy described
+in Section 3.2. For three-model setting, we enumerate all possible configuration sets by increasing
+the fraction by 0.1 per model one at a time, which eventually gives rise to 66 configurations that
+include pairwise combinations of DiT-S/XL, DiT-S/B, DiT-S/XL, and three model combinations
+DiT-S/B/XL. By default, we adopt a classifier-free guidance scale of 1.5 as it achieves the best FID
+for DiT-XL, which is also the target model in our setting.
+Evaluation metrics. We adopt Fréchet Inception Distance (FID) (Heusel et al., 2017) as our default
+metric to measure the overall sample quality as it captures both diversity and fidelity (lower values
+
+
+                                                                                             6
+Under review as a conference paper at ICLR 2024
+
+
+
+Table 1: T-Stitch with LDM (Rombach et al., 2022) and LDM-S on class-conditional ImageNet. All
+evaluations are based on DDIM and 100 timesteps. We adopt a classifier-free guidance scale of 3.0.
+The time cost is measured by generating 8 images on one RTX 3090.
+ Fraction of LDM-S      0%       10%      20%      30%         40%     50%       60%        70%        80%      90%     100%
+ FID                    20.11    19.54    18.74    18.64     18.60     19.33     21.81      26.03     30.41    35.24    40.92
+ Inception Score       199.24   201.87   202.81   204.01    193.62    175.62    140.69     110.81     90.24    70.91    54.41
+ Time Cost (s)           7.1      6.7      6.2      5.8       5.3       4.9       4.5        4.1       3.6      3.1      2.9
+Table 2: T-Stitch with BK-Tiny (Kim et al., 2023) and SD v1.4. We report FID, Inception Score (IS)
+and CLIP score (Hessel et al., 2021) on MS-COCO 256×256 benchmark. The time cost is measured
+by generating one image on one RTX 3090.
+ Fraction of BK-Tiny     0%      10%      20%      30%      40%       50%       60%       70%        80%       90%     100%
+ FID                    13.07    12.59    12.29    12.54    13.65     14.98     15.69     16.57      16.92     16.80    17.15
+ Inception Score        36.72    36.12    34.66    33.32    32.48     31.72     31.48     30.83      30.53     30.48    30.00
+ CLIP Score            0.2957   0.2957   0.2938   0.2910   0.2860    0.2805    0.2770    0.2718     0.2692    0.2682   0.2653
+ Time Cost (s)           3.1      3.0      2.9      2.8      2.6       2.5       2.4       2.3        2.1       2.0      1.9
+
+indicate better results). Additionally, we report the Inception Score as it remains a solid performance
+measure on ImageNet, where the backbone Inception network (Szegedy et al., 2016) is pretrained.
+We use the reference batch from ADM (Dhariwal & Nichol, 2021) and sample 5,000 images to
+compute FID. In the supplementary material, we show that sampling more images (e.g., 50K) does
+not affect our observation. By default, the time cost is measured by generating 8 images on a single
+RTX 3090 in seconds.
+Results. Based on the pretrained model families, we first apply T-Stitch with any two-model com-
+binations, including DiT-XL/S, DiT-XL/B, and DiT-B/S. For each setting, we begin the sampling
+steps with a relatively smaller model and then let the larger model deal with the last timesteps. In
+Figure 5, we report the FID comparisons on different combinations. In general, we observe that us-
+ing a smaller model at the early 40-50% steps brings a minor performance drop for all combinations.
+Besides, the best/worst performance is roughly bounded by the smallest and largest models in the
+pretrained model family.
+Furthermore, we show that T-Stitch can adopt a medium-sized model at the intermediate denoising
+intervals to achieve more speed and quality trade-offs. For example, built upon the three different-
+sized DiT models: DiT-S, DiT-B, DiT-XL, we start with DiT-S at the beginning then use DiT-B at
+the intermediate denoising intervals, and finally adopt DiT-XL to draw fine local details. Figure 6
+indicates that the three-model combinations effectively obtain a smooth Pareto Frontier for both
+FID and Inception Score. In particular, at the time cost of ∼10s, we achieve 1.7× speedups with
+comparable FID (9.21 vs. 9.19) and Inception Score (243.82 vs. 245.73). We show the effect of
+using different classifier-free guidance scales in Section A.4.
+
+4.2   U-N ET E XPERIMENTS
+
+In this section, we show T-Stitch is complementary to the architectural choices of denoisers. We
+experiment with prevalent U-Net as it is widely adopted in many diffusion models. We adopt the
+class-conditional ImageNet implementation from the latent diffusion model (LDM) (Rombach et al.,
+2022). Based on their official implementation, we simply scale down the network channel width
+from 256 to 64 and the context dimension from 512 to 256. This modification produces a 15.8×
+smaller LDM-S. A detailed comparison between the two pretrained models is shown in Table 4.
+Results. We report the results on T-Stitch with U-Net in Table 1. In general, under DDIM and
+100 timesteps, we found the first ∼50% steps can be taken by an efficient LDM-S with comparable
+or even better FID and Inception Scores. At the same time, we observe an approximately linear
+decrease in time cost when progressively using more LDM-S steps in the trajectory. Overall, the
+U-Net experiment indicates that our method is applicable to different denoiser architectures. We
+provide the generated image examples in Section A.16 and also show that T-Stitch can be applied
+with even different model families in Section A.10.
+
+4.3   T EXT- TO -I MAGE S TABLE D IFFUSION
+
+Benefiting from the public model zoo on Diffusers (von Platen et al., 2022), we can directly adopt
+a small SD model to accelerate the sampling speed of any large pretrained or styled SD models
+
+
+                                                           7
+Under review as a conference paper at ICLR 2024
+
+
+                  0%         10%         20%      30%         40%           50%                    60%    70%           80%         90%          100%
+
+
+SD-1.4
+
+
+
+                                                         Prompt: “a vase with different flowers”
+
+
+InkPunk
+
+
+
+                                                   Prompt: “a squirrel in the park, nvinkpunk style”
+
+
+Figure 7: Based on a general pretrained small SD model, T-Stitch simultaneously accelerates a
+large general SD and complements the prompt alignment with image content when stitching other
+finetuned/stylized large SD models, i.e., “park” in InkPunk Diffusion. Better viewed when zoomed
+in digitally.
+                   T = 10                                                                                                                       T = 10
+                                                                                              40
+
+
+                                                                              Time Cost (s)
+                   T = 20                                                                                                                       T = 20
+      40           T = 50                                                                                                                       T = 50
+FID
+
+
+                   T = 100                                                                                                                      T = 100
+                   T = 250                                                                    20                                                T = 250
+      20
+
+                                                                                              0
+            0.0        0.2         0.4     0.6     0.8        1.0                                  0.0   0.2      0.4         0.6         0.8       1.0
+                              Fraction of DiT-S                                                                 Fraction of DiT-S
+
+Figure 8: Left: we compare FID between different numbers of steps. Right: We visualize the
+time cost of generating 8 images under different number of steps, based on DDIM and a classifier-
+guidance scale of 1.5. “T” denotes the number of sampling steps.
+
+without any training. In this section, we show how to apply T-Stitch to accelerate existing SD models
+in the model zoo. Previous research from Kim et al. (2023) has produced multiple SD models with
+different sizes by pruning the original SD v1.4 and then applying knowledge distillation. We then
+directly adopt the smallest model BK-SDM Tiny for our stable diffusion experiments. By default,
+we use a guidance scale of 7.5 under 50 steps using PNDM (Liu et al., 2022) sampler.
+Results. In Table 2, we report the results by applying T-Stitch to the original SD v1.4. In addition
+to the FID and Inception Score, we also report the CLIP score for measuring the alignment of the
+image with the text prompt. Overall, we found the early 30% steps can be taken by BK-SDM Tiny
+without a significant performance drop in Inception Score and CLIP Scores while achieving even
+better FID. We believe a better and faster small model in future works can help to achieve better
+quality and efficiency trade-offs. Furthermore, we demonstrate that T-Stitch is compatible with
+other large SD models. For example, as shown in Figure 7, under the original SD v1.4, we achieve
+a promising speedup while obtaining comparable image quality. Moreover, with other stylized SD
+models such as Inkpunk style1 , we observe a natural style interpolation between the two models.
+More importantly, by adopting a small fraction of steps from a general small SD, we found it helps
+the image to be more aligned with the prompt, such as the “park” in InkPunk Diffusion. In this case,
+we assume finetuning in these stylized SD may unexpectedly hurt prompt alignment, while adopting
+the knowledge from a general pretrained SD can complement the early global structure generation.
+Overall, this strongly supports another practical usage of T-Stitch: Using a small general expert at
+the beginning for fast sketching and better prompt alignment, while letting any stylized SD at the
+later steps for patiently illustrating details. We provide more examples in Section A.11.
+
+4.4          A BLATION S TUDY
+
+Effect of T-Stitch with different steps. To explore the efficiency gain on different numbers of sam-
+pling steps, we conduct experiments based on DDIM and DiT-S/XL. As shown in Figure 8, T-Stitch
+achieves consistent efficiency gain when using different number of steps and diffusion model sam-
+plers. In particular, we found the 40% early steps can be safely taken by DiT-S without a significant
+performance drop. It indicates that small DPMs can sufficiently handle the early denoising steps
+where they mainly generate the low-frequency components. Thus, we can leave the high-frequency
+       1
+           https://huggingface.co/Envvi/Inkpunk-Diffusion
+
+
+                                                                        8
+Under review as a conference paper at ICLR 2024
+
+
+
+                       10 Steps                                        20 Steps                                                              50 Steps
+      100                                              60                                                                    40
+                  DDPM                                            DDPM                                                                  DDPM
+                  DDIM                                            DDIM                                                                  DDIM
+       75         DPM Solver++                                    DPM Solver++                                               30         DPM Solver++
+                                                       40
+FID
+
+
+                                                 FID
+
+
+                                                                                                                       FID
+       50                                                                                                                    20
+                                                       20
+       25
+                                                                                                                             10
+            0.0            0.5             1.0              0.0             0.5                          1.0                      0.0             0.5        1.0
+                   Fraction of DiT-S                               Fraction of DiT-S                                                     Fraction of DiT-S
+                  Figure 9: Effect of T-Stitch with different samplers, under guidance scale of 1.5.
+                                                       M-Stitch                                                M-Stitch
+
+
+                                                                                 Inception Score
+      60
+                                                       T-Stitch                                    200         T-Stitch
+FID
+
+
+      40
+                                                                                                   100
+      20
+
+
+                       5              10         15                                                                5                    10              15
+                                 Time Cost (s)                                                                                    Time Cost (s)
+
+Figure 10: T-Stitch (TS) vs. model stitching (MS) (Pan et al., 2023b) based on DiTs and DDIM 100
+steps, with a classifier-free guidance scale of 1.5.
+generation of fine local details to a more capable DiT-XL. This is further evidenced by the generation
+examples in Figure 17, where we provide the sampled images at all fractions of DiT-S steps across
+different total number of steps. In Section A.6, we also show that T-Stitch achieves competitive
+speed and quality trade-offs with directly reducing sampling steps.
+Effect of T-Stitch with different samplers. Advanced diffusion model samplers (Lu et al., 2022)
+have been widely adopted in order to achieve better generation quality in fewer timesteps. To this
+end, we experiment with prevalent samplers to demonstrate the effectiveness of T-Stitch with these
+orthogonal techniques: DDPM (Ho et al., 2020), DDIM (Song et al., 2021a) and DPM-Solver++ (Lu
+et al., 2022). In Figure 9, we use the DiT-S to progressively replace the early steps of DiT-XL
+under different samplers and steps. In general, we observe a consistent efficiency gain at the initial
+sampling stage, which strongly justifies that our method is a complementary solution with existing
+samplers for accelerating DPM sampling.
+T-Stitch vs. model stitching. Previous works (Pan et al., 2023a;b) such as SN-Net have demon-
+strated the power of model stitching for obtaining numerous architectures that with different com-
+plexity and performance trade-offs. Thus, by adopting one of these architectures as the denoiser for
+sampling, SN-Net naturally achieves flexible quality and efficiency trade-offs. To show the advan-
+tage of T-Stitch in the Pareto frontier, we conduct experiments to compare with the framework of
+model stitching proposed in SN-Netv2 (Pan et al., 2023b). We provide implementation details in
+Section A.8. In Figure 10, we compare T-Stitch with model stitching based on DDIM sampler and
+100 steps. Overall, while both methods can obtain flexible speed and quality trade-offs, T-Stitch
+achieves clearly better advantage over model stitching across different metrics.
+
+5          C ONCLUSION
+We have proposed Trajectory Stitching, an effective and general approach to accelerate existing pre-
+trained large diffusion model sampling by directly leveraging pretrained smaller counterparts at the
+initial denoising process, which achieves better speed and quality trade-offs than using an individ-
+ual large DPM. Comprehensive experiments have demonstrated that T-Stitch achieved consistent
+efficiency gain across different model architectures, samplers, as well as various stable diffusion
+models. Besides, our work has revealed the power of small DPMs at the early denoising process.
+Future work may consider disentangling the sampling trajectory by redesigning or training experts
+of different sizes at different denoising intervals. For example, designing a better, faster small DPM
+at the beginning to draw global structures, then specifically optimizing the large DPM at the later
+stages to refine image details. Besides, more guidelines for the optimal trade-off and more in-depth
+analysis of the prompt alignment for stylized SDs can be helpful, which we leave for future work.
+Limitations. T-Stitch requires a smaller model that has been trained on the same data distribution
+as the large model. Thus, a sufficiently optimized small model is required. Furthermore, adopting
+an additional small model for denoising sampling will slightly increase memory usage.
+
+
+                                                                        9
+Under review as a conference paper at ICLR 2024
+
+
+R EFERENCES
+Yogesh Balaji, Seungjun Nah, Xun Huang, Arash Vahdat, Jiaming Song, Karsten Kreis, Miika
+  Aittala, Timo Aila, Samuli Laine, Bryan Catanzaro, Tero Karras, and Ming-Yu Liu. ediff-i:
+  Text-to-image diffusion models with an ensemble of expert denoisers. CoRR, abs/2211.01324,
+  2022.
+Yamini Bansal, Preetum Nakkiran, and Boaz Barak. Revisiting model stitching to compare neural
+  representations. In NeurIPS, pp. 225–236, 2021.
+Fan Bao, Shen Nie, Kaiwen Xue, Yue Cao, Chongxuan Li, Hang Su, and Jun Zhu. All are worth
+  words: A vit backbone for diffusion models. In CVPR, 2023.
+Adrián Csiszárik, Péter Korösi-Szabó, Ákos K. Matszangosz, Gergely Papp, and Dániel Varga. Sim-
+  ilarity and matching of neural network representations. In NeurIPS, pp. 5656–5668, 2021.
+Prafulla Dhariwal and Alexander Nichol. Diffusion models beat gans on image synthesis. NeurIPS,
+  34:8780–8794, 2021.
+Gongfan Fang, Xinyin Ma, and Xinchao Wang. Structural pruning for diffusion models. arXiv
+  preprint arXiv:2305.10924, 2023.
+Jack Hessel, Ari Holtzman, Maxwell Forbes, Ronan Le Bras, and Yejin Choi. Clipscore: A
+  reference-free evaluation metric for image captioning. In EMNLP, pp. 7514–7528, 2021.
+Martin Heusel, Hubert Ramsauer, Thomas Unterthiner, Bernhard Nessler, and Sepp Hochreiter.
+ Gans trained by a two time-scale update rule converge to a local nash equilibrium. In NeurIPS,
+ pp. 6626–6637, 2017.
+Jonathan Ho and Tim Salimans. Classifier-free diffusion guidance. CoRR, abs/2207.12598, 2022.
+Jonathan Ho, Ajay Jain, and Pieter Abbeel. Denoising diffusion probabilistic models. NeurIPS, 33:
+  6840–6851, 2020.
+Alexia Jolicoeur-Martineau, Ke Li, Rémi Piché-Taillefer, Tal Kachman, and Ioannis Mitliagkas.
+  Gotta go fast when generating data with score-based models. CoRR, abs/2105.14080, 2021.
+Tero Karras, Miika Aittala, Timo Aila, and Samuli Laine. Elucidating the design space of diffusion-
+  based generative models. In NeurIPS, 2022.
+Bo-Kyeong Kim, Hyoung-Kyu Song, Thibault Castells, and Shinkook Choi. Bk-sdm: Architec-
+  turally compressed stable diffusion for efficient text-to-image generation. ICML Workshop on
+  Efficient Systems for Foundation Models (ES-FoMo), 2023.
+Zhifeng Kong, Wei Ping, Jiaji Huang, Kexin Zhao, and Bryan Catanzaro. Diffwave: A versatile
+  diffusion model for audio synthesis. In ICLR. OpenReview.net, 2021.
+Yunsung Lee, Jin-Young Kim, Hyojun Go, Myeongho Jeong, Shinhyeok Oh, and Seungtaek Choi.
+  Multi-architecture multi-expert diffusion models. CoRR, abs/2306.04990, 2023.
+Karel Lenc and Andrea Vedaldi. Understanding image representations by measuring their equivari-
+  ance and equivalence. In CVPR, pp. 991–999, 2015.
+Yaniv Leviathan, Matan Kalman, and Yossi Matias. Fast inference from transformers via speculative
+  decoding. In Andreas Krause, Emma Brunskill, Kyunghyun Cho, Barbara Engelhardt, Sivan
+  Sabato, and Jonathan Scarlett (eds.), ICML, volume 202, pp. 19274–19286, 2023.
+Xiuyu Li, Long Lian, Yijiang Liu, Huanrui Yang, Zhen Dong, Daniel Kang, Shanghang Zhang, and
+  Kurt Keutzer. Q-diffusion: Quantizing diffusion models. ICCV, 2023.
+Luping Liu, Yi Ren, Zhijie Lin, and Zhou Zhao. Pseudo numerical methods for diffusion models on
+  manifolds. In ICLR, 2022.
+Cheng Lu, Yuhao Zhou, Fan Bao, Jianfei Chen, Chongxuan Li, and Jun Zhu. Dpm-solver: A fast
+  ODE solver for diffusion probabilistic model sampling in around 10 steps. In NeurIPS, 2022.
+
+
+                                                 10
+Under review as a conference paper at ICLR 2024
+
+
+Simian Luo, Yiqin Tan, Longbo Huang, Jian Li, and Hang Zhao. Latent consistency models: Syn-
+  thesizing high-resolution images with few-step inference, 2023.
+Zizheng Pan, Jianfei Cai, and Bohan Zhuang. Stitchable neural networks. In CVPR, 2023a.
+Zizheng Pan, Jing Liu, Haoyu He, Jianfei Cai, and Bohan Zhuang. Stitched vits are flexible vision
+  backbones. arXiv, 2023b.
+William Peebles and Saining Xie.        Scalable diffusion models with transformers.       CoRR,
+ abs/2212.09748, 2022.
+Dustin Podell, Zion English, Kyle Lacey, Andreas Blattmann, Tim Dockhorn, Jonas Müller, Joe
+  Penna, and Robin Rombach. SDXL: improving latent diffusion models for high-resolution image
+  synthesis. CoRR, 2023.
+Ben Poole, Ajay Jain, Jonathan T. Barron, and Ben Mildenhall. Dreamfusion: Text-to-3d using 2d
+  diffusion. In ICLR. OpenReview.net, 2023.
+Geoffrey Roeder, Luke Metz, and Durk Kingma. On linear identifiability of learned representations.
+  In ICML, volume 139, pp. 9030–9039, 2021.
+Robin Rombach, Andreas Blattmann, Dominik Lorenz, Patrick Esser, and Björn Ommer. High-
+  resolution image synthesis with latent diffusion models. In CVPR, pp. 10684–10695, 2022.
+Tim Salimans and Jonathan Ho. Progressive distillation for fast sampling of diffusion models. In
+  ICLR. OpenReview.net, 2022.
+Segmind. Segmind Stable Diffusion Model (SSD-1B).              https://huggingface.co/
+  segmind/SSD-1B, 2023.
+Yuzhang Shang, Zhihang Yuan, Bin Xie, Bingzhe Wu, and Yan Yan. Post-training quantization on
+  diffusion models. CVPR, Jun 2023.
+Andy Shih, Suneel Belkhale, Stefano Ermon, Dorsa Sadigh, and Nima Anari. Parallel sampling of
+  diffusion models. CoRR, abs/2305.16317, 2023.
+Jiaming Song, Chenlin Meng, and Stefano Ermon. Denoising diffusion implicit models. In ICLR.
+   OpenReview.net, 2021a.
+Yang Song, Jascha Sohl-Dickstein, Diederik P Kingma, Abhishek Kumar, Stefano Ermon, and Ben
+  Poole. Score-based generative modeling through stochastic differential equations. ICLR, 2021b.
+Yang Song, Prafulla Dhariwal, Mark Chen, and Ilya Sutskever. Consistency models. In ICML,
+  volume 202, 2023.
+Christian Szegedy, Vincent Vanhoucke, Sergey Ioffe, Jonathon Shlens, and Zbigniew Wojna. Re-
+  thinking the inception architecture for computer vision. In CVPR, pp. 2818–2826. IEEE Computer
+  Society, 2016.
+Patrick von Platen, Suraj Patil, Anton Lozhkov, Pedro Cuenca, Nathan Lambert, Kashif Rasul,
+  Mishig Davaadorj, and Thomas Wolf. Diffusers: State-of-the-art diffusion models. https:
+  //github.com/huggingface/diffusers, 2022.
+Xingyi Yang, Daquan Zhou, Songhua Liu, Jingwen Ye, and Xinchao Wang. Deep model reassembly.
+  NeurIPS, 2022.
+Xingyi Yang, Daquan Zhou, Jiashi Feng, and Xinchao Wang. Diffusion probabilistic model made
+  slim. In CVPR, pp. 22552–22562. IEEE, 2023.
+Lvmin Zhang, Anyi Rao, and Maneesh Agrawala. Adding conditional control to text-to-image
+  diffusion models. In ICCV, pp. 3836–3847, 2023.
+Hongkai Zheng, Weili Nie, Arash Vahdat, Kamyar Azizzadenesheli, and Anima Anandkumar. Fast
+  sampling of diffusion models via operator learning. In ICML, pp. 42390–42402. PMLR, 2023.
+
+
+                                               11
+Under review as a conference paper at ICLR 2024
+
+
+                 5.0                                                                                              t = 999
+                                                                                                                  t = 888
+                                                                                                                  t = 777
+ Log amplitude   4.5                                                                                              t = 666
+                                                                                                                  t = 555
+                 4.0                                                                                              t = 444
+                                                                                                                  t = 333
+                 3.5                                                                                              t = 222
+                                                                                                                  t = 111
+                 3.0                                                                                              t=0
+
+                 2.5
+
+                   0.0                0.2                   0.4                  0.6               0.8                  1.0
+                                                                   Frequency
+
+Figure 11: Frequency analysis in denoising process of DiT-XL, based on DDIM 10 steps and guid-
+ance scale of 4.0. We visualize the log amplitudes of Fourier-transformed latent noises at each step.
+Results are averaged over 32 images.
+
+Table 3: Performance comparison of pretrained DiT model family on class-conditional ImageNet.
+FLOPs are measured by a single forward process given a latent noise in the shape of 4 × 32 × 32.
+                                  Parameters (M)          FLOPs (G)       Train Iters    Time Cost (s)     FID
+                         DiT-S         33.0                  5.5           5000K             1.6          33.46
+                         DiT-B        130.5                  21.8          1600K             4.0          12.30
+                         DiT-XL       675.1                 114.5              -             16.5          9.20
+
+A                A PPENDIX
+
+A.1                P RACTICAL D EPLOYMENT OF T-S TITCH
+
+In this section, we provide guidelines for the practical deployment of T-Stitch by formulating our
+model allocation strategy into a compute budget allocation problem.
+Given a set of denoisers {D1 , D2 , ..., DK } and their corresponding computational costs
+{C1 , C2 , ..., CK } for sampling in a T -steps trajectory, where Ck−1 < Ck , we aim to find an op-
+timal configuration set {r1 , r2 , ..., rK } that allocates models into corresponding denoising intervals
+to maximize the generation quality, which can be formulated as
+                                     max           M (F (D1 , r1 ) ◦ F (D2 , r2 ) · · · ◦ F (DK , rK ))                       (5)
+                                  r1 ,r2 ,...,rK
+                                                   K
+                                                   X                    K
+                                                                        X
+                                  subject to             rk Ck ≤ CR ,         rk = 1,                                         (6)
+                                                   k=1                  k=1
+
+where F (Dk , rk ) refers to the denoising process by applying denoiser Dk at the k-th interval indi-
+cated by rk , ◦ denotes to a composition, M represents a metric function for evaluating generation
+performance, and CR is the compute budget constraint. Since {C1 , C2 , ..., CK } is known, we can
+efficiently enumerate all possible fraction combinations and obtain a lookup table, where each frac-
+tion configuration set corresponds to a compute budget (i.e., time cost). In practice, we can sample
+a few configuration sets from this table that satisfy a budget and then apply to generation tasks.
+
+A.2                F REQUENCY A NALYSIS IN D ENOISING P ROCESS
+
+We provide evidence that the denoising process focuses on low frequencies at the initial stage and
+high frequencies in the later steps. Based on DiT-XL, we visualize the log amplitudes of Fourier-
+transformed latent noises at each sampling step. As shown in Figure 11, the low-frequency ampli-
+tudes increase rapidly at the early timesteps (i.e., from 999 to 555), indicating that low frequencies
+are intensively generated. At the later steps, especially for t = 111 and t = 0, we observe the
+
+
+                                                                    12
+Under review as a conference paper at ICLR 2024
+
+
+        Table 4: Performance comparison of LDM and LDM-S on class-conditional ImageNet.
+
+                         Model       Param (M)   Train Iter                   Time Cost (s)      FID
+                         LDM-S           25        400K                           2.9           40.92
+                         LDM            394        200K                           7.1           20.11
+
+
+
+       30                                   s = 1.5                     400
+                                            s = 2.0
+
+
+                                                      Inception Score
+       25                                   s = 3.0                     300
+ FID
+
+
+       20
+                                                                        200                                    s = 1.5
+       15                                                                                                      s = 2.0
+                                                                        100                                    s = 3.0
+       10
+                     5          10         15                                         5             10        15
+                          Time Cost (s)                                                       Time Cost (s)
+
+Figure 12: Trajectory stitching based on three models: DiT-S, DiT-B, and DiT-XL. We adopt DDIM
+100 timesteps with a classifier-free guidance scale of 1.5, 2.0 and 3.0.
+
+
+log amplitude of high frequencies increases significantly, which implies that the later steps focus on
+detail refinement.
+
+A.3         P RETRAINED D I T S AND U-N ETS
+
+In Table 3 and Table 4, we provide detailed comparisons of the pretrained DiT model family, as well
+as our reproduced small version of U-Net. Overall, as mentioned earlier in Section 3, we make sure
+the models at each model family have a clear gap in model size between each other such that we can
+achieve a clear speedup.
+
+A.4         E FFECT OF DIFFERENT CLASSIFIER - FREE GUIDANCE ON THREE - MODEL TRAJECTORY
+            STITCHING
+
+In Figure 12, we provide the results by applying T-Sittch with DiTs using different guidance scales
+under three-model settings. In general, T-Stitch performs consistently with different guidance scales,
+where it interpolates a smooth Pareto frontier between the DiT-S and DiT-XL. As common practice
+in DPMs adopt different guidance scales to control image generation, this significantly underscores
+the broad applicability of T-Stitch.
+
+A.5         FID-50K VS . FID-5K
+
+For efficiency concerns, we report FID based on 5,000 images by default. Based on DiT, we apply T-
+Stitch with DDPM 250 steps with a guidance scale of 1.5 and sample 50,000 images for evaluating
+FID. As shown in Figure 13, the observation between FID-50K and FID-5K are similar, which
+indicates that sampling more images like 50,000 does not affect the effectiveness.
+
+A.6         C OMPARED TO DIRECTLY REDUCING SAMPLING STEPS
+
+Reducing sampling steps has been a common practice for obtaining different speed and quality
+trade-offs during deployment. Although we have demonstrated that T-Stitch can achieve consistent
+efficiency gain under different sampling steps, we show in Figure 15 that compared to directly
+reducing the number of sampling steps, the trade-offs from T-Stitch are very competitive, especially
+for the 50-100 steps region where the FIDs under T-Stitch are even better. Thus, T-Stitch is able to
+serve as a complementary or an alternative method for practical DPM sampling speed acceleration.
+
+
+                                                      13
+Under review as a conference paper at ICLR 2024
+
+
+          30                                                           20
+
+          25                                                           15
+
+
+                                                             FID-50K
+ FID-5K
+
+          20
+                                                                       10
+          15
+                                                                       5
+          10
+               0.0    0.2     0.4      0.6      0.8   1.0                   0.0   0.2     0.4      0.6      0.8   1.0
+                            Fraction of DiT-S                                           Fraction of DiT-S
+
+Figure 13: Trajectory stitching based on three models: DiT-S, DiT-B, and DiT-XL. We adopt DDPM
+250 timesteps with a classifier-free guidance scale of 1.5.
+
+
+Pretrained
+
+
+Finetuned
+
+
+Figure 14: Image quality comparison by stitching pretrained and finetuned DiT-B and DiT-XL at the
+later steps, based on T-Stitch schedule of DiT-S/B/XL of 50% : 30% : 20%.
+
+
+
+A.7            M ODEL COMPRESSION AT THE LATER STEPS
+
+In practice, T-Stitch is orthogonal to individual model optimization. For example, with a BK-SDM
+Tiny and SDv1.4, we can still apply compression into SDv1.4 in order to reduce the computational
+cost at the later steps from the large SD. In Figure 16, we show that by adopting a compressed SD
+v1.4, i.e., BK-SDM Small, we can further reduce the time cost with a trade-off for image quality.
+
+
+A.8            I MPLEMENTATION D ETAILS OF M ODEL S TITCHING BASELINE
+
+We adopt a LoRA rank of 64 when stitching DiT-S/XL, which leads to 134 stitching configurations.
+The stitched model is finetuned on 8 A100 GPUs for 1,700K training iterations. We pre-extract the
+ImageNet features with a Stable Diffusion AutoEncoder (Rombach et al., 2022) and do not apply
+any data augmentation. Following the baseline DiT, we adopt the AdamW optimizer with a constant
+learning rate of 1 × 10−4 . The total batch size is set as 256. All other hyperparameters adopt the
+default setting as DiT.
+
+
+A.9            I MAGE E XAMPLES UNDER THE D IFFERENT N UMBER OF S AMPLING S TEPS
+
+Figure 17 shows image examples generated using different numbers of sampling steps under T-Stitch
+and DiT-S/XL. As the figure shows, adopting a small model at the early 40% steps has a negligible
+effect on the final generated images. When progressively increasing the fraction of DiT-S, there is
+a visible trade-off between speed and quality, with the final image becoming more similar to those
+generated from DiT-S.
+
+
+                                                            14
+Under review as a conference paper at ICLR 2024
+
+
+                                s = 1.5                                                           s = 2.0
+                                                                       22.5
+                                                 T-Stitch                                                          T-Stitch
+      30                                         Reduce Steps          20.0                                        Reduce Steps
+      25                                                               17.5
+FID
+
+
+                                                                 FID
+      20                                                               15.0
+      15                                                               12.5
+      10                                                               10.0
+            2.5    5.0    7.5     10.0    12.5     15.0   17.5                2.5     5.0   7.5     10.0    12.5     15.0   17.5
+                           Time Cost (s)                                                     Time Cost (s)
+
+Figure 15: Based on DDIM, we report the FID and speedup comparisons on DiT-XL by using
+T-Stitch and directly reducing the sampling step from 100 to 10. “s” denotes the classifier-free
+guidance scale. Trajectory stitching adopts the three-model combination (DiT-S/B/XL) under 100
+steps.
+
+   1.54s          1.46s         1.33s            1.26s           1.22s        1.14s
+
+
+                                                                                                               0.85s
+
+      0%          10%           20%              30%              40%          50%
+
+                                            with BK-SDM Small at later steps
+
+
+   0.98s          0.96s         0.95s            0.94s          0.93s         0.93s                         BK-SDM Tiny
+
+                                                                                                      a backpack in the snow
+
+
+      0%          10%           20%              30%              40%          50%
+
+Figure 16: Comparison of T-Stitch by adopting SDv1.4 and its compressed version (i.e., BK-SDM
+Small) at the later steps.
+
+
+A.10       T-S TITCH WITH DIFFERENT PRETRAINED MODEL FAMILIES
+
+As different pretrained models trained on the same dataset to learn similar encodings, T-Stitch is
+able to directly integrate different pretrained model families. For example, based on U-ViT H (Bao
+et al., 2023), we apply DiT-S at the early sampling steps just as we have done for DiTs and U-
+Nets. Remarkably, as shown in Table 5, it performs very well, which demonstrates the advantage of
+T-Stitch as it can be applied for more different models in the public model zoo.
+
+A.11       M ORE E XAMPLES IN S TABLE D IFFUSION
+
+We show more examples by applying T-Stitch to SD v1.4, InkPunk Diffusion and Ghibli Diffusion
+with a small SD model, BK-SDM Tiny (Kim et al., 2023). For all examples, we adopt the default
+scheduler and hyperparameters of StableDiffusionPipeline in Diffusers: PNDM scheduler, 50 steps,
+guidance scale 7.5. In Figure 21, we observe that adopting a small SD in the sampling trajectory of
+SD v1.4 achieves minor effect on image quality at the small fractions and obtain flexible trade-offs
+in speed and quality by using different fractions. In Figure 24, we show T-Stitch performs favorably
+with more complex prompts. Besides, by adopting a smaller and distilled SSD-1B, we can easily
+accelerate SDXL while being compatible with complex prompts and ControlNet (Zhang et al., 2023)
+for practical art generation, as shown in Figure 25 and Figure 26. Furthermore, we demonstrate that
+T-Stitch is robust in practical usage. As shown in Figure 27, 8 consecutive runs can generate stable
+
+
+                                                                 15
+Under review as a conference paper at ICLR 2024
+
+
+               0%      10%       20%         30%      40%      50%       60%        70%     80%       90%      100%
+
+
+ 10 Steps
+
+
+ 20 Steps
+
+
+ 50 Steps
+
+
+100 Steps
+
+
+250 Steps
+
+
+Figure 17: Based on DDIM and a classifier-free guidance scale of 1.5, we stitch the trajectories from
+DiT-S and DiT-XL and progressively increase the fraction (%) of DiT-S timesteps at the beginning.
+
+ Table 5: T-Stitch with DiT-S and U-ViT H, under DPM-Solver++, 50 steps, guidance scale of 1.5.
+         Fraction of DiT-S    0%     10%      20%     30%     40%     50%    60%    70%     80%     90%     100%
+         FID                 15.04   13.68    12.44   12.76   14.19   17.6   29.4   53.75   74.14   84.33   121.95
+         Time Cost (s)       15.90   13.21    11.91   10.61   9.42    7.92   6.57    5.23    3.84    2.50    1.40
+
+
+
+images with great quality. For stylized SDs, such as InkPunk-Diffusion and Ghibli-Diffusion2 , we
+show in Figures 22 and 23 that T-Stitch helps to complement the prompt alignment by effectively
+utilizing the knowledge of the pretrained small SD. Benefiting from the interpolation on speeds,
+styles and image contents, T-Stitch naturally increases the diversity of the generated images given a
+prompt by using different fractions of small SD.
+
+A.12        F INETUNING ON S PECIFIC T RAJECTORY S CHEDULE
+
+When progressively using a small model in Table 6: Performance comparison of stitching
+the trajectory, we observe a non-negligible per- pretrained and finetuned DiTs at the later steps.
+formance drop. However, we show that we We set the denoising interval of DiT-S/B/XL with
+can simply finetune the model at the allocated 50% : 30% : 20%
+denoising intervals to improve the generation
+quality. For example, based on DDIM and 100                             FID     Inception Score
+steps, allocating DiT-S at the early 50%, DiT-B
+                                                         Pretrained 16.49           123.11
+at the subsequent 30%, and DiT-XL at the last
+20% obtains an FID of 16.49. In this exper-              Finetuned     13.35        155.35
+iment, we separately finetune DiT-B and DiT-
+XL at their allocated denoising intervals, with additional 250K iterations on ImageNet-1K under the
+default hyperparameters in DiT (Peebles & Xie, 2022). In Table 6, we observe a clear improvement
+over FID, Precision and Recall. Furthermore, we provide a comparison of the generated images in
+Figure 14, where we observe that finetuning clearly improves local details.
+
+
+
+A.13        C OMPARED WITH MORE STITCHING BASELINES
+
+By default, we design T-Stitch to start from a small DPM and then switch into a large DPM for the
+last denoising sampling steps. To show the effectiveness of this design, we compare our method
+with several baselines in Table 7 based on DiT-S and DiT-XL, including
+
+    2
+        https://huggingface.co/nitrosocke/Ghibli-Diffusion
+
+
+                                                              16
+Under review as a conference paper at ICLR 2024
+
+
+Table 7: Compared to other trajectory stitching baselines based on DiT-S/XL, DDIM 100 steps and
+guidance scale of 1.5. FID is calculated by 5K images. Memory and time cost are measured by a
+batch size of 8 on one RTX 3090.
+
+                   Method                   FID       Inception Score   Time Cost
+                   Interleave              19.02          120.04          10.1
+                   Decreasing Prob         12.94          163.45           9.8
+                   Large to Small          27.61           72.60          10.0
+                   Small to Large (Ours)   10.06          200.81           9.9
+
+Table 8: Local storage and memory cost comparison between DiT-S, DiT-XL and T-Stitch. Memory
+and time cost are measured by generating 8 images in parallel on one RTX 3090.
+
+  Name              Parameter (M)     Local Storage (MB)      Memory Cost (MB)       Time Cost (s)
+  DiT-S                   33                  263                  3088                    1.7
+  DiT-XL                 675                 2576                  3166                   16.5
+  T-Stitch (50%)     708 (×1.04)        2839 (×1.10)            3296 (×1.04)          9.4 (×1.76)
+
+
+       • Interleaving. During denoising sampling, we interleave the small and large model along
+         the trajectory. Eventually, DiT-S takes 50% steps and DiT-XL takes another 50% steps.
+       • Decreasing Prob. Linearly decreasing the probability of using DiT-S from 1 to 0 during
+         the denoising sampling steps.
+       • Large to Small. Adopting the large model at the early 50% steps and the small model at
+         the last 50% steps.
+       • Small to Large (our default design). The default strategy of T-Stitch by adopting DiT-S
+         at the early 50% steps and using DiT-XL at the last 50% steps.
+
+As shown in Table 7, in general, our default design achieves the best FID and Inception Score with
+similar sampling speed, which strongly demonstrate its effectiveness.
+
+
+
+A.14    A DDITIONAL MEMORY AND STORAGE OVERHEAD OF T-S TITCH
+
+Intuitively, T-Stitch adopts a small DPM which can introduce additional memory and storage over-
+head. However, in practice, the large DPM is still the main bottleneck of memory and storage
+consumption. In this case, the additional overhead from small DPM is considerably minor. For
+example, as shown in Table 8, compared to DiT-XL, T-Stitch by adopting 50% steps of DiT-S only
+introduces additional 5% parameters, 4% GPU memory cost, 10% local storage cost, while signifi-
+cantly accelerating DiT-XL sampling speed by 1.76×.
+
+
+A.15    P RECISION AND R ECALL M EASUREMENT OF T-S TITCH
+
+Following common practice (Dhariwal & Nichol, 2021), we adopt Precision to measure fidelity and
+Recall to measure diversity or distribution coverage. In Table 9, we show that T-Stitch introduces a
+minor effect on Precision and Recall at the early 40-50% steps, while at the later steps we observe
+clear trade-offs, which is consistent with FID evaluations.
+A.16    I MAGE E XAMPLES OF T-S TITCH ON D I T S AND U-N ETS
+
+In Figures 19 and 20, we provide image examples that generated by applying T-Stitch with DiT-
+S/XL, LDM-S/LDM, respectively. Overall, we observe that adopting a small DPM at the begin-
+ning still produces meaningful and high-quality images, while at the later steps it achieves flexible
+speed and quality trade-offs. Note that different from DiTs that learn a null class embedding during
+
+
+                                                 17
+Under review as a conference paper at ICLR 2024
+
+
+Table 9: Precision and Recall evaluation based on DiT-S/XL, with DDIM 100 steps and guidance
+scale of 1.5.
+
+  Fraction of DiT-S           0%     10%      20%    30%      40%    50%      60%     70%     80%     90%     100%
+  FID                         9.20   9.17     8.99   9.03     8.95   10.06    12.46   18.04   25.44   30.11   33.46
+  Precision                   0.81   0.81     0.81   0.81     0.80    0.76     0.72   0.67     0.62    0.59    0.58
+  Recall                      0.74   0.74     0.74   0.74     0.75    0.75     0.74   0.73     0.69    0.65    0.63
+
+
+                   50           400K
+                                1000K
+                                2000K
+                   40
+                                3000K
+                                4000K
+             FID
+
+
+                   30           5000K
+
+
+                   20
+
+
+                   10
+
+                        0.0             0.2             0.4             0.6            0.8            1.0
+                                                        Fraction of DiT-S
+
+Figure 18: Effect of different pretrained DiT-S in T-Stitch for accelerating DiT-XL, based on DDPM,
+250 steps and guidance scale of 1.5. For example, “400K” indicates the pretrained weights of DiT-S
+at 400K iterations.
+
+
+classifier-free guidance, LDM inherently omits this embedding in their official implementation 3 .
+During sampling, LDM and LDM-S have different unconditional signals, which eventually results
+in various image contents under different fractions.
+
+A.17       E FFECT OF D I T-S UNDER DIFFERENT TRAINING ITERATIONS
+
+In our experiments, we adopt a DiT-S that trained with 5,000K iterations as it can be sufficiently
+optimized. In Figure 18, we indicate that even under a short training schedule of 400K iterations,
+adopting DiT-S at the initial stages of the sampling trajectory also has a minor effect on the overall
+FID. The main difference is at the later part of the sampling trajectory. Therefore, it implies the early
+denoising sampling steps can be easier to learn and be handled by a compute-efficient small model.
+
+
+   3
+       https://github.com/CompVis/latent-diffusion
+
+
+                                                               18
+Under review as a conference paper at ICLR 2024
+
+
+               0%    10%     20%     30%     40%        50%   60%     70%     80%     90%      100%
+
+
+   crate
+
+
+coral_fungus
+
+
+ restaurant
+
+
+   pillow
+
+
+  admiral
+
+
+ dowitcher
+
+
+ gyromitra
+
+
+  spotted
+salamander
+
+
+
+convertible
+
+
+Figure 19: Image examples of T-Stitch on DiT-S and DiT-XL. We adopt DDIM and 100 steps, with
+a guidance scale of 4.0. From left to right, we gradually increase the fraction of LDM-S steps at the
+beginning, then let the original LDM to process later denoising steps.
+
+
+                                                   19
+Under review as a conference paper at ICLR 2024
+
+
+                    0%   10%   20%    30%     40%     50%     60%     70%     80%     90%     100%
+
+
+  promontory
+
+
+    macaw
+
+
+ aircraft_carrier
+
+
+German_shepherd
+
+
+    beacon
+
+
+sewing_machine
+
+
+      hen
+
+
+ English_springer
+
+
+      bison
+
+
+Figure 20: Image examples of T-Stitch on U-Net-based LDM and LDM-S. We adopt DDIM and 100
+steps, with a guidance scale of 3.0. From left to right, we gradually increase the fraction of LDM-S
+steps at the beginning, then let the original LDM to process later denoising steps.
+
+
+                                                20
+Under review as a conference paper at ICLR 2024
+
+
+                          10%           20%               30%               40%     50%
+
+
+                          60%           70%               80%               90%     100%
+
+
+    SD-v1.4
+
+
+
+                                         a bowl that has vegetables inside of it
+
+
+                          10%           20%               30%               40%     50%
+
+
+                          60%            70%              80%               90%      100%
+
+
+    SD-v1.4
+
+
+
+                                         a brown and white cat laying on a bed
+
+
+                          10%           20%               30%               40%     50%
+
+
+                          60%            70%              80%               90%      100%
+
+
+    SD-v1.4
+
+
+
+                                          A very large tower has a clock on it
+
+
+Figure 21: T-Stitch based on Stable Diffusion v1.4 and BK-SDM Tiny. We annotate the faction of
+BK-SDM on top of images.
+
+
+                                               21
+Under review as a conference paper at ICLR 2024
+
+
+                          10%             20%              30%               40%               50%
+
+
+                          60%            70%              80%               90%                100%
+
+
+  Inkpunk SD
+
+
+                                          A polar bear on mars, nvinkpunk style
+
+
+                          10%             20%              30%               40%               50%
+
+
+                          60%            70%              80%               90%                100%
+
+
+  Inkpunk SD
+
+
+                                 an lion wearing a suit in a meeting room, nvinkpunk style
+
+
+                          10%            20%               30%               40%               50%
+
+
+                          60%            70%               80%               90%               100%
+
+
+  Inkpunk SD
+
+
+                                   A train pulling into a station on a cloudy day, nvinkpunk style
+
+
+Figure 22: T-Stitch based on Inkpunk-Diffusion SD an BK-SDM Tiny. We annotate the faction of
+BK-SDM on top of images.
+
+
+                                                22
+Under review as a conference paper at ICLR 2024
+
+
+                          10%               20%               30%                40%               50%
+
+
+                          60%               70%               80%                90%               100%
+
+
+   Ghibli SD
+
+
+
+                                      a ghibli style princess with golden hair in New York City
+
+
+                          10%               20%               30%                40%               50%
+
+
+                          60%               70%               80%                90%               100%
+
+
+   Ghibli SD
+
+
+
+                                      ghibli style beautiful Caribbean beach tropical (sunset)
+
+
+                          10%               20%               30%                40%               50%
+
+
+                          60%               70%               80%                90%               100%
+
+
+   Ghibli SD
+
+
+
+                         ghibli style ice field white mountains ((northern lights)) starry sky low horizon
+
+
+Figure 23: T-Stitch based on Ghibli-Diffusion SD and BK-SDM Tiny. We annotate the faction of
+BK-SDM on top of images.
+
+
+                                                  23
+Under review as a conference paper at ICLR 2024
+
+
+                          10%              20%              30%               40%               50%
+
+
+                          60%              70%               80%               90%              100%
+
+
+   SD-v1.4
+
+
+
+                           A clock and several vases sit on a table in front of a gold framed mirror
+
+                          10%              20%               30%              40%               50%
+
+
+                          60%              70%               80%               90%              100%
+
+
+   SD-v1.4
+
+
+                        Macro photography of dewdrops on a spiderweb, with morning sunlight creating
+                                                        rainbows.
+
+                          10%               20%              30%               40%               50%
+
+
+                           60%              70%              80%               90%               100%
+
+
+   SD-v1.4
+
+
+                       Aerial photography of a winding river through autumn forests, with vibrant red and
+                                                         orange foliage.
+
+
+Figure 24: T-Stitch with more complex prompts based on Stable Diffusion v1.4 and BK-SDM Tiny.
+We annotate the faction of BK-SDM on top of images.
+
+
+                                                  24
+Under review as a conference paper at ICLR 2024
+
+
+   SDXL, 13.6s        20%, 12.04s         40%, 11.05s        60%, 10.6s        80%, 9.7s            100%, 8.8s
+
+
+ Prompt: highly detailed albert einstein at an epic laboratory oﬃce, shelves with detailed items in
+         background, ((long shot)), highly detailed realistic painting by grandmaster, unreal engine,
+         octane render, 4k, trending on artstation
+
+
+ Prompt: concept art of dragon ﬂying over town, clouds. digital artwork, illustrative, painterly, matte
+         painting, highly detailed, cinematic composition
+ Negative Prompt: photo, photorealistic, realism, ugly
+
+
+ Prompt: anime artwork an empty classroom. anime style, key visual, vibrant, studio anime, highly
+         detailed
+ Negative Prompt: photo, deformed, black and white, realism, disﬁgured, low contrast
+
+
+ Prompt: claymation style captain jack sparrow on tropical island. sculpture, clay art, centered
+         composition, play-doh
+ Negative Prompt: sloppy, messy, grainy, highly detailed, ultra textured, photo, mutated
+
+
+ Prompt: 16-bit pixel art, a cozy cafe side view, a beautiful day
+ Negative Prompt: sloppy, messy, blurry, noisy, highly detailed, ultra textured, photo, realistic
+
+
+Figure 25: T-Stitch with more complex prompts based on SDXL (Podell et al., 2023) and SSD-
+1B (Segmind, 2023). We annotate the faction of SSD-1B on top of images. Time cost is measured
+by generating one image on RTX 3090.
+
+
+                                                        25
+Under review as a conference paper at ICLR 2024
+
+
+                                       Image               Canny edges
+   SDXL, 19.7s       20%, 18.4s          40%, 17.5s           60%, 16.6s    80%, 15.6s       100%, 14.8s
+
+
+ Prompt: highly detailed cinematic aerial view of a futuristic research complex in Antarctica, 4K
+ Negative Prompt: blur, low quality, bad quality, sketches
+
+
+                                       Image                   Depth
+   SDXL, 19.4s       20%, 18.4s          40%, 17.3s           60%, 16.4s    80%, 15.5s       100%, 14.6s
+
+
+ Prompt: a beautiful bosai tree, masterpiece, 4K
+ Negative Prompt: blur, low quality, bad quality, sketches
+
+
+                                     Image
+
+                                       Image                   Pose
+   SDXL, 19.4s       20%, 18.4s          40%, 17.5s           60%, 16.5s    80%, 15.6s       100%, 14.7s
+
+
+ Prompt: Ironman dancing in a futuristic city, high quality
+ Negative Prompt: low quality, bad quality
+
+
+Figure 26: T-Stitch with SDXL-based ControlNet. We annotate the faction of SSD-1B on top of
+images. Time cost is measured by generating one image on one RTX 3090.
+
+
+                                                      26
+Under review as a conference paper at ICLR 2024
+
+
+          0%     10%        20%        30%        40%          50%       60%         70%        80%        90%         100%
+
+
+8 runs
+
+
+               Cluttered house in the woods, anime, oil painting, high resolution, cottagecore, ghibli inspired, 4k.
+
+
+Figure 27: Based on Stable Diffusion v1.4 and BK-SDM Tiny, we generate images by different
+fractions of BK-SDM for 8 consecutive runs (a for-loop) on one GPU. T-Stitch demonstrates stable
+performance for robust image generation. Best viewed in digital version and zoom in.
+
+
+                                                          27
+Under review as a conference paper at ICLR 2024
+
+
+   LCM-SDXL, 768ms                             50%, 685ms                              100%, 634ms
+
+
+            Prompt: Astronaut in a jungle, cold color palette, muted colors, detailed, 8k
+
+        LCM-SDXL                                   50%                                       100%
+
+
+                          Prompt: A picture of a cute Welsh Corgi in a bucket
+
+
+Figure 28: T-Stitch based on distilled models: LCM-SDXL (Luo et al., 2023) and LCM-SSD-
+1B (Luo et al., 2023), under 2 sampling steps. We annotate the faction of LCM-SSD-1B on top of
+images. Time cost is measured by generating one image on RTX 3090 in milliseconds.
+
+
+
+LCM-SDXL, 1029ms           25%, 968ms            50%, 921ms            75%, 870ms           100%, 823ms
+
+
+              Prompt: Self-portrait oil painting, a beautiful cyborg with golden hair, 8k
+
+      LCM-SDXL               25%                    50%                    75%                 100%
+
+
+                     Prompt: a close-up picture of an old man standing in the rain
+
+
+Figure 29: T-Stitch based on distilled models: LCM-SDXL (Luo et al., 2023) and LCM-SSD-
+1B (Luo et al., 2023), under 4 sampling steps. We annotate the faction of LCM-SSD-1B on top of
+images. Time cost is measured by generating one image on RTX 3090 in milliseconds.
+
+
+
+                                                    28

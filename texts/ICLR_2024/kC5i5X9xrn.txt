@@ -1,0 +1,931 @@
+Under review as a conference paper at ICLR 2024
+
+
+L IGHT S EQ : S EQUENCE L EVEL PARALLELISM FOR
+D ISTRIBUTED T RAINING OF L ONG C ONTEXT T RANS -
+FORMERS
+
+ Anonymous authors
+ Paper under double-blind review
+
+
+
+                                           A BSTRACT
+
+         Increasing the context length of large language models (LLMs) unlocks funda-
+         mentally new capabilities, but also significantly increases the memory footprints
+         of training. Previous model-parallel systems such as Megatron-LM partition and
+         compute different attention heads in parallel, resulting in large communication
+         volumes, so they cannot scale beyond the number of attention heads, thereby
+         hindering its adoption. In this paper, we introduce a new approach, L IGHT-
+         S EQ, for long-context LLMs training. L IGHT S EQ has many notable advan-
+         tages. First, L IGHT S EQ partitions over the sequence dimension, hence is agnos-
+         tic to model architectures and readily applicable for models with varying num-
+         bers of attention heads, such as Multi-Head, Multi-Query and Grouped-Query
+         attention. Second, L IGHT S EQ not only requires up to 4.7× less communica-
+         tion than Megatron-LM on popular LLMs but also overlaps the communica-
+         tion with computation. To further reduce the training time, L IGHT S EQ features
+         a novel gradient checkpointing scheme to bypass an forward computation for
+         memory-efficient attention. We evaluate L IGHT S EQ on Llama-7B and its vari-
+         ants with sequence lengths from 32K to 512K. Through comprehensive experi-
+         ments on single and cross-node training, we show that L IGHT S EQ achieves up
+         to 1.24-2.01× end-to-end speedup, and a 2-8× longer sequence length on mod-
+         els with fewer heads, compared to Megatron-LM. Anonymous codes available at
+         https://anonymous.4open.science/r/lightseq-anonymized.
+
+
+
+1   I NTRODUCTION
+
+Transformers with long-context capabilities have enabled fundamentally new applications, such as
+comprehensive document understanding, generating a complete codebase, and extended interactive
+chatting (Osika, 2023; Liu et al., 2023; Li et al., 2023). However, training LLMs with long sequences
+induces large activation memory footprints, posing new challenges to existing distributed systems.
+One effective method for reducing these large activation memory footprints is to partition the acti-
+vation across devices. To achieve this, existing systems like Megatron-LM (Korthikanti et al., 2023;
+Shoeybi et al., 2019) usually partition the attention heads. However, this design poses a strong
+assumption that the number of attention heads must be divisible by the parallelism degree, which
+does not hold for many model architectures. For example, Llama-33B (Touvron et al., 2023) and its
+fine-tuned versions (e.g., Tulu-30B (Wang et al., 2023)) have 52 attention heads, Falcon-7B (Penedo
+et al., 2023) has 71 attention heads, and GPT-2-XL (Radford et al., 2019) has 25 attention heads.
+These numbers are not divisible by commonly chosen parallelism degrees such as 8, 16, and 32,
+according to the topology of NVIDIA clusters. In addition, partitioning attention heads restricts the
+maximum parallelism degree to be no greater than the number of attention heads. However, many
+popular LLMs do not have enough attention heads for it to scale up, e.g., CodeGen (Nijkamp et al.,
+2022) only has 16 attention heads. Moreover, many works have shown that the future Transformer
+architecture design may have even fewer attention heads. For example, Bian et al. (2021) demon-
+strates that Transformers with a single head outperforms its multi-head counterparts, representing a
+challenging scenario for solutions like Megatron-LM.
+
+
+                                                 1
+Under review as a conference paper at ICLR 2024
+
+
+To scale beyond the number of heads, we propose partitioning solely the input tokens (i.e., sequence
+parallelism) rather than the attention heads, along the line of research in sequence parallelism Li
+et al. (2021); Korthikanti et al. (2023). We present a solution that is agnostic to the model architec-
+ture and exhibits a maximal parallelism degree that scales with the sequence length. Specifically, we
+introduce a parallelizable and memory-efficient exact attention mechanism, D ISTATTN, in (§3.1).
+Our design enables opportunities for overlapping, where we can hide communication into attention
+computation(§ 3.2). We also propose a load-balancing technique to avoid the computation bub-
+ble caused by the unbalanced workload in causal language modeling (§3.2). While extending the
+FlashAttention (Dao, 2023) algorithm to D ISTATTN, we found a way to leverage the underlying
+rematerialization logic to significantly improve the speed of gradient checkpointing training (§ 3.3).
+This technique also applies to non-distributed usage of memory-efficient attention, and in our exper-
+iments translates to an additional 1.31× speedup (§ 4.3).
+Our main contributions are:
+      1. We design L IGHT S EQ, a long-context LLM training prototype based on sequence-level par-
+         allelism. We develop a distributed memory-efficient exact attention D ISTATTN, with novel
+         load balancing and communication overlapping scheduling for causal language modeling.
+      2. We propose a novel checkpointing strategy that bypasses one attention forward pass when
+         using memory-efficient attention with gradient checkpointing training.
+      3. We evaluate L IGHT S EQ on Llama-7B and its variants with different attention heads pat-
+         terns, and demonstrate up to 2.01× end-to-end speedup compared to Megatron-LM in long-
+         context training. We further show that L IGHT S EQ scales beyond the number of attention
+         heads and enables 2-8× longer sequences training.
+
+2   R ELATED WORK
+Memory-efficient attention. Dao et al. (2022) and Lefaudeux et al. (2022) propose to use an on-
+line normalizer (Milakov & Gimelshein, 2018) to compute the attention in a blockwise and memory-
+efficient way. It reduces peak memory usage by not materializing large intermediate states, e.g. the
+attention matrix or the up projection matrix output of the MLP layers (Liu & Abbeel, 2023). Instead,
+the attentions are computed in smaller blocks and only the final activation are stored. In the back-
+ward pass, the intermediate states need to be recomputed. Research on sparse attention computes
+only a sparse subset of the attention score, which also reduces the memory footprints yet may lead
+to inferior performance (Beltagy et al., 2020; Sun et al., 2022; Zaheer et al., 2020). In this work, we
+limit our scope to exact attention.
+Sequence parallelism, model parallelism, and FSDP. Li et al. (2021) is among the first to par-
+allelize along the sequence dimension. However, it is not optimized for the computational pattern
+of causal language modeling and is incompatible with memory-efficient attention, which are crucial
+to long-context LLM training. Model parallelism partitions model parameters and also distributes
+the activation in parallel LLM training. Megatron-LM (Korthikanti et al., 2023) proposes a hybrid
+usage of tensor parallelism and sequence parallelism to better reduce the activation on a single de-
+vice and is the main baseline of the paper. Fully sharded data-parallelism (FSDP) (Zhao et al., 2023;
+Rajbhandari et al., 2020) distributes optimizer states, gradients, and model parameters onto different
+devices and gathers them on-the-fly. It is orthogonal to our work, and we use L IGHT S EQ in tandem
+with FSDP to further reduce memory acquired by models in experiments.
+Pipeline parallelism Pipeline parallelism Korthikanti et al. (2023) also partitions the activation.
+However, it keeps a high memory pressure to the first stage when applying interleaved pipeline par-
+allelism to minimize the computation bubble Korthikanti et al. (2023). We show in § 4.2 that pipeline
+parallelism is less effective in supporting long sequence lengths compared with tensor model paral-
+lelism and our sequence parallelism. Thus, we focus on comparing with tensor model parallelism
+(combined with sequence parallelism) in this work and only consider including pipeline parallelism
+for comparison when the tensor parallelism is limited by the number of heads.
+Gradient checkpointing. Gradient checkpointing (Chen et al., 2016) trades computation for
+memory by not storing the activation for certain layers and recomputing their activations during
+forward. Selective checkpointing (Korthikanti et al., 2023) proposes to only recompute the attention
+module as it requires large memory but with small FLOPs (in smaller context length). Check-
+mate (Jain et al., 2020) searches optimal checkpointing using integer linear programming. However,
+
+
+                                                  2
+Under review as a conference paper at ICLR 2024
+
+
+ worker 1                            worker 8
+
+                                                                worker 1
+
+               FFN                                 FFN          worker 2                                                      Bubble
+                                                                                            Bubble                            size = 4
+                                                                worker 3
+            o projection                        o projection                               size = 28
+                                                                worker 4
+                               comm.
+             DistAttn                            DistAttn       worker 5
+
+                                                                worker 6
+
+                                                                worker 7
+
+       q, k, v projection                  q, k, v projection   worker 8
+
+
+                                                                                          total time steps: 8              total time steps: 5
+              "This"                             "LLM"
+                                                                               Before Balancing                 After Balancing
+                                                                                Larger Bubble                   Smaller Bubble
+       Input: "This is a very long input to LLM"                                 Longer Time                     Shorter Time
+
+
+Figure 1: Left: Sequence parallelism in L IGHT S EQ. The input sequence is split into chunks along
+the sequence dimension and distributed to different workers (8 workers in the illustration). During
+forward and backward, only the attention module, D ISTATTN, requires communication of inter-
+mediate tensors like 𝑘 and 𝑣. Some modules like LayerNorm are ignored for simplicity. Right:
+Illustration of the load-balanced scheduling. Each circle is a unit of computation. And circles in the
+same color means that they are computed in the same time step. For instance, the rightmost and bot-
+tommost circle means that at time step 1 (t1), worker 8 is executing attn(𝑞 8 , 𝑘 8 , 𝑣 8 ). Similarly, green
+color denotes computations that happen at the second time step (𝑡2 ). At 𝑡2 , worker 1 is executing
+attn(𝑞 8 , 𝑘 1 , 𝑣 1 ). “Bubble size” represents the times that a worker is idle. Causal language modeling
+naturally introduces imbalanced workloads, e.g., worker 1 is idle from time step 2 to time step 8 be-
+fore balancing. We reduce the bubble fraction by allocating computation from the busy worker (e.g.,
+worker 8) to the idle worker (e.g., worker 1), so worker 1 is only idle at time step 5 after balancing.
+A more detailed illustration of the load-balancing design can be found is Appendix C.
+
+                          GPU
+                       Computation
+                         Stream
+
+                       GPU
+                   Communication
+                      Stream
+
+
+
+Figure 2: Forward pass example of overlapping communication using worker 7 out of 8 workers. 𝑜
+denotes the attention output computed by a remote worker. For instance, 𝑜1 = 𝑎𝑡𝑡𝑛(𝑞 7 , 𝑘 1 , 𝑣 1 ) for
+worker 7. In the communication stream, “S” stands for sending, and “R” stands for receiving. For
+instance, 𝑆 : 𝑘𝑣 7 → 𝑝 8 denotes sending the local 𝑘𝑣 7 to the remote worker 𝑝 8 . In Appendix C, the
+communication schema at each time step is reflected in Figure 7.
+none of these designs have considered memory-efficient attention kernels which perform recomputa-
+tion inside the computational kernel to avoid materializing large tensors. As a result, many previous
+recomputation policies become less effective. In this work, we focus on checkpointing at the bound-
+ary of every transformer layer, which is a popular strategy adopted by many current open-sourced
+projects such as FastChat (Zheng et al., 2023).
+
+3     M ETHOD
+In this section, we describe the design of the key components in L IGHT S EQ. We first introduce a dis-
+tributed memory-efficient attention, D ISTATTN (§3.1) which parallelizes the computation along the
+sequence dimension. We then introduce a load-balanced scheduling for causal language modeling
+to reduce the computation bubble as well as an asynchronous communication design that overlaps
+the communication into computation (§3.2). Finally, we propose a rematerialization-aware check-
+pointing strategy (§3.3) which effectively cuts off the recomputation time in gradient checkpointing.
+
+3.1    D ISTATTN : DISTRIBUTED MEMORY- EFFICIENT ATTENTION
+
+The core idea in D ISTATTN is to split the input sequence consisting of 𝑁 tokens evenly across 𝑃
+workers (e.g. GPUs) along the sequence dimension. Each worker is therefore responsible for com-
+
+
+                                                                           3
+Under review as a conference paper at ICLR 2024
+
+
+puting the forward and backward pass for only 𝑁/𝑃 of the 𝑁 tokens. For modules like the Feed
+Forward Layer (FFN), Layer Norm (LN), and the embedding layer the tokens can be computed in-
+dependently without coordination (embarrasingly parallel) and the work is balanced across workers.
+Unfortunately, for the attention modules where local tokens may need to attend to remote tokens,
+coordination is required. To address this, each worker collects all the keys and values associated with
+other tokens and then locally computes the attention following Dao (2023). To address the memory
+pressure introduced by collecting all other keys and values, this process is done online by streaming
+the key and values from workers with earlier tokens to workers with later tokens. More formally,
+denote q 𝑝 , k 𝑝 , v 𝑝 as the query, key, value inputs held on the 𝑝-th worker (𝑝 = {1, · · · , 𝑃}), denote
+𝑎𝑡𝑡𝑛(q 𝑝 , k 𝑝′ , v 𝑝′ ) as the attention computation w.r.t. 𝑝-th chunk of the query and 𝑝 ′ -th chunk of
+the key and value, denote 𝑝 local ∈ {1, · · · , 𝑃} as the local rank, and denote 𝑝 remote ∈ {1, · · · , 𝑃} as
+one of the remote ranks. Figure. 1 (“Before Balancing”) shows the vanilla version of D ISTATTN,
+where each worker computes the attention for q 𝑝local and loops over both the local and the remote
+key and value blocks. We fetch k 𝑝remote and v 𝑝remote from rank 𝑝 remote before the computation of
+𝑎𝑡𝑡𝑛(q 𝑝local , k 𝑝remote , v 𝑝remote ). In Appendix. A, we provide pseudo-code on how to use D ISTATTN
+in L IGHT S EQ, on the 𝑝-th worker where there are 𝑃 total workers.
+
+3.2   L OAD BALANCED SCHEDULING WITH COMMUNICATION AND COMPUTATION OVERLAP
+Load balanced scheduling. Causal language modeling objective (Brown et al., 2020; Touvron
+et al., 2023) is one of the most prevalent objectives for LLMs, where each token only attends to its
+previous tokens. This naturally introduces a work imbalance between workers in our block-wise
+attention: as shown in Figure 1 (“Before Balancing”), in an 8-worker (𝑃 = 8) scenario, the last
+worker needs to attend to tokens on all other 7 workers, while the first worker is idle after attending
+                                                                                                         2
+to its local tokens, which results in a total idle time of 28. In a general form, the idle fraction is 𝑃2𝑃−𝑃
+                                                                                                           2
+
+(→ 21 when 𝑃 → ∞), which means roughly half of the workers are idle. To reduce this idle time
+(a.k.a., the bubble time), we let early workers that have finished their computation for local q 𝑝local to
+help compute for q 𝑝remote of the later workers. For instance, we let worker 1 compute 𝑎𝑡𝑡𝑛(q8 , k1 , v1 )
+and send the result to worker 8. When the number of workers is odd, the idle fraction is 0. When the
+                                                      1
+number of workers is even, the idle fraction is 2𝑃      , which is asymptotically 0 when scaling to more
+number of workers. We detail the load-balancing design in Appendix C.
+
+Communication and computation overlap. D ISTATTN relies on peer-to-peer (P2P) communi-
+cation to fetch the k, v (or q chunks in the load balanced scheduling) from remote devices before
+computing the corresponding attention block. However, these communications can be easily over-
+lapped with the computation of the former blocks. For instance, When the first worker is computing
+attention for its local token, it can pre-fetch the next chunk of tokens it needs for the next time step.
+In modern accelerators, this can be done by placing the attention computation kernel in the main
+GPU stream, and the P2P communication kernel in another stream, where they can run in paral-
+lel (Zhao et al., 2023). We demonstrate the overlapped scheduling for worker 7 on the 8 workers
+example in Figure. 2. Empirically, we find this optimization greatly reduces the communication
+overhead (§4.3).
+
+3.3   R EMATERIALIZATION - AWARE CHECKPOINTING STRATEGY
+                                                                                                                         233.87
+                                                                               attention
+The de-facto way of training transformers re-                          200     Other
+quires gradient checkpointing. Often, the sys-
+                                                     Wall-clock time
+
+
+tem uses heuristics to insert gradient check-                          150
+points at each Transformer layer (Wolf et al.,
+                                                                       100                                                        95.78
+2019). However, with the presence of Dao                                                                 74.35
+et al. (2022), we found the previous gradient                          50                                        47.22
+checkpointing strategy will cause an extra re-                                             27.08 23.66
+                                                                          12.94 10.5
+computation of the flash attention forward ker-                         0     8K              16K            32K             64K
+nel. Concretely, when computing the gradient                                                    sequence length
+of the MLP layer, Wolf et al. (2019) will re-           Figure 3: Time breakdown of attention versus
+compute the forward of the entire Transformer           other modules in a forward pass. Time mea-
+layer, including the one in flash attention. How-       sured with Flash-Attention (Dao, 2023) on a sin-
+ever, when computing the gradient of the flash          gle 40GB A100 GPU. (Unit ms).
+
+
+                                                     4
+Under review as a conference paper at ICLR 2024
+
+
+                         checkpoint           forward                recomputation               backward       other modules
+
+
+    Fwd                                                                       Fwd
+
+             Flash                Flash                  Flash                        Flash                  Flash               Flash
+              Attn        FFN      Attn      FFN          Attn      FFN                Attn        FFN        Attn      FFN       Attn      FFN
+            Attention            Attention              Attention                    Attention              Attention           Attention
+
+
+    Bwd                                                                       Bwd
+
+
+
+                        Huggingface Checkpointing Strategy                            Rematerialization-Aware Checkpointing Strategy (Ours)
+
+Figure 4: Comparison of HuggingFace gradient checkpointing strategy and our materialization-
+aware gradient checkpointing strategy. Note that our checkpointing strategy saves an entire flash
+attention forward per layer in recomputation.
+
+attention kernel, it needs to re-compute the forward of the flash attention again. Essentially, this is
+because flash attention will not materialize the intermediate values during the forward, and will re-
+compute it during the backward, regardless of the re-computation strategy in the outer system level.
+To tackle this, we propose to insert checkpoints at the output of the flash attention kernel, instead
+of at the Transformer layer boundary. In this case, we only need to recompute the forward of flash
+attention once, effectively saving a forward of attention for each Transformer layer as shown in Fig-
+ure. 4. In Figure. 3, we show the attention time dominates in the forward pass when scaling up the
+sequence length, which indicates our method can save ∼ 0.23 × 32 (i.e., ∼ 7) seconds when training
+a 64K sequence example on Llama-7b using the local version of flash attention. In addition, this
+saves a communication brought by our D ISTATTN forward in the distributed training scenario. We
+benchmark the end-to-end speedup brought by this materialization-aware checkpointing strategy in
+§4.3.
+Communication and memory analysis Denote the hidden dimension as 𝑑. In D ISTATTN, every
+worker needs to fetch key and value chunks both of size 𝑁𝑃 𝑑 before performing the corresponding
+chunk-wise computation. Thus, the total communication volume in the 𝑃-workers system is 2 ×
+𝑁
+𝑃 𝑑 × 𝑃 = 2𝑁 𝑑. With the causal language objective, half of the keys and values do not need to
+be attended, halving the forward communication volume to 𝑁 𝑑. In the backward pass, D ISTATTN
+needs to communicate keys, values, and their gradients, which has 2𝑁 𝑑 volume. It adds up to 3𝑁 𝑑
+as the total communication volume for D ISTATTN. In Megatron-LM (Korthikanti et al., 2023), each
+worker needs to perform six all-gather and four reduce-scatter on a 𝑁 𝑃 𝑑 size tensor, thus giving
+a total communication volume of 10𝑁 𝑑. Considering gradient check-pointing, Megatron-LM will
+perform communication in the forward again, giving a total volume of 14𝑁 𝑑. On the other hand, our
+communication volume remains 3𝑁 𝑑 because of the rematerialization-aware strategy. In conclusion,
+L IGHT S EQ achieves 4.7x communication volume reduction compared with Megatron-LM.
+In large model training, we usually utilize techniques such as FSDP to also reduce the memory
+consumed by model weights. In this case, We note that the communication introduced by FSDP is
+only proportional to the size of model weights, which does not scale up with long sequence length.
+We show the end-to-end speedup with FSDP in Table 1. For clarity, we also note that L IGHT S EQ
+is orthogonal to FSDP and by default can be used by itself. In the situations where the model
+uses MQA or GQA, L IGHT S EQ further saves the communication volumes by the shared key and
+values, which we discuss in detail in § 4.1. However, we also note that this is a theoretical analysis,
+where the wall-clock time may differ because of factors such as implementations. In the experiment
+section, we provide wall-clock end-to-end results for comparison.
+
+4     E XPERIMENTS
+In this section, we evaluate L IGHT S EQ against Megatron-LM (Korthikanti et al., 2023) and show:
+
+          1. L IGHT S EQ has faster training speed on a wide range of models. It achieves up to 2.01×
+             speedup over Megatron-LM on various MHA and GQA models.
+          2. L IGHT S EQ supports longer sequence length by scaling beyond the number of attention
+             heads. We show our method can support 2x-8x longer sequences than Megatron-LM.
+
+In the ablation study, we provide the gain from each component of L IGHT S EQ: Load balancing,
+computation-communication overlapping, and rematerialization-aware checkpointing.
+
+                                                                          5
+Under review as a conference paper at ICLR 2024
+
+
+Cluster setup. We evaluate our method and the baseline in (1) A single A100 DGX box with
+8x80 GB GPUs. These GPUs are connected with NVLink; (2) 2 DGX boxes with the same setting.
+These two boxes are interconnected by 100 Gbps Infiniband. This is representative of cross-node
+training, where the communication overhead has a larger effect. This is the default setup unless
+otherwise stated. (3) Our in-house cluster with 2x8 A100 40GB GPUs without Inifiniband. To save
+computational budget, we report some results on this cluster where conclusions can be drawn from
+a single-node setup or without involving cross-node training time.
+Model setup. We evaluate our system on Llama-7B and its variants of different representative fam-
+ilies: (1) Multi-head attention(MHA) models: LLama-7B with 4096 hidden size and 32 query(key
+and value) heads (Touvron et al., 2023); (2) Grouped-Query attention (GQA) models: Llama-
+GQA Ainslie et al. (2023), same as Llama-7B but with 8 key and value heads. During attention
+computation, it will first replicate to 32 heads in order to do matrix multiplication with the correct
+shape. (3) models with more general number of attention heads: Llama-33H. Llama-33H has the
+same configuration as Llama-7B but with 33 query (key and value) attention heads per layer. (4)
+models with fewer attention heads: we design Llama-16H, Llama-8H, Llama-4H, Llama-2H with
+16, 8, 4, and 2 heads. According to Liu et al. (2021), we keep the number of attention heads by
+scaling the number of layers properly1 and keep the intermediate FFN layer size the same to make
+the model sizes still comparable. For example, Llama-16H has 16 attention heads per layer, a hidden
+size of 2048, an FFN layer of size 11008, and 64 layers.
+Implementation. L IGHT S EQ is a lightweight scheduling level prototype. In particular, we imple-
+ment the load balancing and overlapping in Python and NCCL Pytorch bindings in 1000 lines of
+codes (Paszke et al., 2019; Jeaugey, 2017), and the checkpointing strategy in 600 lines of Pytorch.
+It is attention backend agnostic. To reduce the memory consumption and reach faster speed in the
+attention module, we use the FlashAttention2 algorithm (Dao, 2023). We use the triton (Tillet et al.,
+2019) implementation and minimally modify it to keep around statistics in the flash attention algo-
+rithm. We tweak all block sizes to 128 and the number of stages to 1 for the best performance in our
+cluster. We reuse the C++ backward kernels of FlashAttention2 because we do not need to modify
+the backward logic. We run L IGHT S EQ using FSDP (inter-node if applicable) so that it consumes
+similar memory than the Megatron-LM baseline for a fair comparison (Zhao et al., 2023). For fair
+comparisons, we run all comparisons using the same attention backend. We also add support for
+Megatron-LM so that comparing with them can produce a more insightful analysis: (1) not mate-
+rializing the causal attention mask, greatly reducing the memory footprint. For instance, without
+this support, Megatron-LM will run out of memory with Llama-7B at a sequence length of 16K per
+GPU. (2) head padding where the attention heads cannot be divided by device number. All results
+are gathered with Adam optimizer, 10 iterations of warm-up, and averaged over the additional 10
+iterations.
+
+4.1   FASTER TRAINING SPEED AND BETTER SUPPORT FOR DIFFERENT MODEL
+      ARCHITECTURES
+
+In this section, we compare our method with Megatron-LM on three settings: (1) the multi-head
+attention (MHA) models where the number of key and value heads equals the number of query
+heads; (2) the grouped-query attention (GQA) models where the number of key and value heads is
+less than the number of query heads; (3) the models with arbitrary numbers of heads, i.e. the number
+heads is unnecessarily a multiple of the parallelism degree.
+
+Multi-head attention (MHA). On the Llama-7B model, our method achieves 1.24× and 1.44×
+speedup compared to Megatron-LM in single node and cross node setting, up to the longest sequence
+length we experiment. This is a joint result of our overlapping communication technique and our
+rematerialization-aware checkpointing strategy. We analyze how much each factor contributes to this
+result in the ablation study ( § 4.3). We do note that our method does not achieve better performance
+in shorter sequences, such as per GPU 4K setting for cross node. This is because the communication
+dominates the training run-time, where our overlapping technique has not been able to reduce much.
+We leave the optimization of P2P communication on MHA models and shorter sequence length as
+an exciting future work.
+   1 For instance, Llama-7B has 32 attention heads and 32 layers, thus Llama-16H has 16 attention heads per
+layers and 64 layers
+
+
+                                                    6
+Under review as a conference paper at ICLR 2024
+
+
+Table 1: Per iteration wall-clock time of L IGHT S EQ and Megatron-LM (Korthikanti et al., 2023)
+(Unit: seconds). Speedup in bold denotes the better of the two systems in the same configuration.
+Time measured with 2 DGX boxes.
+
+    Method      # GPUs    Sequence Length        Llama-7B          Llama-GQA           Llama-33H
+                          Per GPU Total       Time    speedup    Time    speedup     Time   speedup
+                  1x8        4K       32K     2.54      1.0x      2.43     1.0x       3.15   1.0x
+                  1x8        8K       64K     6.81      1.0x      6.60     1.0x       8.37   1.0x
+ Megatron-LM
+                  1x8       16K      128K    20.93      1.0x     20.53     1.0x      25.75   1.0x
+                  1x8       32K      256K    72.75      1.0x     71.93     1.0x      90.21   1.0x
+                  1x8        4K       32K     2.50      1.02x     2.30     1.06x      2.58   1.22x
+                  1x8        8K       64K     5.98      1.14x     5.61     1.18x      6.08   1.38x
+  L IGHT S EQ
+                  1x8       16K      128K    17.26      1.21x    16.86     1.22x     17.77   1.45x
+                  1x8       32K      256K    58.46      1.24x    57.01     1.26x     59.96   1.50x
+                  2x8       4K        64K     5.29      1.0x      5.26     1.0x       7.52   1.0x
+                  2x8        8K      128K    14.26      1.0x     14.21     1.0x      20.63   1.0x
+ Megatron-LM
+                  2x8       16K      256K    43.44      1.0x     43.20     1.0x      62.78   1.0x
+                  2x8       32K      512K    147.06     1.0x    146.38     1.0x     216.70   1.0x
+                  2x8        4K       64K      6.85     0.77x    4.92      1.07x      7.03   1.07x
+                  2x8        8K      128K     12.75     1.12x     9.74     1.46x     13.12   1.57x
+  L IGHT S EQ
+                  2x8       16K      256K     30.21     1.44x    28.49     1.52x     31.33   2.00x
+                  2x8       32K      512K    106.37     1.38x   102.34     1.43x    107.76   2.01x
+
+
+
+Table 2: The maximal sequence length Per GPU supported by L IGHT S EQ and Megatron-LM with
+tensor parallelism and pipeline parallelism on 16xA100 40GB GPUs. L IGHT S EQ supports 512K
+sequence length in all models, while Megatron-LM strategy maximal sequence length decreases
+with fewer heads, with either data parallelism or pipeline parallelism.
+
+                                   Llama-16H      Llama-8H      Llama-4H     Llama-2H
+           Megatron TP+DP             512K            256K        128K            64K
+          Megatron-LM TP+PP           512K            256K        256K            128K
+              L IGHT S EQ             512K            512K        512K            512K
+
+
+Grouped-query attention (GQA). On LLama-GQA model, our method achieves better speedup
+because our communication of key and value vectors significantly reduces. Note that our communi-
+cation time is proportional to the sum of query, key, value, and output (for load balancing) vectors,
+where reducing key and value sizes to 8 almost half-en our communication time. On the contrary,
+the communication time in Megatron-LM does not decrease because its communication happens
+outside of the attention module, i.e. not influenced by optimization inside the attention module.
+Thus, its overall training run-time does not decrease as much as L IGHT S EQ.
+We take the 4K per-GPU sequence length and 2x8 GPUs as an example for analysis. In the MHA
+experiment, the communication in a forward and a backward pass of a single attention module is
+roughly 143ms and the computation time is roughly 53ms. In addition, our overlapping technique is
+able to hide 45ms into the computation, resulting in a total run-time of 151ms and a net communi-
+cation overhead of 98 ms. As a reference, the communication in Megatron-LM takes 33ms, which
+is why Megatron-LM is faster than L IGHT S EQ under this particular setting in the MHA experiment.
+When considering the GQA case, the communication in L IGHT S EQ roughly reduces to 71 ms. Over-
+lapping with the computation, the communication overhead is now less than that of Megatron-LM.
+Combined with the checkpointing technique, we are seeing a positive speedup gain at 4K per-GPU
+sequence length. As the sequence length increases, our overlapping technique, driven by the fact
+that computation time surpasses communication time, and our checkpointing method, due to the ris-
+ing ratio of a single attention forward, both contribute to greater speedup. Overall, we can observe
+speedups up to 1.52× on the cross-node setting, making an additional eight percent enhancement
+compared to the results in the MHA experiment of the same setting.
+
+
+                                                 7
+Under review as a conference paper at ICLR 2024
+
+
+                                                                              2.33
+
+
+                                                Normalized iteration time
+               single machine                                                        1.95       2.05                                        No overlap
+       6       balanced schedule                                        2.0                                                                 overlap
+               unbalanced schedule                                                                                      1.65                no communication
+                                                                        1.5                            1.44                              1.33
+ Speedup
+       4
+                                                                        1.0                 1                   1               1.08 1          1.01 1
+       2                                                                0.5
+           0   50000 100000150000200000250000                           0.0          64K               128K                     256K            512K
+                      sequence length                                                                         sequence length
+  Figure 5: Ablation on the effect of balanced schedule (left) and the effect of overlapping (right).
+In support of arbitrary numbers of heads. With Llama-33H models, Megatron-LM exhibits an
+additional performance decline compared to L IGHT S EQ. This is due to its requirement to pad the
+number of attention heads so that the number of attention heads is divisible by the number of de-
+vices. On the other hand, L IGHT S EQ does not need to partition attention heads and can support an
+arbitrary number of heads efficiently. For instance, when using 8 GPUs, Megatron-LM must pad the
+attention heads to 40, resulting in 21.2% of the computation being wasted. In the case of 16 GPUs,
+Megatron-LM is compelled to pad the attention heads to 48, leading to a more substantial computa-
+tion wastage of 45.5%. This roughly corresponds to a 1.21× or 1.45× increase in run-time compared
+to L IGHT S EQ when training a Llama-7B model. This performance degradation of Megatron-LM is
+primarily because the training time is dominated by the attention module’s computation time when
+scaling to longer sequence lengths. Empirically, we observe a 1.50× and 2.01× speedup (an addi-
+tional 20% and 45% speedup compared to Llama-7B cases, aligned with the theoretical analysis).
+
+4.2        S CALING BEYOND THE NUMBER OF HEADS .
+
+Assuming the number of heads being a multiple of the tensor parallelism degree constraints
+Megatron-LM to scale its tensor parallelism degree beyond the number of heads, thus limiting its
+scaling ability to longer sequence lengths. When the number of GPUs exceeds the number of atten-
+tion heads, there will be three possible solutions to use Megatron-LM. First, the user can pad dummy
+heads as in the Llama-33H scenario. However, when scaling to longer sequences, the percentage
+of dummy heads padded almost directly translates to the percentage of slowdown. For instance, for
+Llama-8H, this solution pads 2× dummy heads and would almost translate to a 2× slowdown, which
+is very inefficient. Second, the user can use data parallelism for excess GPUs. For instance, a user
+with 16 GPUs can choose to use 4-way data parallelism and 4-way tensor parallelism on the Llama-
+4H model. Since data parallelism does not partition the activation, the system can only support
+sequences as if the user only has 4 GPUs. Lastly, the user may choose to use pipeline parallelism
+to partition activation. However, the memory usage at each stage of the pipeline is not evenly dis-
+tributed, still limiting the maximal sequence length supported. In particular, the first pipeline stage
+usually stores more activations because it will hold the most active micro-batches. For instance,
+in the Llama-2H experiment, we find that different stages consume from 18GB to 32GB in a 64K
+sequence length (Section E). In addition, using pipeline parallelism introduces an extra fraction of
+GPU idle time. We demonstrate the effect of using the latter two solutions in Table 6. In 16 A100
+40GB GPUs, L IGHT S EQ supports the training of 2× and 8× longer sequences.
+4.3        A BLATION S TUDY
+Effect of load balancing. We study the effect of load balancing using the forward pass of an
+attention operation in Llama-7B model, on 8 A100 40GB GPUs. The backward pass follows a
+similar analysis. With an unbalanced schedule (Figure 1), the total work done is 36, where the
+total work could be done in 8 units of time is 64. Thus, the expected maximal speedup is 4.5x. In
+the balanced schedule, the expected maximal speedup is 7.2x. We scale the total sequence length
+from 4K to 256K. The unbalanced version saturates in 4.5x speedup compared to a single GPU
+implementation, while the balanced version saturates 7.5x 2 speedup. Both of them align with our
+earlier theoretical analysis and show the importance of our balanced scheduling.
+Effect of overlapping communication and computation. We study the benefits of overlapping
+communication on Llama-7B and 2 DGX boxes. We find that overlapping greatly reduce the com-
+munication overhead. For instance, on a global sequence length of 128K, the communication over-
+head is reduced from 105% to 44%. This overlapping scheme maximizes its functionality when the
+   2 We find the single machine attention flops drop with very long sequence length, resulting in a slightly
+higher speedup than assuming its perfect scalability.
+
+
+                                                                                            8
+Under review as a conference paper at ICLR 2024
+
+
+communication overhead is less than 100%, where all communication can be potentially overlapped.
+Empirically, we find the system only exhibits 8% and 1% overhead in these cases, showing a close
+performance to an ideal system without communication.
+Effect of materialization-aware checkpointing. We show in Table. 3 the ablation results of our
+rematerialization-aware gradient checkpointing. Our method achieves 1.16x, 1.24x, and 1.31x
+speedup at the sequence length of 8K, 16K, and 32K per GPU respectively. The materialization-
+aware checkpointing strategy speeds up more at longer sequence lengths because it saves an entire
+attention forward which dominates the computation at longer sequence lengths.
+
+Table 3: Ablation study on the effect of the rematerialization-aware gradient checkpointing on 8
+A100s in a single node with a batch size of 1. We report the end-to-end run time in seconds and show
+the speedup of our gradient checkpointing strategy (“Our ckpt”) over the HuggingFace gradient
+checkpointing strategy (“HF ckpt”).
+
+                  Ckpt Method               Sequence Length Per GPU
+                                   1K      2K     4K     8K      16K          32K
+                    HF ckpt       0.84     1.29       2.64   6.93    21.44    76.38
+                    Our ckpt      0.84     1.36       2.50   5.98    17.26    58.46
+                    Speedup       1.0x    0.94x    1.06x     1.16x   1.24x    1.31x
+
+
+4.4   C OMPARISON WITH D EEP S PEED U YLESS
+
+DeepSpeed-Ulysses 3 is a concurrent open-sourced implementation, which uses all-to-all commu-
+nication primitive to reduce the communication volume. In our testing, we verified that their com-
+munication is lower than Megatron-LM. Yet, as it is also partitioning the attention head dimension,
+it suffers from similar problems as analyzed above. We provide some end-to-end comparisons in
+Appendix B. We note that the communication in DeepSpeed Ulysses can be faster than L IGHT-
+S EQ, especially with shorter context length and slower network, where the overlapping technique
+in L IGHT S EQ cannot perfectly hide all the communication. This can be potentially addressed by
+optimizing the P2P communication as discussed above.
+
+4.5   D ISCUSSION
+
+In this section, we discuss the future directions that can further improve L IGHT S EQ.
+Optimizing P2P communication and better support for shorter context length and lower band-
+width region. As shown in §4.1, L IGHT S EQ may be slower in shorter context length and MHA
+models (Llama-7B on per GPU sequence length 4K). Based on our preliminary investigation, this is
+because our usage of P2P is not as optimized as primitives used in tensor model parallelism, such
+as all-gather kernels .For instance, they are not aware of the underlying cluster topology. For the
+same reason, we also observed that the current P2P optimization has not achieved the theoretical
+4.7× speedup in a very low bandwidth region (e.g. in our in-house cluster). In the future, we plan to
+implement the P2P scheduling in a topology-aware way to further improve the communication time.
+
+5     C ONCLUSION
+
+In this work, we introduce L IGHT S EQ, a sequence parallel prototype for long-context transformer
+training. L IGHT S EQ presents novel system optimizations including load balancing for causal lan-
+guage modelings, overlapped communication with computation in the distributed attention compu-
+tation, and a re-materialization-aware checkpointing strategy. Our experiments evaluate multiple
+families of transformer models and on different cluster types, showing that it achieves up to 2.01×
+speedup and scales up to 8x longer sequences, compared to another popular system, Megatron-LM,.
+Future directions include implementing topology-aware P2P operations to further reduce training
+time in lower sequence lengths.
+  3 https://github.com/microsoft/DeepSpeed/tree/master/blogs/
+deepspeed-ulysses
+
+
+                                                  9
+Under review as a conference paper at ICLR 2024
+
+
+R EFERENCES
+Joshua Ainslie, James Lee-Thorp, Michiel de Jong, Yury Zemlyanskiy, Federico Lebrón, and Sumit
+  Sanghai. Gqa: Training generalized multi-query transformer models from multi-head check-
+  points. arXiv preprint arXiv:2305.13245, 2023.
+
+Iz Beltagy, Matthew E Peters, and Arman Cohan. Longformer: The long-document transformer.
+   arXiv preprint arXiv:2004.05150, 2020.
+
+Yuchen Bian, Jiaji Huang, Xingyu Cai, Jiahong Yuan, and Kenneth Church. On attention redun-
+  dancy: A comprehensive study. In Proceedings of the 2021 conference of the north american
+  chapter of the association for computational linguistics: human language technologies, pp. 930–
+  945, 2021.
+
+Tom Brown, Benjamin Mann, Nick Ryder, Melanie Subbiah, Jared D Kaplan, Prafulla Dhariwal,
+  Arvind Neelakantan, Pranav Shyam, Girish Sastry, Amanda Askell, et al. Language models are
+  few-shot learners. Advances in neural information processing systems, 33:1877–1901, 2020.
+
+Tianqi Chen, Bing Xu, Chiyuan Zhang, and Carlos Guestrin. Training deep nets with sublinear
+  memory cost. arXiv preprint arXiv:1604.06174, 2016.
+
+Tri Dao. Flashattention-2: Faster attention with better parallelism and work partitioning. arXiv
+  preprint arXiv:2307.08691, 2023.
+
+Tri Dao, Dan Fu, Stefano Ermon, Atri Rudra, and Christopher Ré. Flashattention: Fast and memory-
+  efficient exact attention with io-awareness. Advances in Neural Information Processing Systems,
+  35:16344–16359, 2022.
+
+Paras Jain, Ajay Jain, Aniruddha Nrusimha, Amir Gholami, Pieter Abbeel, Joseph Gonzalez, Kurt
+  Keutzer, and Ion Stoica. Checkmate: Breaking the memory wall with optimal tensor rematerial-
+  ization. Proceedings of Machine Learning and Systems, 2:497–511, 2020.
+
+Sylvain Jeaugey. Nccl 2.0. In GPU Technology Conference (GTC), volume 2, 2017.
+
+Vijay Anand Korthikanti, Jared Casper, Sangkug Lym, Lawrence McAfee, Michael Andersch, Mo-
+  hammad Shoeybi, and Bryan Catanzaro. Reducing activation recomputation in large transformer
+  models. Proceedings of Machine Learning and Systems, 5, 2023.
+
+Benjamin Lefaudeux, Francisco Massa, Diana Liskovich, Wenhan Xiong, Vittorio Caggiano, Sean
+  Naren, Min Xu, Jieru Hu, Marta Tintore, Susan Zhang, Patrick Labatut, and Daniel Haziza.
+  xformers: A modular and hackable transformer modelling library. https://github.com/
+  facebookresearch/xformers, 2022.
+
+Dacheng Li, Rulin Shao, Anze Xie, Ying Sheng, Lianmin Zheng, Joseph E Gonzalez, Ion Stoica,
+  Xuezhe Ma, and Hao Zhang. How long can open-source llms truly promise on context length,
+  2023.
+
+Shenggui Li, Fuzhao Xue, Yongbin Li, and Yang You. Sequence parallelism: Making 4d parallelism
+  possible. arXiv preprint arXiv:2105.13120, 2021.
+
+Hao Liu and Pieter Abbeel. Blockwise parallel transformer for long context large models. arXiv
+  preprint arXiv:2305.19370, 2023.
+
+Liyuan Liu, Jialu Liu, and Jiawei Han. Multi-head or single-head? an empirical comparison for
+  transformer training. arXiv preprint arXiv:2106.09650, 2021.
+
+Nelson F Liu, Kevin Lin, John Hewitt, Ashwin Paranjape, Michele Bevilacqua, Fabio Petroni, and
+  Percy Liang. Lost in the middle: How language models use long contexts. arXiv preprint
+  arXiv:2307.03172, 2023.
+
+Maxim Milakov and Natalia Gimelshein. Online normalizer calculation for softmax. arXiv preprint
+ arXiv:1805.02867, 2018.
+
+
+                                               10
+Under review as a conference paper at ICLR 2024
+
+
+Erik Nijkamp, Bo Pang, Hiroaki Hayashi, Lifu Tu, Huan Wang, Yingbo Zhou, Silvio Savarese,
+  and Caiming Xiong. Codegen: An open large language model for code with multi-turn program
+  synthesis. arXiv preprint arXiv:2203.13474, 2022.
+Anton Osika.  gpt-engineer, 2023.             URL https://github.com/AntonOsika/
+  gpt-engineer.
+Adam Paszke, Sam Gross, Francisco Massa, Adam Lerer, James Bradbury, Gregory Chanan, Trevor
+  Killeen, Zeming Lin, Natalia Gimelshein, Luca Antiga, et al. Pytorch: An imperative style, high-
+  performance deep learning library. Advances in neural information processing systems, 32, 2019.
+Guilherme Penedo, Quentin Malartic, Daniel Hesslow, Ruxandra Cojocaru, Alessandro Cappelli,
+  Hamza Alobeidli, Baptiste Pannier, Ebtesam Almazrouei, and Julien Launay. The RefinedWeb
+  dataset for Falcon LLM: outperforming curated corpora with web data, and web data only. arXiv
+  preprint arXiv:2306.01116, 2023. URL https://arxiv.org/abs/2306.01116.
+Alec Radford, Jeffrey Wu, Rewon Child, David Luan, Dario Amodei, Ilya Sutskever, et al. Language
+  models are unsupervised multitask learners. OpenAI blog, 1(8):9, 2019.
+Samyam Rajbhandari, Jeff Rasley, Olatunji Ruwase, and Yuxiong He. Zero: Memory optimizations
+  toward training trillion parameter models. In SC20: International Conference for High Perfor-
+  mance Computing, Networking, Storage and Analysis, pp. 1–16. IEEE, 2020.
+Mohammad Shoeybi, Mostofa Patwary, Raul Puri, Patrick LeGresley, Jared Casper, and Bryan
+ Catanzaro. Megatron-lm: Training multi-billion parameter language models using model par-
+ allelism. arXiv preprint arXiv:1909.08053, 2019.
+Yutao Sun, Li Dong, Barun Patra, Shuming Ma, Shaohan Huang, Alon Benhaim, Vishrav
+  Chaudhary, Xia Song, and Furu Wei. A length-extrapolatable transformer. arXiv preprint
+  arXiv:2212.10554, 2022.
+Philippe Tillet, Hsiang-Tsung Kung, and David Cox. Triton: an intermediate language and compiler
+  for tiled neural network computations. In Proceedings of the 3rd ACM SIGPLAN International
+  Workshop on Machine Learning and Programming Languages, pp. 10–19, 2019.
+Hugo Touvron, Thibaut Lavril, Gautier Izacard, Xavier Martinet, Marie-Anne Lachaux, Timothée
+  Lacroix, Baptiste Rozière, Naman Goyal, Eric Hambro, Faisal Azhar, et al. Llama: Open and
+  efficient foundation language models. arXiv preprint arXiv:2302.13971, 2023.
+Yizhong Wang, Hamish Ivison, Pradeep Dasigi, Jack Hessel, Tushar Khot, Khyathi Raghavi
+  Chandu, David Wadden, Kelsey MacMillan, Noah A. Smith, Iz Beltagy, and Hannaneh Hajishirzi.
+  How far can camels go? exploring the state of instruction tuning on open resources, 2023.
+Thomas Wolf, Lysandre Debut, Victor Sanh, Julien Chaumond, Clement Delangue, Anthony Moi,
+  Pierric Cistac, Tim Rault, Rémi Louf, Morgan Funtowicz, et al. Huggingface’s transformers:
+  State-of-the-art natural language processing. arXiv preprint arXiv:1910.03771, 2019.
+Manzil Zaheer, Guru Guruganesh, Kumar Avinava Dubey, Joshua Ainslie, Chris Alberti, Santiago
+ Ontanon, Philip Pham, Anirudh Ravula, Qifan Wang, Li Yang, et al. Big bird: Transformers for
+ longer sequences. Advances in neural information processing systems, 33:17283–17297, 2020.
+Yanli Zhao, Andrew Gu, Rohan Varma, Liang Luo, Chien-Chin Huang, Min Xu, Less Wright,
+  Hamid Shojanazeri, Myle Ott, Sam Shleifer, et al. Pytorch fsdp: experiences on scaling fully
+  sharded data parallel. arXiv preprint arXiv:2304.11277, 2023.
+Lianmin Zheng, Wei-Lin Chiang, Ying Sheng, Siyuan Zhuang, Zhanghao Wu, Yonghao Zhuang,
+  Zi Lin, Zhuohan Li, Dacheng Li, Eric. P Xing, Hao Zhang, Joseph E. Gonzalez, and Ion Stoica.
+  Judging llm-as-a-judge with mt-bench and chatbot arena, 2023.
+
+
+                                               11
+Under review as a conference paper at ICLR 2024
+
+
+A PPENDIX
+
+A     U SING D ISTATTN IN L IGHT S EQ
+
+
+Algorithm 1 D ISTATTN in L IGHT S EQ (forward pass)
+                                           𝑁
+Require: Matrices Q 𝑝 , K 𝑝 , V 𝑝 ∈ R P ×𝑑 in HBM, block sizes 𝐵𝑐 , 𝐵𝑟 , rank
+ 1: function STANDALONEl FWD     m (q, k, v, o, ℓ, m, causal, last)
+                              𝑁
+ 2:    Divide 𝑞 into 𝑇𝑟 = P𝐵𝑟 blocks 𝑞 1 , . . . , 𝑞 𝑇𝑟 of size 𝐵𝑟 × 𝑑 each,
+                                   l     m
+                                     𝑁
+ 3:    and divide 𝑘, 𝑣 in to 𝑇𝑐 = P𝐵   𝑐
+                                           blocks 𝑘 1 , . . . , 𝑘 𝑇𝑐 and 𝑣 1 , . . . , 𝑣 𝑇𝑐 , of size 𝐵𝑐 × 𝑑 each.
+                                      𝑁
+ 4:     Divide the output 𝑜 ∈ R P ×𝑑 into 𝑇𝑟 blocks 𝑜𝑖 , . . . , 𝑜𝑇𝑟 of size 𝐵𝑟 × 𝑑 each, and divide the
+    logsumexp 𝐿 into 𝑇𝑟 blocks 𝐿 𝑖 , . . . , 𝐿 𝑇𝑟 of size 𝐵𝑟 each.
+ 5:     for 1 ≤ 𝑖 ≤ 𝑇𝑟 do
+ 6:         Load 𝑞 𝑖 from HBM to on-chip SRAM.
+ 7:         Load 𝑜𝑖 ∈ R 𝐵𝑟 ×𝑑 , ℓ𝑖 ∈ R 𝐵𝑟 , 𝑚 𝑖 ∈ R 𝐵𝑟 from HBM to on-chip SRAM as 𝑜𝑖(0) , ℓ𝑖(0) , 𝑚 𝑖(0) .
+ 8:         for 1 ≤ 𝑗 ≤ 𝑇𝑐 do
+ 9:             if causal and 𝑖 ≤ 𝑗 then
+10:                 Continue
+11:             end if
+12:             Load 𝑘 𝑗 , 𝑣 𝑗 from HBM to on-chip SRAM.
+                                     ( 𝑗)
+13:             On chip, compute 𝑠𝑖 = 𝑞 𝑖 𝑘 𝑇𝑗 ∈ R 𝐵𝑟 ×𝐵𝑐 .
+                                           ( 𝑗)             ( 𝑗 −1)              ( 𝑗)            ( 𝑗)           ( 𝑗)
+14:               On chip, compute 𝑚 𝑖            = max(𝑚 𝑖           , rowmax(𝑠𝑖 )) ∈ R 𝐵𝑟 , 𝑝˜𝑖       = exp(𝑆𝑖       −
+      ( 𝑗)                         ( 𝑗)             𝑗 −1 ( 𝑗)
+                                                   ( 𝑗 −1)                  ( 𝑗)
+                                                   𝑚𝑖 −𝑚𝑖
+    𝑚 𝑖 ) ∈ R 𝐵𝑟 ×𝐵𝑐 (pointwise), ℓ𝑖 = 𝑒         ℓ𝑖          + rowsum( 𝑝˜𝑖 ) ∈ R 𝐵𝑟 .
+                                    ( 𝑗)     ( 𝑗 −1)     ( 𝑗)     (   −1)      ( 𝑗)
+               On chip, compute 𝑜𝑖 = diag(𝑒 𝑚𝑖 −𝑚𝑖 ) −1 𝑜𝑖
+                                                                    𝑗
+15:                                                                       + 𝑝˜𝑖 𝑣 𝑝𝑗 .
+16:            end for
+17:            On chip, compute 𝑜𝑖 = diag(ℓ𝑖(𝑇𝑐 ) ) −1 𝑜𝑖(𝑇𝑐 ) .
+18:            Write 𝑜𝑖 to HBM as the 𝑖-th block of 𝑜.
+19:            if last then
+20:                 On chip, compute 𝐿 𝑖 = 𝑚 𝑖(𝑇𝑐 ) + log(ℓ𝑖(𝑇𝑐 ) ).
+21:                 Write 𝐿 𝑖 to HBM as the 𝑖-th block of 𝐿.
+22:            end if
+23:      end for
+24:      Return 𝑜, ℓ, 𝑚 and the logsumexp 𝐿.
+25: end function                       𝑁                         𝑁                           𝑁
+26: Initialize O 𝑝 = (0) 𝑁 ×𝑑 ∈ R P ×𝑑 , ℓ ( 𝑝) = (0) 𝑁 ∈ R P , 𝑚 𝑝 = (−∞) 𝑁 ∈ R P .
+                              P                         P                            P
+27: O 𝑝 , ℓ 𝑝 , 𝑚 𝑝 , 𝐿 𝑝 = standalone fwd(Q 𝑝 , K 𝑝 , V 𝑝 , O 𝑝 , ℓ 𝑝 , 𝑚 𝑝 , True, p=1)
+28: for 1 ≤ 𝑟 < 𝑝 do
+29:      Receive K𝑟 and V𝑟 from Remote worker 𝑟 into HBM.
+30:      O 𝑝 , ℓ 𝑝 , 𝑚 𝑝 , 𝐿 𝑝 = standalone fwd(Q 𝑝 , K 𝑦 , V 𝑦 , O 𝑝 , ℓ 𝑝 , 𝑚 𝑝 , False, r=(p-1)
+31:      Delete K𝑟 and V𝑟 from HBM.
+32: end for
+33: Return the output O 𝑝 and the logsumexp 𝐿.
+
+
+
+In this section, we provide more details of D ISTATTN, and how it can be used with the outer L IGHT-
+S EQ logic of the forward pass (Alg 1). For conceptual simplicity, we demonstrate it in the most
+vanilla version, without the actual scheduling (e.g. load balancing and overlapping). We also demon-
+strate it with the causal language modeling objective. The standalone attention is mainly borrowed
+from the FlashAttention2 paper (Dao, 2023). To make it compatible with D ISTATTN, we mainly
+revised the several points:
+
+      1. Accumulate results statistics 𝑜, 𝑚 and 𝑙 from previous computation, instead of initializing
+         them inside the function.
+
+
+                                                          12
+Under review as a conference paper at ICLR 2024
+
+
+      2. Pass an extra argument ”last”, which means whether this is the last chunk of attention
+         computation. Only when it is true, we compute the logsumexp 𝐿.
+
+At a high level, on a worker 𝑝, L IGHT S EQ first initializes local statistics 𝑚, 𝑙, 𝐿. Then L IGHT S EQ
+loops over all its previous workers. In each iteration, it fetches the key and the value from a worker
+and invokes the revised standalone attention to update local statistics. At the end of the iteration,
+it needs to delete the remote key and value from HBM so that the memory does not accumulate.
+At the last iteration of the loop, it additionally calculates the logsumexp according to the final 𝑚
+and 𝑙 (the ”last” variable in the algorithm). At the end of the forward pass, worker 𝑝 has the correct
+𝑚, 𝑙, 𝐿. The backward pass is similar and conceptually simpler because we do not need to keep track
+of statistics such as 𝑚 and 𝑙. Instead, we only need to use the logsumexp stored in the forward pass.
+
+B    C OMPARISON WITH D EEP S PEED U LYSSES
+We run a subset of the experiments compared with DeepSpeed-Ulysses. Firstly, DeepSpeed-Ulysses
+does reduce the communication overhead, and thus better than Megatron-LM on scenarios listed in
+Table 4. L IGHT S EQ achieves better performance than DeepSpeed-Ulysses on longer sequences
+or models with a more general number of heads (e.g. Llama-33H). We also note that DeepSpeed-
+Ulysses can not scale beyond the number of attention heads because it also relies on sharding the
+attention heads. However, we need to point out that in shorter sequences and MHA models (where
+L IGHT S EQ does not have a communication advantage, compared to GQA/MQA models), the com-
+munication primitives used in DeepSpeed-Ulysses are more advantageous. We leave our further
+optimization in P2P in shorter sequences and MHA models as an exciting future work.
+
+C    L OAD - BALANCING A LGORITHM FOR C AUSAL M ODELING
+In this section, we detail the design of our load-balancing algorithm for causal modeling. We show
+the workload of each worker in all time steps in Figure 6 (before applying load-balancing) and
+Figure 7 (after applying load-balancing) in an 8-worker scenario. The communication schema is
+also reflected in both figures by comparing the tensors each worker holds at the consecutive two
+time steps.
+
+D    C OMPARISON WITH R ING S ELF -ATTENTION (RSA)
+Ring self-attention is among the first sequence parallelism work for Transformers, proposed in Li
+et al. (2021). It communicates tensors in a ring fashion. Firstly, we report the maximal sequence
+length of RSA and L IGHT S EQ in Table 5, and found that L IGHT S EQ supports at least 8x longer
+sequences than RSA. This is mainly because RSA is not natively compatible with memory-efficient
+attention (i.e. it modifies the attention computation). We further measure the iteration time with
+the maximal sequence length RSA can support in Table 6, and found that L IGHT S EQ is 4.45x -
+5.64x faster than RSA. This is mainly because L IGHT S EQ has optimized sequence parallelism
+in (1) causal language objective ( 2x speedup), and (2) memory-efficient attention (Dao, 2023).
+In explanation, memory-efficient attention also speeds up the attention computation by carefully
+managing the IO during attention, as pointed out in (Dao et al., 2022; Dao, 2023).
+
+E    M EMORY C ONSUMPTION FOR P IPELINE PARALLELISM
+In this section, we show the memory consumption of Megatron-LM when training with tensor par-
+allelism and pipeline parallelism. As presented in table 7, memory consumption are uneven across
+different pipeline stages, making scaling through pipeline parallelism hard.
+
+
+                                                  13
+Under review as a conference paper at ICLR 2024
+
+
+         Method                  # GPUs      Sequence Length            Time        Speedup
+                                             Per GPU Total
+        Llama-7B
+                                  2x8            4K          64K        5.29          1.0x
+                                  2x8            8K         128K       14.26          1.0x
+     Megatron-LM
+                                  2x8           16K         256K       43.44          1.0x
+                                  2x8           32K         512K       147.06         1.0x
+                                  2x8            4K          64K        4.29         1.23x
+                                  2x8            8K         128K       11.61         1.23x
+ DeepSpeed-Ulysses
+                                  2x8           16K         256K       37.53         1.16x
+                                  2x8           32K         512K       134.09        1.10x
+                                  2x8            4K          64K        6.85         0.77x
+                                  2x8            8K         128K       12.75         1.12x
+       L IGHT S EQ
+                                  2x8           16K         256K       30.21         1.44x
+                                  2x8           32K         512K       106.37        1.38x
+       Llama-33H
+                                  2x8            4K          64K        7.52          1.0x
+                                  2x8            8K         128K       20.63          1.0x
+     Megatron-LM
+                                  2x8           16K         256K       62.78          1.0x
+                                  2x8           32K         512K       216.70         1.0x
+                                  2x8            4K          64K        6.42         1.17x
+                                  2x8            8K         128K       17.47         1.18x
+ DeepSpeed-Ulysses
+                                  2x8           16K         256K       56.63         1.11x
+                                  2x8           32K         512K       202.89        1.07x
+                                  2x8            4K          64K        7.03         1.07x
+                                  2x8            8K         128K       13.12         1.57x
+       L IGHT S EQ
+                                  2x8           16K         256K       31.33         2.00x
+                                  2x8           32K         512K       107.76        2.01x
+Table 4: Per iteration wall-clock time of L IGHT S EQ, Megatron-LM (Korthikanti et al., 2023) and
+DeepSpeed Ulysses (Unit: seconds). Speedup in bold denotes the better of the three systems. We
+calculate the speedup based on Megatron-LM iteration time. Time measured with cluster 2, 2 DGX
+boxes.
+
+
+
+       Table 5: Maximal sequence length on Llama-7B on the DGX (A100-80GB) cluster.
+
+                                  1 Node (8 GPUs)     2 Nodes (16 GPUs)
+                      RSA              32K                  64K
+                   L IGHT S EQ        > 256K               > 512K
+
+
+                                               14
+Under review as a conference paper at ICLR 2024
+
+
+        Figure 6: Illustration of D ISTATTN before applying load-balancing on 8 workers.
+                                               15
+Under review as a conference paper at ICLR 2024
+
+
+            Figure 7: Illustration of D ISTATTN after applying load-balancing on 8 workers.
+
+
+        Table 6: Per iteration time comparison with RSA (seconds) on the DGX clusters.
+
+                                          1 Node (32K)      2 Nodes (64K)
+                               RSA             14.10            30.49
+                            L IGHT S EQ         2.50             6.85
+                             Speedup           5.64x            4.45x
+
+
+Table 7: The memory consumption of Megatron-LM when training Llama-2H with tensor paral-
+lelism (degree=2) and pipeline parallelism (degree=8) on 16xA100 40GB GPUs at the sequence
+length of 128K. The memory consumption is highly uneven across pipeline stages.
+
+              Worker 1   Worker 2   Worker 3   Worker 4   Worker 5   Worker 6   Worker 7   Worker 8
+   node 1     31.5GB     31.4GB     28.7GB     28.7GB     26.0GB     26.0GB     24.6GB     24.6GB
+   node 2     21.8GB     21.8GB     20.5GB     20.5GB     17.9GB     17.8GB     32.0GB     32.1GB
+
+
+
+                                                   16

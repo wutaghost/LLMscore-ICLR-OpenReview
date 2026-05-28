@@ -1,0 +1,615 @@
+Under review as a conference paper at ICLR 2025
+
+
+000
+001
+      D E M O : D ECOUPLED M OMENTUM O PTIMIZATION
+002
+003    Anonymous authors
+004    Paper under double-blind review
+005
+006
+007
+                                                 A BSTRACT
+008
+009
+               Training large scale neural networks typically involves sharing the gradients be-
+010
+               tween all accelerators, which necessitates specialized high-speed interconnects.
+011
+               Taking cues from signal processing, we show that it is not necessary to share or
+012            synchronize the full optimizer states and model parameters during training. By
+013            decoupling the momentum and allowing divergence in the optimizer states across
+014            accelerators, it is possible to even improve convergence compared to previous state
+015            of the art optimizers. From this, we introduce Decoupled Momentum, a fused
+016            optimizer and data parallel algorithm (DeMo) that reduces the communication re-
+017            quirements by several orders of magnitude, potentially enabling future training of
+018            large neural networks on slow internet bandwidths with heterogeneous network-
+019            ing hardware. Furthermore, our method is agnostic to the network topology and
+020
+               neural network architecture, and supports scalable clock-synchronous distributed
+               training with negligible compute and memory overhead. Empirically, we show
+021
+               that models trained with DeMo match or surpass the performance of equal models
+022
+               trained with AdamW, entirely bypassing the need for high-speed interconnects for
+023            pre-training large scale foundation models.
+024
+025
+026   1   I NTRODUCTION
+027
+028   Large scale neural networks, particularly language models, are characterized by high parameter
+029   counts. Indeed, it is not uncommon to talk about models with trillions of parameters. To train these
+030   models, multiple accelerators (e.g. GPUs, TPUs) must be used to make training time tractable.
+031   There are multiple strategies to split the training among these accelerators, such as Distributed Data
+032   Parallelism (Li et al., 2020) and Fully Sharded Data Parallelism (Zhao et al., 2023). These techniques
+033
+      work by having the accelerators split the weights and synchronize the gradients (sometimes multiple
+      times per step), the size of which is on the order of the size of the model itself.
+034
+035   Gradient synchronization between accelerators necessitates the use of specialized high-speed in-
+036   terconnects (e.g. Infiniband). These interconnects are expensive localized networking topologies,
+037   which requires that all accelerators be present in the same data center. However, if the amount of
+038   data needed to be synchronized could be massively reduced, these requirements could be relaxed.
+039   In this paper we show that the gradients and optimizer states during training of many large scale
+040   neural networks are redundant and highly compressible. Armed with this knowledge, we develop
+041   DeMo, an optimizer that leverages this compressibility to reduce the communication needs between
+042   accelerators by several order of magnitudes. To evaluate DeMo, we train a standard LLM architec-
+043   ture (decoder-only Transformer (Vaswani, 2017)) using the baseline optimizer (AdamW (Loshchilov
+044   & Hutter, 2019)) on traditional high-speed interconnect as well as with DeMo under bandwidth con-
+045
+      strained scenarios, and show that the models trained with DeMo meet or exceed the performance of
+      their vanilla counterparts.
+046
+047
+048   2   BACKGROUND AND R ELATED W ORK
+049
+050   To mitigate the communication overhead in distributed training, a variety of strategies have been
+051   employed over the years. The most effective techniques for centralized and clock-synchronous
+052   training can be sorted into three broad categories:
+053
+
+
+
+                                                        1
+      Under review as a conference paper at ICLR 2025
+
+
+054
+             • Quantization and sparsification of gradients.
+055
+056          • Low rank projection of gradients.
+057          • Federated averaging (also known as Local-SGD).
+058
+059   It is important to note that this work will not consider asynchronous methods, decentralized methods
+060   or any method that requires the use of specific network topologies or neural network architectures.
+061   Such methods constitute a distinct class of techniques; they introduce considerable complexity in
+062   analysis, are not generalizable to all use cases, and involve numerous factors that are beyond the
+063   scope of this study. Rather, we will restrict our focus to the simplest and most generalizable scenario:
+064   a centralized and clock-synchronous distributed optimizer.
+065
+066   2.1    Q UANTIZATION AND S PARSIFICATION
+067
+068   Previous work, such as (Wang et al., 2023), focuses mainly on the compressibility of the gradients
+069   as-is, within the assumption that the gradient values are uncorrelated and tolerant to quantization
+070
+      and sparsification errors. Of note, the compression gain that can be obtained from quantization
+      is bounded – a 16-bit gradient can only be at most compressed down to one bit. The gain from
+071
+      sparsification is unbounded, but sparsifiction can only achieve limited compression ratios without
+072
+      hampering training, and is therefore best suited for fine-tuning existing models.
+073
+074
+075
+      2.2    L OW R ANK P ROJECTION
+076
+      It was shown in (Zhao et al., 2024) that the gradients of LLMs are very low rank during training.
+077   As such, a Singular Value Decomposition (SVD) can be used to find a low rank projection matrix
+078   that preserves the most significant directions of the gradient, and the model can be optimized using
+079   only the projected gradients. This drastically reduces the size of the gradients and optimizer states
+080   that have to be stored and transmitted to other accelerator nodes. A disadvantage of this approach
+081   is that finding the SVD of the gradients of a very large model is expensive, and the relatively large
+082   projection matrix must be shared or recomputed across all nodes. This overhead can be reduced
+083   by not recomputing the SVD and projection matrices every single step, but it remains a significant
+084   bottleneck that only gets worse as the model size increases. However, as this method achieves
+085
+      convergence1 parity with full rank optimizers when pre-training LLMs, it teaches us a very important
+      and useful lesson: that compression using a low rank projection is better than sparsity and should be
+086
+      investigated further.
+087
+088
+089   2.3    F EDERATED AVERAGING
+090
+      In (McMahan et al., 2017), federated averaging is used to reduce the amount of communication
+091
+      needed between nodes during a distributed training run. Essentially, each accelerator node trains
+092
+      independently for a fixed number of steps, then synchronizes the accelerator nodes by averaging
+093   their weights, which means that the gradient and optimizer states do not need to be communicated
+094   for every single step. However, at synchronization this method still requires sharing the full param-
+095   eter weights across every node, which has the same order of bandwidth cost as unmodified training.
+096   Furthermore, increasing the number of steps between synchronizations hurts convergence, exchang-
+097   ing one training speed bottleneck with another. In one extreme, the training iterations run very fast
+098   because there is little communication between the nodes, but convergence is very slow. In the other
+099   extreme, we can have convergence parity with traditional optimizers, but the time spent synchroniz-
+100   ing the parameters becomes significant, so on average one iteration will be prohibitively slow. The
+101
+      optimal point is somewhere in the middle. In practice, federated averaging slows down training by a
+      non-negligible factor and does not scale well with respect to the number of accelerator nodes, which
+102
+      makes it difficult to find the optimal hyper-parameters2 for specific training runs.
+103
+104      1
+           Rate of loss decrease per iteration, or per minibatch of data.
+105      2
+           A lot of extraneous variables unrelated to the optimizer itself will affect the optimal hyper-parameters,
+106   such as (but not exclusively), the number of accelerator nodes, the network bandwidth, the neural network
+107   architecture, the batch sizes, etc. In most cases, federated averaging only works on a case-by-case basis, and is
+      not suitable as a drop-in optimizer replacement.
+
+
+                                                             2
+      Under review as a conference paper at ICLR 2025
+
+
+108
+      3     M ETHODOLOGY
+109
+110
+      Rather than relying on ad-hoc modifications of existing optimization algorithms, we propose in
+111   this work a novel and general decoupled momentum optimization algorithm that allows and utilizes
+112   different optimizer states between accelerators.
+113
+114   3.1     A SSUMPTIONS
+115
+116   To formulate our method, we made three crucial assumptions that, while currently lacking theoretical
+117   proof, show indications of validity based on empirical evidence.
+118
+119   Conjecture 3.1 Fast moving components of the momentum are highly spatially auto-correlated,
+120
+      most of the energy of the momentum is concentrated in a few principal components.
+121
+      Conjecture 3.2 Fast moving components of the momentum have low temporal variance and should
+122
+      be used to update the parameters immediately, whereas slow moving components of the momentum
+123   have high temporal variance and should be smoothed out temporally and be used over a longer
+124   period of time.
+125
+126   Conjecture 3.3 Slow moving components of the momentum are very important for long-term con-
+127   vergence, they should not be filtered out or be discarded.
+128
+129   We will not formally prove any of these conjectures in this work, but the optimizer that we show
+130   was made with all of these assumptions in mind. We hope that by proposing this novel method, it
+131
+      can help develop these ideas further in future research.
+132
+133   3.2     A LGORITHM
+134
+      Starting from the SGD with Momentum optimization algorithm, we first remove the all-reduce op-
+135   eration on the gradients g̃k , decoupling the momentum m in each accelerator node. Then, after
+136   updating the momentum, we extract and remove from it the fast components q, which can be syn-
+137   chronized very efficiently with a minimal amounts of data being transmitted. The pseudo-code of
+138   the algorithm is described in Algorithm 1.
+139
+140   Algorithm 1 Decoupled Momentum Optimization
+141     Input: learning rate η, decay β ∈ (0, 1), parameters xt , momentum mt , hyperparameters s, k
+142     g̃t ← LocalStochasticGradient(xt )                        ▷ Get local gradient g without all-reduce
+143     mt ← βmt + g̃t                                            ▷ Accumulate gradient in momentum m
+144     qt ← ExtractFastComponents(mt , s, k)                          ▷ Extract fast components q from m
+145     mt+1 ← mt − qt                                                                  ▷ Remove q from m
+146     Qt ← Synchronize(qt )                                       ▷ Synchronize q across all accelerators
+147     xt+1 ← xt − ηQt                                                             ▷ Parameter update step
+148
+149
+      3.2.1    E FFICIENT E XTRACTION OF FAST M OVING C OMPONENTS
+150
+151   In order for our method to work, we first have to decorrelate, separate and extract the principal
+152   components from the momentum during training. Assuming 3.1 is true, one way would be to apply
+153   a spatial Kosambi–Karhunen–Loève Transform (KLT) to the momentum in order to separate the
+154   faster moving components from the slower ones. However, computing the KLT on the momentum
+155   of a large neural network with billions or even trillions of parameters is prohibitively expensive.
+156   Alternatively, taking cues from signal processing work, the Discrete Cosine Transform (DCT) can
+157   act as an approximation of the KLT, if used for the purpose of energy compaction, as they are
+158   both decorrelating transforms. It is shown that for highly spatially correlated signals, the DCT
+159   approximation approaches the KLT (Roma & Sousa, 2011). While the DCT approximation is not
+160   perfect, it has many advantages that cannot be overlooked. Firstly, the DCT is highly parallelizable
+161   and is extremely fast to compute on modern GPUs. Furthermore, it being a separable transform
+      ensures that its computational complexity scales linearly for 2D, 3D or even n-dimensional signals.
+
+
+                                                       3
+      Under review as a conference paper at ICLR 2025
+
+
+162
+      Finally, the DCT has a fixed orthogonal basis, which means it is possible to perfectly decode a DCT-
+163   encoded signal without any auxiliary information; the transform matrix and its inverse are known in
+164   advance.
+165
+166
+      If 3.1 is true, we can assume that the DCT would be a good approximation to the KLT for extracting
+      the fast moving components from our momentum, as the momentum is assumed to be spatially
+167
+      auto-correlated. Empirically, we found that using the DCT alone is enough to extract a very good
+168
+      approximation of the principal components.
+169
+170   During training, we treat each momentum tensor as a d-dimensional auto-correlated signal, and
+171   we chunk each momentum tensor of shape (n0 , n1 , ..., nd−1 ) into contiguous chunks with shape
+172
+      (s0 , s1 , ..., sd−1 ), where each si is a divisor of ni , and apply a separable d-dimensional decorre-
+      lating DCT transform on all chunks. Next, we find the top-k DCT frequencies with the biggest
+173
+      amplitudes in each chunk and treat them as if they were the principal components of the momentum.
+174
+      Both (s0 , s1 , ..., sd−1 ) and k are hyperparameters and control the size of the effective ”rank” of the
+175   frequencies that we extract.
+176
+177   After extracting the highest energy frequencies, we are left with two tensors of size
+178
+      ( ns00 , ns11 , ..., nsd−1
+                             d−1
+                                 , k), one tensor representing the discrete frequency bins as integer indices, the other
+179   representing the amplitudes as a floating point number.
+180   Effectively what we have done here is create a fast transform p that tries to maximize ”energy
+181   compaction”. This way, most of the ”movement” described by the momentum can be compressed
+182   down to fewer numbers without resorting to sparsity or quantization, which is a similar idea to but
+183   is not exactly the same as a low rank projection. For ease of reference, we will define the transform
+184   p here as follows, where s is the vector representing the chunk sizes for each dimension of mt :
+185
+                                             m̃t f req , m̃t ampl = p(mt , s, k)                                    (1)
+186
+187
+      We can reverse this transform by first scattering both frequency and amplitude tensors onto a sparse
+188
+      tensor chunked the same way as before, then apply the inverse DCT transform, obtaining something
+189
+      close to the “fast moving components” q of the original momentum:
+190
+191                                            qt = p−1 (m̃t f req , m̃t ampl )                                     (2)
+192
+193
+      The next step’s momentum is then set to be equal to the residual, which represents the ”slow moving
+      components” of the original momentum:
+194
+195                                                  mt+1 = mt − qt                                                 (3)
+196
+197   Note that because the principal components are removed from the momentum at each step, the
+198   momentum decay rate should be lowered in general. For example, β = 0.999 would be a more
+199   reasonable value for pre-training a LLM, instead of the usual β = 0.9.
+200
+      Also, since the DCT is computed on relatively small static chunks of shape (s0 , s1 , ..., sd−1 ), the
+201
+      required transition matrices can be pre-computed in advance and reused at each iteration, which
+202   makes the memory and computational overhead almost negligible if implemented correctly.
+203
+204
+      3.2.2    L OW BANDWIDTH S YNCHRONIZATION
+205
+206   After extracting m̃t f req , m̃t ampl from the momentum mt , we can then perform an all-gather on the
+207   last dimension of the extracted bins. This allows us to perform the same inverse DCT operation by
+208   scattering both frequency and amplitude tensors the same way as before, but this time we average
+209   the amplitude of any duplicate frequencies. If s and k are chosen appropriately, the two tensors
+210   m̃t f req , m̃t ampl can be orders of magnitude smaller than the size of the model, which allows for a
+211   communications efficient way of synchronizing the update step across all accelerators.
+212   Given 3.2 and 3.3, here we are effectively averaging all of the fast moving components of the mo-
+213   mentum at each step, while letting the slow moving components be decoupled from each-other. If
+214   we assume that slow moving components in the gradient are high variance, they will be accumulated
+215   over time in the momentum. As such, slow moving components can slowly overtake fast moving
+      components in strength, which is then transmitted and removed from the momentum. From this,
+
+
+                                                              4
+      Under review as a conference paper at ICLR 2025
+
+
+216
+      we can conclude that slow moving components are gradually transmitted alongside the immediate
+217   transmission of fast components.
+218
+219   Finally, the gradient descent step is described here, where η is the learning rate and Qt the fast
+220
+      moving components of the momentum accumulated from all accelerators:
+221
+                                                     θt+1 = θt − ηQt                                               (4)
+222
+223
+224   3.3     S IGNUM
+225
+226   In order to improve convergence when training LLMs, a signum (Bernstein et al., 2018) variant of
+227
+      DeMo can be used instead, where the gradient descent step is replaced by:
+228
+                                                θt+1 = θt − η sign(ηQt )                                           (5)
+229
+230
+231
+      Since the second moment is not computed here, this variant of DeMo uses less memory for optimizer
+      states as compared to AdamW.
+232
+233
+234   4       E XPERIMENTAL RESULTS
+235
+236
+      We performed experiments on the signum variant of DeMo using OLMo (Groeneveld et al., 2024),
+237
+      a highly reproducible large language model pre-training framework. Adapting OLMo to use DeMo
+238   consisted only of including the DeMo optimizer class in the training code. The only additional
+239   change needed was disabling the gradient synchronization in PyTorch Distributed Data Paral-
+240   lelism (Li et al., 2020). We have publicly released the modified OLMo code as well as the con-
+241   figuration files for all experiments.
+242
+      Our experiments used the Dolma v1.53 dataset for pre-training. As a baseline we used the publicly
+243
+      released OLMo-1B4 , a standard decoder-only Transformer model consisting of 1.18 billion param-
+244   eters using the AdamW optimizer (β1 = 0.9, β2 = 0.95, weight decay = 0.1) as compared to using
+245   the DeMo optimizer (β = 0.999).
+246
+247
+      Due to constrained compute availability we trained models for 100 billion total tokens rather than
+      the full 3 trillion tokens in Dolma. As a secondary baseline and for complete comparability we
+248
+      re-trained OLMo-1B with these same 100 billion tokens and the learning rate schedule adjusted
+249
+      accordingly. We also repeated the experiments on a smaller 300M model identical to the 1B except
+250   halving the model’s hidden size. All experiments were performed on 64 H100 GPUs with a global
+251   batch size of 2048 with a sequence length 2048 tokens, resulting in a per-GPU batch size of 8.
+252
+253
+      Figure 1 shows the cross-entropy training loss of DeMo to the reference AdamW model for vari-
+      ous values of the hyperparameters k and fixed shape5 of s = 64. Additionally we report the final
+254
+      training loss, per-GPU communication requirements, and downstream evaluation scores of the Hel-
+255
+      laswag (Zellers et al., 2019), ARC-Easy (Clark et al., 2018), and PiQA (Bisk et al., 2020) tasks for
+256   these configurations as well as s = 128 in Table 1.
+257
+258
+259   5       C ONCLUSION
+260
+261   In conclusion, we have shown that our proposed DeMo optimization algorithm can act as a drop-in
+262   replacement to AdamW when training LLMs, with no noticeable slowdown in convergence while
+263   reducing communication requirements by several orders of magnitude. The signum variant of DeMo
+264   is more memory efficient than AdamW and has negligible compute overhead if we use small pre-
+265   computed DCT transition matrices. Finally, the LLMs pre-trained with DeMo have equivalent or
+266   better scores on multiple standard benchmarks compared to their equivalents trained with AdamW.
+267
+          3
+268         https://huggingface.co/datasets/allenai/dolma/blob/main/urls/v1_5.txt
+          4
+269         https://huggingface.co/allenai/OLMo-1B
+          5
+            For brevity, s = 64 means a shape of (64, 64) for a 2D parameter tensor and (64, ..., 64) for a n-D tensor.
+
+
+                                                              5
+      Under review as a conference paper at ICLR 2025
+
+
+270
+                                   300M                                                   1B
+271
+                                                                        2.9
+272
+273
+            3.1
+274
+275
+                                                                        2.8
+276
+277             3
+278
+279                                                                     2.7
+280
+281         2.9
+282                        AdamW                                                  AdamW
+283                                                                     2.6
+284                 0          10,000           20,000                        0      10,000           20,000
+285                            Training Steps                                        Training Steps
+286
+287             k = 32             k = 16            k=8                 k=4            k=2               k=1
+288
+289
+290   Figure 1: Convergence of training cross-entropy loss across model sizes trained on 100B tokens of
+291   reference AdamW and DeMo with s = 64 for various values of k hyperparameter
+292
+293                                                         300M
+294                     Loss                    Hellaswag                 ARC-Easy                    PIQA
+295        3                          0.4
+296                                  0.38                         0.5                    0.68
+      2.95
+297                                  0.36
+          2.9                                                    0.48
+298
+                                     0.34                                                0.66
+299   2.85                                                       0.46
+                                     0.32
+300
+          2.8                         0.3    0.44               0.64
+301             1 2 4 8 16 32 1 2 4 8 16 32       1 2 4 8 16 32      1 2 4 8 16 32
+302                  k              k                  k                   k
+303
+                                           1B
+304
+               Loss             Hellaswag           ARC-Easy             PIQA
+305
+306
+       2.8                0.5                0.56               0.72
+307   2.75               0.48
+                                             0.54
+308                      0.46                                    0.7
+       2.7                                   0.52
+309                      0.44
+310   2.65               0.42                                   0.68
+                                              0.5
+311    2.6                0.4
+312
+           1 2 4 8 16 32      1 2 4 8 16 32       1 2 4 8 16 32      1 2 4 8 16 32
+313             k                   k                  k                   k
+314
+315
+316   Figure 2: Final loss and downstream evaluation scores of model sizes trained on 100B tokens for
+317
+      various values of the k hyperparameter. The red line represents the reference AdamW training run.
+318
+319
+320   6     R EPRODUCIBILITY S TATEMENT
+321
+322   As described in Section 4 we chose the OLMo framework and references to maximize reproduca-
+323   bility and comparability of our experiments. We have provided as publicly available supplementary
+      material a standalone PyTorch implementation of DeMo, as well as the minimal patch to OLMo
+
+
+                                                             6
+      Under review as a conference paper at ICLR 2025
+
+
+324
+       Model                   Final Loss ↓    Hellaswag ↑    ARC-Easy ↑       PIQA ↑     Data Tx ↓
+325
+                                                acc norm         acc          acc norm     MB/step
+326
+327    DeMo 300M
+328    s = 64,   k = 32             2.87           0.37            0.46          0.67           29.9
+329    s = 64,   k = 16             2.87           0.38            0.50          0.67           14.9
+330    s = 64,   k=8                2.88           0.38            0.47          0.67           7.49
+331    s = 64,   k=4                2.89           0.37            0.47          0.67           3.74
+332    s = 64,   k=2                2.93           0.36            0.46          0.65           1.87
+333
+       s = 64,   k=1                2.97           0.35            0.45          0.65           0.93
+334    s = 128, k = 32              2.88           0.37            0.50          0.66           7.49
+335    s = 128, k = 16              2.90           0.37            0.47          0.67           3.74
+336    s = 128, k = 8               2.93           0.36            0.49          0.66           1.87
+337    s = 128, k = 4               2.98           0.35            0.46          0.64           0.93
+338    s = 128, k = 2               3.06           0.33            0.45          0.65           0.46
+339
+       s = 128, k = 1               3.16           0.31            0.45          0.63           0.23
+340    AdamW-DDP 300M               2.98           0.35            0.46          0.65          636.9
+341    DeMo 1B
+342
+343
+       s = 64,   k = 32             2.63           0.48            0.55          0.70         110.32
+       s = 64,   k = 16             2.63           0.47            0.53          0.70          55.16
+344
+       s = 64,   k=8                2.64           0.47            0.52          0.69          27.58
+345
+       s = 64,   k=4                2.67           0.45            0.52          0.70          13.79
+346    s = 64,   k=2                2.71           0.44            0.51          0.69           6.89
+347    s = 64,   k=1                2.76           0.41            0.52          0.69           3.44
+348
+       s = 128, k = 32              2.65           0.46            0.53          0.69          27.58
+349
+       s = 128, k = 16              2.67           0.46            0.50          0.70          13.79
+350
+       s = 128, k = 8               2.72           0.44            0.52          0.68           6.89
+351    s = 128, k = 4               2.76           0.41            0.50          0.67           3.44
+352
+353
+       AdamW-DDP 1B                 2.73           0.43            0.51          0.68         2416.6
+354
+355   Table 1: Results of training loss, downstream evaluation scores, and per-GPU communication re-
+356   quirements of the model sizes and reference trained on 100B tokens
+357
+358
+      and configuration files used for the experiments. We do this in hopes of encouraging independent
+359
+      reproduction and improvement of our method.
+360
+361
+362   R EFERENCES
+363
+      Jeremy Bernstein, Yu-Xiang Wang, Kamyar Azizzadenesheli, and Anima Anandkumar. signsgd:
+364
+         compressed optimisation for non-convex problems. In International Conference on Machine
+365      Learning, 2018. URL https://api.semanticscholar.org/CorpusID:7763588.
+366
+367   Yonatan Bisk, Rowan Zellers, Ronan Le bras, Jianfeng Gao, and Yejin Choi. Piqa: Reasoning about
+368     physical commonsense in natural language. Proceedings of the AAAI Conference on Artificial
+369     Intelligence, 34(05):7432–7439, Apr. 2020. doi: 10.1609/aaai.v34i05.6239. URL https://
+370     ojs.aaai.org/index.php/AAAI/article/view/6239.
+371
+      Peter Clark, Isaac Cowhey, Oren Etzioni, Tushar Khot, Ashish Sabharwal, Carissa Schoenick, and
+372
+        Oyvind Tafjord. Think you have solved question answering? try arc, the ai2 reasoning challenge,
+373     2018. URL https://arxiv.org/abs/1803.05457.
+374
+375   Dirk Groeneveld, Iz Beltagy, Pete Walsh, Akshita Bhagia, Rodney Kinney, Oyvind Tafjord, A. Jha,
+376     Hamish Ivison, Ian Magnusson, Yizhong Wang, Shane Arora, David Atkinson, Russell Authur,
+377     Khyathi Raghavi Chandu, Arman Cohan, Jennifer Dumas, Yanai Elazar, Yuling Gu, Jack Hessel,
+        Tushar Khot, William Merrill, Jacob Daniel Morrison, Niklas Muennighoff, Aakanksha Naik,
+
+
+                                                     7
+      Under review as a conference paper at ICLR 2025
+
+
+378
+        Crystal Nam, Matthew E. Peters, Valentina Pyatkin, Abhilasha Ravichander, Dustin Schwenk,
+379     Saurabh Shah, Will Smith, Emma Strubell, Nishant Subramani, Mitchell Wortsman, Pradeep
+380     Dasigi, Nathan Lambert, Kyle Richardson, Luke Zettlemoyer, Jesse Dodge, Kyle Lo, Luca Sol-
+381     daini, Noah A. Smith, and Hanna Hajishirzi. Olmo: Accelerating the science of language mod-
+382     els. arXiv preprint, 2024. URL https://api.semanticscholar.org/CorpusID:
+383     267365485.
+384
+      Shen Li, Yanli Zhao, Rohan Varma, Omkar Salpekar, Pieter Noordhuis, Teng Li, Adam Paszke, Jeff
+385
+        Smith, Brian Vaughan, Pritam Damania, and Soumith Chintala. Pytorch distributed: experiences
+386
+        on accelerating data parallel training. Proc. VLDB Endow., 13(12):3005–3018, Aug 2020. ISSN
+387     2150-8097.
+388
+389   Ilya Loshchilov and Frank Hutter. Decoupled weight decay regularization. In International Confer-
+390      ence on Learning Representations, 2019. URL https://openreview.net/forum?id=
+391      Bkg6RiCqY7.
+392   Brendan McMahan, Eider Moore, Daniel Ramage, Seth Hampson, and Blaise Aguera y Ar-
+393     cas. Communication-Efficient Learning of Deep Networks from Decentralized Data. In
+394     Aarti Singh and Jerry Zhu (eds.), Proceedings of the 20th International Conference on Artifi-
+395     cial Intelligence and Statistics, volume 54 of Proceedings of Machine Learning Research, pp.
+396     1273–1282. PMLR, 20–22 Apr 2017. URL https://proceedings.mlr.press/v54/
+397     mcmahan17a.html.
+398
+      Nuno Roma and Leonel Sousa. A tutorial overview on the properties of the discrete cosine
+399
+        transform for encoded image and video processing. Signal Processing, 91(11):2443–2464,
+400     2011. ISSN 0165-1684. doi: https://doi.org/10.1016/j.sigpro.2011.04.015. URL https:
+401     //www.sciencedirect.com/science/article/pii/S0165168411001137.
+402
+403   A Vaswani. Attention is all you need. Advances in Neural Information Processing Systems, 2017.
+404
+      Jue Wang, Yucheng Lu, Binhang Yuan, Beidi Chen, Percy Liang, Christopher De Sa, Christopher
+405     Re, and Ce Zhang. CocktailSGD: Fine-tuning foundation models over 500Mbps networks. In An-
+406     dreas Krause, Emma Brunskill, Kyunghyun Cho, Barbara Engelhardt, Sivan Sabato, and Jonathan
+407     Scarlett (eds.), Proceedings of the 40th International Conference on Machine Learning, volume
+408     202 of Proceedings of Machine Learning Research, pp. 36058–36076. PMLR, 23–29 Jul 2023.
+409     URL https://proceedings.mlr.press/v202/wang23t.html.
+410
+      Rowan Zellers, Ari Holtzman, Yonatan Bisk, Ali Farhadi, and Yejin Choi. HellaSwag: Can a ma-
+411
+        chine really finish your sentence? In Proceedings of the 57th Annual Meeting of the Association
+412
+        for Computational Linguistics, pp. 4791–4800, Florence, Italy, July 2019. Association for Com-
+413     putational Linguistics. doi: 10.18653/v1/P19-1472. URL https://aclanthology.org/
+414     P19-1472.
+415
+416   Jiawei Zhao, Zhenyu Zhang, Beidi Chen, Zhangyang Wang, Anima Anandkumar, and Yuandong
+417      Tian. Galore: Memory-efficient llm training by gradient low-rank projection, 2024.
+418   Yanli Zhao, Andrew Gu, Rohan Varma, Liang Luo, Chien-Chin Huang, Min Xu, Less Wright,
+419     Hamid Shojanazeri, Myle Ott, Sam Shleifer, Alban Desmaison, Can Balioglu, Bernard Nguyen,
+420     Geeta Chauhan, Yuchen Hao, and Shen Li. PyTorch FSDP: Experiences on scaling fully sharded
+421     data parallel, 2023. arXiv: 2304.11277.
+422
+423
+424
+425
+426
+427
+428
+429
+430
+431
+
+
+
+                                                     8

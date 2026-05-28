@@ -1,0 +1,1532 @@
+Published as a conference paper at ICLR 2025
+
+
+ED I T:           A      L OCAL -SGD-BASED E FFICIENT D IS -
+TRIBUTED                T RAINING M ETHOD FOR L ARGE L AN -
+GUAGE M ODELS
+
+ Jialiang Cheng, Ning Gao, Yun Yue, Zhiling Ye, Jiadi Jiang, Jian Sha ∗
+ Ant Group
+ {jichen.cjl,yunsheng.gn,yueyun.yy}@antgroup.com
+ {yezhiling.yzl,jiadi.jjd,jian.sha}@antgroup.com
+
+
+
+                                              A BSTRACT
+
+           Distributed training methods are crucial for large language models (LLMs). How-
+           ever, existing distributed training methods often suffer from communication bot-
+           tlenecks, stragglers, and limited elasticity, particularly in heterogeneous or large-
+           scale environments. Local SGD methods have been proposed to address these
+           issues, but their effectiveness remains limited to small-scale training due to ad-
+           ditional memory overhead and lack of concerns on efficiency and stability. To
+           tackle these issues, we propose EDiT, an innovative Efficient Distributed Training
+           method that combines a tailored Local SGD approach with model sharding tech-
+           niques to enhance large-scale training efficiency. EDiT performs layer-wise pa-
+           rameter synchronization during forward pass, reducing communication and mem-
+           ory overhead and enabling overlap. Besides, EDiT employs a pseudo gradient
+           penalty strategy to suppress loss spikes, which ensures training stability and im-
+           proves performance. Additionally, we introduce A-EDiT, a fully asynchronous
+           variant of EDiT that accommodates heterogeneous clusters. Building on EDiT/A-
+           EDiT, we conduct a series of experiments to validate large-scale asynchronous
+           training for LLMs, accompanied by comprehensive analyses. Experimental re-
+           sults demonstrate the superior performance of EDiT/A-EDiT, establishing them
+           as robust solutions for distributed LLM training in diverse computational ecosys-
+           tems. The code is available at Atorch codebase 1 .
+
+
+1       I NTRODUCTION
+
+With the explosive growth of model scale and data volume (Touvron et al., 2023; Bai et al., 2023),
+distributed methods (Rajbhandari et al., 2020; Narayanan et al., 2021; Dean et al., 2012) become
+increasingly critical for training deep neural networks. These approaches rely on synchronous
+paradigm, which introduces significant communication overhead during the training process (Douil-
+lard et al., 2023). Besides, the synchronous paradigm also introduces the straggler problem, where
+faster workers are idle waiting for the slower ones to catch up. This issue is particularly prevalent
+in large/heterogeneous clusters (Lian et al., 2018). Lastly, in resource-constrained clusters, there is
+a compelling need for elastic training (Li et al., 2023). However, synchronous training paradigms
+struggle in elastic settings, where dynamic scaling of resources disrupts optimal hyperparameters.
+These challenges have spurred significant research into distributed optimization methods. A typi-
+cal method is Local Stochastic Gradient Descent (a.k.a Local SGD or Local-Update SGD) (Zhang
+et al., 2016), where each worker independently executes multiple local optimization steps in parallel
+before averaging model parameters across all workers. Subsequent studies have improved upon this
+foundational paradigm to improve the performance (Lin et al., 2019; Wang et al., 2019; Douillard
+et al., 2023). However, existing Local SGD methods are not easily applicable to the training of
+large language models (LLMs). These methods do not handle model sharding well, preventing their
+application to models larger than billions of parameters. Moreover, they have focused on small-
+    ∗
+        Corresponding author.
+    1
+        https://github.com/intelligent-machine-learning/atorch/
+
+
+                                                    1
+Published as a conference paper at ICLR 2025
+
+
+                                                                        Forward Pass                                             Backward Pass                          Local Update
+  Worker D                Worker A
+   Params                   Params
+
+
+                                            Worker A
+                                                                          Module 𝒍                                                 Module 𝒍
+  Module 𝟏                 Module 𝟏                    …     All       All                   Free Full   …     All       Back-      Reduce       All    Free Full   …     Update
+ Shard 1 Shard 2          Shard 1 Shard 2                                      Forward                                                                                    Params
+                   Fast                                    Reduce     Gather                 Params           Gather     ward       Scatter    Reduce   Params
+    …                        …
+  Module 𝑳                 Module 𝑳
+ Shard 1 Shard 2          Shard 1 Shard 2          Sync Params (Periodic)                                                             Sync Grads (Warmup)
+
+
+                                            Worker B
+                                                                          Module 𝒍                                                 Module 𝒍
+       Slow
+
+
+                                Slow
+                                                       …                                                 …                                                          …     Update
+                                                             All       All                   Free Full         All       Back-      Reduce       All    Free Full
+                                                                               Forward                                                                                    Params
+                                                           Reduce     Gather                 Params           Gather     ward       Scatter    Reduce   Params
+ Worker C                 Worker B
+   Params                   Params
+                                                                   Gather Params                         Gather Params            Sync Grads
+  Module 𝟏                 Module 𝟏
+
+
+                                            Worker C
+ Shard 1 Shard 2          Shard 1 Shard 2
+    …              Fast      …                                            Module 𝒍                                                 Module 𝒍
+                                                       …                                                 …                                                          …      Update
+  Module 𝑳                 Module 𝑳                          All       All                   Free Full         All       Back-      Reduce       All    Free Full
+                                                                               Forward                                                                                     Params
+ Shard 1 Shard 2          Shard 1 Shard 2                  Reduce     Gather                 Params           Gather     ward       Scatter    Reduce   Params
+
+
+
+          Held             Released                                                  Operation                    Communication                              Communication
+                                                       Operation
+          Params           Params                                                    (Optional)                   (Model Sync Group)                         (Model Shard Group)
+
+
+Figure 1: The schematic illustration of our proposed EDiT method with 4 workers and a 2×2 device
+mesh as an example. The left part shows the communication groups and parameter sharding, and
+the right part presents the detailed computation and communication flows within worker B.
+
+
+scale, highly curated datasets (Zhang et al., 2016; Douillard et al., 2023), making their results less
+transferable to LLM training that relies on vast, noisy datasets where instability may be introduced
+during training. Besides, although current Local SGD methods diminish the impact of random strag-
+glers, they still struggle with the presence of consistent stragglers within heterogeneous devices (Liu
+et al., 2024). Additionally, in most existing Local SGD methods, parameter synchronization oper-
+ations will introduce non-overlapped communication overhead (Sun et al., 2023). Lastly, current
+Local SGD methods predominantly employ a uniform averaging strategy to synchronize the pa-
+rameters, failing to fully capitalize on the inherent differences in training progress across diverse
+workers (Douillard et al., 2023).
+To address these challenges, we propose a novel Efficient Distributed Training (EDiT) method for
+large language models. As illustrated in Figure 1, EDiT employs a hierarchical distribution strategy
+on a two-dimensional device mesh, where all workers are data parallel. Model parameters are fully
+sharded along the model shard dimension and synchronized along the model sync dimension. With
+the efficient communication links within the model shard groups and the low-frequency periodic
+synchronization strategy within the model sync groups, the impact of communication overhead and
+random stragglers is effectively alleviated. When synchronizing parameters, EDiT operates layer
+by layer during the forward pass and makes use of a prefetch strategy to overlap computation and
+communication, thereby reducing the additional communication and GPU memory overhead intro-
+duced by parameter synchronization. Additionally, EDiT employs a novel pseudo-gradient penalty
+method, which addresses the instability problem caused by diverse large-scale corpus and leverages
+the differences among workers to improve performance. Furthermore, we propose an asynchronous
+variant of the EDiT method named A-EDiT to deal with the consistent stragglers in heterogeneous
+clusters. We conducted a comprehensive evaluation of our proposed methods on LLM tasks, demon-
+strating its effectiveness compared to state-of-the-art methods.
+Our primary contributions can be summarized as follows:
+
+              • Engineering Innovation: We introduce EDiT, an efficient large-scale distributed training
+                method that integrates Local SGD with the model sharding strategy. EDiT reduces the
+                impact of stragglers and communication overhead and supports elastic training.
+              • Algorithmic Novelty: EDiT performs layer-wise parameter sync during forward pass to
+                reduce communication and memory overhead. With prefetch strategy, the parameter-sync
+                communication can be further overlapped with computation. Besides, we propose a new
+                pseudo gradient penalty method to improve the training stability and model performance.
+                We also provide a fully asynchronous variant of EDiT, called A-EDiT, to address the chal-
+                lenges of consistent stragglers.
+              • Practical Contributions: We provide a large-scale verification of asynchronous pre-training
+                for LLMs, along with an extensive analysis of convergence, generalization, acceleration,
+                scalability, and stability. This work offers critical insights into optimizing asynchronous
+                distributed LLM training at scale.
+
+
+                                                                                         2
+Published as a conference paper at ICLR 2025
+
+
+2     R ELATED W ORK
+
+One of the early works that proposed the concept of Local SGD was Zhang et al. (2016), establishing
+the paradigm of parallel multi-step training followed by periodic averaging. Lin et al. (2019) intro-
+duced the Post Local SGD method, which starts with standard synchronized training for warm-up
+before switching to the Local SGD mode. SlowMo (Wang et al., 2019) utilizes a slow momentum
+to transform model averaging into moving average. DiLoCo (Douillard et al., 2023) demonstrates
+that the Nesterov optimizer (Nesterov, 1983) is suitable as an outer optimizer. Multi-Level Local
+SGD (Castiglia et al., 2020) partition the network into disjoint sub-networks and hierarchically syn-
+chronizes the models. Wang & Joshi (2019) and Balles et al. (2023) have respectively explored
+the optimal hyperparameter settings for Local SGD. Shen et al. (2021) advocated for gradually in-
+creasing synchronization intervals while decreasing learning rates to optimize model performance.
+Extensive theoretical analyses of Local SGD have also emerged. Yu et al. (2019), Khaled et al.
+(2020), Spiridonoff et al. (2020), and Deng et al. (2022) examined convergence rates under various
+conditions. Gu et al. (2022) found that Local SGD improves generalization with a small learning
+rate and long training duration. Pan & Song (2023) demonstrated faster convergence by leveraging
+second-order information.
+Researchers have also explored the combination of Local SGD with asynchronous training
+paradigms that decouple computation and communication. Early works were predominantly based
+on the federated learning framework (Xie et al., 2019). FedBuff (Nguyen et al., 2022) updates the
+server model only after accumulating a certain amount of pseudo gradients. DN-DyLN (Liu et al.,
+2024) improves the buffer mechanism to employ delayed Nesterov update. TimelyFL (Zhang et al.,
+2023) dynamically adjusts the local training workload according to the real-time resource situation.
+Subsequently, several works based on other architectures were also proposed. Gossip-PGA (Chen
+et al., 2021) incorporates periodic global averaging into the gossip SGD framework (Lian et al.,
+2017). CO2 (Sun et al., 2023) utilizes Local SGD and asynchronous communication to hide the
+overhead. A key challenge for asynchronous training is the staled model problem, resulting in infe-
+rior performance compared to synchronous training methods (Liu et al., 2024).
+Notably, current All-Reduce-based Local SGD methods (Lin et al., 2019; Wang et al., 2019; Sun
+et al., 2023) hold complete model parameters on each GPU, making it difficult to handle model
+sharding for LLM training. Although Sun et al. (2023) claims that they can combine CO2 with
+ZeRO series optimizers (Rajbhandari et al., 2020), the additional communication introduced de-
+grades CO2 to a synchronized mode, negating the performance gains from periodic synchronization
+and overlapped communication. Furthermore, the extra parameters and outer momentum further
+increase memory pressure, limiting their scalability to larger models. In contrast, our proposed
+EDiT and A-EDiT methods effectively utilize the characteristics of model sharding, leveraging de-
+vice mesh, layer-wise parameter synchronization, prefetch strategy, and CPU offload to minimize
+communication and memory overhead, making it more suitable for LLM training.
+
+
+3     M ETHOD
+
+3.1   OVERVIEW
+
+Our proposed EDiT method integrates model sharding with periodic synchronization to acceler-
+ate the training of LLMs. The detailed procedure of EDiT is illustrated in Figure 1 and for-
+mally outlined in Algorithm 1 in Appendix. To start with, EDiT builds an M × N device mesh
+across K workers : M model sync groups G r = {G1r , · · · , GM  r
+                                                                  } with each comprising N workers
+Gi = {W(i,1) , W(i,2) , · · · , W(i,N ) } , and N model shard groups G s = {G1s , · · · , GN
+  r                                      2                                                 s
+                                                                                             } with each
+                             s
+comprising M workers Gi = {W(1,i) , W(2,i) , · · · , W(M,i) }, where M × N = K. This structured
+arrangement aims to tailor communication patterns to the diverse capabilities and network latencies
+inherent in the distributed system. For instance, in a multi-node GPU cluster where intra-node com-
+munication is significantly faster than inter-node communication, all GPUs within the same node
+can be connected as a model shard group, while GPUs of the same rank across different nodes
+can be connected as a model sync group. Model parameters are sharded uniformly in each model
+   2
+     The employment of double subscripts herein is merely a notational convenience to denote the relationship
+between workers and groups. Similar considerations apply to the cases discussed below.
+
+
+                                                     3
+Published as a conference paper at ICLR 2025
+
+
+shard group and each worker Wi retains a fraction of each parameter for the complete L modules:
+θ (i) = {θ (i,1) , · · · , θ (i,L) }. In this way, workers as a whole within a model shard group Gis main-
+tain a complete replica of model parameters: θ = Concat({θ (i) : θ (i) ∈ Gis }), while workers
+within a model sync group Gir maintain an identical shard of the parameters. The EDiT method
+centralizes communication-intensive operations within the model shard groups and utilizes peri-
+odic synchronization to mitigate the communication overhead in the model sync groups, thereby
+achieving training acceleration. To enhance the stability of the initial training process, EDiT utilizes
+a two-phase training strategy. This begins with a warmup phase using standard mini-batch SGD,
+followed by a periodic synchronization phase utilizing Local SGD. More specifically,
+      1. During the forward pass of the l-th module, if the current updated step requires model
+         synchronization, i.e., (t∗τ +p) > twarm and p == 0 where t is the outer step, p is the inner
+         step, twarm is the number of warmup steps and τ is the synchronization interval, parameters
+         are synced in model sync groups, as outlined in lines 7 to 9 in Algorithm 1. In practice,
+         the communication overhead is minimal due to the large synchronization interval (τ ≫ 1)
+         and sharded parameters. Herein a novel pseudo gradient penalty strategy is introduced
+         to enhance training stability that will be detailed in Section 3.2. After that, each worker
+         gathers the full module parameters through its model shard group for forward computations
+         and promptly frees excess parameters to conserve memory.
+      2. During the backward pass of the l-th module, workers again aggregate parameters via
+         model shard groups for gradient calculations, followed by a reduce-scatter operation to
+         average gradients across each model shard group. If the current step t is within the warmup
+         phase, i.e., t ≤ twarm , an additional all-reduce operation will be performed within each
+         model sync group to synchronize gradients across all workers; otherwise this operation will
+         be skipped (lines 19 to 21). Afterwards, each worker frees the excess parameters.
+      3. Once all modules have completed one forward-backward iteration, the optimizer updates
+         the local parameters of each worker. Note that to distinguish from the outer optimizer
+         (OuterOpt) used in parameter synchronization, we refer to the optimizer for local updates
+         as the inner optimizer (InnerOpt).
+Different from other Local SGD methodologies that synchronize parameters before next step, EDiT
+performs layer-wise parameter synchronization during forward pass. In practice, we normally em-
+ploy a prefetch strategy that aggregates parameters for the upcoming module concurrently with
+ongoing computations, with which communications within model sync groups can be effectively
+overlapped with forward computations. In this way, EDiT further diminishes the additional commu-
+nication overhead introduced by parameter synchronization.
+It is also noteworthy that EDiT is compatible with most current large-scale distributed training
+frameworks. Although this manuscript mainly discusses its integration within ZeRO-3/FSDP frame-
+work (Rajbhandari et al., 2020), it can be transposed with relative ease to other frameworks such as
+3D parallelism (Shoeybi et al., 2019).
+
+3.2   P SEUDO G RADIENT P ENALTY
+
+                                                                           Pseudo Gradients Penalty
+                               − 𝜽(𝟏,𝒍)
+                                  𝒕                                                                                                         (𝟏,𝒍)
+                                                                                                                                           𝜽𝒕
+                                                                                      ×𝒘𝟏 = 𝟎
+           Worker A    (𝟏,𝒍)
+                      𝜽𝒕,𝝉
+                                             (𝟏,𝒍)
+                                            𝚫𝒕                                (𝟏,𝒍)
+                                                                             𝚫𝒕                 Anomaly                         '(𝟏,𝒍)
+                                                                                                                                𝚫 𝒕
+                                                                                                                                                     (𝟏,𝒍)
+                                                                                                                                                    𝜽𝒕+𝟏
+                                                                                                                                         𝐎𝐮𝐭𝐞𝐫𝐎𝐩𝐭
+                                                     Eliminate Anomalies
+
+
+                                    (𝟐,𝒍)
+                               −   𝜽𝒕                                                                                                       (𝟐,𝒍)
+                                                                                                                                           𝜽𝒕
+                       (𝟐,𝒍)                 (𝟐,𝒍)                            (𝟐,𝒍)   ×𝒘𝟐                                                            (𝟐,𝒍)
+           Worker B   𝜽𝒕,𝝉                  𝚫𝒕                               𝚫𝒕                                                 '(𝟐,𝒍)
+                                                                                                                                𝚫 𝒕                 𝜽𝒕+𝟏
+                                                                                                                                         𝐎𝐮𝐭𝐞𝐫𝐎𝐩𝐭
+                                                                                                +          𝐂𝐥𝐢𝐩          𝐒𝐲𝐧𝐜
+                               −    (𝟑,𝒍)
+                                   𝜽𝒕                                                               #(𝒍)
+                                                                                                    𝚫 𝒕
+                                                                                                                  '(𝒍)
+                                                                                                                  𝚫 𝒕                       (𝟑,𝒍)
+                                                                                                                                           𝜽𝒕
+                       (𝟑,𝒍)                 (𝟑,𝒍)                            (𝟑,𝒍)   ×𝒘𝟑                                                            (𝟑,𝒍)
+           Worker C   𝜽𝒕,𝝉                  𝚫𝒕                               𝚫𝒕                                                 '(𝟑,𝒍)
+                                                                                                                                𝚫 𝒕                 𝜽𝒕+𝟏
+                                                                                                                                         𝐎𝐮𝐭𝐞𝐫𝐎𝐩𝐭
+                               − 𝜽(𝟒,𝒍)
+                                  𝒕                                                                                                         (𝟒,𝒍)
+                                                                                                                                           𝜽𝒕
+                       (𝟒,𝒍)                 (𝟒,𝒍)                            (𝟒,𝒍)   ×𝒘𝟒                                                            (𝟒,𝒍)
+           Worker D   𝜽𝒕,𝝉                  𝚫𝒕                               𝚫𝒕                                                 '(𝟒,𝒍)
+                                                                                                                                𝚫 𝒕                 𝜽𝒕+𝟏
+                                                                                                                                         𝐎𝐮𝐭𝐞𝐫𝐎𝐩𝐭
+
+
+Figure 2: Illustration of model synchronization and our proposed pseudo gradient penalty method,
+depicted with an example of four workers in a model sync group.
+Despite diligent data cleaning efforts, there are still significant amount of low-quality data in the
+LLM pre-training corpora (Albalak et al., 2024), resulting in training instability manifested as loss
+
+
+                                                                                      4
+Published as a conference paper at ICLR 2025
+
+
+spikes. This issue can be addressed by large batch sizes typical of synchronous training regimes, but
+becomes salient in Local SGD regimes where each worker operates on relatively smaller batches.
+To tackle this issue, we introduce a novel pseudo gradient penalty strategy at the parameter syn-
+chronization stage, as depicted in Figure 2 and Algorithm 2 in Appendix. This strategy consists of
+anomaly elimination, weighted averaging, and gradient clipping. To illustrate the idea, we use a
+                      r
+model sync group Gm     = {W1 , · · · , WN } as an example. We begin by computing the pseudo gradi-
+       (i,l)    (i,l)   (i,l)                          (i,l)
+ents ∆t = θt,τ − θt for each worker, where θt,τ is the sharded parameters of module l held
+                                                                          (i,l)
+by worker Wi at outer step t and inner step τ , and θt                             denotes the corresponding synchronized
+parameters at the beginning of outer step t.
+Anomaly elimination. We first eliminate the significantly anomalous workers to reduce their ad-
+verse impacts on the overall model performance. Since anomalies cause substantial parameter fluc-
+tuations and lead to large pseudo-gradient norms, we use the pseudo-gradient norm as the criterion.
+Here we utilize an Exponential Moving Average (EMA) z-test method for statistical analysis. Let
+  (i,l)      (i,l)
+Gt = ∥∆t ∥2 denotes the pseudo gradient norm for the worker Wi , then the EMA z-score can
+                                (i,l)        (i,l)
+                   (i,l)       Gt       −µt                    (i,l)            (i,l)
+be calculated by zt        =         (i,l)           , where µt        and σt           are the EMA mean and standard devi-
+                                    σt
+           (i,l)                                     (i,l)                                             (i,l)
+ation of Gt , respectively. A worker Wi with zt            > δ is identified as an anomaly and its Gt
+                                                                                       (i,l)     (i,l)
+will be set to infinity, where δ is a threshold, typically set to 3 in practice. Both µt and σt are
+updated at each step using an exponential moving average to capture the convergence trend of the
+gradient norm during the training process:
+                                                 q
+         (i,l)     (i,l)           (i,l)   (i,l)             (i,l)         (i,l)  (i,l)      (1)
+       µt+1 = αGt + (1 − α)µt , σt+1 = (1 − α)(σt )2 + α(Gt − µt+1 )2 ,
+where α is a weighting coefficient, commonly assigned a value of 0.02 in practical applications.
+                                                   (i,l)
+The update of Equation 1 will be skipped if Gt is infinite. In the preliminary stage, a warm-up
+                                              (i,l)      (i,l)
+period is set to establish stable values for µt and σt , during which no workers are flagged as
+anomalies. Notably, to maintain consistent updates within the same module, we compute the pseudo
+gradient norm for the entire module, and subsequently introduced gradient norm-related operations
+follow the same procedure. Because this process only introduces one scalar communication in the
+model shard groups, the overhead is negligible. If all workers are identified anomalous, all the
+                                                                               (i,l)
+parameters will be effectively rollbacked to the last synchronized parameters θt .
+Weighted averaging. Furthermore, considering that large pseudo gradients may still exert consid-
+erable impacts on the overall update direction, we propose to weigh the pseudo gradients of each
+worker based on the norms, which was similarly demonstrated in Thakkar et al. (2023). The weight
+                                                         r
+assigned to the pseudo gradients corresponding to Wi ∈ Gm  is calculated by
+                                                                           (i,l)
+                                                             exp(−Gt )
+                                                     wt,i = P        (j,l)
+                                                                             .                                          (2)
+                                                             j exp(−Gt     )
+In this way, a larger pseudo gradient norm leads to stronger suppression, thereby allowing all workers
+to contribute equally to the update direction and thus increasing the likelihood to find the correct
+                                                                                                r
+direction. Following that, by performing a weighted summation of all pseudo gradients in Gm       , we
+obtain the synchronized pseudo gradients:
+                                 ¯ (i,l) =            (j,l)
+                                           X
+                                                                    r
+                                 ∆ t          wt,j ∆t , ∀ Wi ∈ Gm     .                             (3)
+                                                         j
+
+
+Gradient clip. We then adopt a gradient clip strategy to constrain the update step size. Let
+  (i,l)     ¯ (i,l) ∥2 denote the synchronized pseudo gradient norm and ϕ denote the threshold, the
+Ḡt     = ∥∆  t
+clip coefficient is computed by
+                                                                       (i,l)
+                                               βt = min(ϕ/(Ḡt                 + ϵ), 1),                                (4)
+where ϵ is a small positive constant to avoid division by zero. The pseudo gradients are clipped by
+                                                        b (i,l) = βt ∆
+                                                        ∆            ¯ (i,l) .                                          (5)
+                                                          t            t
+
+
+                                                                  5
+Published as a conference paper at ICLR 2025
+
+
+                                               (i,l)        (i,l)                        (i,l)      (i,l)
+Proceeding further, we update θt                         by θt+1 = OuterOpt(θt                   ,∆
+                                                                                                  b
+                                                                                                    t       ) on each worker.
+In EDiT, the extra parameters and outer momentum on each worker are sharded in correspondence
+with the sharded parameters. Compared to previous methods that maintain full extra parameters and
+outer momentum on each worker, EDiT reduces the additional memory usage. Additionally, based
+on layer-wise synchronization and prefetch strategy, EDiT can further offload the extra parameters
+and outer momentum to the CPU and only transfer the corresponding layer’s data to GPU as needed,
+thereby further minimizing memory overhead. Since the data for each layer is relatively small,
+the GPU-CPU data transfer can be effectively overlapped with GPU computations and GPU-GPU
+communications, ensuring fast parameter synchronization.
+
+3.3   A SYNCHRONOUS ED I T
+
+        Faster Worker                                                     Faster Worker
+        Local Update   Local Update               Idle         Sync       Local Update    Local Update      Local Update   Idle   Sync
+
+        Slower Worker                                                     Slower Worker
+              Local Update                   Local Update      Sync             Local Update                    Local Update      Sync
+
+
+
+                             Step Interval                                               Time Interval
+
+
+         (a) The synchronization scheme of EDiT.                          (b) The synchronization scheme of A-EDiT.
+
+           Figure 3: A comparison of the synchronization scheme of EDiT and A-EDiT.
+
+EDiT requires periodic synchronization at every τ inner iterations. However, the fastest worker
+idles awaiting the peers to finish τ iterations even if it completes its own τ iterations earlier. As a
+consequence, the overall training efficiency is pegged to the slowest worker. This issue becomes
+more pronounced in heterogeneous clusters, where nodes are equipped with diverse devices.
+Intuitively, it would be beneficial to allow different workers to train at their own pace and remove
+the constraint of fixed-step synchronization. Therefore, we propose an asynchronous variant of the
+EDiT method, named A-EDiT. The differences are depicted in Figure 3. Herein, we set a fixed
+time interval τtime , and let each worker update locally until surpassing this specified time threshold.
+Then, a parameter synchronization ensues. This modification enables faster workers to undertake
+more iterations in each inner loop. Theoretically, no worker will wait longer than the single step
+time of the slowest worker at each parameter synchronization. We empirically verified that A-EDiT
+achieves faster training in all scenarios with comparable model performance.
+
+4     E XPERIMENTS
+4.1   E XPERIMENTAL S ETUPS
+
+Models We consider four different scales of Llama models (Touvron et al., 2023) in our experi-
+ments: 350M, 1B, 3B, and 7B. Their specific configurations are detailed in Table 3 in Appendix.
+Datasets We use a new large-scale open-source dataset, FineWeb-Edu (Lozhkov et al., 2024) in our
+experiments. Additionally, we also utilize an in-house private out of production pre-training dataset,
+which we will refer to as in-house dataset below.
+Baselines We consider several state-of-the-art methods, including standard mini-batch (Baseline),
+Post Local SGD (Lin et al., 2019), DiLoCo (Douillard et al., 2023), and CO2/CO2* (Sun et al.,
+2023). Here CO2* is the memory-efficient version of CO2 that shards extra parameters and outer
+momentum across workers (Sun et al., 2023).
+Training Following DiLoCo (Douillard et al., 2023), we use AdamW (Loshchilov & Hutter, 2019)
+as the inner optimizer and Nesterov momentum (Nesterov, 1983) as the outer optimizer. The models
+are initialized with µP (Yang et al., 2021) for efficient hyperparameter search. Synchronization
+intervals τ and τtime are set to 128 and 600s, respectively. Experiments are conducted on eight
+Nvidia A100 GPU nodes with 64 GPUs and an 8 × 8 device mesh. ϕ is 10 for pseudo gradient clip.
+For more detailed setups, please refer to the Appendix A.2.
+
+
+                                                                      6
+  Published as a conference paper at ICLR 2025
+
+
+  4.2                    C ONVERGENCE AND G ENERALIZATION
+                5.5                                                                          34                             Baseline 17.42                    5.5                                                                                                                  Baseline 9.82
+                          3.1                     Baseline 2.852
+                                                  PLS 2.954
+                                                                                                   18.5
+                                                                                                                            PLS 18.65                                   2.6                           Baseline 2.345
+                                                                                                                                                                                                      DiLoCo 2.389
+                                                                                                                                                                                                                                               21                                  DiLoCo 10.31
+                                                                                             31                                                               5.0
+
+
+                                                                     Validation Perplexity
+
+
+                                                                                                                                                                                                                       Validation Perplexity
+                5.0       2.9                     DiLoCo 2.859                                     17.5                     DiLoCo 17.49
+                                                                                                                                                                        2.4                           EDiT 2.335                               19                                  EDiT 9.94
+                                                  CO2 2.920                                                                 CO2 18.08                                                                 A-EDiT 2.359                                                                 A-EDiT 10.02
+                                                                                                                                                              4.5
+Training Loss
+
+
+                                                                                                                                              Training Loss
+                4.5                               EDiT 2.848                                 28                             EDiT 17.38
+                          2.7
+                            95k   97.5k   100k    A-EDiT 2.867                                     16.5
+                                                                                                      95k   97.5k   100k    A-EDiT 17.43
+                                                                                                                                                              4.0
+                                                                                                                                                                        2.2
+                                                                                                                                                                         145k    147.5k    150k                                                17                         10.5
+                4.0                                                                          25                                                                                                                                                15                         10.0
+                                                                                                                                                              3.5
+                3.5                                                                          22                                                               3.0                                                                              13                          9.5
+                                                                                                                                                                                                                                                                            145k   147.5k   150k
+                3.0                                                                          19                                                               2.5                                                                              11
+                2.50     20k      40k       60k   80k        100k                            160   20k      40k       60k   80k        100k                   2.00    25k       50k       75k     100k 125k 150k                                90    25k   50k     75k     100k 125k 150k
+                                      Steps                                                                     Steps                                                                 Steps                                                                        Steps
+
+                 (a) FineWeb-Edu loss.                                                       (b) FineWeb-Edu PPL.                                                    (c) In-house loss.                                                              (d) In-house PPL.
+
+  Figure 4: The loss and PPL curves of different methods on the (a) & (b) FineWeb-Edu dataset and
+  (c) & (d) in-house dataset. The final values are marked, with the best ones in bold. Here we use the
+  average of the last 10 values as results to prevent randomness. PLS is short for Post Local SGD.
+
+  Table 1: The evaluation results for different methods on the public benchmarks (Fourrier et al., 2023;
+  OpenCompass Contributors, 2023), with the best results in bold and second-best underlined. PLS is
+  short for Post Local SGD.
+
+                                                                                                             FineWeb-Edu dataset                                                                                                               in-house dataset
+                         Benchmark                          Baseline                               PLS              DiLoCo           CO2                        EDiT            A-EDiT               Baseline                                  DiLoCo             EDiT             A-EDiT
+                         MMLU (↑)                                  32.28                           30.86            32.55           31.33                       32.29             31.96                 24.12                                    24.63            24.47            24.56
+                         ARC-E (↑)                                 59.90                           57.60            58.60           57.00                       60.00             57.70                 36.80                                    36.70            38.70            37.40
+                         ARC-C (↑)                                 30.20                           28.60            31.00           30.50                       32.40             30.20                 22.50                                    22.80            23.00            22.40
+                        HellaSwag (↑)                              50.99                           48.03            51.64           48.66                       51.75             51.60                 40.60                                    40.80            40.90            40.20
+                          PIQA (↑)                                 69.90                           67.80            69.50           67.00                       68.10             69.90                 67.10                                    66.80            67.00            66.40
+                CommonSense-QA (↑)                                 37.40                           33.80            35.40           34.40                       36.30             35.30                 18.50                                    18.20            18.50            17.90
+                       OpenBookQA (↑)                              25.40                           22.80            25.20           24.40                       26.00             24.00                 18.00                                    17.80            18.00            18.20
+                       WinoGrande (↑)                              50.70                           49.20            47.80           50.70                       51.70             50.50                 49.10                                    49.20            49.10            48.80
+                         Average (↑)                               44.60                           42.34            43.96           43.00                       44.82             43.90                 34.59                                    34.62            34.96            34.49
+
+
+  We first applied different methods to train the Llama 1B model on the FineWeb-Edu dataset and
+  in-house dataset separately. Here we only compared the best-performing methods, i.e., Baseline,
+  DiLoCo, EDiT, and A-EDiT, on the in-house dataset. The training loss (↓) 3 and validation PPL (↓)
+  results are shown in Figure 4.
+  As can be seen, our proposed EDiT and A-EDiT both achieve consistently good performance.
+  Specifically, EDiT achieves the lowest training loss on both datasets and achieves the lowest val-
+  idation PPL on the FineWeb-Edu dataset, even surpassing the Baseline. A-EDiT marginally lags
+  behind the sync version due to the lagging workers, but it still performs better than other methods in
+  most scenarios. Because the in-house dataset contains diverse data types and lower-quality corpora,
+  DiLoCo (Douillard et al., 2023) experienced a noticeable decline in performance. In contrast, EDiT
+  and A-EDiT filtered out low-quality data with the pseudo gradient penalty strategy, achieving results
+  that were nearly comparable to the Baseline.
+  We evaluated the trained models on public benchmarks (Fourrier et al., 2023; OpenCompass Con-
+  tributors, 2023). Table 1 presents the evaluation results. As can be seen, the models trained with
+  EDiT both achieve the best average performance, and A-EDiT also performs well on the eight eval-
+  uation benchmarks. These results demonstrate that both EDiT and A-EDiT exhibit strong conver-
+  gence and generalization capabilities.
+  Besides, we additionally trained the Llama 350M, 3B, and 7B models on the FineWeb-Edu dataset
+  using EDiT, the results in Figure 8 and Table 5 demonstrate that EDiT performs consistently well
+  across different model scales.
+
+  4.3                    ACCELERATION
+
+  We measured the speeds of different methods when training Llama models of four different scales
+  on two A100 nodes. The synchronization interval was set to 5, and the results are the average
+                   3
+                       In this manuscript the ↑ means the bigger the better and the ↓ means the smaller the better.
+
+
+                                                                                                                                             7
+Published as a conference paper at ICLR 2025
+
+
+Table 2: The speeds of different methods on training models of various scales. The values in the
+table correspond to throughput (tokens/sec) and TFLOPS, respectively.
+
+                      Baseline        Post Local SGD                DiLoCo                     CO2            CO2*                      EDiT         A-EDiT
+    350M             4.52e5/107           4.67e5/111               4.56e5/108             4.84e5/116        4.66e5/110             4.81e5/114       4.82e5/115
+         1B          2.08e5/146           2.12e5/149               1.87e5/131*                 OOM          2.12e5/148             2.25e5/158       2.27e5/160
+         3B          1.05e5/177              OOM                     OOM                       OOM            OOM                  1.11e5/187       1.12e5/189
+         7B          5.14e4/200              OOM                     OOM                       OOM            OOM                  5.42e4/211       5.45e4/213
+
+
+throughput (tokens/sec) and TFLOPS over 100 steps. As shown in Table 2, all Local SGD-based
+methods achieved higher throughput than the Baseline. It should be noted that when training the
+Llama 1B model with DiLoCo, extra parameters and outer momentum were placed on CPUs to
+prevent out of memory (OOM), resulting in non-overlapped extra GPU-CPU data transfer overhead.
+While CO2 achieved the highest throughput on the smallest model, holding its extra parameters and
+outer momentum caused significant memory overhead preventing the method to be scaled beyond
+350M model. CO2* alleviates memory pressure by sharding extra parameters and outer momentum,
+but introduces additional non-overlapping communication, causing a throughput drop. Our pro-
+posed methods synchronize sharded parameters layer-by-layer during the forward pass, and utilize
+a prefetch strategy to overlap computation with communication, achieving nearly the same through-
+put as CO2 (−0.5%). We also performed a profiling analysis of the synchronization operations for
+different methods, and detailed results can be found in Appendix A.3.2 and Figure 9.
+
+         240                                                 240                                                      240
+         200                                                 200                                                      200
+TFLOPS
+
+
+                                                    TFLOPS
+
+
+         160                                                 160                                             TFLOPS   160
+         120   Baseline                                      120    Baseline                                          120    Baseline
+               EDiT                                                 EDiT                                                     EDiT
+               A-EDiT                                               A-EDiT                                                   A-EDiT
+          80     0        1.5   2.5    3.5    4.5             80      0        1.5       2.5    3.5   4.5              80      0        10     20   30   40
+                           Lag Time (s)                                         Lag Time (s)                                            Repeat Times
+               (a) Random Straggler.                               (b) Consistent Straggler.                                (c) Limited Bandwidth.
+
+                     Figure 5: The TFLOPS of different methods under different training scenarios.
+
+We further evaluated the training speed of our proposed EDiT and A-EDiT methods against the
+Baseline method in various more challenging training scenarios. Here we manually introduced
+stragglers and communication delays. Specifically, we simulated stragglers by pausing the training
+process of one selected node at each step, and simulated inter-node bandwidth constraints by artifi-
+cially repeating inter-node communications. Experiments were conducted on the Llama 7B model.
+Detailed experimental results are presented in Figure 5 and Table 6 in Appendix.
+The results reveal a consistent trend where A-EDiT and EDiT outperforms the Baseline method.
+As anticipated, the Baseline’s training speed declines rapidly with increased lag time or inter-node
+congestion. In the random straggler scenario, EDiT and A-EDiT experience only slight speed re-
+ductions. This is attributed to the periodic synchronization that ensures relatively uniform training
+speeds across workers. In the consistent straggler scenario, since the cumulative delay at a single
+node cannot be eliminated by periodic synchronization, the performance of EDiT declines visibly.
+A-EDiT, leveraging its asynchronous nature, maintains a high training speed. In the bandwidth-
+constrained scenario, both EDiT and A-EDiT are not affected. This is due to the large synchro-
+nization interval, which minimizes inter-node communication overhead. In summary, our proposed
+methods consistently demonstrate superior training speed compared to the Baseline method across
+various scenarios, and A-EDiT further effectively addresses the issue of consistent stragglers.
+
+4.4            S CALABILITY
+
+Elastic training is the ability to dynamically adjust the resources in accordance with workload fluc-
+tuations. However, varying the resources alters the global batch size and requires additional learning
+rate tuning. Intuitively, the optimal learning rate of the Local SGD methods may be solely related to
+
+
+                                                                                     8
+Published as a conference paper at ICLR 2025
+
+
+                        65                                                                      65                                                                       34                     Baseline(1-2-4-8) 18.41
+                        60                                                                                                                                               31                     EDiT(1-2-4-8) 17.59
+
+Validation Perplexity
+
+
+                                                                        Validation Perplexity
+
+
+                                                                                                                                                 Validation Perplexity
+                                                                                                60                                                                                              Baseline(8-4-2-1) 18.92
+                        55                                                                                                                                               28                     EDiT(8-4-2-1) 18.43
+                                                                                                55                                                                                                  20.0
+                        50                                                                                                                                               25                         18.5
+                            worker-1                                                            50                                  worker-1
+                        45 worker-2                                                                                                 worker-2                             22                         17.0
+                            worker-4                                                                                                worker-4                                                           90k     95k     100k
+                        40 worker-8                                                             45                                  worker-8                             19
+                            worker-16                                                                                               worker-16
+                        35 14.0 13.5 13.0 12.5 12.0 11.5 11.0                                   40 14.0 13.5 13.0 12.5 12.0 11.5 11.0                                    160           25k    50k            75k         100k
+                                    Learning Rate (Log2)                                                     Learning Rate (Log2)                                                            Steps
+                    (a) PPL-LR curves of Baseline.                                               (b) PPL-LR curves of EDiT.                                        (c) PPL curves in elastic training.
+
+Figure 6: (a) & (b) The PPL results against learning rates (log 2 scale) under different number of
+workers for the Baseline and EDiT methods. (c) The PPL curves in the simulated training scenarios.
+
+
+the per-worker batch size, which has not been extensively studied in prior research. To validate this
+hypothesis, we conducted experiments on the Llama 350M model to investigate the optimal learn-
+ing rate shift for the Baseline method and EDiT method under different worker numbers, fixing the
+batch size per worker at 128. The validation PPL results are shown in Figure 6a and Figure 6b, and
+the detailed training losses are shown in Figure 10 in Appendix. It can be seen that as the worker
+number increases, the optimal learning rate for Baseline gradually increases, whereas that for EDiT
+consistently remains at 1.5e-4. These results validate our hypothesis. The scalability of EDiT makes
+it suitable for elastic training scenarios. Besides, this property enables us to economize resources
+by initially tuning the learning rate on a single worker before scaling up to hundreds of workers.
+We also note that the training loss for EDiT is more stable than that of the Baseline method across
+different worker numbers and learning rates, as shown in Figure 10. This not only demonstrates
+the robustness of EDiT but also highlights its potential to maintain consistent performance across
+diverse training configurations.
+We further simulated a realistic elastic training scenario. We conducted experiments on the Llama
+1B model, setting the batch size per worker to 128 and fixing the learning rate at 1.5e-4. We system-
+atically scaled the worker number upwards (1-2-4-8) and downwards (8-4-2-1), training for 25,000
+steps at each worker number, and observed the validation PPL for both the Baseline and EDiT meth-
+ods. As illustrated in Figure 6c, although the Baseline method initially decreases faster than EDiT,
+EDiT maintains a significant decline rate in the later stages and achieves the optimal PPL values in
+both scaling scenarios, yielding a 4.5% and 2.6% improvement, respectively. These findings affirm
+the EDiT’s viability and advantage in real-world, elastic training scenarios.
+
+4.5                            A BLATION S TUDY
+
+                        30                             Baseline 12.59                           6.0                                    Worker1                            5.5                                        Worker1
+                                                       EDiT 12.85                                                                      Worker2                                                                       Worker2
+                        27                                                                      5.5
+Validation Perplexity
+
+
+                                                       w/o AE 13.52                                                                    Worker3                            5.0                                        Worker3
+                                                       w/o WA 13.20                                                                    Worker4                                                                       Worker4
+                                                                                                5.0
+                                                                            Training Loss
+
+
+                                                                                                                                                          Training Loss
+
+
+                        24                             w/o GC 13.30                                                                    Worker5                            4.5                                        Worker5
+                                                       w/o ALL 14.89                                                                   Worker6                                                                       Worker6
+                                                                                                4.5                                    Worker7                                                                       Worker7
+                        21                                                                                                             Worker8                            4.0                                        Worker8
+                                                                                                4.0
+                        18                                                                      3.5                                                                       3.5
+                        15                                                                      3.0                                                                       3.0
+                        121k   4k   7k 10k 13k 16k 19k 22k 25k                                  2.51k   4k   7k 10k 13k 16k 19k 22k 25k                                   2.51k   4k    7k 10k 13k 16k 19k 22k 25k
+                                          Steps                                                                     Steps                                                                     Steps
+                                (a) Validation PPL.                                                  (b) Training loss of DiLoCo.                                              (c) Training loss of EDiT.
+
+Figure 7: (a) The validation PPL curves of different versions of EDiT with the final PPL values
+marked. (b) & (c) The training loss curves for DiLoCo and EDiT, respectively.
+
+We conducted ablation studies on the pseudo gradient penalty strategy to better understand its capa-
+bilities. In this experiment, we employ the in-house dataset as it is of higher diversity and thus serves
+as an ideal testbed. We individually removed anomaly elimination (w/o AE), weighted averaging
+(w/o WA), and gradient clip (w/o GC) from EDiT, as well as all three components simultaneously
+(w/o ALL). The validation PPL results are shown in Figure 7a. It can be observed that without the
+pseudo gradient penalty strategy (w/o ALL), the PPL curve exhibits noticeable spikes and deviates
+considerably from the Baseline. Individually removing anomaly elimination, weighted averaging,
+
+
+                                                                                                                    9
+Published as a conference paper at ICLR 2025
+
+
+or gradient clip each adversely affects stability and validation PPL, demonstrating that every compo-
+nent of the pseudo gradient penalty strategy is effective. We further investigated the training losses
+across eight different workers. As depicted in Figure 7b and Figure 7c, all workers in DiLoCo si-
+multaneously encounter loss spikes and take a long time to recover. In contrast, EDiT can swiftly
+rectify deviations in individual workers. Even when all workers experience abnormal losses, they
+can promptly revert to normal loss levels through the rollback strategy. These results demonstrate
+the effectiveness of the pseudo gradient penalty strategy.
+
+5     T HEORETICAL A NALYSIS
+In this section, we choose SGD (Robbins & Monro, 1951) as the inner optimizer and the outer opti-
+mizer for simplicity. Under the framework developed in Wang et al. (2019), we have the following
+convergence theorem.
+Theorem 1. Suppose that the following assumptions are satisfied:
+
+1. L is differential and lower bounded, i.e., L(θ ∗ ) > −∞ where θ ∗ is an optimal solution. L is
+   also L-smooth, i.e., ∀u, v ∈ Rn , we have L(u) ≤ L(v) + ⟨∇L(v), u − v⟩ + L2 ∥u − v∥2 .
+                                                     r
+2. At the outer step t and inner step p, ∀ Wi ∈ Gm     , m ∈ 1, · · · , M , the algorithm can access a
+                                                                           (i)               (i)
+   bounded noisy gradient and the true gradient is bounded, i.e., ∥gt,p ∥∞ ≤ G∞ , ∥E[gt,p ]∥∞ ≤
+   G∞ , ∀ t ∈ [T − 1] := {0, · · · , T − 1}, ∀ p ∈ [τ − 1] := {0, · · · , τ − 1}.
+                                                                         (i)       (i)     (i)    (i)
+3. The noisy gradient is unbiased and the noise is independent, i.e., gt,p = E[gt,p ] + ζt,p , E[ζt,p ] =
+              (i)                      (i)
+     0 and ζt,p is independent of ζt′ ,p′ if t ̸= t′ or p ̸= p′ .
+                                                        √
+4. The learning rate of the inner optimizer is ηt,p = η/ tτ + p + 1, and the learning rate of the
+   outer optimizer is ν.
+
+Then Algorithm 1 yields
+            min  E[∥∇L(θt,p )∥2 ]
+      t∈[T −1],p∈[τ −1]
+                                                                                         (6)
+                     L(θ0,0 ) LnG2∞ τ ϕη 2 (1 + ln(τ T )) LνnG2∞ ϕ2 η 2 (1 + ln(τ T ))
+
+           1
+    ≤ √ √                    +                           +                              .
+     2 τ η( T − 1)     ν                  ϵ                         2ϵ2
+where the meaning of n, ϕ and ϵ are listed in Table 7 of Appendix A.4.
+
+The proof of Theorem 1 is presented
+                                 √ in Appendix A.4. Therefore, the convergence (to the stationary
+point) rate of EDiT is O(log(T )/ T ).
+
+6     C ONCLUSION
+In this work, we investigate the challenge of training LLMs on large-scale clusters. We analyze the
+fundamental characteristics of large scale clusters and the limitations of the existing Local SGD-type
+methods. On this basis, we propose a novel Efficient Distributed Training method for LLMs called
+EDiT. This method effectively integrates model sharding strategies with tailored Local SGD mech-
+anisms. We propose layer-wise synchronization to achieve overlap of computation and communica-
+tion and reduce communication and memory overhead. We enhance the convergence and stability of
+EDiT by introducing a pseudo gradient penalty strategy. We also present an asynchronous variant of
+EDiT (A-EDiT) to tackle the problem of consistent stragglers in heterogeneous clusters. Extensive
+experimental results demonstrate the superior capabilities of our proposed methods across multiple
+dimensions, and the convergence analysis provides a theoretical foundation for our method.
+Several potential avenues for future research are identified. First, for the A-EDiT, the stragglers
+negatively impact the overall performance. Mitigating the impact of these stragglers warrants further
+investigation. Second, our simulation of elastic training currently entails halting and restarting the
+training process upon node addition or subtraction. We look forward to a truly elastic framework
+that can swiftly adjust training resources without disrupting the ongoing training process.
+
+
+                                                        10
+Published as a conference paper at ICLR 2025
+
+
+ACKNOWLEDGMENTS
+We thank Ke Zhang for bringing the straggler and communication issues in distributed training to
+our attention and fully supporting our research on this topic. We thank Ji Zhang for providing us
+with insights into Local SGD. We thank Haitao Zhang for his technical advice and assistance. We
+thank Chunjie Shen for helping to apply our techniques to practical training scenarios.
+
+R EFERENCES
+Alon Albalak, Yanai Elazar, Sang Michael Xie, Shayne Longpre, Nathan Lambert, Xinyi Wang,
+  Niklas Muennighoff, Bairu Hou, Liangming Pan, Haewon Jeong, Colin Raffel, Shiyu Chang,
+  Tatsunori Hashimoto, and William Yang Wang. A survey on data selection for language models.
+  arXiv preprint arXiv:2402.16827, 2024. https://arxiv.org/abs/2402.16827.
+Jinze Bai, Shuai Bai, Yunfei Chu, Zeyu Cui, Kai Dang, Xiaodong Deng, Yang Fan, Wenbin Ge,
+   Yu Han, Fei Huang, et al. Qwen technical report. arXiv preprint arXiv:2309.16609, 2023.
+Lukas Balles, Cedric Archambeau, et al. On the choice of learning rate for local sgd. Transactions
+  on Machine Learning Research, 2023.
+Timothy Castiglia, Anirban Das, and Stacy Patterson. Multi-level local sgd: Distributed sgd for
+  heterogeneous hierarchical networks. In International Conference on Learning Representations,
+  2020.
+Yiming Chen, Kun Yuan, Yingya Zhang, Pan Pan, Yinghui Xu, and Wotao Yin. Accelerating gossip
+  sgd with periodic global averaging. In International Conference on Machine Learning, pp. 1791–
+  1802. PMLR, 2021.
+Jeffrey Dean, Greg Corrado, Rajat Monga, Kai Chen, Matthieu Devin, Mark Mao, Marc’aurelio
+   Ranzato, Andrew Senior, Paul Tucker, Ke Yang, et al. Large scale distributed deep networks.
+   Advances in neural information processing systems, 25, 2012.
+Yuyang Deng, Mohammad Mahdi Kamani, and Mehrdad Mahdavi. Local sgd optimizes overpa-
+  rameterized neural networks in polynomial time. In International Conference on Artificial Intel-
+  ligence and Statistics, pp. 6840–6861. PMLR, 2022.
+Arthur Douillard, Qixuan Feng, Andrei A Rusu, Rachita Chhaparia, Yani Donchev, Adhiguna
+  Kuncoro, Marc’Aurelio Ranzato, Arthur Szlam, and Jiajun Shen. Diloco: Distributed low-
+  communication training of language models. arXiv preprint arXiv:2311.08105, 2023.
+Clémentine Fourrier, Nathan Habib, Thomas Wolf, and Lewis Tunstall. Lighteval: A lightweight
+  framework for llm evaluation, 2023.      URL https://github.com/huggingface/
+  lighteval.
+Xinran Gu, Kaifeng Lyu, Longbo Huang, and Sanjeev Arora. Why (and when) does local sgd gen-
+  eralize better than sgd? In The Eleventh International Conference on Learning Representations,
+  2022.
+Ahmed Khaled, Konstantin Mishchenko, and Peter Richtárik. Tighter theory for local sgd on identi-
+  cal and heterogeneous data. In International Conference on Artificial Intelligence and Statistics,
+  pp. 4519–4529. PMLR, 2020.
+Jiamin Li, Hong Xu, Yibo Zhu, Zherui Liu, Chuanxiong Guo, and Cong Wang. Lyra: Elastic
+   scheduling for deep learning clusters. In Proceedings of the Eighteenth European Conference on
+   Computer Systems, pp. 835–850, 2023.
+Xiangru Lian, Ce Zhang, Huan Zhang, Cho-Jui Hsieh, Wei Zhang, and Ji Liu. Can decentralized
+  algorithms outperform centralized algorithms? a case study for decentralized parallel stochastic
+  gradient descent. Advances in neural information processing systems, 30, 2017.
+Xiangru Lian, Wei Zhang, Ce Zhang, and Ji Liu. Asynchronous decentralized parallel stochastic
+  gradient descent. In International Conference on Machine Learning, pp. 3043–3052. PMLR,
+  2018.
+
+
+                                                11
+Published as a conference paper at ICLR 2025
+
+
+Tao Lin, Sebastian U Stich, Kumar Kshitij Patel, and Martin Jaggi. Don’t use large mini-batches,
+  use local sgd. In International Conference on Learning Representations, 2019.
+Bo Liu, Rachita Chhaparia, Arthur Douillard, Satyen Kale, Andrei A Rusu, Jiajun Shen, Arthur
+  Szlam, and Marc’Aurelio Ranzato. Asynchronous local-sgd training for language modeling.
+  arXiv preprint arXiv:2401.09135, 2024.
+Ilya Loshchilov and Frank Hutter. Decoupled weight decay regularization. In International Confer-
+   ence on Learning Representations, 2019. URL https://openreview.net/forum?id=
+   Bkg6RiCqY7.
+Anton Lozhkov, Loubna Ben Allal, Leandro von Werra, and Thomas Wolf. Fineweb-edu, May 2024.
+  URL https://huggingface.co/datasets/HuggingFaceFW/fineweb-edu.
+Deepak Narayanan, Mohammad Shoeybi, Jared Casper, Patrick LeGresley, Mostofa Patwary, Vi-
+  jay Korthikanti, Dmitri Vainbrand, Prethvi Kashinkunti, Julie Bernauer, Bryan Catanzaro, et al.
+  Efficient large-scale language model training on gpu clusters using megatron-lm. In Proceed-
+  ings of the International Conference for High Performance Computing, Networking, Storage and
+  Analysis, pp. 1–15, 2021.
+Y. E. Nesterov. A method for solving the convex programming problem with convergence rate
+  O k12 . Proceedings of the USSR Academy of Sciences, 269:543–547, 1 1983. URL https:
+
+  //ci.nii.ac.jp/naid/10029946121/.
+John Nguyen, Kshitiz Malik, Hongyuan Zhan, Ashkan Yousefpour, Mike Rabbat, Mani Malek, and
+  Dzmitry Huba. Federated learning with buffered asynchronous aggregation. In International
+  Conference on Artificial Intelligence and Statistics, pp. 3581–3607. PMLR, 2022.
+OpenCompass Contributors. Opencompass: A universal evaluation platform for foundation models.
+  https://github.com/open-compass/opencompass, 2023.
+Linxuan Pan and Shenghui Song. Local sgd accelerates convergence by exploiting second order
+  information of the loss function. arXiv preprint arXiv:2305.15013, 2023.
+Guilherme Penedo, Hynek Kydlı́ček, Loubna Ben allal, Anton Lozhkov, Margaret Mitchell, Colin
+  Raffel, Leandro Von Werra, and Thomas Wolf. The fineweb datasets: Decanting the web for the
+  finest text data at scale, 2024. URL https://arxiv.org/abs/2406.17557.
+Samyam Rajbhandari, Jeff Rasley, Olatunji Ruwase, and Yuxiong He. Zero: Memory optimizations
+  toward training trillion parameter models. In SC20: International Conference for High Perfor-
+  mance Computing, Networking, Storage and Analysis, pp. 1–16. IEEE, 2020.
+Herbert Robbins and Sutton Monro. A stochastic approximation method. The annals of mathemati-
+  cal statistics, pp. 400–407, 1951.
+Shuheng Shen, Yifei Cheng, Jingchang Liu, and Linli Xu. Stl-sgd: Speeding up local sgd with stage-
+  wise communication period. In Proceedings of the AAAI Conference on Artificial Intelligence,
+  volume 35, pp. 9576–9584, 2021.
+Mohammad Shoeybi, Mostofa Patwary, Raul Puri, Patrick LeGresley, Jared Casper, and Bryan
+ Catanzaro. Megatron-lm: Training multi-billion parameter language models using model par-
+ allelism. arXiv preprint arXiv:1909.08053, 2019.
+Artin Spiridonoff, Alex Olshevsky, and Ioannis Ch Paschalidis. Local sgd with a communication
+  overhead depending only on the number of workers. arXiv preprint arXiv:2006.02582, 2020.
+Weigao Sun, Zhen Qin, Weixuan Sun, Shidi Li, Dong Li, Xuyang Shen, Yu Qiao, and Yiran Zhong.
+ Efficient distributed training with full communication-computation overlap. In The Twelfth Inter-
+ national Conference on Learning Representations, 2023.
+Ilya Sutskever, James Martens, George Dahl, and Geoffrey Hinton. On the importance of initial-
+   ization and momentum in deep learning. In International conference on machine learning, pp.
+   1139–1147. PMLR, 2013.
+
+
+                                               12
+Published as a conference paper at ICLR 2025
+
+
+Megh Thakkar, Tolga Bolukbasi, Sriram Ganapathy, Shikhar Vashishth, Sarath Chandar, and Partha
+ Talukdar. Self-influence guided data reweighting for language model pre-training. arXiv preprint
+ arXiv:2311.00913, 2023.
+Hugo Touvron, Louis Martin, Kevin Stone, Peter Albert, Amjad Almahairi, Yasmine Babaei, Niko-
+  lay Bashlykov, Soumya Batra, Prajjwal Bhargava, Shruti Bhosale, et al. Llama 2: Open founda-
+  tion and fine-tuned chat models. arXiv preprint arXiv:2307.09288, 2023.
+Jianyu Wang and Gauri Joshi. Adaptive communication strategies to achieve the best error-runtime
+   trade-off in local-update sgd. Proceedings of Machine Learning and Systems, 1:212–229, 2019.
+Jianyu Wang, Vinayak Tantia, Nicolas Ballas, and Michael Rabbat. Slowmo: Improving
+   communication-efficient distributed sgd with slow momentum. In International Conference on
+   Learning Representations, 2019.
+Cong Xie, Sanmi Koyejo, and Indranil Gupta. Asynchronous federated optimization. arXiv preprint
+  arXiv:1903.03934, 2019.
+Ge Yang, Edward Hu, Igor Babuschkin, Szymon Sidor, Xiaodong Liu, David Farhi, Nick Ryder,
+  Jakub Pachocki, Weizhu Chen, and Jianfeng Gao. Tuning large neural networks via zero-shot
+  hyperparameter transfer. Advances in Neural Information Processing Systems, 34:17084–17097,
+  2021.
+Hao Yu, Sen Yang, and Shenghuo Zhu. Parallel restarted sgd with faster convergence and less
+  communication: Demystifying why model averaging works for deep learning. In Proceedings of
+  the AAAI conference on artificial intelligence, volume 33, pp. 5693–5700, 2019.
+Jian Zhang, Christopher De Sa, Ioannis Mitliagkas, and Christopher Ré. Parallel sgd: When does
+   averaging help? arXiv preprint arXiv:1606.07365, 2016.
+Tuo Zhang, Lei Gao, Sunwoo Lee, Mi Zhang, and Salman Avestimehr. Timelyfl: Heterogeneity-
+  aware asynchronous federated learning with adaptive partial training. In Proceedings of the
+  IEEE/CVF Conference on Computer Vision and Pattern Recognition, pp. 5064–5073, 2023.
+
+
+                                               13
+Published as a conference paper at ICLR 2025
+
+
+A     A PPENDIX
+A.1   M ETHOD
+
+Here we provide the formal descriptions of EDiT method and model synchronization with pseudo
+gradient penalty strategy in Algorithm 1 and Algorithm 2, respectively, to help readers better under-
+stand our work.
+
+Algorithm 1 EDiT Algorithm
+Require: K workers W = {W1 , · · · , WK } with each worker Wi contains L sharded modules
+      (i,l)    (i,l)         (i,1)      (i,L)
+    θ0,0 = θ0 = {θ0 , · · · , θ0 }; K data shards D = {D1 , · · · , DK }; M × N device mesh
+    with the columns forming model shard groups G s = {G1s , · · · , GN      s
+                                                                               } and rows forming model
+                      r         r      r
+    sync groups G = {G1 , · · · , GM }; outer training steps T ; sync period τ ; warmup steps twarm ;
+ 1: for t = 0 to T − 1 do
+ 2:      for p = 0 to τ − 1 do
+ 3:          for worker Wi parallel do
+                                                               r
+ 4:              Confirm Wi is in the model sync group Gm          and model shard group Gns
+                     (i,0)    (i)
+ 5:              (xt,p , yt,p ) ∼ Di
+ 6:              for l = 1 to L do                                                         ▷ Forward Pass
+ 7:                    if (t ∗ τ + p) > twarm and p == 0 then
+                                                r    (i,l)      (i,l)          (i,l)   r
+ 8:                         Sync parameters in Gm : θt,0 = θt = Sync(θt−1,τ ; Gm         )
+ 9:                    end if
+                                                           (l)                   (i,l)
+10:                    Gather module parameters in Gns : θt,p = AllGather(θt,p ; Gns )
+                                               (i,l)        (l)   (i,l−1)
+11:                 Forward calculation: xt,p = f (θt,p , xt,p              )
+                                             (i,l)        (l)
+12:                 Free module parameters: θt,p = Shard(θt,p )
+13:             end for
+                                       (i,L)  (i)
+14:             Calculate loss: L = ℓ(xt,p , yt,p )
+15:             for l = L to 1 do                                                  ▷ Backward Pass
+                                                       (l)              (i,l)
+16:                 Gather module parameters in Gns : θt,p = AllGather(θt,p ; Gns )
+                                                 (l)               (l)      (i,l−1)
+17:                 Backward calculation: gbt,p = ∇θ(l) L(θt,p , xt,p                 )
+                                                            t,p
+                                         (i,l)                (l)
+18:                                                          gt,p ; Gns )
+                    Sync grads in Gns : gt,p = ReduceScatter(b
+19:                if (t ∗ τ + p) ≤ twarm then
+                                       r            (i,l)            (i,l)  r
+20:                     Sync grads in Gm (Warmup): gt,p = AllReduce(gt,p ; Gm )
+21:                end if
+                                             (i,l)        (l)
+22:                Free module parameters: θt,p = Shard(θt,p )
+23:             end for
+24:         end for
+                          (i,l)
+25:         for module θt,p parallel do                                        ▷ Local Update
+                                       (i,l)                      (i,l)   (i,l)
+26:           Update parameters: θt,p+1 = InnerOpt(θt,p , gt,p )
+27:        end for
+28:    end for
+29: end for
+
+
+                                                       14
+Published as a conference paper at ICLR 2025
+
+
+Algorithm 2 Sync() in Algorithm 1
+                                          r                                                                 (i,l)
+Require: The m-th model sync group Gm        = {W1 , · · · , WN }; the sharded parameters θt,τ of the
+    l-th module in the i-th worker Wi at outer step t and inner step τ ; the corresponding last synced
+                           (i,l)
+    sharded parameters θt at outer step t;
+                                     (i,l)     (i,l)     (i,l)
+ 1: Calculate the pseudo gradient: ∆t       = θt,τ − θt
+                                                  (i,l)           (i,l)
+ 2: Calculate the pseudo gradient norm: Gt                = ∥∆t           ∥2
+                     (i,l)
+ 3: if IsAnomaly(Gt          ) then                                                             ▷ Eliminate Anomalies
+         (i,l)
+ 4:     Gt = ∞
+ 5: end if                                 P        (k,l)       r
+ 6: Sync the pseudo gradient norms: γt = k exp(−Gt ) for Wj in Gm
+ 7: if γ == 0 then
+                               (i,l)    (i,l)
+ 8:     Rollback parameters: θt+1,0 = θt
+ 9: else
+                                              (i,l)
+10:     Calculate the weight: wt,i = exp(−Gt )/γt                                                 ▷ Weighted Average
+11:     Sync the pseudo gradients: ∆ ¯ (i,l) = P wt,j ∆(j,l) for Wj in G r
+                                       t         j          t           m
+12:     Clip the pseudo gradient: ∆b (i,l) = Clip(∆¯ (i,l) )                                    ▷ Clip Grad, Eq. 2 & 5
+                                     t               t
+                             (i,l)                 (i,l) b (i,l)
+13:     Update parameters: θ       = OuterOpt(θ , ∆
+                                     t+1                      t  )    t
+                               i,l         i,l
+14:     Sync parameters: θt+1,0 = θt+1
+15: end if
+            (i,l)
+16: return θt+1,0
+
+
+
+A.2   E XPERIMENTAL S ETUPS
+
+Here we provide a more detailed description of the experimental setups to facilitate readers in re-
+producing the experimental results of this paper.
+Models We consider four different scales of Llama models (Touvron et al., 2023) in our experi-
+ments: 350M, 1B, 3B, and 7B. Their specific configurations are detailed in Table 3. We configure
+the models to have the same number of layers and head dimensions, which facilitates the utilization
+of µP (Yang et al., 2021) for hyperparameter search.
+
+                   Table 3: Configurations for the four scales of Llama models.
+
+                              Hyperparameter          350M          1B          3B      7B
+                              Number of Layers            32        32          32      32
+                                Hidden Size               768     1,536        2,560   4,096
+                              Intermediate Size       2,048       4,096        6,912   11,008
+                              Number of Heads             6         12          20      32
+                        Number of K/V Heads               6         12          20      32
+                                 Vocab Size                               79,800
+
+
+Datasets Departing from small language datasets used in prior works (Douillard et al., 2023), we
+employ a new large-scale open-source dataset, FineWeb-Edu (Lozhkov et al., 2024) in our exper-
+iments. This dataset comprises 1.3T tokens of premium educational web pages filtered from the
+extensive FineWeb repository (Penedo et al., 2024). Additionally, we also utilize an in-house private
+pre-training dataset, which consists of a diverse collection of corpus of varying quality.
+Baselines We compare the proposed EDiT and A-EDiT method against several state-of-the-
+art methods, including standard mini-batch (Baseline), Post Local SGD (Lin et al., 2019),
+DiLoCo (Douillard et al., 2023), and CO2/CO2* (Sun et al., 2023). Here CO2* is the memory-
+efficient version of CO2 that shards extra parameters and outer momentum across workers (Sun
+et al., 2023). Since Parallel SGD (Zhang et al., 2016) and SlowMo (Wang et al., 2019) are equiva-
+
+
+                                                          15
+Published as a conference paper at ICLR 2025
+
+
+lent to Post Local SGD (Lin et al., 2019) and DiLoCo (Douillard et al., 2023), respectively, we do
+not include them in comparisons.
+Training Follow DiLoCo (Douillard et al., 2023), we use AdamW (Loshchilov & Hutter, 2019) as
+the inner optimizer and Nesterov momentum (Sutskever et al., 2013) as the outer optimizer. The
+models are initialized with µP (Yang et al., 2021), enabling the hyperparameters transfer from the
+smallest scale model (350M) to models of larger magnitude. To balance efficiency and performance,
+the synchronization interval τ and τtime are set to 128 and 600s, respectively. Across all experi-
+ments, a context length of 4,096 tokens and a cosine learning rate decay schedule are consistently
+applied. For the FineWeb-Edu dataset (Lozhkov et al., 2024), the total batch size is set to 1,024 and
+the training step is set to 100,000 (∼420B tokens). The learning rate for Baseline, inner learning
+rate, outer learning rate, and outer momentum are set to 3e-4, 1.5e-4, 0.8, and 0.85, respectively.
+For the in-house dataset, the total batch size is set to 1,536 and the training step is set to 150,000
+(∼950B tokens). The learning rate for Baseline, inner learning rate, outer learning rate, and outer
+momentum are set to 6e-4, 6e-4, 1.0, and 0.8, respectively. We list the searched hyperparameters in
+detail in Table 4. The experimental infrastructure comprised eight Nvidia A100 GPU nodes with 64
+GPUs and an 8 × 8 device mesh. For the hyperparameters in the pseudo gradient penalty strategy,
+we set ϕ = 10.
+
+                                 Table 4: The hyperparameters searched in the experiments.
+
+                                         Hyperparameter                                                  Value
+                                     Inner Learning Rate         3e-5                         6e-5       1.5e-4   3e-4    6e-4
+                                   Synchronization Interval          16                            64     128     256     512
+                                     Outer Learning Rate             0.5                           0.7    0.8     0.9     1.0
+                                         Outer Momentum              0.6                           0.8   0.85     0.9     0.95
+
+
+A.3                A DDITIONAL E XPERIMENTAL R ESULTS
+
+A.3.1                  C ONVERGENCE AND G ENERALIZATION
+In the main text, we present the performance of EDiT and other Local SGD methods in training
+the Llama 1B model in Figure 4 and Table 1. To demonstrate that EDiT performs consistently well
+across different model scales, we additionally trained Llama 350M, 3B, and 7B models using EDiT
+on the FineWeb-Edu dataset, each with a total of 420B tokens. The corresponding training loss,
+validation PPL, and evaluation results are shown in Figure 8 and Table 5. It can be observed that
+EDiT is robust across various model scales. Besides, to our knowledge, this is the first time to train
+a 7B model on a large-scale dataset with a Local SGD-related method. Although CO2 (Sun et al.,
+2023) also claimed that they trained a 7B model, they only used about 50B tokens and provided only
+the final validation PPL results.
+                5.0                                     350M 3.239                                 39                                     350M 24.97
+                                                        1B 2.848                                                                          1B 17.38
+                                                                           Validation Perplexity
+
+
+                4.5                                     3B 2.629                                   34                                     3B 14.03
+                                                        7B 2.421                                                                          7B 10.91
+Training Loss
+
+
+                4.0                                                                                29
+                3.5                                                                                24
+                3.0                                                                                19
+                2.5                                                                                14
+                2.00      20k      40k       60k       80k      100k                                90      20k     40k          60k     80k      100k
+                                      Steps                                                                              Steps
+                           (a) Training loss curves.                                                        (b) Validation PPL curves.
+
+Figure 8: The training loss and validation PPL curves for the 350M, 1B, 3B, and 7B models trained
+with the EDiT method on the FineWeb-Edu dataset. The final loss and PPL values are marked in the
+figures, which are the average values of the last 10 values to prevent randomness.
+
+
+                                                                       16
+Published as a conference paper at ICLR 2025
+
+
+Table 5: The evaluation results on the public benchmarks (Fourrier et al., 2023; OpenCompass
+Contributors, 2023) for the 350M, 1B, 3B, and 7B models trained with the EDiT method.
+
+                                   Benchmark            350M       1B       3B       7B
+                                    MMLU (↑)            28.96    32.29     34.70   36.20
+                                    ARC-E (↑)           53.00    60.00     67.60   68.30
+                                    ARC-C (↑)           25.40    32.40     36.10   39.20
+                                  HellaSwag (↑)         39.44    51.75     58.55   62.31
+                                    PIQA (↑)            65.00    68.10     72.40   73.70
+                               CommonSense-QA (↑)       29.50    36.30     37.30   42.60
+                                 OpenBookQA (↑)         21.40    26.00     27.40   28.60
+                                 WinoGrande (↑)         50.50    51.70     52.00   52.40
+                                   Average (↑)          39.15    44.82     48.26   50.41
+
+
+
+A.3.2      ACCELERATION
+In the main text, we analyzed the throughput and TFLOPS of different acceleration methods. Here,
+we further profile the synchronization operations of different methods when training the Llama 1B
+model. As shown in Figure 9, Post Local SGD introduces a significant additional communication
+overhead of 160ms during model synchronization. Although CO2* successfully overlaps model
+synchronization communication with the forward computation of the next step, it incurs two seg-
+ments of non-overlapping communication overhead to deal with the sharded extra parameters and
+outer momentum, causing a delay of approximately 300ms. This delay negates the acceleration ben-
+efits gained from overlapped parameter synchronization. However, without the memory-efficient
+mode, the complete copies of model parameters and outer momentum in CO2 lead to severe mem-
+ory usage, resulting in OOM in this scenario. In contrast, EDiT synchronizes sharded parameters
+layer-by-layer during the forward pass, reducing communication volume and overlapping compu-
+tation with communication through a prefetch strategy. It achieves the same performance as CO2
+without introducing additional communication burdens or memory overhead. As a result, EDiT only
+introduces 19ms delay in this scenario.
+Besides, we provide the detailed TFLOPS corresponding to the Figure 5 in Table 6.
+
+            Table 6: The TFLOPS of different methods under different training scenarios.
+
+           Random Straggler                       Consistent Straggler                      Limited Bandwidth
+ Lag (s)   Baseline   EDiT     A-EDiT   Lag (s)   Baseline    EDiT       A-EDiT    Repeat   Baseline   EDiT     A-EDiT
+   0        225.75    236.50   237.45     0        225.75     236.50     237.45      0      225.75     236.50   237.45
+   1.5      175.21    228.06   230.05    1.5       175.12     181.20     230.12     10      205.71     234.74   237.85
+   2.5      150.26    219.72   224.38    2.5       150.03     154.12     227.58     20      136.64     236.20   238.04
+   3.5      130.94    214.36   219.49    3.5       130.80     134.00     225.08     30      105.06     236.46   237.73
+   4.5      115.29    209.44   214.53    4.5       115.94     118.47     223.07     40       85.18     236.39   238.03
+
+
+
+A.3.3      S CALABILITY
+Here we provide the detailed training loss curves of the Baseline and EDiT methods under different
+numbers of workers and distinct learning rates in Figure 10, which correspond to the Figure 6 in the
+main text.
+
+
+                                                         17
+Published as a conference paper at ICLR 2025
+
+
+                                          (a) Baseline.
+
+
+                                       (b) Post Local SGD.
+
+
+                                            (c) CO2*.
+
+
+                                            (d) EDiT.
+
+Figure 9: The profiling results of Baseline, Post Local SGD, CO2, and EDiT during synchronization
+while training the Llama 1B model. The parts corresponding to model synchronization and compu-
+tation are highlighted with red boxes.
+
+
+
+                                               18
+Published as a conference paper at ICLR 2025
+
+
+                      12           4.3                                 3e-5                      12           4.3                                 3e-5
+                                                                       6e-5                                                                       6e-5
+                                   4.1                                 1e-4                                   4.1                                 1e-4
+                      10                                               1.5e-4                    10                                               1.5e-4
+
+
+
+      Training Loss
+
+
+                                                                                 Training Loss
+                                   3.9                                 2e-4                                   3.9                                 2e-4
+                                    4500        4750     5000          3e-4                                    4500        4750     5000          3e-4
+                       8                                               4e-4                       8                                               4e-4
+                                                                       5e-4                                                                       5e-4
+                                                                       6e-4                                                                       6e-4
+                       6                                                                          6
+
+                       4                                                                          4
+                        0   1000         2000          3000     4000      5000                     0   1000         2000          3000     4000      5000
+                                            Steps                                                                      Steps
+                             (a) Baseline worker 1.                                                      (b) EDiT worker 1.
+                      12           4.2                                 3e-5                      12           4.3                                 3e-5
+                                                                       6e-5                                                                       6e-5
+                                   4.0                                 1.5e-4                                 4.1                                 1e-4
+                      10                                               2e-4                      10                                               1.5e-4
+      Training Loss
+
+
+                                                                                 Training Loss
+                                   3.8                                 3e-4                                   3.9                                 2e-4
+                                    4500        4750     5000          4e-4                                    4500        4750     5000          3e-4
+                       8                                               5e-4                       8                                               6e-4
+                                                                       6e-4
+
+                       6                                                                          6
+
+                       4                                                                          4
+                        0   1000         2000          3000     4000      5000                     0   1000         2000          3000     4000      5000
+                                            Steps                                                                      Steps
+                             (c) Baseline worker 2.                                                      (d) EDiT worker 2.
+                      12           4.0                                 3e-5                      12           4.2                                 3e-5
+                                                                       6e-5                                                                       6e-5
+                                   3.8                                 1.5e-4                                 4.0                                 1e-4
+                      10                                               2e-4                      10                                               1.5e-4
+      Training Loss
+
+
+                                                                                 Training Loss
+
+
+
+                                   3.6                                 3e-4                                   3.8                                 2e-4
+                                    4500        4750     5000          4e-4                                    4500        4750     5000          3e-4
+                       8                                               5e-4                       8                                               6e-4
+                                                                       6e-4
+
+                       6                                                                          6
+
+                       4                                                                          4
+                        0   1000         2000          3000     4000      5000                     0   1000         2000          3000     4000      5000
+                                            Steps                                                                      Steps
+                             (e) Baseline worker 4.                                                      (f) EDiT worker 4.
+                      12           3.9                                 3e-5                      12           4.1                                 3e-5
+                                                                       6e-5                                                                       6e-5
+                                   3.7                                 1.5e-4                                 3.9                                 1e-4
+                      10                                               3e-4                      10                                               1.5e-4
+      Training Loss
+
+
+                                                                                 Training Loss
+
+
+                                   3.5                                 4e-4                                   3.7                                 2e-4
+                                    4500        4750     5000          5e-4                                    4500        4750     5000          3e-4
+                       8                                               6e-4                       8                                               6e-4
+                                                                       8e-4
+
+                       6                                                                          6
+
+                       4                                                                          4
+                        0   1000         2000          3000     4000      5000                     0   1000         2000          3000     4000      5000
+                                            Steps                                                                      Steps
+                             (g) Baseline worker 8.                                                      (h) EDiT worker 8.
+                      12           3.9                                 3e-5                      12           4.1                                 6e-5
+                                                                       6e-5                                                                       1e-4
+                                   3.7                                 1.5e-4                                 3.9                                 1.5e-4
+                      10                                               3e-4                      10                                               2e-4
+      Training Loss
+
+
+                                                                                 Training Loss
+
+
+                                   3.5                                 4e-4                                   3.7                                 3e-4
+                                    4500        4750     5000          5e-4                                    4500        4750     5000
+                       8                                               6e-4                       8
+                                                                       8e-4
+
+                       6                                                                          6
+
+                       4                                                                          4
+                        0   1000         2000          3000     4000      5000                     0   1000         2000          3000     4000      5000
+                                            Steps                                                                      Steps
+                            (i) Baseline worker 16.                                                      (j) EDiT worker 16.
+
+Figure 10: The training loss curves of the Baseline and EDiT methods under different numbers of
+workers and distinct learning rates.
+
+
+                                                                                19
+Published as a conference paper at ICLR 2025
+
+
+A.4    P ROOF OF T HEOREM 1
+
+                              Table 7: The hyperparameters of Theorem 1.
+
+                  Symbol                                         Meaning
+                     η         The initial learning rate of the inner optimizer
+                     ν         The learning rate of the outer optimizer
+                     τ         The synchronization interval
+                     ϕ         The gradient norm clip threshold
+                     L         The loss function is L-smooth
+                     ϵ         The small positive constant to avoid division by zero
+                     n         The dimension of model parameters
+                    G∞         The upper bound of the gradients
+
+
+                                                                 r
+Proof. Since the inner and outer optimizer are both SGD, ∀ Wi ∈ Gm , m ∈ {1, · · · , M }, we have
+                                              (i)     (i)
+                                             θt,0 = θt ,                                                                           (7)
+                                              (i)      (i)         (i)
+                                             θt,p+1 = θt,p − ηt,p gt,p ,                                                           (8)
+                                             θt+1 = θt − ν ∆
+                                                           b t,                                                                    (9)
+where ηt,p and ν are the inner optimizer learning rate and the outer optimizer learning rate, respec-
+tively. Here, we omit the superscripts of variables in Equation 9, as they remain identical across
+                 r
+all workers in Gm  . The following proof will also adopt this simplified notation without risk of
+confusion. Hence, by the Equations 2, 3, 4, 5, 7 and 8, we have
+                                          (j)                 (j)    (j)
+                               X                   X
+             ∆        ¯ t = βt
+             b t = βt ∆            wt,j ∆t = βt        wt,j (θt,τ − θt,0 )
+                                   j                             j
+                                                                                                     τ −1                         (10)
+                                          (j)         (j)              (j)                                        (j)
+                        X                                                            X               X
+                 = βt        wt,j (ηt,p gt,τ −1 + θt−1,τ − θt,0 ) = βt                        wt,j          ηt,p gt,p .
+                         j                                                                j          p=0
+
+Let
+                                                                            (j)
+                                                            X
+                                             ht,p = βt            wt,j gt,p ,                                                     (11)
+                                                             j
+then
+                                                                     (j)
+                                                    X
+                               E[ht,p ] = E[βt              wt,j gt,p ] = βt E[gt,p ].                                            (12)
+                                                      j
+Combining Equation 7, Equation 10 and Equation 11 into Equation 9, we have
+                                                                     τ
+                                                                     X −1
+                                    θt+1,0 − θt,0 = −ν                      ηt,p ht,p .                                           (13)
+                                                                     p=0
+
+                                       (i)
+For proving the convergence of {θt,p }, we need to define the auxiliary sequence {ψt,p }. Denote
+                            
+                             ψ0,0 = θ0,0 ,         Pτ −1
+                                ψt+1,0 = ψt,0 − ν p=0 ηt,p ht,p ,
+                                ψt,p+1 = ψt,p − νηt,p ht,p .
+                            
+
+It is easy to prove ψt+1,0 = ψt,τ . Then we have
+                                    p−1
+                                    X                                       p−1
+                                                                            X                                      p−1
+                                                                                                                   X
+E[ψt,p ] − E[θt,p ] = E[ψt,0 − ν          ηt,k ht,k ] − E[θt,0 −                  ηt,k gt,k ] = (1 − νβt )                ηt,k E[gt,k ]
+                                    k=0                                     k=0                                    k=0
+                                                                                                                                  (14)
+
+
+                                                            20
+Published as a conference paper at ICLR 2025
+
+
+By assumption 1, we have
+                                                         L
+L(ψt,p+1 ) ≤ L(ψt,p ) + ⟨∇L(ψt,p ), ψt,p+1 − ψt,p ⟩ +       ∥ψt,p+1 − ψt,p ∥2
+                                                         2
+                                                   Lν 2 ηt,p
+                                                          2
+           = L(ψt,p ) − νηt,p ⟨∇L(ψt,p ), ht,p ⟩ +           ∥ht,p ∥2
+                                                       2
+                              D                               E         D            E Lν 2 η 2
+                                                   (i)                        (i)                t,p
+           = L(ψt,p ) − νηt,p ∇L(ψt,p ) − ∇L(θt,p ), ht,p − νηt,p ∇L(θt,p ), ht,p +                  ∥ht,p ∥2
+                                                                                              2
+                                                              D               E Lν 2 η 2
+                                         (i)                          (i)             t,p
+           ≤ L(ψt,p ) + νηt,p L∥ψt,p − θt,p ∥∥ht,p ∥ − νηt,p ∇L(θt,p ), ht,p +            ∥ht,p ∥2 .
+                                                                                   2
+                                                                                              (15)
+Rearranging Equation 15 and taking expectation both sides, by assumption 2, assumption 3, Equa-
+tion 12 and Equation 14, we get
+     νηt,p βt E[∥∇L(θt,p )∥2 ]
+                                                              Lν 2 ηt,p
+                                                                    2
+  ≤E[L(ψt,p ) − L(ψt,p+1 )] + νηt,p LE[∥ψt,p − θt,p ∥∥ht,p ∥] +         E[∥ht,p ∥2 ]
+                                                                  2
+                                       √                          Lν 2 ηt,p
+                                                                        2
+                                                                            βt2 nG2∞
+  ≤E[L(ψt,p ) − L(ψt,p+1 )] + νηt,p Lβt nG∞ E[∥ψt,p − θt,p ∥] +
+                                                                           2
+                                                       p−1
+                                       √               X                        Lν 2 ηt,p
+                                                                                      2
+                                                                                          βt2 nG2∞
+  =E[L(ψt,p ) − L(ψt,p+1 )] + νηt,p Lβt nG∞ (1 − νβt )     ηt,k E[∥gt,k ∥] +
+                                                                                         2
+                                                                                k=0
+
+                                2
+                                                 Lν 2 ηt,p
+                                                       2
+                                                           βt2 nG2∞
+  ≤E[L(ψt,p ) − L(ψt,p+1 )] + νηt,0 Lβt nG2∞ τ +                    .
+                                                          2
+                                                                                                                    (16)
+Telescoping Equation 16 for p = 0 to τ − 1 and t = 0 to T − 1, we have
+              T
+              X −1 τ
+                   X −1
+                          νηt,p βt E[∥∇L(θt,p )∥2 ]
+              t=0 p=0
+                                                                     T −1                         T −1 τ −1
+                                                                     X                  Lν 2 nG2∞ X X 2 2
+            ≤E[L(ψ0,0 ) − L(ψT −1,τ )] + νLnG2∞ τ 2                             2
+                                                                            βt ηt,0 +                     βt ηt,p   (17)
+                                                                     t=0
+                                                                                             2    t=0 p=0
+                                          T −1                               T −1 τ −1
+                                          X                    Lν 2 nG2∞ X X 2 2
+            ≤L(θ0,0 ) + νLnG2∞ τ 2                     2
+                                                   βt ηt,0 +                     βt ηt,p .
+                                          t=0
+                                                                    2    t=0 p=0
+
+Since from Equation 4, we have 1 ≤ βt ≤ ϕϵ . Combining with Equation 17, we can get
+ T −1 τ −1                                                         T −1                  T −1 τ −1
+ X    X                                       L(θ0,0 ) LnG2∞ τ 2 ϕ X 2         LνnG2∞ ϕ2 X X 2
+             ηt,p E[∥∇L(θt,p )∥2 ] ≤                  +                 ηt,0 +                     ηt,p . (18)
+  t=0 p=0
+                                                ν         ϵ        t=0
+                                                                                  2ϵ2    t=0 p=0
+
+Since
+T −1 τ −1              T −1                        T −1
+X    X                 X                  √        X        1
+            ηt,p ≥ τ          ηt,τ −1 =       τη          √
+t=0 p=0                t=0                         t=0
+                                                           t+1
+                              Z 2                         !
+                                                          Z T +1     Z T +1
+                  √            1                     1         √               1
+               = τη           √ ds + · · · +        √ ds ≥ τ η                √ ds
+                           1    1              T      T               1         s
+                   √ √                      √ √
+               = 2 τ η( T + 1 − 1) ≥ 2 τ η( T − 1),
+  −1   −1            −1              −1
+T    τ             T               T                     Z 1                     Z T −1             !
+XX
+           2
+                    X
+                         2       2
+                                   X      1      2              1                           1
+          ηt,p ≤ τ      ηt,0 = η               =η 1+              1 ds + · · · +               1 ds
+t=0 p=0             t=0            t=0
+                                        t + τ1            0 1+ τ                  T −2 T − 1 + τ
+                            Z T −1           !
+                   2                  1
+               ≤η 1+                      ds = η 2 (1 + ln(τ T − τ + 1)) ≤ η 2 (1 + ln(τ T )),
+                             0     s + τ1
+                                                                                                 (19)
+
+
+                                                                21
+Published as a conference paper at ICLR 2025
+
+
+substituting Equation 19 into Equation 17, we have
+        min           E[∥∇L(θt,p )∥2 ]
+  t∈[T −1],p∈[τ −1]
+                                                     T −1                   T −1 τ −1
+                                                                                        !
+           1                   L(θ0,0 ) LnG2∞ τ 2 ϕ X 2        LνnG2∞ ϕ2 X X 2
+   ≤ PT −1 Pτ −1                       +                ηt,0 +                   ηt,p
+        t=0     p=0 ηt,p
+                                 ν         ϵ        t=0
+                                                                  2ϵ2    t=0 p=0
+
+                              L(θ0,0 ) LnG2∞ τ ϕη 2 (1 + ln(τ T )) LνnG2∞ ϕ2 η 2 (1 + ln(τ T ))
+
+          1
+   ≤ √ √                              +                           +                                   .
+    2 τ η( T − 1)               ν                  ϵ                         2ϵ2
+                                                                                                  (20)
+This completes the proof.
+
+
+                                                    22

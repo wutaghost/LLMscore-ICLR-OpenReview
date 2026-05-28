@@ -1,0 +1,2897 @@
+Under review as a conference paper at ICLR 2025
+
+
+000
+001
+      FRUGAL: M EMORY-E FFICIENT O PTIMIZATION BY R E -
+002   DUCING S TATE OVERHEAD FOR S CALABLE T RAINING
+003
+004
+005    Anonymous authors
+006    Paper under double-blind review
+007
+008
+009                                               A BSTRACT
+010
+011            With the increase in the number of parameters in large language models, the
+012            process of pre-training and fine-tuning increasingly demands larger volumes of
+013            GPU memory. A significant portion of this memory is typically consumed by the
+014            optimizer state. To overcome this challenge, recent approaches such as low-rank
+015            adaptation (LoRA (Hu et al., 2021)), low-rank gradient projection (GaLore (Zhao
+016            et al., 2024a)), and blockwise optimization (BAdam (Luo et al., 2024)) have been
+017            proposed. However, in all these algorithms, the effective rank of the weight updates
+018
+               remains low-rank, which can lead to a substantial loss of information from the
+               gradient. This loss can be critically important, especially during the pre-training
+019
+               stage. In this paper, we introduce FRUGAL (Full-Rank Updates with GrAdient
+020
+               spLitting), a new memory-efficient optimization framework. FRUGAL leverages
+021            gradient splitting to perform low-dimensional updates using advanced algorithms
+022            (such as Adam), while updates along the remaining directions are executed via state-
+023            free methods like SGD or signSGD (Bernstein et al., 2018). Our framework can be
+024            integrated with various low-rank update selection techniques, including GaLore
+025            and BAdam. We provide theoretical convergence guarantees for our framework
+026            when using SGDM for low-dimensional updates and SGD for state-free updates.
+027            Additionally, our method consistently outperforms concurrent approaches across
+028            various fixed memory budgets, achieving state-of-the-art results in pre-training and
+029
+               fine-tuning tasks while balancing memory efficiency and performance metrics.
+030
+031
+032
+      1    I NTRODUCTION
+033
+      In recent years, Large Language Models (LLMs) such as GPT (OpenAI, 2023) and LLaMA-3
+034
+      Dubey et al. (2024) have demonstrated remarkable performance across various disciplines (Brown,
+035
+      2020b; Yang et al., 2024; Romera-Paredes et al., 2024). However, a critical factor in achieving
+036   these results is the size of these models (Hoffmann et al., 2022). A larger number of parameters not
+037   only increases computational cost but also significantly raises memory requirements. For instance,
+038   training an 8 billion parameter LLaMA model in a 16-bit format necessitates each parameter to
+039   occupy 2 bytes, resulting in 16GB for storing the parameters and an additional 16GB for gradients.
+040   Utilizing the Adam optimizer (Kingma, 2014), which is standard for pre-training and fine-tuning
+041   LLMs, adds a further 32GB of memory to store the m and v statistics, resulting in 64GB total amount
+042   of memory. Furthermore, to achieve higher-quality results, training in pure 16-bit format is often
+043   insufficient (Zamirai et al., 2020). This necessitates storing master weights and optimizer statistics in
+044
+      32-bit format, leading to total memory demands that exceed the capacity of cutting-edge graphics
+      cards, such as the A100-80GB.
+045
+046   Numerous research projects have been aimed at reducing these significant costs. These approaches
+047   include engineering solutions like gradient checkpointing Chen et al. (2016) and memory offloading
+048   (Rajbhandari et al., 2020), which do not change the training trajectory. There are also methods
+049   that adjust the training algorithm by decreasing the number of trainable parameters (Frankle &
+050
+      Carbin, 2018; Wang et al., 2023; Sreenivasan et al., 2022; Horváth et al., 2024) or their bit precision
+      (Wortsman et al., 2023), as well as optimizer statistics (Dettmers et al., 2021; Shazeer & Stern, 2018;
+051
+      Zhang et al., 2024c). In this work, we concentrate on the latter category.
+052
+053   Parameter-Efficient Fine-Tuning (PEFT) methods, such as LoRA (Hu et al., 2021), Dora (Liu et al.,
+      2024), and BitFit (Zaken et al., 2021) reduce memory costs by training a relatively small number of
+
+
+                                                         1
+      Under review as a conference paper at ICLR 2025
+
+
+054
+055
+                                         Algorithm 1 FRUGAL (State-Full, State-Free)
+056
+057
+                                          Input: model fθ (·) with p parameters {θi ∈ Rdi }pi=1 , loss L,
+                                          gradient projectors Pk,i for i ∈ [p], number of steps K.
+058
+                                           1: for k = 1, 2, . . . K do
+059
+                                           2:     get data batch (x, y)
+060
+                                           3:     compute ℓ ← L(fθ (x), y)                         ▷ Forward
+061                                                            ∂ℓ
+                                           4:     for gi = ∂θ      from Backward       do
+062                                                              i
+                                           5:         gfull,i ← Pk,i (gi ),                    ▷ Project Grad
+063                                                                       −1
+064
+                                           6:         gfree, i ← gi − Pk,i   (gfull,i )            ▷ Residual
+                                                                        −1
+065   Figure 1: FRUGAL reduces memory 7:              sθi ← [Pk,i (Pk−1,i (s), s ∈ sθi ]▷ Project State s
+066   usage by splitting gradient updates 8:          ufull, i ← State-Full.update(θi , gfull,i , sθi )
+067   into low-dimensional updates with 9:            ufree, i ← State-Free.update(θi , gfree,i )
+                                                                      −1
+068   advanced optimizers (e.g., AdamW) 10:           θi ← θi + Pk,i     (ufull,i ) + ufree, i
+069   and using state-free methods (e.g., 11:     end for
+070   SignSGD and SGD) for the rest.      12: end for
+071
+072   parameters compared to the size of the original model, while the remaining modules are frozen. This
+073   approach has proven effective for the task of efficient fine-tuning of pre-trained language models.
+074
+      However, PEFT methods have a fundamental limitation: parameter updates always lie in a low-
+      dimensional subspace L, which prevents the use of these methods for pre-training (Lialin et al., 2023)
+075
+      and may constrain their capabilities in fine-tuning (Zhang et al., 2024a).
+076
+077   Recent works, such as GaLore (Zhao et al., 2024a), ReLoRA (Lialin et al., 2023), BAdam (Luo
+078   et al., 2024) and BlockLLM (Ramesh et al., 2024), offer a solution to this problem. These methods
+079   enable higher-dimensional full-parameter learning by periodically changing the optimizable low-rank
+080
+      subspace L. However, even though these methods result in overall parameter changes that are
+      high-dimensional, the updates in each step remain low-dimensional. The dimensionality of the frozen
+081
+      subspace dim M = dim L⊥ significantly exceeds dim L. The remaining information contained in
+082
+      the gradient is not utilized for parameter updates. Nevertheless, this information can still be leveraged
+083   to train the model.
+084
+085   We present the FRUGAL framework, designed to bridge this gap. Our approach stems from a crucial
+086
+      observation: although memory constraints prevent using optimizers with auxiliary optimizer state —
+      such as Adam (Kingma, 2014) — in the remaining subspace M , one still can update M using state-
+087
+      free optimization algorithms like Stochastic Gradient Descent (SGD) or signSGD (Bernstein et al.,
+088
+      2018). This solution allows for high-dimensional updates, which provides additional opportunities to
+089   explore the parameter space and improves convergence. We will further refer to subspaces L and M
+090   according to the types of optimizers used for their updates - state-full and state-free.
+091
+092
+      Contributions. We summarize the main contributions of our work as follows:
+093
+      • We present a new memory-efficient optimization framework that combines the use of advanced
+094     optimization algorithms for the state-full subspace with state-free algorithms for the complementary
+095     subspace. The framework supports various types of state-full optimizers, state-free optimizers, and
+096     different methods for projecting the gradient onto the state-full subspace.
+097   • We provide theoretical convergence guarantees for our framework. In the proof, we consider the
+098     case where SGDM acts as the state-full optimizer and SGD as the state-free optimizer, and we
+099     show that FRUGAL matches the best-known convergence rate in many scenarios.
+100
+      • To verify the practical applicability of FRUGAL, we conduct extensive experiments in popular real-
+101     world scenarios.1 In these experiments, we pre-train LLaMA-like models (up to 1B parameters) on
+102     the Colossal Clean Crawled Corpus (C4) dataset (Raffel et al., 2020) and fine-tune RoBERTa (Liu,
+103     2019) on the GLUE benchmark (Wang, 2018). The results show that our method significantly
+104     outperforms previous memory-efficient algorithms while using the same memory budget.
+105   • We demonstrate that only the Logits layer in transformer-like models requires advanced optimizers
+106     like Adam, while other modules (including Embeddings and RMSNorms) can use simpler methods
+107
+         1
+             The code is available at https://anonymous.4open.science/r/frugal-666D.
+
+
+                                                         2
+      Under review as a conference paper at ICLR 2025
+
+
+108
+            like signSGD without significant performance loss. This opens new possibilities for memory-
+109         efficient training and provides crucial insights into the learning dynamics of Transformers.
+110
+111
+112   2                R ELATED WORK
+113
+114
+      Memory-efficient full-parameter learning. Recent research has focused on reducing the memory
+      footprint of LLMs by decreasing the size of optimizer states while maintaining their performance.
+115
+      Low-rank adaptation methods, such as LoRA (Hu et al., 2021), inject trainable rank decomposition
+116
+      matrices into each layer of the model, reducing memory requirements by optimizing only a few
+117   learnable adapters. ReLora (Lialin et al., 2023) builds upon this by merging low-rank adaptations
+118   into the main model weights during training, potentially increasing the total rank of the update.
+119   BAdam (Luo et al., 2024) leverages Block Coordinate Descent for full-parameter training by switch-
+120   ing active blocks during fine-tuning. MicroAdam (Modoranu et al., 2024) compresses gradient
+121   information before feeding it into the optimizer state, significantly reducing memory footprint while
+122   enabling full parameter learning through error feedback mechanisms. GaLore (Zhao et al., 2024a)
+123   maintains full parameter learning by projecting gradients onto a low-rank subspace using truncated
+124   SVD decomposition, storing optimizer states in this reduced space. Notably, GaLore achieves good
+125
+      results in pre-training, with performance close to that of Adam. However, while these methods
+      effectively reduce memory overhead, they all perform low-rank updates at each iteration. In contrast,
+126
+      our approach utilizes all available gradient information to perform full-dimensional updates at each
+127
+      optimizer step, offering a novel perspective on memory-efficient optimization for LLMs.
+128
+129   Other memory-efficient optimization. Several other methods have been proposed to reduce the
+130   memory footprint of optimizers. AdaFactor (Shazeer & Stern, 2018) attempts to mimic Adam’s
+131
+      behavior while reducing memory usage through factorization of the variance matrix v. Adam-
+      mini (Zhang et al., 2024c) further reduces memory by storing only one value v per block. Dettmers
+132
+      et al. (2021) and Li et al. (2024) decrease memory footprint by quantizing optimizer states to the
+133
+      lower-precision representations. Lv et al. (2023) proposed to reduce weight gradient memory by
+134   fusing the backward operation with the optimizer update. Notably, these approaches are orthogonal
+135   to our method FRUGAL and can be combined with it for further memory efficiency.
+136
+137
+      Block Coordinate Descent. Block Coordinate Descent (BCD) is a well-established optimization
+      method with a rich history in mathematical optimization (Ortega & Rheinboldt, 2000; Tseng, 2001;
+138
+      Richtárik & Takáč, 2014; 2015b; Richtárik & Takác, 2016; Takáč et al., 2013; Richtárik & Takáč,
+139
+      2015a). In recent years, a specific instance of BCD, known as layer-wise learning, has been applied
+140   to deep learning. Notable examples include (Luo et al., 2024; Pan et al., 2024), which leverage
+141   this approach for LLM fine-tuning. To the best of our knowledge, our work presents the first
+142   theoretical analysis of an extended BCD framework (Section 5) where the remaining coordinates are
+143   also updated using a different algorithm. This novel approach extends traditional BCD techniques,
+144   opening new avenues for full model optimization in deep learning.
+145
+      Sign-based methods for training language models. Since its introduction, Adam has become
+146   the de facto primary optimization algorithm, demonstrating superior practical results compared to
+147   SGD-based algorithms across various deep learning tasks. This difference is particularly noticeable
+148   when training Transformers on language tasks. While Zhang et al. (2020) hypothesized that Adam
+149   outperforms SGD in this setup due to the heavy-tailed distribution of sampling-induced errors,
+150
+151
+                              1000 and 2000                            1000 and 10000                            1000 and 99000                                   Random
+152                                                                                                                                             6
+      Frequency
+
+
+                                                            20
+153               30                                                                                  15
+                                                                                                                                                4
+
+154               20
+                                                            10
+                                                                                                      10
+
+                                                                                                                                                2
+155               10                                                                                   5
+
+
+156                0
+                       0.0    0.2   0.4   0.6   0.8   1.0
+                                                             0
+                                                                 0.0    0.2   0.4   0.6   0.8   1.0
+                                                                                                       0
+                                                                                                           0.0    0.2   0.4   0.6   0.8   1.0
+                                                                                                                                                0
+                                                                                                                                                    0.0     0.2     0.4   0.6   0.8
+
+157                          Principal cosines                         Principal cosines                         Principal cosines                        Principal cosines
+158
+159   Figure 2: Histograms of principal angle cosines. The first three are taken between Pt and Pt′
+160   from different iterations t and t′ . P is obtained from the truncated SVD decomposition of the
+161
+      gradient G of the Key projection from the 5th layer. The last histogram is taken between two random
+      semi-orthogonal projections R and R′ for comparison.
+
+
+                                                                                                3
+      Under review as a conference paper at ICLR 2025
+
+
+162
+163   Table 1: Comparison of different projection and state-free subspace optimization strategies on
+164   pre-training LLaMA-130M on C4 with Adam as the state-full algorithm.
+165
+                       Projection     Optimizes state-     Validation perplexity after iterations ↓
+166
+                          type         free subspace       4k       20k     40k      100k 200k
+167
+168                      SVD                No            39.75    26.35    24.38     22.30    21.11
+169
+                        Random              No            42.31    25.99    23.55     21.33    20.01
+170
+                        Random              Yes           37.26    23.46    21.53     19.66    18.64
+                         SVD                Yes           33.96    22.54    21.01     19.30    18.35
+171
+                        RandK               Yes           36.38    23.02    21.25     19.70    18.63
+172
+                       Blockwise            Yes           37.20    23.34    21.42     19.59    18.60
+173                                 Adam                  33.95    21.90    20.56     18.97    18.13
+174
+175
+176
+177
+      Kunstner et al. (2023) demonstrated that this superiority persists even in full-batch training. They
+      proposed a new hypothesis suggesting that Adam’s key success factor is related to its similarity to
+178
+      signSGD (Balles & Hennig, 2018; Balles et al., 2020), and both Kunstner et al. (2023) and Zhao
+179
+      et al. (2024b) showed that signed descent with momentum reduces the performance gap with Adam.
+180   In contrast, to the best of our knowledge, we are the first to train the majority of language model’s
+181   parameters using signSGD without momentum, achieving minimal loss in quality. This approach
+182   further demonstrates the effectiveness of sign-based methods for LLM training, paving the way for
+183   more efficient and scalable optimization strategies in deep learning.
+184
+185
+      3       E MPIRICAL A NALYSIS AND M OTIVATION
+186
+187
+      In this section, we present empirical evidence that motivates our approach. First, we show that
+188
+      access to the whole parameter space is crucial during training. Then, we show how utilizing full-rank
+189   updates can significantly improve model performance.
+190
+191   3.1       T HE IMPORTANCE OF EXPLORING THE ENTIRE SPACE DURING THE TRAINING PROCESS
+192
+193   In recent work, Zhao et al. (2024a) proposed GaLore, an optimization method based on projecting the
+194   gradient matrix G of each Linear layer2 onto a low-dimensional subspace. To obtain the projection
+195   matrix P , they use SVD decomposition of Gt , which is recomputed with frequency T . The vectors
+196   or rows of G are projected onto the first r left or right singular vectors, respectively. This approach
+197   has theoretical foundations: the first r singular vectors correspond to the first r singular values and,
+198
+      therefore, should better utilize information from the spectrum of G.
+199   The authors pointed out that calculating the SVD decomposition results in extra computational
+200   overhead, which can be as much as a 10% increase as the hidden size of the model grows. To
+201   minimize this cost and examine the significance of using SVD decomposition, one may wonder about
+202   the possibility of employing a random semi-orthogonal projection matrix R instead of projecting
+203   onto the first r singular columns with P . Surprisingly, while SVD decomposition provides better
+204
+      initial performance, random projection proves superior in long-term training, yielding significant
+      improvements. As an illustration, we took the pre-training3 of a 130M model with LLaMA-like
+205
+      architecture on the C4 dataset (Raffel et al., 2020). The results are presented in the first part
+206
+      of Table 1 (Optimizes state-free subspace = No), where we compare SVD and Random
+207   projections. The ranks of both projections P and R are equal to 192.
+208
+209   To investigate this phenomenon, we pre-trained the LLaMA-60M model and collected gradients Gt
+210
+      from different iterations t for examination. Following the setup from GaLore (Zhao et al., 2024a), we
+      computed SVD decompositions and extracted projections Pt with a rank of 128. We evaluated the
+211
+      similarity of the projection matrices by calculating the principal angles between different projections
+212
+      Pt at different steps. Similarly to the observations in Q-Galore (Zhang et al., 2024d), we found that
+213   these projections show minimal change during the training period; see Figure 2.
+214
+          2
+215           Since Linear layers contain most parameters and require most memory, we primarly focus on them.
+          3
+              See Section 6.1 for a detailed description and discussion on the experimental setup.
+
+
+                                                             4
+      Under review as a conference paper at ICLR 2025
+
+
+216
+      Here, we take the projection matrix corresponding to the 5-th layer and plot histograms of the cosine
+217   of the principal angles between pairs Pt and Pt′ from different iterations. For comparison, we
+218   also include the random projections on the right. As can be seen, the distributions of cosines differ
+219   significantly for the Pt and for the random projections. While Rt feature no angles with cosines
+220   higher than 0.9, the top 57 cosines for Pt surpass 0.9, even for gradients 1000 steps apart.
+221
+      This leads to the conclusion that although SVD decomposition generally better captures the informa-
+222
+      tion contained in the Gt , the original GaLore algorithm updates weights only in a small subspace. We
+223   hypothesize that training with random projections yields superior results due to the more extensive
+224   investigation of the optimizable space during the training process. This finding indicates that to
+225   achieve better convergence, it is important to seek out optimization algorithms that explore the entire
+226   space during the training process.
+227
+228   3.2    A DVANTAGE OF THE F ULL -R ANK U PDATES
+229
+230   The insight from the Section 3.1 suggests that the training of language models performs significantly
+231   better when the entire parameter space is utilized during the training process. Given the importance
+232   of updating parameters in all directions, this poses the question: Is it optimal to use low-rank
+233
+      updates, as employed by methods such as GaLore (Zhao et al., 2024a), ReLoRA (Lialin et al., 2023),
+      and BAdam (Luo et al., 2024)? Using low-rank updates means the effective rank of the update is
+234
+      significantly smaller than the full dimensionality of the parameter space, inevitably leading to a loss
+235
+      of valuable information contained in the gradient.
+236
+237   However, the method to leverage the full-rank gradient for updating parameters is not readily obvious.
+238   Using algorithms like Adam (Kingma, 2014) is not an option due to the memory overhead they
+239
+      introduce, which is precisely what we aim to avoid. An alternative approach is to use state-free
+      optimizers such as SGD or signSGD (Bernstein et al., 2018). Unfortunately, SGD have been shown
+240
+      to be ineffective for training transformer models, as shown in Zhang et al. (2020); Pan & Li (2023).
+241
+242   Nevertheless, a recent study Zhao et al. (2024b) suggests a promising methodology: while SGDM
+243   doesn’t generally work well with transformers, using SGDM for the majority of parameters and Adam
+244   for a selected subset can lead to effective training. This raises the question: could a hybrid approach
+245
+      using SGD or signSGD instead of SGDM be viable? If the key subset of parameters is handled by
+      advanced algorithms, can the other parameters be trained effectively with state-free optimizers?
+246
+247   To address this question, we conducted an experiment on LLaMA-130m, where we utilized the
+248   Adam (Kingma, 2014) for state-full parameters and signSGD (Bernstein et al., 2018) for state-
+249   free parameters. A detailed description of the experimental setup can be found at Appendix A.1.
+250   Once again we used Random projection and highlighted the result in the second part of Table 1
+251
+      (Optimizes state-free subspace = Yes). Full-rank updates significantly enhance per-
+      formance, approaching the efficiency of the memory-intensive Adam optimizer, which serves as a
+252
+      upper bound in terms of performance. These findings underscore the potential of state-free algorithms
+253
+      for updating a substantial portion of the parameter space, paving the way for efficient, scalable
+254   optimization methods that deliver high performance without the significant memory costs traditionally
+255   associated with state-of-the-art optimizers.
+256
+257
+258
+      4     FRUGAL: F ULL -R ANK U PDATES WITH G R A DIENT SP L ITTING
+259
+260
+      General framework. The setup outlined at the conclusion of the Section 3.2 results in a general
+      framework for memory-efficient optimization. It operates as follows: the entire space is partitioned
+261
+      into state-full and state-free subspaces. The state-full subspace is updated using advanced algorithms,
+262
+      while the state-free subspace is updated using a state-free method. After a certain number of steps, the
+263   state-full subspace is changed to better explore the optimization space. A formal description of the
+264   final algorithm is presented in Algorithm 1. We note that this framework allows for variation not only
+265   in the State-Full optimizer but also in the choice of projection and State-Free optimizer.
+266
+      However, determining the optimal state-free optimizer and the projection method onto the state-full
+267
+      subspace is not readily apparent. In this section, we strive to find the optimal configuration.
+268
+269   State-free optimizer. We conducted a preliminary experiment updating all parameters using state-
+      free algorithms to choose between SGD and signSGD (Bernstein et al., 2018). Table 8 presents these
+
+
+                                                         5
+      Under review as a conference paper at ICLR 2025
+
+
+270
+      Algorithm 2 FRUGAL (SGDM, SGD)
+271
+272
+      Input: momentum weight β ∈ [0, 1), initialization x1 ∈ Rd and m0 = 0, step sizes {αk > 0}K
+                                                                                               k=1 ,
+      momentum set Jk ⊂ [d] for k = 1, 2, . . ..
+273
+       1: for k = 1, 2, . . . do
+274
+       2:     Compute stochastic gradient g̃ k ← ∇fζ k (xk );
+275                                                                 k−1
+276                                       k               k        m̃j  if j ∈ Jk ,
+       3:     Update momentum vector m̃j ← (1 − β)g̃j + β
+277                                                                0    otherwise;
+                                               k
+278                                            m̃  j if j ∈ J k ,
+       4:     Compute update vector ũkj ←
+279                                            g̃jk otherwise;
+280    5:     Update iterate xk+1 ← xk − αk ũk ;
+281    6: end for
+282
+283
+284   results. After testing various learning rates, we found that signSGD consistently outperforms SGD,
+285   leading us to favor signSGD. We attribute this performance to the similarities between signSGD
+286
+      and Adam (Kingma, 2014), as noted in Balles & Hennig (2018); Balles et al. (2020); Kunstner et al.
+      (2023). Additionally, signSGD produces updates of similar magnitude to those generated by Adam,
+287
+      which simplifies the calibration of the learning rate for state-free parameters.
+288
+289   Projection type. When selecting a projection method, it is crucial to strike a balance between quality
+290   and memory efficiency. When using SVD decomposition for projection matrices, as in GaLore (Zhao
+291   et al., 2024a), the method better preserves the information embedded in the gradient but requires
+292
+      additional memory for storing projection matrices and computational resources for performing the
+      SVD. To reduce computational demands, one could employ random coordinate projection denoted as
+293
+      RandK, but this requires additional memory or recomputation4 . A more structured alternative is to
+294
+      select not random entries but entire random columns or rows. The most aggressive approach follows
+295   the method from BAdam, wherein an entire block is chosen as the state-full subspace.
+296
+297   The performance results obtained with all these variants are presented in the second part of Table 1.
+298
+      SVD outperforms both RandK and Block projections, demonstrating comparable performance. The
+      superior performance of SVD projection can be explained by its ability to extract the principal
+299
+      information from the gradient. Nonetheless, a downside is the increased compute and memory
+300
+      demand from SVD. Therefore, we opt for the blockwise selection, as it is the most memory-efficient
+301   — requiring only the storage of active block indices.
+302
+303   In our experiments, we use a specific variant with Adam as the State-Full optimizer and signSGD
+304
+      as the State-Free optimizer. We primarily employ blockwise projection but switch to column-wise
+      projection when the number of parameters in any single block exceeds memory budget, as detailed
+305
+      in Section 6.2. In addition, PyTorch-like pseudocode of our framework is presented in Appendix G.
+306
+307   For Line 7, state projection, in Algorithm 1, we note that if the projection does not change, i.e.,
+                                    −1
+308   Pk,i = Pk−1,i , then Pk,i (Pk−1,i (s)) = s. Thus, we only need to project states when the projection
+309   changes from one round to another. However, our preliminary experiments with RandK selection
+310   showed that resetting states performs comparably to projection. Therefore, we could replace this
+311
+      projection with state resetting when the projection changes, which also aligns with blockwise subspace
+      selection. However, either resetting or projecting states is important since we want projected gradients
+312
+      and optimizer states to reside in the same space. For instance, GaLore ignores this step, which leads
+313
+      to degraded performance when projections are updated frequently; see Appendix C for details.
+314
+315
+316   5       T HEORETICAL R ESULTS
+317
+318   For the theoretical analysis, we consider the case where the State-Free optimizer is SGD and the
+319
+      State-Full optimizer is SGD with momentum (SGDM). For the projection, we use coordinate-
+      wise projection. This special case of FRUGAL is provided in Algorithm 2. We minimize the objective
+320
+321                                     minx∈Rd f (x) := Eζ k [fζ k (x)] ,                           (1)
+322   where we access f via a stochastic oracle that takes x as input and returns (fζ k (x), ∇fζ k (x)).
+323
+          4
+              See Appendix B for discussion on the memory requirements for different projection methods.
+
+
+                                                              6
+      Under review as a conference paper at ICLR 2025
+
+
+324
+      5.1   N OTATION AND P RELIMINARIES
+325
+326   We use ∥ · ∥ for the vector ℓ2 -norm, and ⟨·, ·⟩ stands for the dot product. Let g k denote the full gradient
+327   of f at xk , i.e., g k := ∇f (xk ), g̃ k denote the stochastic gradient g̃ k = ∇fζ k (xk ) for random sample
+328   ζ k , and f ∗ := minx∈Rd f (x). We use subscript j to denote the j-th coordinate. We call a function
+329   L-smooth if it is continuously differentiable and its gradient is Lipschitz continuous:
+330                                           ∥∇f (x) − ∇f (y)∥ ≤ L∥x − y∥.                                     (2)
+331
+      Assumption 1. We make the following assumptions, which are standard in non-convex stochastic
+332
+      optimization; see (Liu et al., 2020).
+333
+334         1. Smoothness: The objective f (x) in equation 1 is L-smooth (eq. (2)).
+335
+336
+            2. Unbiasedness: At each iteration k, g̃ k satisfies Eζ k [g̃ k ] = g k .
+337         3. Independent samples: The random samples {ζ k }∞
+                                                             k=1 are independent.
+338
+339         4. Bounded variance: The variance of g̃jk with respect to ζ k satisfies Varζ k (g̃jk ) = Eζ k [∥g̃jk −
+340
+                                                               Pd
+               gjk ∥2 ] ≤ σj2 for some σj2 > 0. We denote σ 2 = j=1 σj2 .
+341
+342   Finally, we define the probability that index j ∈ Jk is selected, conditioned on the prior iteration
+343   k − 1, as pkj := Prk−1 [j ∈ Jk ]. Other useful quantities are pkmax := maxj∈[d] {pkj } and pkmin :=
+344   minj∈[d] {pkj }.
+345
+346   5.2   C ONVERGENCE OF A LGORITHM 2
+347
+348   Below, we present the main convergence theorem.
+                                                                1−β
+349   Theorem 1. Let Assumption 1 hold and αk = α ≤ L(4−β+β         2 ) . Then, the iterates of Algorithm 2
+350   satisfy
+351
+                                            f (x1 ) − f ∗                p̂kmax (1 − p̄kmin )β
+
+                   1
+                     Pk        i 2                              2
+352                k   i=1 E[∥g ∥ ] = O                   + Lασ 1 +                               ,      (3)
+                                                kα                             (1 − β)
+353
+                       Pk
+354   where p̄kmin = k1 i=1 p̄imin and p̂kmax = maxi∈[k] {pimax }.
+355
+356   The proof is deferred to Appendix E. Let us analyze the obtained result. Firstly, if Jk = [d] or
+                                                                                                k
+357
+      Jk = ∅, Algorithm 2 becomes SGDM and SGD, respectively. In this case, we           have p̄min = 1 for
+                    k                                                                2
+358   SGDM and p̂max = 0 for SGD. Therefore, the resulting rate is O /kα + Lασ , which recovers the
+                                                                       1
+
+359
+      best-known rate for both SGD and SGDM under these assumptions Liu et al. (2020). Furthermore, if
+      at each step each coordinate is sampled independently with probability p, we have p̄kmin = p̂kmax = p.
+360
+      Therefore, we recover the same rate if p = O (1 − β) or p = O (β). Finally, in the worst case (e.g.,
+361                                                       k            k
+362                   2
+                             0 < |Jk | < d), we have p̄min = 0 and p̂max = 1. Thus, the rate becomes
+      Jk is deterministic and
+      O /kα +
+          1       Lασ  /1−β , which is worse by a factor of /1−β . However, this is expected since the bias
+                                                            1
+363   from momentum is not outweighed by the variance reduction effect, as only the coordinates with
+364   momentum enjoy reduced variance; see Lemmas 1 and 2 in the appendix for details.
+365
+366
+367
+      6     E XPERIMENTS
+368
+      This section presents the main experimental results of the paper. To evaluate the performance of
+369
+      FRUGAL, we conducted experiments both on the pre-training and fine-tuning of language models.
+370
+371
+      6.1   P RE - TRAINING EXPERIMENTS
+372
+373   Setup. The core setup for pre-training is taken from the Zhao et al. (2024a). We utilize LLaMA-
+374   based (Touvron et al., 2023a) model architectures with up to 1B parameters and train them on the
+375   Colossal Clean Crawled Corpus (C4) dataset (Raffel et al., 2020). The C4 dataset is intended for pre-
+376   training, making this setup a good approximation of real-world applications. A detailed description
+377   of the setup can be found in Appendix A.1. However, we made several modifications that we would
+      like to discuss in detail below.
+
+
+                                                            7
+      Under review as a conference paper at ICLR 2025
+
+
+378
+379   Table 2: Comparison of validation perplexity and memory estimation for various optimization
+380   methods across LLaMA model scales trained on C4. We also indicate the additional memory
+381   overhead introduced by the optimization algorithm. The values are calculated assuming that each
+382   float value occupies 4 bytes (float32). ρ denotes the proportion of the Linear layer parameters in the
+383
+      state-full subspace. Note that Embeddings, RMSNorms, and Logits are always trained with Adam.
+384                                       60M              130M              350M             1B
+385           Adam                    22.73 (0.43G)    18.13 (1.00G)     14.43 (2.74G)   12.02 (9.98G)
+386           GaLore, ρ = 0.25        25.68 (0.30G)    21.11 (0.54G)     16.88 (1.10G)   13.69 (3.41G)
+387           BAdam, ρ = 0.25         24.86 (0.29G)    20.34 (0.52G)     16.41 (1.05G)   13.75 (3.23G)
+388           FRUGAL, ρ = 0.25        23.59 (0.29G)    18.60 (0.52G)     14.79 (1.05G)   12.32 (3.23G)
+389           FRUGAL, ρ = 0.0         24.06 (0.24G)    18.90 (0.37G)     15.03 (0.49G)   12.63 (0.98G)
+390           Training tokens              20B                20B               24B          30B
+391           Number of iterations         200k               200k              240k         300k
+392
+393
+394
+      • Training Duration. The training approach in Zhao et al. (2024a) aligns with the empirical rule
+395
+        from scaling laws (Hoffmann et al., 2022), which suggests using approximately 20 times the model
+396
+        size in tokens for training. However, this number of tokens is far from achieving convergence. In
+397     practice, models are typically trained for significantly longer periods (Touvron et al., 2023b; Zhang
+398     et al., 2024b). One reason for this discrepancy is that the original scaling laws do not account for
+399     the inference of the model after training. Adjustments to scaling laws considering this parameter
+400     are discussed, for example, in (Sardana & Frankle, 2023). For our experiments we chose 200k
+401     steps for the 60M and 130M models, 240k for 350M model and 300k for the 1B model.
+402   • Learning Rate. The authors of GaLore suggested using different learning rates for fixed un-
+403     projectable parameters (Embeddings, RMSNorms (Zhang & Sennrich, 2019), Logits) and the
+404     remaining projectable parameters (attention and FFN weights modules weights). However, in-
+405     troducing additional hyperparameters complicates the use of the algorithm. Since both sets of
+406     parameters are state-full and trained using the same optimization algorithm, we always used the
+407     same learning rate for them in FRUGAL and BAdam. For GaLore learning rate see Section 6.1.
+408   • Mixed Precision instead of the pure bfloat16 training. Pure 16-bit training has been shown to
+409     potentially compromise model convergence and accuracy (Zamirai et al., 2020). This degradation
+410     stems from storing both the model weights and optimizer statistics in reduced precision formats
+411     such as float16 or bfloat16. However, these formats often lack sufficient precision in representing
+412
+        floating-point numbers. Consequently, mixed precision training has become a more common
+        approach for training language models (Le Scao et al., 2023; Almazrouei et al., 2023)). While
+413
+        training in pure 16-bit format is also possible, stochastic rounding (Gupta et al., 2015; Zamirai
+414
+        et al., 2020) is often employed to mitigate the aforementioned issue. Given that the goal of this
+415     research is to identify the optimal optimization algorithm, we deemed it more appropriate to
+416     compare optimizers in a transparent and stable setup that does not require auxiliary tricks. Hence,
+417     we primarily used Mixed Precision training for its illustrative value in understanding each method’s
+418     potential. However, for completeness, we also conducted experiments in pure bfloat16 format,
+419     detailed in our ablation study Section 6.1.2.
+420
+421
+      6.1.1      C OMPARISON TO EXISTING MEMORY- EFFICIENT ALGORITHMS
+422
+423   To begin, we present the results of comparing FRUGAL with existing memory-efficient methods
+424   across four sizes of LLaMA-based architectures: 60M, 130M, 350M, and 1B5 .
+425   Baselines. We use the following methods as baselines for our approach:
+426
+427   • Full-rank Training. Training using memory-inefficient Adam. Weights, gradients, and statistics
+428     are stored and computed for all parameters. This serves as an upper bound for model performance.
+429   • GaLore. Zhao et al. (2024a) proposed GaLore, a memory-efficient optimization algorithm that
+430     uses a low-rank projection of gradient matrices G. Every T steps, the current gradient matrix Gt is
+431
+         5
+             See preliminary experimental results with LLaMA 7B in Appendix D
+
+
+                                                          8
+      Under review as a conference paper at ICLR 2025
+
+
+432
+433   Table 3: Perplexity of LLaMA-130M models pre-trained on C4 for 100k iterations (10B tokens). The
+434   leftmost column indicates the modules moved to the state-free set and trained using signSGD. The
+435   results show that Logits, unlike Embeddings and RMSNorms, are exceptionally responsive to the
+436   choice of optimization algorithm from Adam to signSGD.
+437                                    State-free modules                             Perplexity ↓
+438
+439
+                Linear (corresponds to the FRUGAL with ρ = 0.0 from Table 2)             20.02
+440
+                                      Linear, RMSNorms                                   20.07
+                                     Linear, Embeddings                                  20.48
+441
+                               Linear, Embeddings, RMSNorms                              20.55
+442
+                                         Linear, Logits                                  34.66
+443
+444     used to compute the projection matrix P via SVD decomposition. The gradient is then projected
+445     onto the low-rank space, where the optimization step is performed. Subsequently, the resulting
+446     low-rank update is projected back into the full-rank space and added to the weights W .
+447   • BAdam. Luo et al. (2024) proposed a block coordinate descent (BCD)-type optimization method
+448     termed BAdam. The parameters are divided into blocks, which are then updated one by one using
+449     Adam. Similar to GaLore, the optimized block is updated every T steps. Although this method
+450     was initially proposed only for fine-tuning, it is the closest method to our FRUGAL. Unlike BAdam,
+451     in our algorithm, state-free blocks are not frozen but are updated using signSGD.
+452   • Other Algorithms. Among other relevant methods, ReLoRA (Lialin et al., 2023) and Mi-
+453     croAdam (Modoranu et al., 2024) can also be highlighted. However, we did not include them for
+454     comparison in this paper for the following reasons: 1. ReLoRA was evaluated in (Zhao et al.,
+455     2024a), where it significantly underperformed compared to GaLore with the same memory budget.
+456     2. MicroAdam. Its current implementation only supports bfloat16 master weights, whereas our
+457     main experiments conducted with mixed precision.
+458
+459
+      Main results. The results of our experiments are presented in Table 2, which includes both validation
+      perplexity and memory footprint estimations for each method. We compared all memory-efficient
+460
+      methods under the same memory budget with a density ρ = 0.25. Here, ρ refers to the proportion
+461
+      of Linear layer parameters in the state-full subspace. Similarly to GaLore, non-Linear modules
+462   (Embeddings, RMSNorms, Logits) are optimized with Adam. See Appendix A.1 for details.
+463
+464   We conducted a grid search to determine the optimal learning rate for Adam, which we then applied
+465
+      uniformly to FRUGAL and BAdam (Luo et al., 2024). For GaLore (Zhao et al., 2024a), we found that
+      using this same learning rate produced better results than the rate originally suggested in their paper.
+466
+      This discrepancy might be attributed to our experiments involving a significantly larger number of
+467
+      training steps than those for which GaLore’s original learning rate was optimized.
+468
+469   Table 2 demonstrates that FRUGAL significantly outperforms the memory-efficient baselines across
+470   all model sizes with the same memory budget, coming close to the performance of Adam.
+471   Zero-density training. Table 2 also reveals a surprising result: FRUGAL with ρ = 0.0 outperforms
+472   both GaLore and BAdam, even when these competing methods use a higher density of ρ = 0.25.
+473   Essentially, for FRUGAL with ρ = 0.0, the parameters are divided into two parts — a state-full part
+474   consisting of the Embeddings, RMSNorms, and Logits, and a state-free part consisting of all other
+475   parameters. This division remains fixed throughout the training. We conducted additional experiments
+476   to determine the maximum subset of parameters that can be trained with a state-free optimizer without
+477
+      significant quality degradation. We systematically moved different combinations of the Embeddings,
+      RMSNorms, and Logits from the state-full to the state-free set and observed the results during
+478
+      the training of LLaMA-130M. Table 3 reveals that the Logits demonstrates a dramatically higher
+479
+      sensitivity, with changes to its optimizer resulting in severe performance degradation. This finding
+480   aligns with results from (Zhao et al., 2024b), where the authors demonstrated that most parameters
+481   can be trained using SGDM, but the Logits require training with Adam.
+482
+483   6.1.2   A BLATION STUDY
+484
+485   We also conducted additional experiments to verify the robustness of our framework to various
+      hyperparameters. Firstly, an ablation study on the state-full subspace update frequency T in Table 10
+
+
+                                                         9
+      Under review as a conference paper at ICLR 2025
+
+
+486
+      shows that the performance keeps improving up to T = 200. We note that, unlike in Zhao et al.
+487   (2024a), the perplexity does not significantly decrease even when reducing the update frequency to
+488   T = 10 (∼ 0.2 drop vs. ∼ 4. drop for GaLore). A detailed explanation for this result can be found
+489   in Appendix C. Second, when using other schedulers, the performance gap between FRUGAL and
+490   baselines remains consistent, as shown in Tables 5 and 6. Then, the results of training in pure
+491   bfloat16 are presented in Table 7, demonstrating consistency with our main experiments in Table 2,
+492   i.e., FRUGAL significantly outperforms the baselines across these variations. We also conducted
+493   experiments to show how perplexity changes with varying ρ, and the results are presented in Table 11.
+494   Finally, we conducted an experiment to compare different strategies for selecting state-full blocks
+495
+      during training. The results in Table 9 show that there is no significant difference between random
+      and structured block selection.
+496
+497   6.2     F INE - TUNING EXPERIMENTS
+498
+      Table 4: Evaluating FRUGAL for memory-efficient fine-tuning RoBERTa-Base on GLUE benchmark. Results
+499   represent the mean and standard deviation across 3 independent runs. Upper ↑ is better.
+500
+501       Method           Modules Rank CoLA STS-B MRPC             RTE     SST2 MNLI QNLI        QQP Avg
+502       Full-parameter    —      —      63.6    91.2    90.2     78.7    94.8    87.6    92.8    91.9 86.4
+503       LoRA              QV     8     63.8±.6 90.9±.1 89.1±.4 79.2±1.1 94.8±.2 87.6±.2 93.1±.1 90.6±.0 86.1
+504       GaLore             All    8    60.0±.2 90.8±.1 89.0±.7 79.7±.9 94.9±.5 87.6±.1 93.3±.1 91.1±.1 85.8
+505       GaLore             QV     8    56.1±.8 90.8±.2 88.1±.3 74.7±1.9 94.3±.1 86.6±.1 92.6±.1 89.4±.1 84.1
+506       FRUGAL             QV     8    64.5±.7 91.1±.1 89.2±.3 82.4±.9 94.8±.2 87.4±.1 92.8±.1 91.4±.1 86.7
+507       FRUGAL            None    0    64.8±.5 91.1±.1 89.1±.3 81.6±.6 94.9±.2 87.3±.1 92.8±.1 91.3±.1 86.6
+508
+509   We evaluated the performance of our framework in the context of memory-efficient fine-tuning
+510   using the GLUE benchmark (Wang, 2018), a widely-used collection of tasks for evaluating language
+511   models. Following the approach from Zhao et al. (2024a), we fine-tuned RoBERTa-base (Liu, 2019)
+512   using LoRA (Hu et al., 2021) and GaLore as baselines for comparison. We adhered to the setup
+513
+      described in LoRA, where low-rank updates of rank 8 were applied only to the Q and V matrices.
+      For a detailed description of the experimental setup, see Appendix A.2.
+514
+515   However, this comparison required a minor modification to FRUGAL compared to the pre-training
+516   phase. Instead of selecting active parameters blockwise, we opted for columnwise selection in each
+517   matrix. This adjustment was necessary to ensure a fair comparison within a similar memory budget,
+518   as the number of trainable parameters in LoRA with rank 8 is approximately 2.5 times fewer than
+519
+      the number of parameters in any RoBERTa matrix. This transition from blockwise to columnwise
+      selection allowed us to maintain comparable memory usage across methods. For the same reason, we
+520
+      did not include comparisons with BAdam (Luo et al., 2024) in this setup.
+521
+522   The results are presented in Table 4. Since the LoRA setup adds trainable adapters only to the Q
+523   and V matrices, while the GaLore code uses all modules as projectable parameters, we conducted
+524   experiments in both setups. The Full-parameter results are taken from the prior works. The results
+525
+      demonstrate that FRUGAL significantly outperforms GaLore and shows comparable results to LoRA.
+526   As in Section 6.1.1, we conducted additional experiments with FRUGAL using ρ = 0.0. In this setup,
+527   only the classification head is trained using Adam, while the embedding parameters remain frozen,
+528   and the remaining parameters are trained using signSGD. The results demonstrate that this training
+529   approach barely compromises performance compared to FRUGAL with rank 8, and still outperforms
+530   GaLore. Similar to our findings in Section 6.1.1, we observe that the classification head parameters
+531
+      are particularly sensitive to the choice of optimizer, which can be seen in Table 13 where the model’s
+      performance significantly deteriorates when using signSGD for classification head optimization.
+532
+533   7      C ONCLUSION
+534
+535   In this work, we introduce a new memory-efficient optimization framework, FRUGAL. Within this
+536   framework, the optimization space is divided into two subspaces: the first is updated using a state-full
+537   algorithm such as Adam, while the second is updated using a state-free algorithm such as signSGD.
+538   We prove theoretical convergence guarantees for our framework with SGDM serving as the state-full
+539   algorithm and SGD as the state-free algorithm. In experiments involving pre-training and fine-tuning
+      of language models, FRUGAL outperforms other approaches while using the same or smaller memory.
+
+
+                                                           10
+      Under review as a conference paper at ICLR 2025
+
+
+540
+      R EFERENCES
+541
+542   Ebtesam Almazrouei, Hamza Alobeidli, Abdulaziz Alshamsi, Alessandro Cappelli, Ruxandra Cojo-
+543     caru, Mérouane Debbah, Étienne Goffinet, Daniel Hesslow, Julien Launay, Quentin Malartic, et al.
+544     The falcon series of open language models. arXiv preprint arXiv:2311.16867, 2023.
+545
+      Lukas Balles and Philipp Hennig. Dissecting adam: The sign, magnitude and variance of stochastic
+546     gradients. In International Conference on Machine Learning, pp. 404–413. PMLR, 2018.
+547
+548   Lukas Balles, Fabian Pedregosa, and Nicolas Le Roux. The geometry of sign gradient descent. arXiv
+549     preprint arXiv:2002.08056, 2020.
+550
+      Jeremy Bernstein, Yu-Xiang Wang, Kamyar Azizzadenesheli, and Animashree Anandkumar.
+551     signSGD: Compressed optimisation for non-convex problems. In Jennifer Dy and Andreas
+552     Krause (eds.), Proceedings of the 35th International Conference on Machine Learning, volume 80
+553     of Proceedings of Machine Learning Research, pp. 560–569. PMLR, 10–15 Jul 2018. URL
+554     https://proceedings.mlr.press/v80/bernstein18a.html.
+555
+556
+      Tom B Brown. Language models are few-shot learners. arXiv preprint arXiv:2005.14165, 2020a.
+557   Tom B Brown. Language models are few-shot learners. arXiv preprint arXiv:2005.14165, 2020b.
+558
+559   Tianqi Chen, Bing Xu, Chiyuan Zhang, and Carlos Guestrin. Training deep nets with sublinear
+560     memory cost. arXiv preprint arXiv:1604.06174, 2016.
+561
+      Xiangning Chen, Chen Liang, Da Huang, Esteban Real, Kaiyuan Wang, Hieu Pham, Xuanyi Dong,
+562     Thang Luong, Cho-Jui Hsieh, Yifeng Lu, et al. Symbolic discovery of optimization algorithms.
+563     Advances in neural information processing systems, 36, 2024.
+564
+565   Tim Dettmers, Mike Lewis, Sam Shleifer, and Luke Zettlemoyer. 8-bit optimizers via block-wise
+566     quantization. arXiv preprint arXiv:2110.02861, 2021.
+567   Abhimanyu Dubey, Abhinav Jauhri, Abhinav Pandey, Abhishek Kadian, Ahmad Al-Dahle, Aiesha
+568     Letman, Akhil Mathur, Alan Schelten, Amy Yang, Angela Fan, et al. The llama 3 herd of models.
+569     arXiv preprint arXiv:2407.21783, 2024.
+570
+571   Jonathan Frankle and Michael Carbin. The lottery ticket hypothesis: Finding sparse, trainable neural
+572
+        networks. arXiv preprint arXiv:1803.03635, 2018.
+573   Suyog Gupta, Ankur Agrawal, Kailash Gopalakrishnan, and Pritish Narayanan. Deep learning with
+574     limited numerical precision. In International conference on machine learning, pp. 1737–1746.
+575     PMLR, 2015.
+576
+577
+      Yongchang Hao, Yanshuai Cao, and Lili Mou. Flora: Low-rank adapters are secretly gradient
+        compressors. arXiv preprint arXiv:2402.03293, 2024.
+578
+579   Jordan Hoffmann, Sebastian Borgeaud, Arthur Mensch, Elena Buchatskaya, Trevor Cai, Eliza
+580     Rutherford, Diego de Las Casas, Lisa Anne Hendricks, Johannes Welbl, Aidan Clark, et al.
+581     Training compute-optimal large language models. arXiv preprint arXiv:2203.15556, 2022.
+582
+      Samuel Horváth, Stefanos Laskaridis, Shashank Rajput, and Hongyi Wang. Maestro: Uncovering low-
+583
+        rank structures via trainable decomposition. In Forty-first International Conference on Machine
+584
+        Learning, 2024. URL https://openreview.net/forum?id=7bjyambg4x.
+585
+586   Edward J Hu, Yelong Shen, Phillip Wallis, Zeyuan Allen-Zhu, Yuanzhi Li, Shean Wang, Lu Wang,
+587     and Weizhu Chen. Lora: Low-rank adaptation of large language models. arXiv preprint
+588     arXiv:2106.09685, 2021.
+589
+      Diederik P Kingma. Adam: A method for stochastic optimization. arXiv preprint arXiv:1412.6980,
+590     2014.
+591
+592   Frederik Kunstner, Jacques Chen, Jonathan Wilder Lavington, and Mark Schmidt. Noise is not the
+593     main factor behind the gap between sgd and adam on transformers, but sign descent might be.
+        arXiv preprint arXiv:2304.13960, 2023.
+
+
+                                                      11
+      Under review as a conference paper at ICLR 2025
+
+
+594
+      Teven Le Scao, Angela Fan, Christopher Akiki, Ellie Pavlick, Suzana Ilić, Daniel Hesslow, Roman
+595     Castagné, Alexandra Sasha Luccioni, François Yvon, Matthias Gallé, et al. Bloom: A 176b-
+596     parameter open-access multilingual language model. 2023.
+597
+598   Bingrui Li, Jianfei Chen, and Jun Zhu. Memory efficient optimizers with 4-bit states. Advances in
+599     Neural Information Processing Systems, 36, 2024.
+600   Vladislav Lialin, Sherin Muckatira, Namrata Shivagunde, and Anna Rumshisky. Relora: High-
+601     rank training through low-rank updates. In The Twelfth International Conference on Learning
+602     Representations, 2023.
+603
+604   Shih-Yang Liu, Chien-Yi Wang, Hongxu Yin, Pavlo Molchanov, Yu-Chiang Frank Wang, Kwang-
+605
+        Ting Cheng, and Min-Hung Chen. Dora: Weight-decomposed low-rank adaptation. arXiv preprint
+        arXiv:2402.09353, 2024.
+606
+607   Yanli Liu, Yuan Gao, and Wotao Yin. An improved analysis of stochastic gradient descent with
+608     momentum. Advances in Neural Information Processing Systems, 33:18261–18271, 2020.
+609
+610   Yinhan Liu. Roberta: A robustly optimized bert pretraining approach.                  arXiv preprint
+611
+        arXiv:1907.11692, 2019.
+612   Qijun Luo, Hengxu Yu, and Xiao Li. Badam: A memory efficient full parameter training method for
+613     large language models. arXiv preprint arXiv:2404.02827, 2024.
+614
+615   Kai Lv, Yuqing Yang, Tengxiao Liu, Qinghui Gao, Qipeng Guo, and Xipeng Qiu. Full parameter
+616
+        fine-tuning for large language models with limited resources. arXiv preprint arXiv:2306.09782,
+        2023.
+617
+618   Ionut-Vlad Modoranu, Mher Safaryan, Grigory Malinovsky, Eldar Kurtic, Thomas Robert, Peter
+619     Richtarik, and Dan Alistarh. Microadam: Accurate adaptive optimization with low space overhead
+620     and provable convergence. arXiv preprint arXiv:2405.15593, 2024.
+621
+      OpenAI. Gpt-4 technical report. arXiv preprint arXiv:2303.08774, 2023.
+622
+623   James M Ortega and Werner C Rheinboldt. Iterative solution of nonlinear equations in several
+624     variables. SIAM, 2000.
+625
+626
+      Rui Pan, Xiang Liu, Shizhe Diao, Renjie Pi, Jipeng Zhang, Chi Han, and Tong Zhang. Lisa:
+        Layerwise importance sampling for memory-efficient large language model fine-tuning. arXiv
+627
+        preprint arXiv:2403.17919, 2024.
+628
+629   Yan Pan and Yuanzhi Li. Toward understanding why adam converges faster than sgd for transformers.
+630     arXiv preprint arXiv:2306.00204, 2023.
+631
+      Colin Raffel, Noam Shazeer, Adam Roberts, Katherine Lee, Sharan Narang, Michael Matena, Yanqi
+632
+        Zhou, Wei Li, and Peter J Liu. Exploring the limits of transfer learning with a unified text-to-text
+633
+        transformer. Journal of machine learning research, 21(140):1–67, 2020.
+634
+635   Samyam Rajbhandari, Jeff Rasley, Olatunji Ruwase, and Yuxiong He. Zero: Memory optimizations
+636     toward training trillion parameter models. In SC20: International Conference for High Performance
+637     Computing, Networking, Storage and Analysis, pp. 1–16. IEEE, 2020.
+638
+      Amrutha Varshini Ramesh, Vignesh Ganapathiraman, Issam H Laradji, and Mark Schmidt. Blockllm:
+639    Memory-efficient adaptation of llms by selecting and optimizing the right coordinate blocks. arXiv
+640    preprint arXiv:2406.17296, 2024.
+641
+642   Peter Richtárik and Martin Takáč. Iteration complexity of randomized block-coordinate descent
+643     methods for minimizing a composite function. Mathematical Programming, 144(1):1–38, 2014.
+644   Peter Richtárik and Martin Takáč. On optimal probabilities in stochastic coordinate descent methods.
+645     Optimization Letters, 2015, pp. 1–11, 2015a.
+646
+647   Peter Richtárik and Martin Takáč. Parallel coordinate descent methods for big data optimization.
+        Mathematical Programming, Series A, pp. 1–52, 2015b.
+
+
+                                                       12
+      Under review as a conference paper at ICLR 2025
+
+
+648
+      Peter Richtárik and Martin Takác. Distributed coordinate descent method for learning with big data.
+649     Journal of Machine Learning Research, 17:1–25, 2016.
+650
+651   Bernardino Romera-Paredes, Mohammadamin Barekatain, Alexander Novikov, Matej Balog,
+652     M Pawan Kumar, Emilien Dupont, Francisco JR Ruiz, Jordan S Ellenberg, Pengming Wang,
+653     Omar Fawzi, et al. Mathematical discoveries from program search with large language models.
+654
+        Nature, 625(7995):468–475, 2024.
+655   Nikhil Sardana and Jonathan Frankle. Beyond chinchilla-optimal: Accounting for inference in
+656     language model scaling laws. arXiv preprint arXiv:2401.00448, 2023.
+657
+658
+      Noam Shazeer and Mitchell Stern. Adafactor: Adaptive learning rates with sublinear memory cost.
+        In International Conference on Machine Learning, pp. 4596–4604. PMLR, 2018.
+659
+660   Kartik Sreenivasan, Jy-yong Sohn, Liu Yang, Matthew Grinde, Alliot Nagle, Hongyi Wang, Eric Xing,
+661     Kangwook Lee, and Dimitris Papailiopoulos. Rare gems: Finding lottery tickets at initialization.
+662     Advances in neural information processing systems, 35:14529–14540, 2022.
+663
+      Martin Takáč, Avleen Bijral, Peter Richtárik, and Nathan Srebro. Mini-batch primal and dual methods
+664    for svms. In In 30th International Conference on Machine Learning, ICML 2013, 2013.
+665
+666   Hugo Touvron, Thibaut Lavril, Gautier Izacard, Xavier Martinet, Marie-Anne Lachaux, Timothée
+667     Lacroix, Baptiste Rozière, Naman Goyal, Eric Hambro, Faisal Azhar, et al. Llama: Open and
+668     efficient foundation language models. arXiv preprint arXiv:2302.13971, 2023a.
+669   Hugo Touvron, Louis Martin, Kevin Stone, Peter Albert, Amjad Almahairi, Yasmine Babaei, Nikolay
+670     Bashlykov, Soumya Batra, Prajjwal Bhargava, Shruti Bhosale, et al. Llama 2: Open foundation
+671     and fine-tuned chat models. arXiv preprint arXiv:2307.09288, 2023b.
+672
+673
+      Paul Tseng. Convergence of a block coordinate descent method for nondifferentiable minimization.
+        Journal of optimization theory and applications, 109:475–494, 2001.
+674
+675   Alex Wang. Glue: A multi-task benchmark and analysis platform for natural language understanding.
+676     arXiv preprint arXiv:1804.07461, 2018.
+677
+      Hongyi Wang, Saurabh Agarwal, Yoshiki Tanaka, Eric Xing, Dimitris Papailiopoulos, et al. Cuttlefish:
+678
+        Low-rank model training without all the tuning. Proceedings of Machine Learning and Systems, 5:
+679
+        578–605, 2023.
+680
+681   Mitchell Wortsman, Tim Dettmers, Luke Zettlemoyer, Ari Morcos, Ali Farhadi, and Ludwig Schmidt.
+682    Stable and low-precision training for large-scale vision-language models. Advances in Neural
+683    Information Processing Systems, 36:10271–10298, 2023.
+684   Jingfeng Yang, Hongye Jin, Ruixiang Tang, Xiaotian Han, Qizhang Feng, Haoming Jiang, Shaochen
+685      Zhong, Bing Yin, and Xia Hu. Harnessing the power of llms in practice: A survey on chatgpt and
+686      beyond. ACM Transactions on Knowledge Discovery from Data, 18(6):1–32, 2024.
+687
+688
+      Elad Ben Zaken, Shauli Ravfogel, and Yoav Goldberg. Bitfit: Simple parameter-efficient fine-tuning
+        for transformer-based masked language-models. arXiv preprint arXiv:2106.10199, 2021.
+689
+690   Pedram Zamirai, Jian Zhang, Christopher R Aberger, and Christopher De Sa. Revisiting bffloat16
+691     training. 2020.
+692
+      Biao Zhang and Rico Sennrich. Root mean square layer normalization. Advances in Neural
+693
+        Information Processing Systems, 32, 2019.
+694
+695   Biao Zhang, Zhongtao Liu, Colin Cherry, and Orhan Firat. When scaling meets llm finetuning: The
+696     effect of data, model and finetuning method. arXiv preprint arXiv:2402.17193, 2024a.
+697
+      Jingzhao Zhang, Sai Praneeth Karimireddy, Andreas Veit, Seungyeon Kim, Sashank Reddi, Sanjiv
+698
+         Kumar, and Suvrit Sra. Why are adaptive methods good for attention models? Advances in Neural
+699      Information Processing Systems, 33:15383–15393, 2020.
+700
+701   Peiyuan Zhang, Guangtao Zeng, Tianduo Wang, and Wei Lu. Tinyllama: An open-source small
+        language model. arXiv preprint arXiv:2401.02385, 2024b.
+
+
+                                                       13
+      Under review as a conference paper at ICLR 2025
+
+
+702
+      Yushun Zhang, Congliang Chen, Ziniu Li, Tian Ding, Chenwei Wu, Yinyu Ye, Zhi-Quan Luo, and
+703     Ruoyu Sun. Adam-mini: Use fewer learning rates to gain more. arXiv preprint arXiv:2406.16793,
+704     2024c.
+705
+706   Zhenyu Zhang, Ajay Jaiswal, Lu Yin, Shiwei Liu, Jiawei Zhao, Yuandong Tian, and Zhangyang
+707     Wang. Q-galore: Quantized galore with int4 projection and layer-adaptive low-rank gradients.
+708
+        arXiv preprint arXiv:2407.08296, 2024d.
+709   Jiawei Zhao, Zhenyu Zhang, Beidi Chen, Zhangyang Wang, Anima Anandkumar, and Yuandong
+710      Tian. Galore: Memory-efficient llm training by gradient low-rank projection. arXiv preprint
+711      arXiv:2403.03507, 2024a.
+712
+713
+      Rosie Zhao, Depen Morwani, David Brandfonbrener, Nikhil Vyas, and Sham Kakade. Deconstructing
+        what makes a good optimizer for language models. arXiv preprint arXiv:2407.07972, 2024b.
+714
+715
+716
+717
+718
+719
+720
+721
+722
+723
+724
+725
+726
+727
+728
+729
+730
+731
+732
+733
+734
+735
+736
+737
+738
+739
+740
+741
+742
+743
+744
+745
+746
+747
+748
+749
+750
+751
+752
+753
+754
+755
+
+
+
+                                                    14
+      Under review as a conference paper at ICLR 2025
+
+
+756
+      A     E XPERIMENTAL SETUPS
+757
+758
+      This section describes the main setups used in the experiments and presents additional experiments.
+759
+760   To begin, we introduce the hyperparameter density ρ. This hyperparameter represents the fraction of
+761   the total space in Linear layers that is updated with a stateful optimizer. For GaLore, this parameter
+762   is equal to ρ = r/h, where r is the projection rank, and h is the hidden size of the model. For
+763
+      RandK projection, this parameter can be expressed as 1 − s, where s means sparsity. For BAdam and
+      FRUGAL with the blockwise update, this parameter denotes the ratio of the number of active blocks
+764
+      ablock to the total number of blocks p, i.e., ρ = ablock /p. When using FRUGAL with the column-wise
+765
+      update, as in Section 6.2, ρ is equal to the ratio of the number of active columns acolumn to their total
+766   number h, i.e., ρ = acolumn /h.
+767
+768
+      A.1    P RE - TRAINING SETUP
+769
+770   We adopt a LLaMA-based architecture with RMSNorm and SwiGLU (Wang, 2018) activations on the
+771   C4 dataset. Following Zhao et al. (2024a), we trained using a batch size of 512 sequences, sequence
+772   length of 256, weight decay of 0, and no gradient clipping. We used T5 tokenizer, since it also was
+773   trained on C4 with dictionary size equal to 32k. The update frequency T is set to 200.
+774
+      Since, unlike GaLore, we consider not only matrix projections, we decided to generalize the concept
+775   of rank r. Instead, we use density ρ, which represents the proportion of Linear layer parameters in the
+776   state-full subspace. Thus, for SVD-like projection as in GaLore, the density equals ρ = r/h, where h
+777   denotes the hidden dimension of the model. We also should point out that similarly to Zhao et al.
+778   (2024a), we keep Embeddings, RMSNorms (Zhang & Sennrich, 2019), and Logits in the state-full
+779   subspace throughout the training and don’t reset the optimizer state for them.
+780
+      We used standard Adam hyperparameters: β1 = 0.9, β2 = 0.999, ε = 1e − 8. For all the methods
+781   except GaLore, we selected the learning rate equal to the optimal learning rate for Adam, which we
+782   determined through a grid search among values [1e − 4, 3e − 4, 1e − 3, 3e − 3]. FRUGAL’s learning
+783   rate for the state-free optimizer was set equal to that for the state-full optimizer for simplicity and
+784   ease of tuning. For a fair comparison with GaLore (Zhao et al., 2024a), we conducted experiments
+785   with two learning rate values: 1) the one specified by the authors in the original paper, and 2) the
+786   optimal learning rate for Adam, as used for other methods. We did this because the learning rate in
+787   the original paper could have been optimized for a different number of iterations.
+788   To match the learning rate changes in the first steps of our training with Zhao et al. (2024a), we used
+789   a cosine learning rate schedule with restarts, with a warmup of 10% of the steps in a cycle length, and
+790   decay of the final learning rate down to 10% of the peak learning rate. To verify that our results are
+791   not sensitive to the choice of scheduler, we repeated the experiments for LLaMA-130M with other
+792   schedulers. Results for constant with warm-up and cosine (one cycle) with warm-up schedulers can
+793   be found in Tables 5 and 6.
+794
+795   Table 5: Perplexity of LLaMA-130M models                Table 6: Perplexity of LLaMA-130M models
+796   pre-trained on C4 using constant scheduler with         pre-trained on C4 using cosine scheduler with
+797   warm-up at various training iterations.                 warm-up at various training iterations.
+798
+799         Method                 100k     200k                   Method                 100k     200k
+800         Adam                   19.51    18.51                  Adam                   19.38    17.95
+801
+            GaLore, ρ = 0.25       22.63    21.03                  GaLore, ρ = 0.25       22.30    20.60
+            BAdam, ρ = 0.25        22.31    20.66                  BAdam, ρ = 0.25        22.35    20.07
+802
+            FRUGAL, ρ = 0.25       19.97    18.85                  FRUGAL, ρ = 0.25       19.62    18.16
+803
+            FRUGAL, ρ = 0.0        20.33    19.14                  FRUGAL, ρ = 0.0        19.83    18.34
+804
+805
+806
+807   A.2    F INE - TUNING SETUP
+808
+809   The batch size and learning rate values used for FRUGAL in the experiments from Table 4 are
+      presented in Table 12. In all experiments, we set the learning rate for the state-free optimizer to 1/10
+
+
+                                                         15
+      Under review as a conference paper at ICLR 2025
+
+
+810
+811                                                           Table 8: Perplexity of LLaMA-130M models
+      Table 7: Perplexity of LLaMA-130M models
+812                                                           pre-trained on C4 for 20k iterations (2.1B to-
+      pre-trained on C4 using pure bfloat16 format
+813                                                           kens) using SGD and signSGD with different
+      both for model weights and optimizer statistics.
+814                                                           learning rates. ∞ means that run diverged. LR
+815       Method                 100k iterations              stands for learning rate.
+816       Adam                       21.88
+                                                                        SGD               signSGD
+817       GaLore, ρ = 0.25           24.19
+                                                                  LR    Perplexity    LR Perplexity
+818       BAdam, ρ = 0.25            25.03
+                                                                  0.1    184.83       3e-4     40.22
+          FRUGAL, ρ = 0.25           23.17
+819                                                               0.3     91.23       1e-3     41.18
+          FRUGAL, ρ = 0.0            22.64
+820                                                               1.0      ∞          3e-3     109.32
+821
+822
+823                                                           Table 10: Perplexity of LLaMA-130M models
+824                                                           pre-trained on C4 for 200k iterations (20B to-
+825   Table 9: Perplexity of LLaMA-130M mod-                  kens) using FRUGAL with ρ = 0.25 and differ-
+826   els pre-trained on C4 for 200k iterations using         ent update frequency T .
+827   FRUGAL with ρ = 1/3 and different Block up-
+828   date strategy, taken from Luo et al. (2024).                 Update frequency T      Perplexity
+                                                                           10                18.82
+829
+                 Method         Perplexity                                 20                18.73
+830
+                 Random           18.50                                    50                18.69
+831              Ascending        18.54                                    100               18.65
+832              Descending       18.50                                    200               18.60
+833                                                                        500               18.60
+834                                                                       1000               18.61
+835
+836
+837   Table 11: Perplexity of LLaMA-130M models pre-trained on C4 for 200k iterations (20B tokens)
+838   using FRUGAL with different density ρ.
+839
+                                              FRUGAL
+840
+841           ρ         1.0 (Adam)      0.5      0.33     0.25      0.125    0.0625    0.0     signSgd
+842       Perplexity       18.13       18.40    18.50     18.63     18.71     18.80   18.90      33.22
+843
+844
+845
+      of the learning rate of the state-full optimizer. Other hyperparameters, such as scheduler, number of
+      epochs, maximum sequence length, and warmup ratio, were taken from Hu et al. (2021).
+846
+847   We also present a comparison between fine-tuning using FRUGAL with ρ = 0.0 and full fine-tuning
+848   using signSGD. Essentially, the only difference is that in the second case, the classification head is
+849   updated with signSGD instead of Adam. The results in Table 13 show that the classification head
+850   is extremely sensitive to the optimizer type, and switching the optimizer significantly drops the
+851
+      accuracy.
+852
+853   B    M EMORY ESTIMATION
+854
+855   In this section, we will examine memory requirements for different projection types using the LLaMA-
+856   like architecture as an example and show that RandK, column-wise, and blockwise projections result
+857   in approximately the same amount of additional memory for a given density value ρ Appendix A. In
+858   contrast, the semi-orthogonal projection matrix (GaLore-like) requires a slightly larger value in this
+859   setup. Recall that we follow the setup from Zhao et al. (2024a), where Embeddings, RMSNorms, and
+860
+      Logits remain in the state-full subspace throughout the training, so the projection does not interact
+      with them, and they give the same memory overhead for all projection methods.
+861
+862   Let the number of parameters in the remaining projectable parameters be P . Then, training using
+863   Adam gives an additional overhead of 2P float values for storing m and v for each parameter. Now,
+      let’s consider blockwise and column-wise projections and suppose we want to achieve a density ρ.
+
+
+                                                         16
+      Under review as a conference paper at ICLR 2025
+
+
+864
+865                 Table 12: Hyperparameters of fine-tuning RoBERTa-base for FRUGAL.
+866
+867                                MNLI       SST-2     MRPC       CoLA      QNLI       QQP       RTE    STS-B
+868
+869
+              Batch Size             128       128       16      256     256             128      32      16
+       State-full Learning Rate     5E-05     5E-05     2E-04   5E-04 1E-04             5E-05    2E-04   1E-04
+870
+        State-free lr multiplier                                 0.1
+871
+            Rank/Density                                r = 8 / r = 0 (ρ = 0)
+872
+873
+874
+875   Table 13: Results of fine-tuning RoBERTa-Base on several tasks from GLUE. The left column
+876   indicates which modules were trained using the state-full optimizer Adam. The remaining modules,
+877   except for the frozen Embedding layer, were trained using the state-free signSGD.
+878                                      Method                                 SST2 QNLI        QQP
+879
+               Classification head (corresponds to the FRUGAL with ρ = 0.0) 94.9±.2 92.8±.1 91.3±.1
+880
+881                None (corresponds to the fine-tuning using signSGD)           89.7    81.6     74.3
+882
+883
+884   For blockwise, we take round(ρ · L) layers, where L is the total number of transformer layers, and for
+885   column-wise, we take round(ρ · k) columns for each matrix of size n × k. Since the memory required
+886   to store block or column indices is negligible compared to other costs, we find that the total size of
+887   the optimizer state when using Adam as a state-full optimizer will be 2ρ · P , with an adjustment for
+888   rounding.
+889
+      In the case of RandK projection, we have the same 2ρ · P float values M and V in the optimizer
+890   state. However, we must also know the current indices corresponding to these values. On the other
+891   hand, it is widely known that if one needs to save a set of random values, they don’t need to store all
+892   these values - it’s sufficient to store only the seed from which they were generated. Thus, for RandK,
+893   the total memory also equals 2ρ · P .
+894
+      If we recalculate this considering a specific LLaMA-like architecture, each layer consists of 7
+895
+      matrices: 4 matrices of size h × h (Query, Key, Value, Output) and 3 matrices of size h × hf f (Gate,
+896   Down, Up), where h is the hidden size of the model, and hf f is the FFN hidden size. In the LLaMA
+897   architecture, it’s typically:
+898
+899
+                                                              2  8
+900                                            hf f = 4h ·      = h.
+                                                              3  3
+901
+902   Then, the amount of memory for RandK projection (and consequently for all others mentioned above)
+903   is:
+904
+905
+                                                                               8
+906               2 · (4 · (ρh2 ) + 3 · (ρ · h · hf f )) = 2 · (4 · ρh2 + 3 · ( ρ · h2 )) = 24ρ · h2
+                                                                               3
+907
+908   for each layer on average (2 corresponds to the number of matrices M and V ).
+909
+910   In the case of a GaLore-like semi-orthogonal projection matrix, the situation is as follows. We have
+911
+      projections onto a low-rank subspace of rank r, where r = round(ρ · h). Then, for Query, Key,
+      Value, and Output projections, we need to store P , M , V ∈ Rh×r , and for Gate, Down and Up
+912
+      projections either P ∈ Rh×r , M , V ∈ Rhf f ×r , or P ∈ Rhf f ×r , M , V ∈ Rh×r . Since the second
+913
+      option requires less memory, it is used by default in (Zhao et al., 2024a) and, therefore, in FRUGAL,
+914   too. Then, the total memory requirements are:
+915
+916
+917                                                                                     8
+        4 · (3 · rh) + 3 · (2 · r · h + r · hf f ) = 12rh + 6rh + 3rhf f = (12 + 6 + 3 · )rh = 26ρh2 .
+                                                                                        3
+
+                                                         17
+      Under review as a conference paper at ICLR 2025
+
+
+918
+      To sum up, RandK, column-wise and blockwise projection requires 2ρP additional memory, while
+919   semi-orthogonal projection (GaLore-like) requires 26         13
+                                                        24 · 2ρP = 12 · 2ρP additional memory.
+920
+921   Let’s recall that in addition to this, SVD requires additional computation, which can take up to 10%
+922
+      as the model size increases (Zhao et al., 2024a). Therefore, for our method, we settled on blockwise
+      projection.
+923
+924
+925   C    O PTIMIZER STATE MANAGEMENT
+926
+927   In this section, we would like to propose some modifications to the GaLore algorithm. These
+928   modifications are also used in our framework as SVD projection.
+929   Specifically, we want to consider the projection of the state when changing the active subspace. In
+930   GaLore (Zhao et al., 2024a), when updating the projection, the optimizer states M and V do not
+931   change. This results in new projected gradients and old M and V being in different subspaces. This
+932   implementation has little effect on the result with large values of update frequency T , as the values
+933   of M and V from the previous subspace decay exponentially quickly. However, more frequent
+934   changes T significantly affect the result. We hypothesize that this is why in Zhao et al. (2024a) the
+935   model quality degraded so significantly when T was decreased, while as seen in Table 10, FRUGAL
+936   experiences much less degradation.
+937   There are two different ways to overcome this obstacle: either project the state back to full-rank space
+938   or reset the state before a new round. However, the first option may be challenging in the case of
+939   arbitrary projection. Specifically, while it’s possible to project momentum back to full-rank space (see
+940   Alg. 2 in Hao et al. (2024)), the same cannot be easily done with variance because its values depend
+941   quadratically on the projection matrix. However, the projection of variance will also be trivial if the
+942   set of basis vectors for the projection is fixed, which is true, for example, for coordinate projection
+943
+      with RandK.
+944
+                      101                               GaLore-like SGDM, rank 3
+945                                                     GaLore-like SGDM with Momentum re-projection, rank 3
+946                                                     GaLore-like SGDM, rank 6
+                                                        GaLore-like SGDM with Momentum re-projection, rank 6
+947
+948
+949
+950
+951
+952
+               Loss
+
+
+953                   100
+954
+955
+956
+957
+958
+959
+960
+961
+                  10 1
+962
+                            0    25       50       75        100      125        150        175        200
+963                                                     Iteration
+964
+965   Figure 3: Toy example of solving quadratic minimization problem with GaLore-like SGDM with and
+966   without re-projection of optimizer state. Algorithm with re-projection converges much faster.
+967
+968   To demonstrate the effectiveness of this improvement, we provide a toy example. We consider a
+969   quadratic minimization problem of ∥W ∥2 , W ∈ R10×10 . For optimization, we use GaLore-like
+970   SGDM and GaLore-like SGDM with Momentum state projection. This projection is similar to Alg. 2
+971   from (Hao et al., 2024), except we additionally normalize the new momentum by the ratio of norms
+      before and after re-projection to preserve momentum mass. We use ranks of 3 and 6, and an update
+
+
+                                                        18
+       Under review as a conference paper at ICLR 2025
+
+
+972
+973    Table 14: Pre-training LLaMA 7B on C4 dataset for 120K steps. Validation perplexity is reported.
+974                                                 40K      80K 120K
+975
+                                   8-bit Adam           18.09    15.47    14.83
+976
+                                   8-bit GaLore         17.94    15.39    14.95
+977                                FRUGAL, ρ = 0.0      17.56    14.50    13.49
+978
+979
+                                   Tokens (B)            5.2     10.5     15.7
+980
+       frequency T = 10 and plot mean and standard deviation across 5 independent runs. The results are
+981
+       presented in Figure 3. As can be seen, the variant with state projection converges much faster.
+982
+983
+984    D    LL A MA 7B PRE - TRAINING RESULTS .
+985
+986    In this section, we present the results of pre-training a LLaMA 7b model on the C4 dataset for 120k
+987    iterations on 12B tokens. See results in Table 14. We conducted the training in pure bfloat16 with
+988
+       the density ρ = 0.0. We used learning rate 0.0005 for state-full optimizer and 0.00015 for state-free
+       optimizer. However, unlike Zhao et al. (2024a), we didn’t use Adam8bit for state-full parameters
+989
+       but rather Adam, so it may not be an entirely fair comparison. Nevertheless, the results show that
+990
+       FRUGAL has the potential for scaling up to 7B parameter models.
+991
+992
+993
+994
+995
+996
+997
+998
+999
+1000
+1001
+1002
+1003
+1004
+1005
+1006
+1007
+1008
+1009
+1010
+1011
+1012
+1013
+1014
+1015
+1016
+1017
+1018
+1019
+1020
+1021
+1022
+1023
+1024
+1025
+
+
+
+                                                        19
+       Under review as a conference paper at ICLR 2025
+
+
+1026
+       E    C ONVERGENCE T HEORY
+1027
+1028
+       Firstly, we provide ommited definition of L-smooth function.
+1029
+1030
+       Definition 1. We say that f : Rd → R is L−smooth with L ≥ 0, if it is differentiable and satisfies
+1031                                                              L
+1032
+                           f (y) ≤ f (x) + ⟨∇f (x), y − x⟩ +        ∥y − x∥2 , ∀x, y ∈ Rd .
+                                                                  2
+1033
+1034   Below, we provide an equivalent formulation of Algorithm 2 that enables us to use the proof of the
+1035   similar structure to SGDM momentum analyis of Liu et al. (2020).
+1036
+1037   Algorithm 3 FRUGAL(SGDM, SGD): Equivalent to Algorithm 2 for constant step isze
+1038   Input: momentum weight β ∈ [0, 1), initialization x1 ∈ Rd and m0 = 0, step sizes {αk := α >
+1039   0}K
+         k=1 , momentum set Jk ⊂ [d] for k = 1, 2 . . ..
+1040    1: for k = 1, 2, . . . do
+1041    2:     Compute stochastic gradient g̃ k ← ∇fζ k (xk );
+1042
+                                                                 k−1
+                                                                m̃j  if j ∈ Jk ,
+1043    3:     Update momentum vector m̃kj ← (1 − β)g̃jk + β
+                                                                0    otherwise;
+1044                               k+1/2     k       k
+        4:               x1
+               Update iterate             ← x − αm̃ ;
+1045
+                         xk+  j
+                                  /2
+                                         βxk
+                                           j
+                              1−β − 1−β       if j ∈
+                                                   / Jk+1 ,
+1046
+        5:     xk+1
+                j   ←
+1047                    xk+ /2  1
+                                              otherwise;
+                               j
+1048
+        6: end for
+1049
+1050
+1051   Next, we present several key ingredients of the proof. Firstly, we can express the momentum term
+1052   m̃kj as
+1053
+                                                              k
+1054                                                          X
+1055
+                                            m̃kj = (1 − β)          β k−i g̃ji ,                           (4)
+1056                                                         i=tk
+                                                                j
+
+1057
+       where tkj := maxt≤k {j ∈
+                              / Jt }, i.e., the last time when the momentum buffer was released. We denote
+1058
+1059                                                          k
+                                                              X
+1060                                        mkj = (1 − β)           β k−i gji ,                            (5)
+1061                                                         i=tk
+                                                                j
+1062
+1063   Using this notation, we proceed with two lemmas, one showing variance reduction effect of momen-
+1064
+       tum, the other boundess of momentum bias.
+1065   Lemma 1. Under Assumption 1, the update vector m̃k in Algorithm 3 satisfies
+1066                                  h             2
+                                                      i 1−β
+1067                                E m̃k − mk         ≤        σ2 .
+                                                          1+β
+1068
+1069                              Pk
+1070
+       Proof. Since m̃kj = (1 − β) i=tk β k−i g̃ji , we have
+                                       j
+
+1071                      h          2
+                                       i   X h                   2
+                                                                   i
+1072                    E m̃k − mk       =          E m̃kj − mkj
+1073                                           j∈[d]
+                                                                                            
+1074                                                                                     2
+                                                         X          k
+1075                                                               X k−i i
+                                            ≤ (1 − β)2                β (g̃j − gji )         .
+                                                                                             
+                                                                 E
+1076
+                                                         j∈[d]          i=tk
+                                                                           j
+1077
+1078
+1079   Moreover, since ζ 1 , ζ 2 , ..., ζ k are independent
+                                                          random variables (item    3 of Assumption 1), we can
+       use conditional expectation to show that E (g̃ji1 − gji1 )(g̃ji2 − gji2 ) = 0 for i1 ̸= i2 . Therefore,
+
+
+
+                                                         20
+       Under review as a conference paper at ICLR 2025
+
+
+1080
+1081                                                                                                          
+1082                         h               i                             k
+                                       k 2
+                                                              X            X
+1083                     E       m̃k − m         ≤ (1 − β)2           E        β 2(k−i) ∥g̃ji − gji ∥2 
+1084                                                          j∈[d]      i=tk
+                                                                            j
+
+1085                                                 1−β X          h            k
+                                                                                        i
+1086                                             ≤                 E (1 − β 2(k−tj +1) ) σj2
+                                                     1+β
+1087                                                       j∈[d]
+
+1088                                               1−β X 2   1−β 2
+                                                 ≤      σj =     σ .
+1089                                               1+β       1+β
+                                                           j∈[d]
+1090
+1091
+1092
+1093   Lemma 2. Under Assumption 1, the update vector m̃k in Algorithm 3 further satisfies
+1094                                                
+                                                   2             "k−1                     #
+                                        k
+1095               X
+                            kj 2
+                                      m j        k         k
+                                                                  X
+                                                                               i+1    i 2
+               E     (1 − β )                − gj    ≤ pmax E        ak,i ∥x     −x ∥ ,
+1096                              (1 − β kj )                      i=1
+                      j∈Jk
+1097
+1098
+       where kj = k − tkj + 1, and
+1099
+1100
+1101
+
+                                                                            β
+1102                                       ak,i = L2 β k−i k − i +                        .                                     (6)
+                                                                           1−β
+1103
+1104
+1105   Proof. Let Prk−1 [j ∈ Jk ] = pkj and pkmax := maxj∈[d] {pkj }. Then,
+1106                                               
+                                                                                                          2
+                                                                                                            
+                                              2                                    k
+1107                              k
+           X                   m  j
+                                                       X                   1−β     X
+               (1 − β kj )2             − gjk  = E      (1 − β kj )2                 β k−i (gji − gjk ) 
+                                                                                                           
+1108   E
+                            (1 − β kj )                                   1 − β kj
+1109      j∈Jk                                                j∈Jk                   k                  i=tj
+1110                                                                                                                                 
+                                                                             k
+1111
+                                                                           X X
+                                                      = (1 − β)2 E                           ⟨β k−i (gjk − gji ), β k−l (gjk − gjl )⟩
+1112
+                                                                           j∈Jk i,l=tk
+                                                                                     j
+1113                                                                                                                       
+1114                                                                         k
+                                                                           X X               1 k                1
+1115                                                  ≤ (1 − β)2 E            β 2k−i−l       ∥g − gji ∥2 ] + ∥gjk − gjl ∥2 
+                                                                                             2 j                2
+1116                                                                j∈Jk i,l=1
+                                                                                                                    
+1117                                                                       k      k
+                                                                                                !
+                                                                     XX         X                 1
+1118                                                  = (1 − β)2 E                   β 2k−i−l       E[∥gjk − gjl ∥2 
+1119                                                                                              2
+                                                                    j∈Jk i=1    l=1
+1120                                                                                             !                  
+                                                                             k       k
+1121                                                                   XX          X                 1 k
+                                                        + (1 − β)2 E                    β 2k−i−l      [∥gj − gji ∥2 
+1122                                                                                                 2
+                                                                      j∈Jk l=1      i=1
+1123                                                                                                         
+1124                                                                       k    k−i          kj
+                                                                     XX       β (1 − β ) k
+1125                                                  = (1 − β)2 E                              ∥gj − gji ∥2 
+                                                                                     1 −  β
+1126                                                                j∈Jk i=1
+                                                                                                
+1127                                                                     k
+                                                                    XX
+1128                                                  ≤ (1 − β)E            β k−i ∥gjk − gji ∥2  ,
+1129                                                                    j∈Jk i=1
+1130                                                                         " k                                   #
+1131
+                                                                              X
+                                                      ≤ (1 − β)pkmax E                β   k−i       k
+                                                                                                 ∥g − g ∥    i 2
+                                                                                                                       ,
+1132
+                                                                                i=1
+1133
+       where we applied Cauchy-Schwarz to the first inequality.
+
+
+                                                              21
+       Under review as a conference paper at ICLR 2025
+
+
+1134
+       By applying triangle inequality and the smoothness of f (item 1 in Assumption 1), we further have
+1135                                           
+                                              2                    " k             k−1
+                                                                                                     #
+1136                           m k
+                                 j
+           X                                                        X              X
+                      kj 2                 k                k            k−i              l+1    l 2
+1137   E      (1 − β )                 − gj     ≤ (1 − β)pmax E       β (k − i)      ∥g     −g ∥
+                            (1 − β kj )                             i=1
+1138      j∈Jk                                                                     l=i
+1139
+                                                      "k−1                    l
+                                                                                            !                #
+                                                       X                     X
+                                                                      k    2     k−i             l+1     l 2
+1140                                              ≤E         (1 − β)pmax L      β (k − i) ∥x         −x ∥ .
+1141                                                     l=1                           i=1
+1142                                             Pl
+1143
+       Therefore, by defining a′k,l = (1 − β)L2 i=1 β k−i (k − i), we get
+1144
+                                                          
+                                                         2          "k−1                    #
+                                             k
+1145
+                      X
+                                  k   2
+                                           m j         k      k
+                                                                      X
+                                                                           ′      l+1   l 2
+                  E      (1 − β )  j
+                                                    − gj  ≤ pmax E       ak,l ∥x     −x ∥ .                  (7)
+1146                                    (1 − β kj )
+                       j∈Jk                                                l=1
+1147
+1148   Furthermore, a′k,j can be calculated as
+1149
+                                                      1                                       β
+1150                   a′k,l = L2 β k −(k − 1) −               + L2 β k−l k − l +                      .      (8)
+1151
+                                                     1−β                                     1−β
+1152   Notice that
+1153
+                                                                         β
+
+1154                                a′k,l < ak,l := L2 β k−l       k−l+                .                      (9)
+                                                                        1−β
+1155
+1156   Combining this with equation 7, we arrive at
+1157              
+                                                       2
+                                                                 "k−1                   #
+                                           k
+1158
+                     X
+                               k   2
+                                         m j         k      k
+                                                                   X
+                                                                               i+1   i 2
+                E       (1 − β )j
+                                                  − gj  ≤ pmax E      ak,i ∥x     −x ∥ ,
+1159                                  (1 − β kj )                  i=1
+                       j∈Jk
+1160
+1161   where
+1162
+
+                                                                      β
+1163                                    ak,i = L2 β k−i k − i +                .
+                                                                     1−β
+1164
+1165
+1166
+1167   From Lemma 2, we know that the distance of the non-stochastic momentum from g k is bounded by
+1168
+       the weighted sum of past successive iterate differences. Furthermore, the coefficients ak,i decays
+       exponentially in β.
+1169
+1170   Therefore, we use the following Lyapunov function
+1171
+1172
+                                                      k−1
+                                                       X
+                                 Lk = f (z k ) − f ⋆ +    ci ∥xk+1−i − xk−i ∥2 .                             (10)
+1173                                                     i=1
+1174
+1175
+       for some positive ci that we specify later. As it is common for convergence theory of SGDM to
+       analyze an auxiliary sequence z k defined as
+1176
+                                          (
+1177
+                                     k      xkj                     k = 1,
+1178                               zj =       1   k−1/2     β  k−1                              (11)
+                                             1−β xj     − 1−β xj     k ≥ 2,
+1179
+1180   which behaves more like an SGD iterate, although the stochastic gradient g̃ k is not taken at z k .
+1181
+       Lemma 3. Let xk ’s be iterates of Algorithm 3, then z k defined in equation 11 satisfies
+1182
+1183                                            z k+1 − z k = −αg̃ k .
+1184
+1185   Proof. We have to consider two different cases. Firstly, if k = 1 or j ∈
+                                                                              / Jk , then
+1186                    k+1/2
+1187
+                       xj    βxkj         xkj − αm̃kj − βxkj − (1 − β)xkj    α(1 − β)g̃jk
+       zjk+1 − zjk =       −      − xkj =                                 =−              = −αg̃jk .
+                       1−β   1−β                       1−β                     1−β
+
+                                                         22
+       Under review as a conference paper at ICLR 2025
+
+
+1188
+       Secondly, if k ≥ 2, j ∈ Jk , then
+1189
+                                            1     k+1/2     k−1/2       β
+1190                        zjk+1 − zjk =      (x       − xj       )−       (xk − xk−1 )
+1191                                       1−β j                       1−β j        j
+
+1192                                        1     k+1/2              β
+                                         =     (x       − xkj ) −       (xk − xk−1  )
+1193                                       1−β j                   1−β j          j
+
+1194                                        1                  β
+                                         =     (−αm̃kj ) −          (−αm̃k−1
+                                                                          j  )
+1195                                       1−β              1−β
+1196                                        1
+1197                                     =     (−αm̃kj + αβ m̃k−1j   ) = −αg̃jk .
+                                           1−β
+1198
+1199
+1200
+1201   Before procceding with the main convergence theory, we require one more proposition that shows
+1202   descent in objective value.
+1203   Proposition 1. Take Assumption 1. Then, for z k defined in equation 11, we have
+1204
+                                              1 + β2 2 1 2
+
+                k+1             k
+1205     E[f (z     )] ≤ E[f (z )] + −α +            Lα + Lα E[∥g k ∥2 ]
+                                              1−β           2
+1206                                                                                                 
+                                                                                                    2
+                                    2                      2                           k
+                                                                                     m
+
+1207                              β       1             Lα       X                     j
+1208                     +              +     Lα2 σ 2 +       E     (1 − β kj )2             − gjk  .
+                              2(1 + β) 2                1−β                       (1 − β kj )
+                                                                           j∈Jk
+1209
+1210                                                                                                             (12)
+1211
+1212   Proof. The smoothness of f yields
+1213                                                                                  L
+                  Eζ k [f (z k+1 )] ≤ f (z k ) + Eζ k [⟨∇f (z k ), z k+1 − z k ⟩] +     E k [∥z k+1 − z k ∥2 ]
+1214                                                                                  2 ζ
+                                                                                                                 (13)
+1215                                      k                  k     Lα2 k
+                              = f (z ) + Eζ k [⟨∇f (z ), −αg̃ ⟩] +     E k [∥g̃ k ∥2 ],
+1216                                                                2 ζ
+1217   where we have applied Lemma 3 in the second step.
+1218
+1219
+       For the inner product term, we can take full expectation E = Eζ 1 ...Eζ k to get
+1220                                 E[⟨∇f (z k ), −αg̃ k ⟩] = E[⟨∇f (z k ), −αg k ⟩],
+1221
+       which follows from the fact that z k is determined by the previous k−1 random samples ζ 1 , ζ 2 , ...ζ k−1 ,
+1222
+       which is independent of ζ k , and Eζ k [g̃ k ] = g k .
+1223
+1224   So, we can bound
+1225            E[⟨∇f (z k ), −αg̃ k ⟩] = E[⟨∇f (z k ) − g k , −αg k ⟩] − αE[∥g k ∥2 ]
+1226                                       ρ0                             1
+1227                                    ≤ α L2 E[∥z k − xk ∥2 ] + α          E[∥g k ∥2 ] − αE[∥g k ∥2 ],
+                                            2                            2ρ0
+1228
+       where ρ0 > 0 can be any positive constant (to be determined later).
+1229
+1230   Combining equation 13 and the last inequality, we arrive at
+1231                                                     ρ0
+                          E[f (z k+1 )] ≤ E[f (z k )] + α L2 E[∥z k − xk ∥2 ]
+1232                                                      2
+1233                                             1                      Lα2
+1234
+                                          + (α        − α)E[∥g k ∥2 ] +     E[∥g̃ k ∥2 ].
+                                               2ρ0                       2
+1235                                    β
+1236
+       By construction, zjk − xkj = − 1−β αm̃k−1j    for j ∈ Jk , 0 otherwise. Consequently,
+                                                                                          
+1237
+                                                         ρ0        β 2      X
+1238                    E[f (z k+1 )] ≤ E[f (z k )] + α3 L2 (          ) E       ∥m̃k−1
+                                                                                    j   ∥2 
+1239                                                      2      1−β
+                                                                                  j∈Jk                           (14)
+1240                                                                          2
+                                                1                    Lα
+1241                                      + (α     − α)E[∥g k ∥2 ] +    E[∥g̃ k ∥2 ].
+                                               2ρ0                    2
+
+
+                                                              23
+       Under review as a conference paper at ICLR 2025
+
+
+1242
+       Let kj = k − tk−1
+                     j   + 1. Then, from Lemma 1 we know that
+1243
+                                                                        
+1244         X                      X                             X
+1245     E      ∥m̃k−1
+                    j   ∥2  ≤ 2E      ∥m̃k−1
+                                           j   − mk−1
+                                                  j   ∥2  + 2E    ∥mk−1
+                                                                      j   ∥2 
+1246         j∈Jk                      j∈Jk                                 j∈Jk
+1247                                                                       
+1248                           1−β X 2                X
+                               ≤2    E        σj + 2        ∥mk−1
+                                                               j    ∥2 
+1249                           1+β
+                                         j∈Jk          j∈Jk
+1250                                                                      
+                                                               k−1         2
+1251        X                     X                          m j
+1252     E     ∥mk−1
+                   j   ∥2  = E      (1 − β (k−1)j )2          (k−1)j )
+                                                                             
+           j∈Jk                  j∈Jk
+                                                         (1 − β
+1253
+                                                                                                 
+1254                                                             k−1             2
+                                   X                          m  j
+                                                                                          X       2
+1255                        ≤ 2E      (1 − β (k−1)j )2           (k−1)j )
+                                                                           − gjk  + 2E      gjk 
+1256                              j∈Jk
+                                                          (1 − β                         j∈Jk
+1257                k 2        2        k 2
+                 E ∥g̃ ∥ ≤ σ + E[∥g ∥ ].
+1258
+                                                                                                   (15)
+1259
+1260   Putting these into equation 14, we arrive at
+1261                                                                          2
+                                                                                  Lα2
+
+                   k+1            k                  1        3    2      β
+1262        E[f (z     )] ≤ E[f (z )] + − α + α         + 2α ρ0 L               +        E[∥g k ∥2 ]
+                                                    2ρ0                 1−β          2
+1263                                                                      !
+                                                  2                  2
+1264                                        β        1 − β      Lα
+                            + α3 ρ0 L2                     σ2 +        σ2
+1265                                      1−β        1+β          2
+1266                                                                                                 
+                                                 2                                 k−1              2
+                                                                                 m
+
+1267                                       β            X                          j
+1268
+                            + 2α3 ρ0 L2             E      (1 − β (k−1)j )2                 − gjk  .
+                                          1−β
+                                                         j∈Jk
+                                                                             (1 − β (k−1)j )
+1269
+1270   Notice that if j ∈ J k , then (k − 1)j = kj − 1. Therefore,
+1271                                                                                 
+                                         2               k−1                k         2
+1272                      mkj                       βm   j    +  (1 −   β)gj
+1273            E                 − gjk  = E                                − gjk 
+                       (1 − β kj )                         (1 − β kj )
+1274
+                                                                                                     
+1275                                                                     2          k−1             2
+                                                                kj −1             m
+
+                                                        (1 −  β       )             j
+1276                                         = β2E                                           − gjk  .
+1277
+                                                          (1 − β kj )         (1 − β (k−1)j )
+1278
+       Substituting the above into the last inequality produces
+1279
+                                                                            β 2 Lα2
+
+1280                                                     1
+               E[f (z k+1 )] ≤ E[f (z k )] + − α + α        + 2α3 ρ0 L2 (      ) +          E[∥g k ∥2 ]
+1281                                                    2ρ0               1−β          2
+1282
+                                                 β 2 1 − β 2 Lα2 2
+
+                                     3      2
+1283                           + α ρ0 L (           )       σ +       σ
+                                               1−β 1+β             2                                      (16)
+1284                                                                                            
+                                                      2                                        2
+                                                                                  k
+1285                                                                            m
+
+                                                  1         X                     j
+1286                           + 2α3 ρ0 L2              E     (1 − β kj )2              − gjk  .
+                                                1−β                          (1 − β kj )
+1287                                                        j∈Jk
+
+1288
+       Finally, ρ0 = 1−β
+                     2Lα gives
+1289
+                                              1 + β2 2 1 2
+
+1290
+         E[f (z k+1 )] ≤ E[f (z k )] + −α +          Lα + Lα E[∥g k ∥2 ]
+1291                                          1−β           2
+1292
+                                                                                                   
+                                                                                                  2
+                                                                                     k
+                                  β2                       2                       m
+
+1293                                      1             Lα       X                   j
+                         +              +     Lα2 σ 2 +       E   (1 − β kj )2             − gjk  .
+1294                          2(1 + β) 2                1−β                     (1 − β kj )
+                                                                     j∈Jk
+1295
+
+
+
+                                                          24
+       Under review as a conference paper at ICLR 2025
+
+
+1296
+       E.1   C ONVERGENCE OF A LGORITHM 3
+1297
+1298   Firstly, by combining results from prior section, we can bound our Lyapunov function Lk defined in
+1299   equation 10.
+1300   Proposition 2. Let Assumption 1 hold and α ≤ √ √ 1−β         √       in Algorithm 3. Let {ci }∞
+                                                                 k2 2L    2pmax     β+β              i=1 in
+1301
+1302   equation 10 be defined by
+1303             β+β 2   3 2
+                (1−β)3 L α                                       Lα2
+
+                                                                                 β
+1304    c1 =           β+β 2
+                                ,           ci+1 = ci − 4c1 α2 +       β i (i +     )L2                       for all i ≥ 1.
+1305         1 − 4α2 (1−β)  2L
+                              2                                  1−β            1−β
+1306   Then, ci > 0 for all i ≥ 1, and
+1307
+                                                    3 − β + β2 2
+
+                               k+1      k
+1308                      E[L        − L ] ≤ −α +             Lα + 4c1 α E[∥g k ∥2 ]
+                                                                        2
+
+1309                                                 2(1 − β)
+                                                                                                                            (17)
+                                                   β2
+
+1310                                                       2 2  1 2 2        2 2
+                                            +            Lα σ + Lα σ + 2c1 α σ .
+1311                                            2(1 + β)        2
+1312
+1313   Proof. Recall that Lk is defined as
+1314
+                                                             k−1
+1315
+                                                             X
+                                     Lk = f (z k ) − f ∗ +            ci ∥xk+1−i − xk−i ∥2 ,
+1316
+                                                              i=1
+1317
+       Therefore, by equation 16 we know that
+1318
+1319           E[Lk+1 − Lk ] ≤
+1320                         1 + β2 2 1 2
+1321             (−α +             Lα + Lα )E[∥g k ∥2 ]
+                             1−β       2
+1322
+                      k−1
+1323
+                      X
+                  +         (ci+1 − ci )E[∥xk+1−i − xk−i ∥2 ] + c1 E[∥xk+1 − xk ∥2 ]                                        (18)
+1324
+                      i=1
+1325                                                                  
+                                                                                                                   2
+                                                                                                                       
+                               2                             2                                   mkj
+
+1326                         β      1                      Lα             X
+                  +               +         Lα2 σ 2 +          E             (1 − β kj )2                 − gjk       .
+1327                      2(1 + β) 2                       1−β                               (1 − β kj )
+                                                                       j∈Jk
+1328
+1329
+       To bound the c1 E[∥xk+1 − xk ∥2 ] term, we need the following inequalities, which are obtained
+1330
+       similarly as equation 15.
+1331
+                                    1−β 2
+1332                  E[∥m̃k ∥2 ] ≤ 2    σ + 2E[∥mk ∥2 ]
+1333                                1+β
+                                                                          
+1334                                                                     2
+                                                            k
+                                        X                 m j
+                                                                                  h
+                                                                                      k 2
+                                                                                          i
+                                                                                                                            (19)
+1335                  E[∥mk ∥2 ] ≤ 2E    (1 − β kj )2             − gj
+                                                                       k    + 2E   g
+1336
+                                                       (1 − β kj )
+                                            j∈Jk
+1337
+                       E[∥g̃ ∥ ] ≤ σ + E[∥g k ∥2 ].
+                              k 2       2
+1338
+1339   Let Prk−1 [j ∈ Jk ] = pkj and pkmin := minj∈[d] {pkj }. Then, c1 E[∥xk+1 − xk ∥2 ] can be bounded as
+1340                                                                                              
+1341
+                                                                       X              X
+                  c1 E[∥xk+1 − xk ∥2 ] = c1 α2 E[∥ũk ∥2 ] = c1 α2 E      ∥m̃kj ∥2 +     ∥g̃jk ∥2 
+1342
+                                                                                 j∈Jk             j ∈J
+                                                                                                    / k
+1343
+                                                   2        k 2
+                                                                  + (1 − pkmin )∥g̃ k ∥2
+
+1344                                        ≤ c1 α E ∥m̃ ∥
+
+1345                                               2      1−β          k       2          k 2
+1346
+                                            ≤ c1 α      2      + 1 − pmin σ + 5E[∥g ∥ ]
+                                                          1+β
+1347                                                      
+                                                                                              2
+                                                                                                
+                                                                                 k
+1348                                                        X                  m j
+                                              + 4c1 α2 E     (1 − β kj )2              − gjk 
+1349                                                                        (1 − β kj )
+                                                             j∈Jk
+
+
+
+                                                                 25
+       Under review as a conference paper at ICLR 2025
+
+
+1350
+       Combine this with equation 18, we obtain
+1351
+1352   E[Lk+1 − Lk ]
+1353           1 + β2 2 1 2                                                         β2
+
+                                                                                          1 c1            1−β
+1354   ≤ (−α +       Lα + Lα + 5c1 α2 )E[∥g k ∥2 ] +                                     + +            2     + 1 − pkmin           Lα2 σ 2
+               1−β       2                                                       2(1 + β) 2  L            1+β
+1355
+              k−1
+1356
+              X
+          +         (ci+1 − ci )E[∥xk+1−i − xk−i ∥2 ]
+1357
+              i=1
+1358                                  
+                                                                                       2
+                                                                                             
+                     Lα2                                             mkj
+
+1359                                      X
+          + 4c1 α2 +                 E       (1 − β kj )2                    − gjk          .
+1360                 1−β                                          (1 − β kj )
+                                       j∈Jk
+1361
+                                                                                                                            (20)
+1362
+1363   In the rest of the proof, let us show that the sum of the last two terms in equation 20 is non-positive.
+1364
+       First of all, by Lemma 2 we know that
+1365                                                    
+1366                                                   2    "     k−1
+                                                                                        #
+                                           k
+                        X
+                                 k  2
+                                         m j         k        k
+                                                                  X
+                                                                              i+1   i 2
+1367               E      (1 − β )
+                                  j
+                                                  − gj  ≤ E pmax     ak,i ∥x     −x ∥ ,
+                                      (1 − β kj )
+1368                     j∈Jk                                     i=1
+1369
+       where
+1370
+1371                                                                              β
+                                             ak,i = L2 β k−i k − i +                          .
+1372                                                                             1−β
+1373   Or equivalently,
+1374                                                             
+                                                              2            "k−1                                     #
+1375              X                       mkj                               X
+1376         E       (1 − β kj )2                    − gjk       ≤E              pkmax ak,k−i ∥xk+1−i − xk−i ∥2       ,
+                                      (1 − β kj )                            i=1
+1377                 j∈Jk
+
+1378   where
+1379
+                                                                              β
+1380                                           ak,k−i = L2 β i i +                       .
+1381                                                                         1−β
+1382   Therefore, to make the sum of the last two terms of equation 20 to be non-positive, we need to have
+1383
+                                                     Lα2
+
+1384                                            2             2 i     i        β
+                            ci+1 ≤ ci − 4c1 α +              L pmax β i +
+1385                                                 1−β                      1−β
+1386   for all i ≥ 1. To satisfy this inequality, we choose
+1387
+                                                        Lα2
+
+1388                                               2           2 i i        β
+                              ci+1 = ci − 4c1 α +             L β pmax i +
+1389                                                   1−β                 1−β
+1390   for all i ≥ 1, which implies that
+1391
+                                                     i−1
+                                             Lα2
+                                                   X
+1392                                      2        2      i i        β
+                           ci = c1 − 4c1 α +      L      β pmax i +       .
+1393                                         1−β                    1−β
+                                                                           l=1
+1394
+1395   To have ci > 0 for all i ≥ 1, we can set c1 as
+1396                                                             ∞
+                                               Lα2
+
+                                          2              2 k
+                                                                X
+                                                                     i    β
+1397                          c1 = 4c1 α +              L p̂max     β i+       .
+                                              1−β                        1−β
+1398                                                            i=1
+1399
+1400
+1401
+       where, p̂kmax = maxi∈[k] {pimax }. Since
+1402                                  j
+                                                                   β(1 − β j )
+
+                                      X                1
+1403                                         iβ i =                            − jβ j+1 ,
+                                       i=1
+                                                      1−β            1−β
+
+
+                                                                      26
+       Under review as a conference paper at ICLR 2025
+
+
+1404             P∞          i       β
+       we have      i=1 iβ       = (1−β) 2 and
+1405
+                                                            Lα2              β + β2
+
+1406
+1407
+                                           c1 =    4c1 α2 +       L2 p̂kmax          ,
+                                                            1−β             (1 − β)2
+1408
+1409
+       which implies that
+                                                                                2
+1410                                                                      β+β
+                                                            α2 L3 p̂kmax (1−β)3
+1411                                               c1 =            β+β  2             .                    (21)
+1412                                                      1 − 4α2 (1−β)     k
+                                                                        2 p̂max L
+                                                                                 2
+
+1413                            1−β √
+       Notice that α ≤      √ √             ensures c1 > 0.
+1414                       2 2L p̂k
+                                  max β+β 2
+1415
+       Therefore,
+1416
+                                             3 − β + 2β 2 2
+
+1417         E[Lk+1 − Lk ] ≤           −α +                Lα + 5c1 α2 E[∥g k ∥2 ]
+1418                                            2(1 − β)
+                                              2
+
+1419                                        β               1                      1−β
+1420                                 +             Lα2 σ 2 + Lα2 σ 2 + c1 α2 σ 2 2     + 1 − pkmin    .
+                                         2(1 + β)           2                      1+β
+1421
+1422
+1423
+1424   By telescoping equation 17, we obtain the convergence bound of our proposed algorithm under
+1425   nonconvex settings.
+1426                                                           1−β
+       Theorem 2. Let Assumption 1 hold and αk = α ≤ L(4−β+β       2 ) . Then, the iterates of Algorithm 3
+1427
+       satisfy
+1428
+                     k
+1429                                      f (x1 ) − f ∗               p̂k (1 − p̄kmin )β
+
+                  1X
+1430                    E[∥g i ∥2 ] ≤ O                 + Lασ 2 1 + max                      ,         (22)
+                  k i=1                       kα                           (1 − β)
+1431
+                           Pk
+1432   where p̄kmin = k1               i         k                i
+                                 i=1 p̄min and p̂max = maxi∈[k] {pmax }.
+1433
+1434   Proof. From equation 17 we know that
+1435
+1436
+1437                                           E[Lk+1 − Lk ] ≤ −R1 E[∥g k ∥2 ] + R2k ,                     (23)
+1438
+       where
+1439
+1440                              3 − β + β2 2
+                       R1 = −α +            Lα + 4c1 α2 ,
+1441                               2(1 − β)
+                               β2
+
+1442                                   2 2   1 2 2        2 2   1−β        k
+1443
+                       R2 =          Lα σ + Lα σ + c1 α σ 2         + 1 − pmin .
+                            2(1 + β)         2                  1+β
+1444
+1445
+       We further define
+                                     β2
+
+1446                                                1                      1−β
+                       R̄2 =               Lα2 σ 2 + Lα2 σ 2 + c1 α2 σ 2 2     + 1 − p̄kmin ,
+1447                              2(1 + β)          2                      1+β
+1448                       Pk
+1449
+       where p̄kmin = k1               i
+                                 i=1 p̄min .
+1450   Telescoping equation 23 yields
+1451                                                                   k                     k
+                                                                       X                     X
+1452                                  L1 ≥ E[L1 − Lk+1 ] ≥ R1                E[∥g i ∥2 ] −         R2k ,
+1453                                                                   i=1                   k=1
+1454
+       and therefore
+1455
+                                                      k
+1456                                               1X                   L1   R̄2
+1457                                                     E[∥g i ∥2 ] ≤     +     .                         (24)
+                                                   k i=1               kR1   R1
+
+
+                                                                  27
+       Under review as a conference paper at ICLR 2025
+
+
+1458
+       In the rest of the proof, we will appropriately bound R1 and R̄2 .
+1459
+1460                                                       1−β
+                                                                         √ 1−β
+       First, let us show that R1 ≥ α2 and α ≤ min L(4−β+β     2) , √       k
+                                                                               √                     .
+1461                                                                   2 2L      p̂max   β+β 2
+1462   From equation 21 we know that
+1463
+                                                                      2
+                                                                   β+β
+1464                                                 α2 L3 p̂kmax (1−β)3
+
+1465                                       c1 =             β+β   2          .
+                                                   1 − 4α2 (1−β)    2 k
+                                                                 2 L p̂max
+1466
+1467                     1−β √
+       Since α ≤     √ √             , we have
+1468                2 2L p̂k
+                           max β+β 2
+1469
+                                                    β + β2 2 k       1
+1470                                         4α2            L p̂max ≤ .
+1471
+                                                   (1 − β)2          2
+1472   Thus,
+1473
+                                                            β + β2       L
+1474                                   c1 ≤ α2 L3 p̂kmax            ≤          .
+1475
+                                                           (1 − β)3   8(1 − β)
+1476   Therefore, in order to ensure R1 ≥ α2 , it suffices to have
+1477
+1478                                      3 − β + β2         αL      1
+                                                     Lα +          ≤
+1479                                       2(1 − β)       2(1 − β)   2
+1480
+1481
+                                                   1−β
+1482   which is equivalent to our condition α ≤ L(4−β+β 2) .
+
+1483                                                             1−β
+       For R̄2 , we can upperbound c1 using our condition α ≤ L(4−β+β 2 ) . Thus,
+1484
+1485
+1486
+                                                            β + β2    p̂kmax βL
+1487                                   c1 ≤ α2 L3 p̂kmax            ≤           .
+                                                           (1 − β)3   2(1 − β)
+1488
+1489   Therefore,
+1490
+                        β2
+
+                                2 2 1 2 2       2 2   1−β         k
+1491           R̄2 =          Lα σ + Lα σ + c1 α σ 2      + 1 − p̄min
+                     2(1 + β)       2                 1+β
+1492
+1493                     β2              1          p̂k βLα2 σ 2                                   β
+                    ≤          Lα2 σ 2 + Lα2 σ 2 + max             + Lα2 σ 2 p̂kmax (1 − p̄kmin )
+1494                  2(1 + β)           2             (1 + β)                                    1−β
+                        2
+1495                    2β + 8p̂kmax    1 p̂kmax (1 − p̄kmin )β
+
+1496                ≤                 + +                         Lα2 σ 2 .
+                          2(1 + β)      2       8(1 − β)
+1497
+1498   By putting them all together, we obtain
+1499
+                k
+                               2 f (x1 ) − f ∗
+
+                                                     2β 2 + 8p̂kmax      1 p̂kmax (1 − p̄kmin )β
+
+1500        1X         i 2
+1501
+                   E[∥g ∥ ] ≤                     +                  + +                           Lασ 2
+            k i=1                      kα              2(1 + β)          2          8(1 − β)
+1502
+                                    f (x1 ) − f ∗                p̂kmax (1 − p̄kmin )β
+
+1503                         =O                         2
+                                                  + Lασ 1 +                               .
+1504                                     kα                            (1 − β)
+1505
+1506
+1507
+1508
+1509
+1510
+1511
+
+
+
+                                                            28
+       Under review as a conference paper at ICLR 2025
+
+
+1512
+1513   Table 15: Comparison of different projection and state-free subspace optimization strategies for
+1514   different values density ρ on pre-training LLaMA-130M on C4 with Adam as the state-full algorithm.
+1515
+               Density    Projection    Optimizes state-       Validation perplexity after iterations ↓
+1516
+                 ρ           type        free subspace         4k       20k     40k      100k 200k
+1517
+1518
+                            SVD                No             36.15 23.85 22.09 20.32 19.30
+                           Random              No             38.52 23.91 21.89 19.97 18.90
+1519             0.5
+1520                      Blockwise            Yes            34.80   22.59    21.27    19.38    18.40
+1521                        SVD                Yes            34.18   22.45    20.85    19.23    18.30
+1522                        SVD                No             38.00   25.18    23.31    21.42    20.31
+1523                       Random              No             40.30   25.00    22.78    20.65    19.46
+1524
+                0.333
+                          Blockwise            Yes            35.77   22.81    21.28    19.50    18.50
+1525
+                            SVD                Yes            34.33   22.54    20.91    19.25    18.33
+1526
+1527                        SVD                No             44.48   29.24    26.80    24.37    22.91
+1528                       Random              No             48.65   28.90    25.78    22.94    21.35
+                0.125
+1529                      Blockwise            Yes            37.21   23.70    21.69    19.76    18.71
+1530                        SVD                Yes            34.95   22.83    21.16    19.44    18.48
+1531
+                            SVD                No             51.05   33.01    29.88    26.84    25.07
+1532                       Random              No             60.54   35.64    29.02    25.30    23.41
+1533           0.0625
+1534
+                          Blockwise            Yes            37.94   23.54    21.53    19.90    18.80
+                            SVD                Yes            35.18   22.93    21.24    19.56    18.56
+1535
+1536
+1537
+1538
+1539   F    A DDITIONAL EXPERIMENTS
+1540
+1541
+       In this section we present additional experiments.
+1542
+1543   Connection between density and type of the projection. First, we present the results of the
+1544   experiments that follow the setup of Table 1 but explore different density ρ values: 0.0625, 0.125,
+1545
+       0.333, and 0.5 (while in Table 1 we use ρ = 0.25). The results, presented in Table 15, align with
+       our findings from Table 1. Specifically, training with random projection significantly outperforms
+1546
+       SVD projection when training without optimizing the state-free subspace. When state-free subspace
+1547
+       optimization is employed, SVD projections marginally outperform their Blockwise counterparts.
+1548
+1549   Different state-full and state-free optimizers. Next, we conducted experiments for other state-full
+1550   and state-free optimizers. We explored two variations: 1. replacing AdamW with Lion (Chen
+1551
+       et al., 2024) as the state-full optimizer, and 2. substituting signSGD with SGD as the state-free
+       optimizer. We pre-trained LLaMA-130M on C4 for 200k steps with the hyperparameters specified
+1552
+       in Appendix A.1. We approached the Lion experiments in the same way as the Adam experiments:
+1553
+       first finding the optimal learning rate for the original algorithm through grid search, then using that
+1554   same learning rate for both GaLore and FRUGAL. For SGD experiments, we kept state-full Adam’s
+1555   learning rate constant while only adjusting the learning rate for the state-free optimizer.
+1556
+1557
+       The results are presented in tables Table 16 and Table 17. As observed, the results for Lion are similar
+       to those obtained with AdamW - the additional optimization of the state-free subspace significantly
+1558
+       improves performance, resulting in FRUGAL significantly outperforming GaLore (Zhao et al., 2024a).
+1559
+       While training with SGD as the state-free optimizer shows somewhat lower performance compared
+1560   to signSGD, it still significantly outperforms both GaLore and BAdam (Luo et al., 2024). However,
+1561   we would like to note that unlike signSGD, hyperparameter tuning for SGD training is considerably
+1562   more challenging. This is because, unlike signSGD, whose update magnitudes approximately equal
+1563   to those of popular Adam-like algorithms, the magnitude of updates (essentially, gradients) in SGD
+1564   differs substantially, necessitating learning rates that deviate significantly from those used with the
+1565   state-full optimizer. Furthermore, successful training with SGD absolutely requires gradient clipping,
+       while the absence of such clipping is not a critical impediment for signSGD.
+
+
+                                                         29
+       Under review as a conference paper at ICLR 2025
+
+
+1566
+1567                                                          Table 17: Perplexity of LLaMA-130M models
+1568   Table 16: Perplexity of LLaMA-130M models              pre-trained on C4 for 200k steps with different
+1569   pre-trained on C4 with Lion as state-full opti-        state-free optimizers for FRUGAL.
+1570   mizer for 200k steps.
+1571                                                                                   State-free   Validation
+            Method                           200k                Method
+1572                                                                                   optimizer    perplexity
+1573
+            Adam                             18.13               Adam                      —          18.13
+1574
+            Lion                             18.55               GaLore, ρ = 0.25          —          21.11
+            GaLore (+ Lion), ρ = 0.25        21.65               BAdam, ρ = 0.25           —          20.34
+1575
+            FRUGAL (+ Lion), ρ = 0.25        18.89               FRUGAL, ρ = 0.25      signSGD        18.60
+1576
+1577                                                             FRUGAL, ρ = 0.25        SGD          19.11
+1578
+1579
+1580   Table 18: Validation perplexity of GPT-2 124M model pre-trained on C4 for 200k steps with various
+1581   optimization methods and different combinations of sequence length (SL), batch size (BS).
+1582
+1583
+                    Method                  {SL, BS} = {256, 512}         {SL, BS} = {512, 256}
+                    Adam                            21.94                         21.90
+1584
+                    GaLore, ρ = 0.25                25.84                         26.90
+1585
+                    BAdam, ρ = 0.25                 25.43                         26.23
+1586
+                    FRUGAL, ρ = 0.25                23.23                         23.13
+1587                FRUGAL, ρ = 0.0                 25.04                         24.51
+1588
+1589
+1590
+1591   Different architectures. We have conducted additional experiments on pre-training GPT-2 124M to
+1592
+       further strengthen our findings. We followed the setup described in Appendix A.1, except for the
+       tokenizer. We utilized the GPT-2 original tokenizer, with 50257 vocabulary size.
+1593
+1594   Note, that we have tried two configurations: 1. with sequence length of 256 and batch size of 512
+1595   sequences (setup from Zhao et al. (2024a), that we used in our previous experiments), 2. with
+1596   sequence length of 512 and batch size of 256 sequences (original sequence length of GPT-2).
+1597   See results in Table 18. Similarly to experiments with LLaMA, we found that FRUGAL significantly
+1598   outperforms GaLore and BAdam.
+1599
+       Computational time. We present the average computational time of the optimizer step for different
+1600
+       sizes of LLaMA models in Table 19. Time is presented in milliseconds. The measurements for
+1601
+       memory-efficient methods were made with density ρ = 0.25 and update gap T equal to 200. We
+1602   report the average time over 200 steps (to capture exactly one step with the state-full subspace update).
+1603   Measurements were conducted on a single A100-80G GPU using PyTorch 2.4.1. We note that these
+1604   experiments were conducted without using torch.compile.
+1605
+1606
+1607   Table 19: Average computational time of optimizer step averaged by 200 steps with update gap 200
+1608   for memory-efficient optimizers. We use ρ = 0.25 for FRUGAL, Badam and GaLore. Measurements
+1609
+       were conducted on a single A100-80G GPU using PyTorch 2.4.1 without torch.compile. Time
+       is presented in milliseconds.
+1610
+1611                  Method                    60M      130M      350M        1B        3B
+1612
+                      Adam                      3.09      6.62     17.88     62.20     124.63
+1613
+                      GaLore                   19.50     37.06     107.11    473.72    1063.31
+1614                  BAdam                    39.58     29.51     63.35      71.37    123.86
+1615                  FRUGAL, RandK            18.16     29.65     54.94     136.55    310.11
+1616                  FRUGAL, Blockwise         6.70      9.76     17.49     47.49      93.49
+1617
+1618
+1619   The results show that memory-efficient methods requiring gradient projection within each Linear layer
+       matrix (GaLore, RandK) stand out negatively. GaLore requires more time than RandK due to SVD de-
+
+
+                                                         30
+       Under review as a conference paper at ICLR 2025
+
+
+1620
+1621   Table 20: Pre-training LLaMA 3B on C4 dataset for 300K steps. Validation perplexity for different
+1622   iterations is reported. * indicates runs, that are still in progress.
+1623
+                         Method                  60k     120k    180k    240k    300k
+1624
+                         Adam                   15.56    13.31   12.38    *       *
+1625
+                         GaLore, ρ = 0.25       17.37    14.94     *      *       *
+1626                     BAdam, ρ = 0.25        18.65    15.61   14.30    *       *
+1627                     FRUGAL, ρ = 0.25       15.51    13.26   12.30     *       *
+1628                     FRUGAL, ρ = 0.0        15.68    13.39     *      *       *
+1629
+                         Training tokens         6B      12B      18B     24B     30B
+1630
+1631
+1632
+1633   composition. As model size increases, blockwise-projection methods even start outperforming Adam,
+1634   despite being implemented through a for-loop over all parameters, while PyTorch uses an efficient
+1635   Adam implementation by stacking updates into a single shared tensor (flag foreach=True) to bet-
+1636
+       ter utilize the parallelization capabilities of modern GPUs. This occurs because Adam’s update step
+       requires significantly more operations than the state-free step in FRUGAL. Therefore, approximately
+1637
+       75% of updates in FRUGAL’s for-loop require significantly less time.
+1638
+1639   LLaMA 3b experiments. To evaluate how our method scales to larger model sizes, we conducted
+1640   pre-training experiments with LLaMA 3B on the C4 dataset. Given the substantial computational
+1641   costs associated with 3B model experiments, we performed a single run using a uniform learning rate
+1642
+       of 1.6e-4 across all methods (learning rate taken from Brown (2020a) Table 2.1), training for 300k
+       steps with gradient clipping set to 1.0 and using a cosine scheduler with 30k warmup steps. Other
+1643
+       hyperparameters remain consistent with Appendix A.1. Preliminary results are presented in Table 20.
+1644
+1645   The results demonstrate that FRUGAL scales excellently to 3B-parameter models, while GaLore and
+1646   BAdam show significantly inferior performance. Surprisingly, FRUGAL with ρ = 0.25 even outper-
+1647   forms Adam. While these results are encouraging, we acknowledge that this performance difference
+1648
+       might be attributed to suboptimal hyperparameter selection that potentially favors Linear weights
+       training through signSGD over Adam. For instance, similar to the setup described in Appendix A.1
+1649
+       which we adopted from GaLore, we use a weight decay value of 0.0, which may not be optimal.
+1650
+       Despite this caveat, we believe this experiment demonstrates the remarkable potential of FRUGAL for
+1651   large-scale training.
+1652
+1653
+1654   G    S IMPLIFIED ALGORITHMS PSEUDOCODE
+1655
+1656
+1657
+1658
+1659
+1660
+1661
+1662
+1663
+1664
+1665
+1666
+1667
+1668
+1669
+1670
+1671
+1672
+1673
+
+
+
+                                                        31
+       Under review as a conference paper at ICLR 2025
+
+
+1674
+       Algorithm 4 FRUGAL step pseudocode, PyTorch-like
+1675
+        1: def svd or randk step(self):
+1676
+        2:     for param in self.params:
+1677    3:         grad = param.grad
+1678    4:         param state = self.state[param]
+1679    5:         # update projector if necessary
+1680    6:         if self.step % self.update gap == 0:
+1681    7:             param state["projector"] = self.update proj(grad)
+1682    8:         projector = param state["projector"]
+1683    9:         # obtain state-full grad and state-free grad
+1684   10:         grad full = projector.proj down(grad)
+1685
+       11:         grad free = grad full - projector.proj up(grad full)
+       12:         # reset state-full optimizer state if necessary
+1686
+       13:         if self.step % self.update gap == 0:
+1687
+       14:             param state["exp avg"] = torch.zeros like(grad full)
+1688   15:             param state["exp avg sq"] = torch.zeros like(grad full)
+1689   16:         # state-full subspace update
+1690   17:         self.step += 1
+1691   18:         update full = self.state full step(grad full, param state)
+1692   19:         update full = projector.proj up(update full)
+1693   20:         # state-free subspace update
+1694   21:         update free = self.state free step(grad free)
+1695   22:         # perform resulting update
+1696
+       23:         update = update full + update free
+       24:         param.add (update)
+1697
+       25:
+1698
+       26: def block step(self):
+1699   27:    # change state-full and state-free blocks if necessary
+1700   28:    if self.step % self.update gap == 0:
+1701   29:        indices full = self.update indices(indices full)
+1702   30:        for idx, param in enumerate(self.params):
+1703   31:           grad = param.grad
+1704   32:           param state = self.state[param]
+1705   33:           if idx in indices full:
+1706   34:               # reset state-full optimizer state
+1707
+       35:               param state["exp avg"] = torch.zeros like(grad)
+       36:               param state["exp avg sq"] = torch.zeros like(grad)
+1708
+       37:               param state["full subspace"] = True
+1709
+       38:           else:
+1710   39:               # free state-full optimizer state to save memory
+1711   40:               param state.clear()
+1712   41:               param state["full subspace"] = False
+1713   42:    # perform updates
+1714   43:    for param in self.params:
+1715   44:        grad = param.grad
+1716   45:        param state = self.state[param]
+1717   46:        # choose the optimizer depending on the block type
+1718
+       47:        if param state["full subspace"]:
+       48:           update = self.state full step(grad, param state)
+1719
+       49:        else:
+1720
+       50:           update = self.state free step(grad)
+1721   51:        # perform resulting update
+1722   52:        param.add (update)
+1723
+1724
+1725
+1726
+1727
+
+
+
+                                                    32
+       Under review as a conference paper at ICLR 2025
+
+
+1728
+       Algorithm 5 Examples of state-full and state-free steps for Algorithm 4
+1729
+        1: def state full adam step(self, grad, param state):
+1730
+        2:     exp avg = param state["exp avg"]
+1731    3:     exp avg sq = param state["exp avg sq"]
+1732    4:     step = self.step
+1733    5:     beta1, beta2 = self.betas
+1734    6:     exp avg.mul (beta1).add (grad, alpha=1.0-beta1)
+1735    7:     exp avg sq.mul (beta2).addcmul (grad, grad, value=1.0-beta2)
+1736    8:     denom = exp avg sq.sqrt()
+1737    9:     step size = self.lr full
+1738   10:     if self.correct bias:
+1739
+       11:         bias correction1 = 1.0 - beta1 ** step
+       12:         bias correction2 = 1.0 - beta2 ** step
+1740
+       13:         step size = self.lr full / bias correction1
+1741
+       14:         bias correction2 sqrt = math.sqrt(bias correction2)
+1742   15:         denom.div (bias correction2 sqrt)
+1743   16:     denom.add (self.eps)
+1744   17:     update full = exp avg / denom * (-step size)
+1745   18:     return update full
+1746   19:
+1747   20: def state free signsgd step(self, grad):
+1748   21:    update free = -self.lr free * grad.sign()
+1749   22:    return update free
+1750
+1751
+1752   H    L IMITATIONS
+1753
+1754
+       We would also like to acknowledge the limitations of this work. Due to computational constraints, we
+       were unable to conduct experiments on pre-training 7B+ LLMs, which is crucial for understanding the
+1755
+       potential of our approach when scaling. Furthermore, our experiments are limited to training language
+1756
+       models, although memory-efficient optimization could also be beneficial for training diffusion models.
+1757   Finally, there may be a better method for selecting the next state-full subspace during the training.
+1758   We leave the exploration of more sophisticated selection strategies for future work.
+1759
+1760
+1761
+1762
+1763
+1764
+1765
+1766
+1767
+1768
+1769
+1770
+1771
+1772
+1773
+1774
+1775
+1776
+1777
+1778
+1779
+1780
+1781
+
+
+
+                                                        33

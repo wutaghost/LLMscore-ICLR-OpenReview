@@ -1,0 +1,1548 @@
+Published as a conference paper at ICLR 2025
+
+
+N O N EED TO TALK :
+A SYNCHRONOUS M IXTURE OF L ANGUAGE M ODELS
+ Anastasiia Filippova †           Angelos Katharopoulos         David Grangier        Ronan Collobert
+ EPFL                             Apple                         Apple                 Apple
+
+
+
+                                                A BSTRACT
+             We introduce S MALLTALK LM, an innovative method for training a mixture of
+             language models in an almost asynchronous manner. Each model of the mix-
+             ture specializes in distinct parts of the data distribution, without the need of high-
+             bandwidth communication between the nodes training each model. At inference,
+             a lightweight router directs a given sequence to a single expert, according to a
+             short prefix. This inference scheme naturally uses a fraction of the parameters
+             from the overall mixture model. Unlike prior works on asynchronous LLM train-
+             ing, our routing method does not rely on full corpus clustering or access to meta-
+             data, making it more suitable for real-world applications. Our experiments on lan-
+             guage modeling demonstrate that S MALLTALK LM achieves significantly lower
+             perplexity than dense model baselines for the same total training FLOPs and an
+             almost identical inference cost. Finally, in our downstream evaluations we outper-
+             form the dense baseline on 75% of the tasks.
+
+
+1       I NTRODUCTION
+Recent research has demonstrated that scaling large language models (LLMs) by increasing model
+capacity and expanding training data consistently leads to significant performance improvements on
+a wide range of downstream tasks (Kaplan et al., 2020; Brown et al., 2020; Henighan et al., 2020;
+Hoffmann et al., 2022; Dubey et al., 2024). Scaling introduces substantial operating and engineering
+costs for both inference and training. In general, training is achieved on a large number of nodes via
+synchronous gradient descent techniques, which relies on high-bandwidth communication to scale.
+Inference of large models may require multiple compute nodes to distribute the model, which relies
+on low-latency communication. In both cases, state-of-the-art interconnect hardware is critical, and
+careful engineering is required to scale, and maintain a large compute cluster. While mainstream
+machine learning frameworks have eased the engineering work on the scaling side, access to a large
+number of well interconnected nodes remains a privilege in the machine learning community.
+In this paper, we explore strategies to mitigate the communication cost of large language models,
+both at training and inference, while keeping the inference efficient. We show that efficient training
+and inference can be achieved without relying on fast interconnects, and without compromising
+model performance, both in terms of perplexity or downstream task accuracy.
+In recent studies aimed at mitigating reliance on high-bandwidth interconnects, researchers have
+developed algorithms that reduce the need for frequent or comprehensive gradient synchronizations.
+Such techniques include asynchronous training (Douillard et al., 2023; Aji & Heafield, 2017; Zhang
+et al., 2015; Liu et al., 2024) and gradient compression (Lin et al., 2017; Dettmers, 2016) which
+effectively decrease communication overhead. By performing updates less frequently or by commu-
+nicating less data, these methods sustain high training throughput while diminishing dependence on
+high-speed interconnects. However, these algorithms still require some level of gradient synchro-
+nization, and resulting models often under perform (in terms of perplexity) compared to training
+approaches synchronizing at every step (Diskin et al., 2021).
+Regarding efficient inference, a number of sparse parameter activation techniques have recently
+become popular (Shazeer et al., 2017; Fedus et al., 2022; Artetxe et al., 2022; Lewis et al., 2021;
+Du et al., 2022), in particular the Switch Transformer mixture of experts (MoE). These approaches
+    †
+        Work done while interning at Apple.
+
+
+                                                       1
+Published as a conference paper at ICLR 2025
+
+
+are effective at reducing significantly the number of active model parameters at inference time. Yet,
+they require routing decisions to be made for each token, demanding rapid interconnections and
+requiring all parameters to be accessible in RAM.
+To achieve both low-bandwidth training and efficient inference, several prior works have explored
+asynchronously training mixtures of models (Gross et al., 2017; Li et al., 2022; Gururangan et al.,
+2023). In these methods, the input space is clustered using unsupervised techniques like K-Means,
+with each model in the mixture trained on an assigned cluster. These approaches reduce communica-
+tion overhead and have demonstrated improvements in model perplexity, while maintaining similar
+inference costs to baseline models (Gross et al., 2017; Gururangan et al., 2023). However, in the
+context of language processing, their practical applicability on standard downstream tasks with rela-
+tively short input prefixes remains a subject of debate, as they rely on full corpus clustering or access
+to metadata (Li et al., 2022; Gururangan et al., 2023).
+In this paper, we introduce S MALLTALK LM, an asynchronous mixture of language models, which
+combines the advantage of asynchronous LM training methods (significantly reducing interconnect
+requirements), and sparse activation methods (it naturally uses only a subset of the overall architec-
+ture parameters during inference). S MALLTALK LM achieves better perplexity, and better accuracy
+on a majority of downstream tasks, compared to a regular dense language model trained with the
+same amount of FLOPs. Our main contributions are as follows:
+
+       • We introduce an algorithm that trains a mixture of independent language models, signif-
+         icantly reducing bandwidth requirements during training compared to regular distributed
+         training methods. Our approach leverages a lightweight router (which accounts for less
+         than 1.5% of the size of each expert) to efficiently route sequences. This router determines
+         the most suitable expert for a given sequence based on a short prefix (see § 2).
+       • We empirically demonstrate that our method achieves significantly lower perplexity than a
+         dense baseline for near-identical training and inference FLOPs and identical training data
+         volume (see Fig. 2). Furthermore, we show that for a constant mixture model size, the
+         improvement in perplexity increases with the number of experts.
+       • We evaluate our method on a set of downstream tasks, showing that it achieves better or
+         similar accuracy compared to a dense baseline on 75% of the tasks (see § 3.3 and App. B).
+
+2     M ETHOD
+
+In this section, we formalize our proposed method: S MALLTALK LM. In § 2.1, we introduce general
+language modeling background, and present a mixture of experts framework in this context. Sub-
+sequently, in § 2.2, we show how we can use independent language models to perform routing to
+different experts in the mixture. We also present the training procedure and implementation details
+of our method. Finally, we discuss its marginal computational overhead and minimal distributed
+communication costs.
+
+2.1   BACKGROUND
+
+Language modeling Let V denote a fixed vocabulary, and consider a sequence of tokens x =
+(x1 , x2 , . . . , xS ), where each xs ∈ V for s = 1, 2, . . . , S. Language modeling is about modeling
+the data distribution p(x), which in practice is cast as training a language model p(xs+1 | x1:s ; θ)
+generating a token xs+1 given a context sequence x1:s = (x1 , x2 , . . . , xs ). Typically, the model
+parameterized by θ is a neural network, and parameters are obtained by minimizing the negative
+log-likelihood:
+                                                      S−1
+                                                      X
+                             L(x; θ) = − p(x ; θ) = −       log p(xs+1 | x1:s ; θ) .                (1)
+                                                    s=1
+
+
+Mixture of Experts There exist many variants of the mixture of experts model (Jacobs et al., 1991;
+Jordan & Jacobs, 1994; Tresp, 2000; Collobert et al., 2001; Shahbaba & Neal, 2009). Following the
+original formulation and applying it to language modeling, we factorize the conditional distribution
+for predicting a given token by summing over a set of E experts:
+
+
+                                                   2
+Published as a conference paper at ICLR 2025
+
+
+                                 S−1
+                                 X            E
+                                              X
+                   L(x; θ) = −          log         p(xs+1 | x1:s , e ; θe ) p(e | x1:s ; θr ),      (2)
+                                 s=1          e=1
+where each expert p(xs+1 | x1:s , e ; θe ) is intended to focus on different parts of the data distribu-
+tion, and the router p(e | x1:s ; θr ) assigns weights to the expert predictions. Each expert e has its
+own set of independent parameters θe , and the router is parameterized by θr .
+While this type of mixture of experts partitions the input space across different models, all experts
+are still involved when computing the conditional likelihood in Equation (2), both at training and
+inference time. Hard mixtures of experts circumvent this issue by hard-assigning a sequence x1:s to
+a single expert e⋆ , minimizing an upper bound of Equation (2):
+                                 S−1
+                                 X                                      ⋆
+                   L(x; θ) ≤ −          log p(xs+1 | x1:s , e⋆ ; θe ) p(e⋆ | x1:s ; θr ),            (3)
+                                  s=1
+
+The way e⋆ is chosen depends of the goal of the approach. For example, in Jacobs et al. (1991), e⋆ is
+sampled at training time, according to the distribution p(e | x1:s ; θr ). In other works, like Collobert
+et al. (2001), it is chosen as the most relevant expert (that is e⋆ = arg maxe p(e | x1:s ; θr )), both
+at training and inference. Regarding the training procedure, mixture models with both soft and
+hard assignments are typically trained with an Expectation-Minimization (EM) scheme, alternating
+between experts and router optimization.
+
+2.2   S MALLTALK LM
+
+Routing With Independent Language Models S MALLTALK LM can be viewed as an instance
+of hard mixture of experts, where a sequence is routed to the most relevant expert e⋆ , according
+to the router posterior p(e | x1:s ; θr ), both at training and inference. However, instead of being a
+monolithic neural network model, the router is implemented as a language model per expert. More
+precisely, with Bayes’ rule we have:
+                              e⋆ = arg max p(e | x1:s ; θr )                                         (4)
+                                          e
+                                               p(x1:s | e ; θr ) p(e)
+                                  = arg max PE                                                       (5)
+                                                                  r
+                                              i=1 p(x1:s | i ; θ ) p(i)
+                                        e
+                                                          r
+                                  = arg max p(x1:s | e ; θ )                                         (6)
+                                          e
+                                  = arg max p(x1:s | θr,e ) ,                                        (7)
+                                          e
+
+where the likelihood p(x1:s | θr,e ) defines a routing language model attributed to the e-th expert
+with independent parameters θr,e , and expert priors p(e) are supposed to be uniform. So far, in
+our definition, there is nothing that prevents θr,e = θe , namely to use the experts themselves to
+implement the router. Interestingly, in that case selecting e⋆ as above is intuitive because it amounts
+to selecting the best expert for a given sequence (in terms of log-likelihood).
+
+Deriving a Practical Model In order for the above formulation to result in a model that is useful
+in practice, we have to solve the following main challenges. Firstly, we need to be able to route using
+a small prefix of the full sequence since in most real world applications we do not have access to a
+full sequence (e.g. in question answering we do not have the answer). Secondly, using the experts
+to implement the router results in a large computational overhead since we need to evaluate every
+single one of them, largely negating the benefits of the hard mixture of experts.
+We solve both of the above problems with the following two key ideas:
+
+      1. We use a short prefix of length M to compute the score for each expert as follows:
+                                              p(e⋆ | x1:s ) ≈ p(e⋆ | x1:M ).                         (8)
+         This enables us to use S MALLTALK LM in real-world applications where only a very small
+         prefix may be available. We show in § 3.4 that our method outperforms the dense baseline
+         even when using as little as 32 tokens for routing.
+
+
+                                                          3
+Published as a conference paper at ICLR 2025
+
+
+      2. We implement the router with E language models that are orders of magnitude smaller
+         than the experts. This results in marginal computational overhead, as little as 1% during
+         training and 3% during inference (§ 3.2).
+
+Using the log-likelihood of a prefix to route a sequence is an intuitive solution since a model that
+is good at predicting the beginning of a sequence is likely to be good at the full sequence. Another
+interpretation is that the prefix can be used to perform some sort of thematic identification of the
+whole sequence that is then used to route to the appropriate expert.
+On the other hand, the efficacy of smaller language models as routers is less intuitive. Even though
+one can expect a large model to be able to perform well on sequences that are beyond the capabilities
+of smaller models, the task of routing boils down to identifying whether a sequence is similar to the
+training data or not. We show that even really small models (4.4M parameters) can perform that task
+very well and result in no discernible difference in performance compared to larger routers (§ 3.4).
+
+Algorithm 1 S MALLTALK LM training.
+ 1: Train the routers
+ 2: X ← N new sequences from the dataset
+ 3: X1:E = random assignments(X)
+ 4: for i = 1 . . . T do
+ 5:     for e = 1 . . . E do
+ 6:         θr,e ≈ arg minθr,e L(Xe ; θr,e ) # Optimize Equation 9 with SGD for the e-th router
+ 7:     end for
+ 8:     X ← N new sequences from the dataset
+ 9:     X1:E = balanced assignments(X, θr )         # Segment the data according to Equation 4
+10: end for
+11: Train the experts
+12: X ← M new sequences from the dataset comprising the total number of training tokens
+13: X1:E = balanced assignments(X, θ r )
+14: for e = 1 . . . E do
+15:     θe ≈ arg minθe L(Xe ; θe )        # Optimize Equation 1 with SGD for the e-th expert
+16: end for
+
+
+Training Procedure We train our proposed hard mixture of experts with EM. Namely we alter-
+nate between a step of optimizing equation 1 and a step of assignments according to equation 4.
+In our framework, assignments e⋆ purposefully do not depend on the experts, and the routers are
+independent language models. This allows us to split the training in two stages:
+
+      1. We train the routers using EM without using the experts at all, namely we minimize
+                                                               M −1
+                                                               X                             ⋆
+                    L(x, θr ) = − log p(e⋆ | x1:M ; θr ) = −          log p xs+1 |x1:s ; θr,e ,        (9)
+                                                                s=1
+
+         in the likelihood maximization step and perform the assignments using equation 4 in the
+         expectation step.
+      2. We train the experts as E independent language models on disjoint dataset segments se-
+         lected by the trained routers.
+
+This procedure is described in pseudocode in Algorithm 1. In the specific case where the experts
+and the routers are the same language models (θe = θr,e ) our training algorithm comes down to a
+regular EM algorithm where the sequences are routed to the best performing expert. In that light,
+we can think of each router as lightweight approximation of the corresponding expert. See § 3.4 for
+experiments where the experts themselves are used for routing.
+
+Balancing the Assignments to Experts A common hurdle to overcome when training mixture of
+experts models is to ensure that the modeling load is shared as evenly as possible across all experts,
+or in other words that the model is utilizing the capacity of all experts efficiently instead of relying on
+a few good ones. Common ways of tackling this problem are either introducing losses that penalize
+
+
+                                                    4
+Published as a conference paper at ICLR 2025
+
+
+    scores matrix assignments            scores matrix             sorted matrix assignments
+
+    1.1 0.9 1                            1.1   0.9     1           0.1 0.4 0.8
+
+    0.1 0.4 0.8        1 0 2             0.1 0.4 0.8               0.8 0.2 0.7           0 1 2
+
+    0.8 0.2 0.7                          0.8 0.2 0.7               1.1   0.9     1
+        (a) Naive assignments              (b) Assignment with respect to the minimum in a chunk.
+
+Figure 1: Balanced assignments. In this scenario we have 3 experts (columns with different colors)
+and 3 sequences to assign (rows) under the constraint that each expert should get 1 sequence. In (a)
+we assign sequentially each row, by negative log-likelihood, leading to sub-optimal assignment
+because the first expert is full when we try to assign the last row. On the other hand, in (b), we first
+sort wrt to the minimum log-likelihood which results in optimal assignments.
+
+
+uneven assignments or introducing noise into the assignments namely by sometimes performing
+“sub-optimal” assignments to avoid local-minima. These techniques are used in all mixture models
+since their introduction in Jacobs et al. (1991) until more recently in Fedus et al. (2022).
+In our setup, we can solve this problem by ensuring that each expert is assigned equally sized distinct
+portions of the dataset. However, a challenge arises when assigning data sequentially based solely
+on Equation 4. In such cases, an expert might already have more than its fair share of the dataset
+assigned yet we continue to find sequences for which it has the lowest loss among all experts,
+as illustrated in Figure 1a. To overcome this issue, during training we perform the assignments
+considering the whole set of sequences rather than one sequence at a time. In particular, we sort
+the sequences based on − maxe log p(x1:M | e; θr ) and perform the assignments in that order. This
+ensures that sequences with high likelihood will be assigned first and avoids the edge-case where
+a sequence with low-loss cannot be assigned to the appropriate expert because it is at capacity. In
+Algorithm 1 we refer to this procedure as balanced assignments and it is demonstrated in Figure 1b.
+During inference, no balancing is performed, and the expert is selected solely based on equation 4.
+
+Computational and Communication Cost It is important to note that the computational cost of
+training and inference with the routers is significantly lower than that of training and inference with
+the experts. This difference arises due to the routers’ much smaller size, smaller batch sizes, and
+the fewer tokens they train on (see Appendix A.3 for further details). As a result, the additional
+computational overhead from training and inference with the routers is negligible.
+Regarding communication requirements for a distributed implementation, in Algorithm 1 all oper-
+ations except for the balanced assignments are completely independent and embarrassingly paral-
+lelizable without any communication. Namely, each expert or each router can be trained on its own
+on a different node or set of nodes. The assignments, however, require that every node has access to
+the scores of every router in order to perform the assignment according to equation 4. This requires
+a small amount of communication as each node needs to share 1 score per sequence which results
+in 2MB per 1M sequences if we represent the scores in 16-bit floats. A detailed analysis is provided
+in the Appendix A.4.
+
+3    E XPERIMENTS
+
+In this section, we experimentally analyze the performance of our proposed method. First, in § 3.2
+we benchmark our approach against a dense LLM trained using regular distributed training tech-
+niques. Second, in § 3.3, we evaluate our method on downstream tasks, demonstrating that it
+achieves performance comparable to baseline models at the same level of perplexity, improving
+upon a dense model given the total training FLOPs spent. Finally, in § 3.4, we analyse the core
+component of our method, the routing. We show that the performance of the mixture does not de-
+pend significantly on the size of the router. Furthermore, we show that our approach outperforms
+less complex routing methods, such as the TF-IDF encoding with K-Means clustering proposed by
+
+
+                                                   5
+Published as a conference paper at ICLR 2025
+
+
+Gururangan et al. (2023). Moreover, we demonstrate that the perplexity gains are not driven by a
+few dominant experts but result from each expert contributing positively to the overall performance.
+
+3.1   E XPERIMENTAL S ETUP
+
+We use the RedPajama-V2 dataset (Computer, 2023), which is a large-scale collection of text data
+designed for training language models. The dataset is built from the ground up based on publicly
+available web data, consisting of 84 crawls provided by Common Crawl (2024).
+Both the experts and routers utilize a Transformer architecture (Vaswani, 2017) with rotary posi-
+tional encoding (Su et al., 2024). All experiments use sequences of 1, 024 tokens. We train the
+models using the AdamW optimizer (Loshchilov & Hutter, 2017) with β1 = 0.9, β2 = 0.99, and a
+weight decay of 0.1. Gradient clipping is applied with a maximum norm of 0.1.
+For the experts, we employ a learning rate schedule featuring a linear warm-up to 5 × 10−4 over
+the first 3, 000 steps, followed by a cosine decay for the remainder of the training period. We
+experiment with two model sizes: a 335M-parameter model with 4, 8, 16, and 32 experts and a
+1.3B-parameter model with 4, 16, and 32 experts. Tables 1 and 2 describe the architectures and the
+training parameters in more detail.
+For the routers, we use models with 4.4M parameters. The routers are trained for 128, 000 steps
+using a constant learning rate of 1 × 10−4 , following a linear warm-up over the first 1, 000 steps.
+Scheduler choice described in details in App. A. Routers are trained with a batch size of 32 and
+perform all-to-all communication of the loss on the dataset chunk approximately every 45 million
+training tokens (see App. A.4). The length of the prefix used for routing is set to 256 tokens, which
+is 25% of the context length.
+
+Comparison to the Dense Model To ensure a fair comparison to the dense baseline, we designed
+our experiments such that the computational cost during inference and the total computational cost
+during training are the same. We achieve this by comparing the performance of models where each
+expert has the same architecture and number of parameters as the dense model, resulting in the same
+inference cost. In addition, we train S MALLTALK LM for the same number of total tokens which
+means we spend the same number of total training FLOPs.
+
+3.2   L ANGUAGE M ODELING R ESULTS
+
+Across all experimental configurations, our method consistently outperforms the baseline while uti-
+lizing the same volume of data, with only minor increases in computational costs. Specifically, for
+the 1.3B parameter model, our approach results in less than a 1% increase in training FLOPs and
+less than a 3% increase in inference FLOPs, while achieving performance gains of up to almost 18%
+in perplexity. Similarly, for the 335M parameter model, the cost increases are modest, with less
+than a 4% increase in training FLOPs and less than a 10% increase in inference FLOPs, alongside
+performance gains of up to nearly 14% in perplexity (see Appendix A.3 for details on FLOPs calcu-
+lation). Figures 2a and 2b illustrate the perplexity on a held-out test set relative to the total training
+cost, measured in petaFLOPs, across different model sizes. Additionally, Figure 2c shows the test
+perplexity as a function of the number of training tokens for the 1.3B parameter model.
+Moreover, it is interesting to compare our model with the smaller 335M parameter experts to the
+1.3B dense baseline. When using 32 experts and roughly the same training budget in FLOPs,
+S MALLTALK LM achieves slightly better perplexity (9.07 vs 9.11) but requires three times less
+compute during inference.
+Finally, we observed that for a constant model size, the improvement in perplexity increases with
+the number of experts. This suggests that our method more efficiently utilizes the training data to
+improve performance, likely due to the specialization of experts on different segments of the data
+distribution.
+
+Communication Overhead Our approach performs minimal communication and does not re-
+quire a fast interconnect. As detailed in § 2, we first train the routers which are then used to effi-
+ciently shard the dataset and each expert is trained completely independently. During their training,
+the routers communicate approximately 100 times with each transmission involving less than 6
+
+
+                                                    6
+Published as a conference paper at ICLR 2025
+
+
+                        12
+                                                                                                                                                                                                                         12                                                            dense 1.3B
+                                                                                                                                                                                                                                                                                       mixture 1.3B
+                                                                                                                         9                                                                                                                                                             4 experts
+                                                                                                                                                                                                                         11                                                            16 experts
+                        11
+                                                                                                                                                                                                                                                                                       32 experts
+
+           Perplexity
+
+
+                                                                                                                                                                                                            Perplexity
+                                                                                                            Perplexity
+                                                                                                                                                                                                                         10
+                                                                                                                         8
+                        10          133M tokens, 4 experts
+                                                                                                                                                                                                                          9
+                                    266M tokens, 8 experts                                                                          266M tokens, 4 experts
+                                    532M tokens, 16 experts                                                              7          1T tokens, 16 experts                                                                 8
+                                    1T tokens, 32 experts                                                                           2T tokens, 32 experts
+                         9          mixture                                                                                         mixture
+                                    dense                                                                                           dense                                                                                 7
+
+                             0.3M               0.6M           1.2M                          2.4M                               2.5M                   5M            10M                        20M                                                250B                         1T             2T
+                                               Training cost (PFLOPS)                                                                             Training cost (PFLOPS)                                                                                       Tokens
+
+
+                 (a) FLOPs vs perplexity, 335M.                                                                          (b) FLOPsvs perplexity, 1.3B.                                                                   (c) Tokens vs perplexity, 1.3B.
+
+Figure 2: Better perplexity for the same price. Test perplexity comparison between our approach
+and the dense baseline, as a function of training cost measured in PFLOPs. In (a), we report results
+for models with 335M parameters using 4, 8, 16, and 32 experts and in (b) for models with 1.3B
+parameters using 4, 16, and 32 experts. In addition, (c) shows the perplexity comparison between
+our approach and the dense baseline, plotted against the cumulative number of tokens processed
+throughout the training for the 1.3B parameter models. We observe that our method significantly out-
+performs the baseline across all experimental configurations. Notably, our 335M parameter model
+with 32 experts achieves a perplexity of 9.07, outperforming the 1.3B dense baseline’s perplexity of
+9.1. This improvement is achieved with a training budget of 2.5 × 1021 FLOPs, which is compara-
+ble to the baseline’s 2.2 × 1021 FLOPs, while requiring three times less computational cost during
+inference (0.87 × 1012 FLOPs compared to 2.81 × 1012 FLOPs). See § 3.2 and App. A for a detailed
+description of our experimental setup.
+
+
+                                                         4 experts, 266B              0.68                                               4 experts, 266B                                                   4 experts, 266B                                                             4 experts, 266B
+           0.32                                                                                                                                                         0.49
+                                                         16 experts, 1T                                                                  16 experts, 1T                                                    16 experts, 1T                       0.33                                   16 experts, 1T
+                                                         32 experts, 2T               0.66                                               32 experts, 2T                 0.48                               32 experts, 2T                                                              32 experts, 2T
+           0.31
+Accuracy
+
+
+                                                                           Accuracy
+
+
+                                                                                                                                                             Accuracy
+
+
+                                                                                                                                                                                                                                     Accuracy
+                                                         dense, 266B                                                                                                    0.47                                                                    0.32
+           0.30                                          dense, 1T                    0.64
+                                                                                                                                                                        0.46                                                                    0.31
+                                                         dense, 2T
+           0.29                                                                                     dense, 266B                                                                   dense, 266B                                                                 dense, 266B
+                                                                                      0.62                                                                              0.45
+                                                                                                    dense, 1T                                                                     dense, 1T                                                     0.30          dense, 1T
+           0.28                                                                                                                                                         0.44
+                                                                                      0.60          dense, 2T                                                                     dense, 2T                                                                   dense, 2T
+
+                             15.5      16.0           16.5      17.0                         18.5    19.0                19.5    20.0      20.5     21.0                       18.2    18.4       18.6             18.8       19.0                     13.5        14.0         14.5          15.0
+                                              Perplexity                                                                    Perplexity                                                        Perplexity                                                                  Perplexity
+
+
+
+                        (a) ARC Challenge                                                       (b) ARC Easy                                                                    (c) HellaSwag                                                                 (d) MMLU
+
+Figure 3: Downstream evaluation. Accuracy with respect to perplexity on (a) ARC Challenge,
+(b) ARC Easy, (c) HellaSwag and (d) MMLU, for 1.3B parameter dense baselines trained on 266B,
+1T and 2T tokens (empty symbols) and mixture models with 1.3B parameter experts and 4, 16 and
+32 experts respectively (filled symbols). The models that have the same symbol shape have near
+identical training and inference FLOPs.
+
+
+
+megabytes per router resulting in truly minimal communication requirements. See A.4 for details
+about the calculation of these numbers.
+
+
+3.3                           D OWNSTREAM EVALUATION
+
+To demonstrate the applicability of our approach in real-world scenarios, we performed zero-shot
+evaluation on a set of natural language processing (NLP) tasks, including ARC Challenge and ARC
+Easy (Clark et al., 2018), HellaSwag (Zellers et al., 2019), SciQ (Welbl et al., 2017), and MMLU
+(Hendrycks et al., 2020). Figure 3 shows both accuracy and perplexity for each task (see Appendix B
+for details regarding perplexity and accuracy computation).
+Specifically, our largest configuration, a model with 32 1.3B parameter experts, demonstrates better
+performance on four out of five tasks, achieving gains of 3%, 2%, 3%, and 1% on ARC Challenge
+(3a), ARC Easy (3b), HellaSwag (3c), and MMLU (3d), respectively, under the same inference cost.
+Moreover, on the MMLU benchmark, our approach either beats the baseline or achieves the same
+performance on 75% of the tasks (42 out of 56), as shown in Table 4.
+
+
+                                                                                                                                                           7
+Published as a conference paper at ICLR 2025
+
+
+                                                                     10                                                                  15
+                                                                                                                                                                           4.4M router
+                                                 335M
+                                                                                                                                                                           TF-IDF
+                                                 110M
+               23.0                              64M
+                                                                                                                                         14
+                                                 4.4M                 9
+               21.0                                                                                                                      13
+
+
+                                                        Perplexity
+
+
+                                                                                                                            Perplexity
+  Perplexity
+               19.0
+                                                                      8                                                                  12
+                                                                              4 experts, 266B
+               17.0                                                           dense, 266B
+                                                                              16 experts, 1T                                             11
+               15.0                                                           dense, 1T
+                                                                      7       32 experts, 2T
+               13.0                                                           dense, 2T                                                  10
+
+                            10B            20B    30B                     8        16           32        64    128   256                     8     16   32        64    128      256
+                                  Tokens                                                        Prefix length                                            Prefix length
+
+
+                         (a) Router size                                        (b) Prefix length                                                 (c) Ours vs TF-IDF
+
+Figure 4: Routing analysis. (a) Test perplexity over training steps for different router sizes using a
+335M parameter model with 4 experts. We compare routers of sizes 335M (where the model routes
+data for itself), 110M, 65M, and 4.4M parameters. (b) Test perplexity as a function of routing prefix
+length during inference for 1.3B parameter model with 4, 16 and 32 experts. We examine how
+reducing the prefix length M̂ used during inference affects performance when the data is partitioned
+during training using a prefix size M ≥ M̂ . (c) Test perplexity over training steps for a 335M
+parameter model with 16 experts, comparing our proposed routing using TF-IDF document encoding
+followed by SVD projection and balanced K-Means clustering.
+
+
+3.4                   ROUTING ANALYSIS
+
+In this section we analyse the most critical component of S MALLTALK LM, the routing. In particu-
+lar, we perform experiments to investigate the impact of the size of the router to the mixture model,
+the impact of the size of the prefix and finally whether the EM algorithm presented in § 2 is critical
+or it could be replaced by simple content based clustering.
+
+Impact of Router Size One of the most critical findings of our work is the fact that the size of the
+model used for routing does not impact the performance of the mixture (Figure 4a). This allows us
+to utilize small router models which reduce dramatically the computational cost of routing during
+training and inference without compromising the model’s performance.
+In detail, we investigated the effect of router size on the performance of our method by experimenting
+with a 335M parameter model configured with 4 experts, using four different router sizes for data
+partitioning: a 335M parameter router (where the model routes data for itself, optimizing for the
+data it handles best), and routers with 110M, 64M, and 4.4M parameters. All models were trained
+with a batch size of 32 for 256, 000 steps, using a routing prefix length of 256 tokens, following the
+same experimental setup as in § 3.2 (see Appendix A for more details about model architectures and
+training parameters). Figure 4a illustrates the test perplexity wrt the number of training tokens for
+these configurations. We observe that all router sizes perform practically identically.
+
+Impact of Prefix Length An important hyperparameter for our mixture model is the length of
+the context used for routing to the expert model. In our experiments, we use a prefix length of 256
+which may be too large for some real-world applications like conversational AI. However, we show
+in Figure 4b that S MALLTALK LM outperforms the dense baseline even when routing with shorter
+prefixes. In particular, we show that even with prefixes of just 32 tokens ( 81 th of the length during
+training) the model still outperforms the dense baseline.
+
+Comparison With Routing Using TF-IDF An alternative approach might suggest that if a tiny
+LLM suffices for routing, simpler methods such as TF-IDF encoding combined with balanced K-
+Means clustering, as proposed by Gururangan et al. (2023), could be adequate. To test this hypoth-
+esis, we trained a 335M parameter model using the routing strategy outlined in (Gururangan et al.,
+2023): applying TF-IDF transformation to the text, followed by Singular Value Decomposition
+(SVD) projection into a low-dimensional space, and then clustering using balanced K-Means.
+We then trained 16 experts on these clustered results. Our findings reveal that routing with TF-
+IDF encoding under performs when the prefix is short, indicating limitations of this simple routing
+approach. As shown in Figure 4c, our proposed routing method significantly outperforms the TF-
+
+
+                                                                                                 8
+Published as a conference paper at ICLR 2025
+
+
+IDF-based routing. This demonstrates that our approach is more effective in capturing the nuances
+of the data distribution, even when using limited context for routing decisions.
+
+Experts Do Specialize A potential concern is that the observed performance gains might be driven
+primarily by a few experts among the E, while the remaining contribute minimally or may even un-
+der perform on their assigned data. To address this concern, we conducted an analysis of each
+expert’s performance individually. Figures 5a, 5b, and 5c compare the perplexity achieved by our
+method and the dense baseline on the routed dataset segments for the 1.3B parameter model, utiliz-
+ing mixtures of 4, 16, and 32 experts, respectively.
+Our findings demonstrate that all experts contribute positively, with consistent perplexity improve-
+ments observed across all routed dataset segments. Moreover, the performance gap between our
+method and the baseline widens as the number of experts increases, suggesting enhanced special-
+ization due to finer partitioning of the data distribution.
+Notably, despite the absence of capacity constraints on experts during inference, unlike the enforced
+capacities during training, all experts are actively utilized and receive substantial portions of the
+data. The consistent improvements across all routed dataset segments confirm that the experts do
+specialize and they all contribute to the overall improvement instead of only a few dominant experts.
+                                                                                                                                -24.6%
+
+
+                                                                                                                                                                                          Mixture                                                                                                                                                                                                                                                                                            Mixture
+
+
+                                                                                                                                                                                                                                                                                                                                                                                                                               -6.1%
+                        Mixture
+                                                     –0.1%
+
+
+                                                                                                                                                                                                                                                                                                                                          -15.5%
+                                                                                                                                                                                                                                         -8.4%
+
+
+                                                                                                                                                                                                                                                                                                                                                                                                                            -20.1%
+
+                                                                                                                                                                                                                                                                                                                                                                                                                                                -7.4%
+                                                                                                                                                                                                                                                                                                                                          -3.4%
+
+
+                                                                                                                                                                                                                                                                                                                                                                                                                           -22.5%
+                                                                                                                                                                                                                                                                          Percentage of assigned data
+
+
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 Percentage of assigned data
+                                                                                                                                                                                          Dense                                                                                                                                                                                                                                                                                              Dense
+
+
+                                                                                                                                                                                                                                                                                                                                                                             -14.8%
+                                                                     Percentage of assigned data
+
+
+                        Dense
+
+
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                   -24.3%
+                                                                                                                        -6.5%
+
+
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 -12.4%
+
+
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 -17.5%
+                                                                                                                                                                                                              -19.0%
+
+
+                                                                                                                                                                                                                                                                                                                                     -14.7%
+
+
+                                                                                                                                                                                                                                                                                                                                                                                                                       -21.6%
+                                                                                                                                         -14.8%
+
+
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               -15.1%
+                                                                                                                                                                                                                                                                                                                     11.0
+                                                                                                                                                  -13.7%
+
+
+                                                                                                                                                                                                                                                 -10.8%
+
+
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             -18.2%
+                                  -2.6%
+
+
+                                                                                                                11.0
+
+
+                                                                                                                                                                                                                                                                                                                                                                                                              -24.4%
+                                                                                                                                                                                                                                -11.8%
+                 11.0                                        27.4%                                                                                                                                                                                                 8.1%                                                                                                                                                                                                                                   4.3%
+                                                                                                                                                           -9.3%
+
+
+                                                                                                                                                                                                                                                                                                                                                                                                            -14.3%
+
+
+                                                                                                                                                                                                                                                                                                                                                                                                                                                          -16.6%
+                                                                                                                                                                                                                                                                                                                                                                                                                                       -14.0%
+
+
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    -17.9%
+                                                                                                                                                                                                                                                                                                                             -9.7%
+                                                                                                                                                                                     -10.7%
+
+
+                                                                                                                                                                                                                                                                                                                                                                                                                                                        -19.1%
+                                                                                                                                                                                                                                                                                                                                                                                       -21.0%
+                                                                                                   Perplexity
+
+
+                                                                                                                                                                                                                                                                                                        Perplexity
+
+
+                                                                                                                                                                                                                                                                                                                                                                                                         -11.9%
+                                                                                                                                                                            -23.0%
+
+
+                                                                                                                                                                                                                                                                                                                      9.0
+
+
+                                                                                                                                                                                                                                                                                                                                                                                      -19.7%
+    Perplexity
+
+
+                                                                                                                                                                                              -8.4%
+
+
+                                                                                                                                                                                                                                                                                                                                                   -22.2%
+
+                                                                                                                                                                                                                                                                                                                                                                     -9.1%
+                        -0.2%
+
+
+                  9.0                                                                                            9.0
+                                                                                                                                                                   -19.2%
+
+
+                                                                                                                                                                                                                       -15.9%
+
+
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                               -20.2%
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                              -22.4%
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                              -19.2%
+                                             -2.5%
+
+
+                                                                                                                                                                                                                                                                   6.2%                                                                                                                                                                                                                                   2.9%
+
+
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                            -23.4%
+                                                             24.7%
+
+
+                                                                                                                                                                                                                                                                                                                                                                                                -12.4%
+                                                                                                                                                                                                                                                                                                                      7.0
+
+
+                                                                                                                                                                                                                                                          -15.2%
+                  7.0                                                                                            7.0
+                                                                                                                                                                                                      -2.1%
+
+
+                                                                                                                                                                                                                                                                                                                                                            -21.6%
+                  5.0                                        22.1%                                               5.0                                                                                                                                               4.3%                                               5.0                                                                                                                                                                                 1.5%
+
+                  3.0                                                                                            3.0                                                                                                                                                                                                  3.0
+
+                  1.0                                                                                            1.0                                                                                                                                                                                                  1.0
+                        0         1           2      3                                                                                                     4                      8                                             12                                                                                                                                                    8                         16                                                           24
+                                   Expert rank                                                                                                                              Expert rank                                                                                                                                                                                                                    Expert rank
+
+
+
+                    (a) 4 experts vs dense, 266B                                                                       (b) 16 experts vs dense, 1T                                                                                                                                                                          (c) 32 experts vs dense, 2T
+
+Figure 5: Experts Do specialize. Test perplexity comparison between our method and the dense
+baseline on the routed dataset segments for the 1.3B parameter model, using mixtures of 4 experts in
+(a) (trained on 266B tokens), 16 experts in (b) (1T tokens), and 32 experts in (c) (2T tokens). Each
+bar represents a dataset segment, with the color intensity indicating the percentage of data assigned
+to that expert – darker shades correspond to a higher proportion of data. Overlapping bars depict the
+perplexity achieved by the dense baseline (translucent) and our proposed mixture model (opaque).
+The results demonstrate that all experts specialize effectively on their assigned segments of the
+data distribution, leading to consistent improvements over the baseline. While the data distribution
+among experts is not perfectly even – with some experts receiving more data than others – all experts
+receive a substantial portion of the data. This shows that each expert contributes meaningfully to the
+overall performance gains.
+
+
+4                   R ELATED W ORK
+Data-parallel training requires synchronization of the gradients after each backward pass, which can
+be slow if the network bandwidth is limited. In this section, we discuss existing methods that aim to
+make data parallelism more communication-efficient via reducing the frequency of the synchroniza-
+tion. Since our paper also explores methods for efficient inference without performance degradation,
+we discuss this branch of research as well.
+Distributed optimization To reduce the frequency of synchronisation during training of large
+models, researchers have explored distributed optimization techniques both theoretically and empir-
+ically (Mcdonald et al., 2009; Stich, 2019; Lian et al., 2018; Wang & Joshi, 2019; McMahan et al.,
+2017; Lin et al., 2018; Zinkevich et al., 2010). The core principle of these methods is to allow each
+worker to execute several local training iterations before engaging in global synchronization – each
+device performs multiple optimizer updates per communication round. This technique also has been
+studied for LLM pre-training (Diskin et al., 2021; Douillard et al., 2023) and fine-tuning (Borzunov
+et al., 2022; Liu et al., 2024; Hilmkil et al., 2021; Ro et al., 2022).
+While theses approaches reduces the frequency of communication, thereby decreasing communica-
+tion overhead, they often result in degraded model performance compared to every step synchroniza-
+
+
+                                                                                                                                                                                               9
+Published as a conference paper at ICLR 2025
+
+
+tion (Diskin et al., 2021), or they lack direct performance comparisons in the context of pre-training
+(Douillard et al., 2023). The degradation in performance is often attributed to the staleness of gra-
+dients and the divergence between local and global models due to delayed synchronization (Zhang
+et al., 2016; Yu et al., 2019; Mitra et al., 2021). Moreover, to our knowledge, all experiments have
+been conducted at a small scale (≤ 400M parameters) (Douillard et al., 2023; Liu et al., 2024;
+Ro et al., 2022). Therefore, scalable solutions that can reduce communication frequency for LLM
+training without compromising performance at larger scales are still needed.
+
+Mixture of Experts Mixture of Experts (MoE) models have emerged as a prominent approach
+to increase model capacity without a proportional increase in inference costs (Jacobs et al., 1991;
+Jordan & Jacobs, 1994). The key idea behind MoE is to partition the input space into subsets
+corresponding to specific subtasks, each managed by a specialized expert. By training different
+experts on distinct tasks, MoE models aim to enhance performance while reducing computational
+overhead during inference.
+Early implementations of MoE employed algorithms such as Gaussian Processes (Tresp, 2000; Theis
+& Bethge, 2015; Deisenroth & Ng, 2015), Dirichlet Processes (Shahbaba & Neal, 2009), and Sup-
+port Vector Machines (SVMs) (Collobert et al., 2001) to model these specialized functions. Recent
+advancements have integrated deep neural networks as experts, providing scalable and flexible im-
+plementations suitable for large-scale models.
+In natural language processing, researchers have generalized the original MoE idea to enhance large-
+scale language models. For instance, Shazeer et al. (2017) introduced a Mixture of Experts feed
+forward layer in which, in contrast to prior works, routing decision is made for every token. This
+layer takes a token representation as an input and routes it to the best-matched top-k experts. By
+doing so the number of active parameters is decreased. Similar approaches have been effectively
+employed in models like the Switch Transformer (Fedus et al., 2022), GShard (Lepikhin et al.,
+2021), GLaM (Du et al., 2022) and Mixtral of Experts (Jiang et al., 2024) which leverage MoE
+layers to achieve state-of-the-art results with reduced number of active parameters costs. However,
+since the routing decision in models like Switch Transformer MoE is made on the token level: (1) all
+experts must be retained in RAM during both training and inference phases, necessitating substantial
+memory resources, and (2) a high communication overhead is required for data transfer and gradient
+synchronization across experts (Lepikhin et al., 2021; Fedus et al., 2022; Riquelme et al., 2021). In
+that respect this approach is completely orthogonal to our proposed S MALLTALK LM. In fact, each
+of the experts in our method could be such a token-level mixture model which would result in even
+smaller inference FLOPs for a specific achieved perplexity albeit with a significantly more complex
+implementation and higher RAM requirements during inference.
+
+Independent Training of Mixture of Experts Models To train experts fully in parallel, recent
+research has also explored independent training of the mixture of experts models (Gross et al., 2017;
+Li et al., 2022; Gururangan et al., 2023). For instance, Gross et al. (2017) proposed to train a gater
+independently from the experts and use the output of the gater to hard assign the input image to
+experts. In language processing, Li et al. (2022) and Gururangan et al. (2023) proposed methods
+that train expert models separately and merge them post-training. However, these approaches rely
+on full document context or metadata for routing, which can be impractical in real-time applica-
+tions involving shorter inputs. For instance, Gururangan et al. (2023) focus on performance in text
+classification tasks, which may not fully reflect real-world scenarios.
+
+5   C ONCLUSION
+In this work, we present S MALLTALK LM – a method that significantly reduces communication
+overhead during LLM training. It also outperforms dense model baselines trained with a similar
+amount of FLOPs and the same data volume and comparable inference costs. In addition, our
+proposed lightweight routing with short prefixes makes S MALLTALK LM practical for real-world
+downstream tasks, where we show it largely outperforms the dense baselines.
+These findings open up multiple directions for future research, including exploring different routing
+strategies for data partitioning among experts and investigating further the impact on downstream
+task performance. Another promising avenue is scaling the mixture to hundreds or even thousands
+of experts, which could further enhance model performance while benefiting from sparse inference.
+
+
+                                                 10
+Published as a conference paper at ICLR 2025
+
+
+ACKNOWLEDGMENTS
+
+We thank Jagrid Digani and Awni Hannun for their insightful discussions on the algorithm and
+experiments. We thank Justin Deschenaux for his contributions to the early stages of the project.
+
+R EFERENCES
+Alham Fikri Aji and Kenneth Heafield. Sparse communication for distributed gradient descent. In
+  Martha Palmer, Rebecca Hwa, and Sebastian Riedel (eds.), Proceedings of the 2017 Conference
+  on Empirical Methods in Natural Language Processing, pp. 440–445. Association for Computa-
+  tional Linguistics, September 2017.
+Mikel Artetxe, Shruti Bhosale, Naman Goyal, Todor Mihaylov, Myle Ott, Sam Shleifer, Xi Victo-
+ ria Lin, Jingfei Du, Srinivasan Iyer, Ramakanth Pasunuru, Giridharan Anantharaman, Xian Li,
+ Shuohui Chen, Halil Akin, Mandeep Baines, Louis Martin, Xing Zhou, Punit Singh Koura, Brian
+ O’Horo, Jeffrey Wang, Luke Zettlemoyer, Mona Diab, Zornitsa Kozareva, and Veselin Stoyanov.
+ Efficient large scale language modeling with mixtures of experts. In Yoav Goldberg, Zornitsa
+ Kozareva, and Yue Zhang (eds.), Proceedings of the 2022 Conference on Empirical Methods
+ in Natural Language Processing, pp. 11699–11732. Association for Computational Linguistics,
+ December 2022.
+Alexander Borzunov, Dmitry Baranchuk, Tim Dettmers, Max Ryabinin, Younes Belkada, Artem
+  Chumachenko, Pavel Samygin, and Colin Raffel. Petals: Collaborative inference and fine-tuning
+  of large models. Association for Computational Linguistics, 2022.
+James Bradbury, Roy Frostig, Peter Hawkins, Matthew James Johnson, Chris Leary, Dougal
+  Maclaurin, George Necula, Adam Paszke, Jake VanderPlas, Skye Wanderman-Milne, and Qiao
+  Zhang. JAX: composable transformations of Python+NumPy programs, 2018.
+Tom Brown, Benjamin Mann, Nick Ryder, Melanie Subbiah, Jared D Kaplan, Prafulla Dhariwal,
+  Arvind Neelakantan, Pranav Shyam, Girish Sastry, Amanda Askell, Sandhini Agarwal, Ariel
+  Herbert-Voss, Gretchen Krueger, Tom Henighan, Rewon Child, Aditya Ramesh, Daniel Ziegler,
+  Jeffrey Wu, Clemens Winter, Chris Hesse, Mark Chen, Eric Sigler, Mateusz Litwin, Scott Gray,
+  Benjamin Chess, Jack Clark, Christopher Berner, Sam McCandlish, Alec Radford, Ilya Sutskever,
+  and Dario Amodei. Language models are few-shot learners. 33:1877–1901, 2020.
+Peter Clark, Isaac Cowhey, Oren Etzioni, Tushar Khot, Ashish Sabharwal, Carissa Schoenick, and
+  Oyvind Tafjord. Think you have solved question answering? try arc, the ai2 reasoning challenge.
+  arXiv preprint arXiv:1803.05457, 2018.
+Ronan Collobert, Samy Bengio, and Yoshua Bengio. A parallel mixture of svms for very large scale
+  problems. Advances in Neural Information Processing Systems, 14, 2001.
+Common Crawl. Common crawl: Open web data, 2024. Accessed: 2024-09-15.
+Together Computer. Redpajama: An open source recipe to reproduce llama training dataset, 2023.
+Marc Deisenroth and Jun Wei Ng. Distributed gaussian processes. In International conference on
+ machine learning, pp. 1481–1490. PMLR, 2015.
+Tim Dettmers. 8-bit approximations for parallelism in deep learning. International Conference on
+  Learning Representations, 2016.
+Michael Diskin, Alexey Bukhtiyarov, Max Ryabinin, Lucile Saulnier, Anton Sinitsin, Dmitry Popov,
+ Dmitry V Pyrkin, Maxim Kashirin, Alexander Borzunov, Albert Villanova del Moral, et al. Dis-
+ tributed deep learning in open collaborations. Advances in Neural Information Processing Sys-
+ tems, 34:7879–7897, 2021.
+Arthur Douillard, Qixuan Feng, Andrei A Rusu, Rachita Chhaparia, Yani Donchev, Adhiguna
+  Kuncoro, Marc’Aurelio Ranzato, Arthur Szlam, and Jiajun Shen. Diloco: Distributed low-
+  communication training of language models. arXiv preprint arXiv:2311.08105, 2023.
+
+
+                                               11
+Published as a conference paper at ICLR 2025
+
+
+Nan Du, Yanping Huang, Andrew M Dai, Simon Tong, Dmitry Lepikhin, Yuanzhong Xu, Maxim
+  Krikun, Yanqi Zhou, Adams Wei Yu, Orhan Firat, et al. Glam: Efficient scaling of language
+  models with mixture-of-experts. In International Conference on Machine Learning, pp. 5547–
+  5569. PMLR, 2022.
+Abhimanyu Dubey, Abhinav Jauhri, Abhinav Pandey, Abhishek Kadian, Ahmad Al-Dahle, Aiesha
+  Letman, Akhil Mathur, Alan Schelten, Amy Yang, Angela Fan, et al. The llama 3 herd of models.
+  arXiv preprint arXiv:2407.21783, 2024.
+William Fedus, Barret Zoph, and Noam Shazeer. Switch transformers: Scaling to trillion parameter
+ models with simple and efficient sparsity. Journal of Machine Learning Research, 23(120):1–39,
+ 2022.
+Leo Gao, Jonathan Tow, Baber Abbasi, Stella Biderman, Sid Black, Anthony DiPofi, Charles Fos-
+  ter, Laurence Golding, Jeffrey Hsu, Alain Le Noac’h, Haonan Li, Kyle McDonell, Niklas Muen-
+  nighoff, Chris Ociepa, Jason Phang, Laria Reynolds, Hailey Schoelkopf, Aviya Skowron, Lintang
+  Sutawika, Eric Tang, Anish Thite, Ben Wang, Kevin Wang, and Andy Zou. A framework for
+  few-shot language model evaluation, 07 2024.
+Sam Gross, Marc’Aurelio Ranzato, and Arthur Szlam. Hard mixtures of experts for large scale
+  weakly supervised vision. In Proceedings of the IEEE Conference on Computer Vision and Pat-
+  tern Recognition, pp. 6865–6873, 2017.
+Suchin Gururangan, Margaret Li, Mike Lewis, Weijia Shi, Tim Althoff, Noah A Smith, and Luke
+  Zettlemoyer. Scaling expert language models with unsupervised domain discovery. arXiv preprint
+  arXiv:2303.14177, 2023.
+Dan Hendrycks, Collin Burns, Steven Basart, Andy Zou, Mantas Mazeika, Dawn Song, and
+  Jacob Steinhardt. Measuring massive multitask language understanding. arXiv preprint
+  arXiv:2009.03300, 2020.
+Tom Henighan, Jared Kaplan, Mor Katz, Mark Chen, Christopher Hesse, Jacob Jackson, Heewoo
+  Jun, Tom B Brown, Prafulla Dhariwal, Scott Gray, et al. Scaling laws for autoregressive generative
+  modeling. arXiv preprint arXiv:2010.14701, 2020.
+Agrin Hilmkil, Sebastian Callh, Matteo Barbieri, Leon René Sütfeld, Edvin Listo Zec, and Olof
+  Mogren. Scaling federated learning for fine-tuning of large language models. In International
+  Conference on Applications of Natural Language to Information Systems, pp. 15–23. Springer,
+  2021.
+Jordan Hoffmann, Sebastian Borgeaud, Arthur Mensch, Elena Buchatskaya, Trevor Cai, Eliza
+  Rutherford, Diego de Las Casas, Lisa Anne Hendricks, Johannes Welbl, Aidan Clark, et al. Train-
+  ing compute-optimal large language models. arXiv preprint arXiv:2203.15556, 2022.
+Robert A Jacobs, Michael I Jordan, Steven J Nowlan, and Geoffrey E Hinton. Adaptive mixtures of
+  local experts. Neural computation, 3(1):79–87, 1991.
+Albert Q Jiang, Alexandre Sablayrolles, Antoine Roux, Arthur Mensch, Blanche Savary, Chris Bam-
+  ford, Devendra Singh Chaplot, Diego de las Casas, Emma Bou Hanna, Florian Bressand, et al.
+  Mixtral of experts. arXiv preprint arXiv:2401.04088, 2024.
+Michael I Jordan and Robert A Jacobs. Hierarchical mixtures of experts and the em algorithm.
+ Neural computation, 6(2):181–214, 1994.
+Jared Kaplan, Sam McCandlish, Tom Henighan, Tom B Brown, Benjamin Chess, Rewon Child,
+   Scott Gray, Alec Radford, Jeffrey Wu, and Dario Amodei. Scaling laws for neural language
+   models. CoRR, 2020.
+Taku Kudo and John Richardson. SentencePiece: A simple and language independent subword
+  tokenizer and detokenizer for neural text processing. In Eduardo Blanco and Wei Lu (eds.), Pro-
+  ceedings of the 2018 Conference on Empirical Methods in Natural Language Processing: System
+  Demonstrations, pp. 66–71, Brussels, Belgium, November 2018. Association for Computational
+  Linguistics.
+
+
+                                                12
+Published as a conference paper at ICLR 2025
+
+
+Dmitry Lepikhin, HyoukJoong Lee, Yuanzhong Xu, Dehao Chen, Orhan Firat, Yanping Huang,
+ Maxim Krikun, Noam Shazeer, and Zhifeng Chen. Gshard: Scaling giant models with conditional
+ computation and automatic sharding. In International Conference on Learning Representations,
+ 2021.
+Mike Lewis, Shruti Bhosale, Tim Dettmers, Naman Goyal, and Luke Zettlemoyer. Base layers:
+ Simplifying training of large, sparse models. In International Conference on Machine Learning,
+ pp. 6265–6274. PMLR, 2021.
+Margaret Li, Suchin Gururangan, Tim Dettmers, Mike Lewis, Tim Althoff, Noah A Smith, and Luke
+ Zettlemoyer. Branch-train-merge: Embarrassingly parallel training of expert language models.
+ arXiv preprint arXiv:2208.03306, 2022.
+Xiangru Lian, Ce Huang, Yijun Li, and Ji Liu. Asynchronous decentralized parallel stochastic
+  gradient descent. In Proceedings of the 35th International Conference on Machine Learning, pp.
+  3043–3052. PMLR, 2018.
+Yujun Lin, Song Han, Huizi Mao, Yu Wang, and William J Dally. Deep gradient compression: Re-
+  ducing the communication bandwidth for distributed training. arXiv preprint arXiv:1712.01887,
+  2017.
+Yujun Lin, Song Han, Huizi Mao, Yu Wang, and William J Dally. Deep gradient compression:
+  Reducing the communication bandwidth for distributed training. In International Conference on
+  Learning Representations, 2018.
+Bo Liu, Rachita Chhaparia, Arthur Douillard, Satyen Kale, Andrei A Rusu, Jiajun Shen, Arthur
+  Szlam, and Marc’Aurelio Ranzato. Asynchronous local-sgd training for language modeling.
+  arXiv preprint arXiv:2401.09135, 2024.
+Ilya Loshchilov and Frank Hutter. Decoupled weight decay regularization. In International Confer-
+   ence on Learning Representations, 2017.
+Ryan Mcdonald, Mehryar Mohri, Nathan Silberman, Dan Walker, and Gideon Mann. Efficient
+  large-scale distributed training of conditional maximum entropy models. Advances in neural
+  information processing systems, 22, 2009.
+H. Brendan McMahan, Eider Moore, Daniel Ramage, Seth Hampson, and Blaise Aguera y Arcas.
+  Communication-efficient learning of deep networks from decentralized data. In Proceedings of
+  the 20th International Conference on Artificial Intelligence and Statistics, pp. 1273–1282. PMLR,
+  2017.
+Praneeth Mitra, Idan Bistritz, Ji Wang, Dan Alistarh, and Wotao Yin. Linear convergence in fed-
+  erated learning: Tackling client heterogeneity and asynchronous updates. In Advances in Neural
+  Information Processing Systems, volume 34, pp. 14606–14619, 2021.
+Adam Paszke, Sam Gross, Francisco Massa, Adam Lerer, James Bradbury, Gregory Chanan, Trevor
+  Killeen, Zeming Lin, Natalia Gimelshein, Luca Antiga, et al. Pytorch: An imperative style, high-
+  performance deep learning library. Advances in neural information processing systems, 32, 2019.
+Pitch Patarasuk and Xin Yuan. Bandwidth optimal all-reduce algorithms for clusters of workstations.
+   Journal of Parallel and Distributed Computing, 69(2):117–124, 2009.
+Ofir Press, Noah A. Smith, and Mike Lewis. Train short, test long: Attention with linear biases
+  enables input length extrapolation. In The Tenth International Conference on Learning Represen-
+  tations, ICLR 2022, Virtual Event, April 25-29, 2022. OpenReview.net, 2022.
+Carlos Riquelme, Joan Puigcerver, Basil Mustafa, Maxim Neumann, Rodolphe Jenatton, André
+  Susano Pinto, Daniel Keysers, and Neil Houlsby. Scaling vision with sparse mixture of experts.
+  Advances in Neural Information Processing Systems, 34:8583–8595, 2021.
+Jae Hun Ro, Theresa Breiner, Lara McConnaughey, Mingqing Chen, Ananda Theertha Suresh,
+  Shankar Kumar, and Rajiv Mathews. Scaling language model size in cross-device federated learn-
+  ing. arXiv preprint arXiv:2204.09715, 2022.
+
+
+                                                13
+Published as a conference paper at ICLR 2025
+
+
+Babak Shahbaba and Radford Neal. Nonlinear models using dirichlet process mixtures. Journal of
+  Machine Learning Research, 10(8), 2009.
+Noam Shazeer, *Azalia Mirhoseini, *Krzysztof Maziarz, Andy Davis, Quoc Le, Geoffrey Hinton,
+  and Jeff Dean. Outrageously large neural networks: The sparsely-gated mixture-of-experts layer.
+  In International Conference on Learning Representations, 2017.
+Sebastian U Stich. Local SGD converges fast and communicates little. In International Conference
+  on Learning Representations, 2019.
+Jianlin Su, Murtadha Ahmed, Yu Lu, Shengfeng Pan, Wen Bo, and Yunfeng Liu. Roformer: En-
+   hanced transformer with rotary position embedding. Neurocomputing, 568:127063, 2024.
+Rajeev Thakur, Rolf Rabenseifner, and William Gropp. Optimization of collective communication
+  operations in mpich. The International Journal of High Performance Computing Applications, 19
+  (1):49–66, 2005.
+Lucas Theis and Matthias Bethge. Generative image modeling using spatial lstms. Advances in
+  neural information processing systems, 28, 2015.
+Volker Tresp. Mixtures of gaussian processes. Advances in neural information processing systems,
+  13, 2000.
+A Vaswani. Attention is all you need. Advances in Neural Information Processing Systems, 2017.
+Jianyu Wang and Gauri Joshi. Adaptive communication strategies to achieve the best error-runtime
+   trade-off in local-update sgd. Proceedings of Machine Learning and Systems, 1:212–229, 2019.
+Johannes Welbl, Nelson F. Liu, and Matt Gardner. Crowdsourcing multiple choice science ques-
+  tions. In Leon Derczynski, Wei Xu, Alan Ritter, and Tim Baldwin (eds.), Proceedings of the 3rd
+  Workshop on Noisy User-generated Text, pp. 94–106. Association for Computational Linguistics,
+  September 2017.
+Hao Yu, Sen Yang, and Shenghuo Zhu. Parallel restarted sgd with faster convergence and less
+  communication: Demystifying why model averaging works for deep learning. In Proceedings of
+  the AAAI Conference on Artificial Intelligence, volume 33, pp. 5693–5700, 2019. doi: 10.1609/
+  aaai.v33i01.33015693.
+Rowan Zellers, Ari Holtzman, Yonatan Bisk, Ali Farhadi, and Yejin Choi. Hellaswag: Can a ma-
+  chine really finish your sentence? In Annual Meeting of the Association for Computational
+  Linguistics, 2019.
+Sixin Zhang, Anna E Choromanska, and Yann LeCun. Deep learning with elastic averaging sgd.
+  Advances in neural information processing systems, 28, 2015.
+Wei Zhang, Suyog Gupta, Xiangru Lian, and Ji Liu. Staleness-aware async-sgd for distributed deep
+ learning. In Proceedings of the 25th International Joint Conference on Artificial Intelligence, pp.
+ 2350–2356, 2016.
+Martin Zinkevich, Markus Weimer, Lihong Li, and Alex Smola. Parallelized stochastic gradient
+ descent. Advances in neural information processing systems, 23, 2010.
+
+
+                                                14
+Published as a conference paper at ICLR 2025
+
+
+C ONTENTS
+
+1   Introduction                                                                                      1
+
+2   Method                                                                                            2
+    2.1   Background . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .      2
+    2.2   S MALLTALK LM . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .         3
+
+3   Experiments                                                                                       5
+    3.1   Experimental Setup . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .      6
+    3.2   Language Modeling Results . . . . . . . . . . . . . . . . . . . . . . . . . . . . .         6
+    3.3   Downstream evaluation . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .       7
+    3.4   Routing analysis . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .    8
+
+4   Related Work                                                                                      9
+
+5   Conclusion                                                                                       10
+
+A Language modeling experiments                                                                      15
+    A.1 Architecture and training details . . . . . . . . . . . . . . . . . . . . . . . . . . .      15
+    A.2 Notation . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .     16
+    A.3 Computational Cost . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .       17
+          A.3.1 Transformer . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .      17
+          A.3.2 Mixture of LLMs . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .        19
+    A.4 Communication overhead . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .         20
+
+B Downstream evaluation                                                                              22
+
+C Additional Results                                                                                 23
+
+
+A     L ANGUAGE MODELING EXPERIMENTS
+
+A.1   A RCHITECTURE AND TRAINING DETAILS
+
+Our architecture is based on the transformer decoder (Vaswani, 2017). We use rotary positional
+encoding (Su et al., 2024). We use a SentencePiece (Kudo & Richardson, 2018) tokenizer with a
+vocabulary of 32000 tokens. The model specific parameters for the different sizes are summarized in
+Table 1. We implemented our EM scheme for training the routers in PyTorch (Paszke et al., 2019).
+After segmenting the training set, the experts were trained independently using Jax (Bradbury et al.,
+2018). All training was done in bfloat16. The optimizer states and operations are in float32.
+The training parameters for specific models are summarised in Table 2.
+We employ different learning rate schedules for routers and experts due to their distinct roles. Ex-
+perts are trained for accurate next-token prediction, using a cosine decay learning rate to optimize
+their performance. In contrast, routers are used solely for routing purposes. We only need an esti-
+mation of how well a router performs on a prefix of a sequence relative to other routers. Since we
+are concerned with relative performance rather than absolute accuracy, applying the same training
+strategy to all routers is sufficient for effective routing decisions. Moreover, using a constant learn-
+
+
+                                                  15
+Published as a conference paper at ICLR 2025
+
+
+ing rate for routers reduces computational overhead and eliminates the need to tune the number of
+training steps.
+
+Model parameters       Role      Hidden size    FFW expansion factor         Layers     Attention heads
+335M                  expert        1024                    4                 24              16
+1.3B                  expert        2048                    4                 24              16
+4.4M                  router        96                      4                 12              12
+64M                   router        416                     4                 12              12
+110M                  router        768                     4                 12              12
+
+                                   Table 1: Model parameters.
+
+
+              Model                 Steps (k)   Tokens (B)      Batch size     # GPUs
+              335M (dense)             256           133           512             8
+              335M (4 experts)         256           133           128             8
+              335M (dense)             512           266           512             32
+              335M (8 experts)         256           266           128             8
+              335M (dense)            1024           532           512             32
+              335M (16 experts)       256            532           128             8
+              1.3B (dense)             512           266           512             32
+              1.3B (4 experts)         512           266           128             8
+              1.3B (dense)            1024           1000         1024             64
+              1.3B (16 experts)       512            1000         128              8
+              1.3B (dense)            1024           2000         2048          128
+              1.3B (32 experts)       512            2000         128            8
+              4.4M (router)            128            4            32              1
+
+                                  Table 2: Training parameters.
+
+
+A.2    N OTATION
+
+For the dense baseline LLM and expert LLM:
+
+       • Number of layers (L)
+       • Hidden dimension size (H)
+       • Number of attention heads (A)
+       • Sequence length (S)
+       • Batch size (B)
+       • Vocabulary size (V )
+       • Feedforward network dimension (Dff )
+
+For the router LLM:
+
+       • Prefix length for routing (M )
+       • Number of layers (Lr )
+       • Hidden dimension size (Hr )
+       • Number of attention heads (Ar )
+       • Batch size (Br )
+       • Feedforward network dimension (Drff ) – parameters specific to the router model
+
+
+                                                16
+Published as a conference paper at ICLR 2025
+
+
+        • Number of training tokens per router between communications T
+
+We also define Nsteps , Nsteps expert , and Nsteps router as the number of training steps for the dense base-
+line, the expert in the mixture, and the router, respectively. The sequence length (S) and vocabulary
+size (V ) are consistent across the dense baseline, router, and expert models. Finally, we denote E as
+the number of experts (routers).
+
+A.3     C OMPUTATIONAL C OST
+
+A.3.1    T RANSFORMER
+To estimate the computational cost of Transformer model during training and inference, we calcu-
+lated the total floating-point operations (FLOPs) based on the model’s architectural parameters.
+For training, we computed the FLOPs per training step by summing the contributions from the
+embedding layer, multi-head attention (MHA), feedforward layers (FFN), and the output projection
+layer. The calculations are as follows:
+
+        • Embedding Layer: Although embeddings are typically implemented as lookups with neg-
+          ligible computational cost, for completeness, we estimate the FLOPs as:
+                                             FLOPsemb = B × S × H
+        • Multi-Head Attention (MHA):
+           1. Linear Projections (Queries, Keys, Values):
+                             FLOPsproj = 3 × 2 × B × S × H × H = 6 × B × S × H 2
+           2. Scaled Dot-Product Attention:
+               FLOPsattn = FLOPsQK +FLOPsV = 2×B×S 2 ×H+2×B×S 2 ×H = 4×B×S 2 ×H
+           3. Output Projection:
+                                         FLOPsout proj = 2 × B × S × H × H
+          Total Multi-Head Attention (MHA):
+                   FLOPsMHA = FLOPsproj + FLOPsattn + FLOPsout proj
+                                = 6 × B × S × H 2 + 4 × B × S2 × H + 2 × B × S × H 2
+                                = 8 × B × S × H 2 + 4 × B × S2 × H
+        • Feedforward Network (FFN):
+                      FLOPsFFN = 2 × 2 × B × S × H × Dff = 4 × B × S × H × Dff
+        • Output projection:
+             FLOPsout = FLOPsoutproj + FLOPssoftmax = 2 × B × S × H × V + 3 × B × S × V
+
+Total FLOPs per Layer:
+                             FLOPslayer = (FLOPsMHA + FLOPsFFN ) × L
+
+Total Forward Pass FLOPs per Step:
+                         FLOPsforward = FLOPsemb + FLOPslayer + FLOPsout
+
+Total Training FLOPs per Step:
+The backward pass is approximately twice as computationally intensive as the forward pass. There-
+fore:
+            FLOPstrain step = FLOPsforward + 2 × FLOPsforward = 3 × FLOPsforward
+
+Total Training FLOPs:
+
+
+                                                     17
+Published as a conference paper at ICLR 2025
+
+
+Multiplying the FLOPs per training step by the total number of training steps:
+           Total Training FLOPs = FLOPstrain step × Nsteps = 3 × FLOPsforward × Nsteps
+
+Total Training FLOPs:
+                                      "
+Total Training FLOPs = 3 × Nsteps × B × S × H
+
+                                          + L × 8 × B × S × H 2 + 4 × B × S 2 × H + 4 × B × S × H × Dff
+                                                                               #
+                                          +2×B×S×H ×V +3×B×S×V                           (10)
+
+
+Total Inference FLOPs:
+                                "
+       Total Inference FLOPs = B × S × H
+
+                                 + L × 8 × S × H 2 + 4 × S 2 × H + 4 × S × H × Dff
+                                                              #
+                                 +2×S×H ×V +3×S×V                                        (11)
+
+
+                                                18
+Published as a conference paper at ICLR 2025
+
+
+A.3.2    M IXTURE OF LLM S
+The total training FLOPs for the mixture model consist of four main components: training routers,
+shading data for routers, training experts, and shading data for the experts.
+For a model trained with batch size B over Nsteps steps, the total number of sequences shaded can
+be estimated as Nsteps × B × E, where each model receives approximately Nsteps × B sequences
+during training.
+Thus, the FLOPs required for shading can be calculated as the inference FLOPs with an effective
+batch size of Nsteps × B × E (see Equation 11).
+Therefore Total Training FLOPs:
+Total Training FLOPs =Training FLOPs Routers + Training FLOPs Experts =                        (12)
+                                        "
+                         + 3 × Nsteps router × Br × S × Hr
+
+                         + Lr × 8 × Br × S × Hr2 + 4 × Br × S 2 × Hr + 4 × Br × S × Hr × Drff
+
+                                                                 #
+                         + 2 × Br × S × Hr × V + 3 × Br × S × V          ×E     (Eq. 13: Training Routers)
+
+                                                                                               (13)
+                                                          "
+                         + Nsteps router × Br × E        × M × Hr
+
+                         + Lr × 8 × M × Hr2 + 4 × M 2 × Hr + 4 × M × Hr × Drff
+
+                                                       #
+                         + 2 × M × Hr × V + 3 × M × V          ×E     (Eq. 14: Shading data for routers)
+
+                                                                                               (14)
+                                           "
+                          3 × Nsteps expert × B × S × H
+
+                         + L × 8 × B × S × H 2 + 4 × B × S 2 × H + 4 × B × S × H × Dff
+
+                                                              #
+                         +2×B×S×H ×V +3×B×S×V                         ×E     (Eq. 15: Training Experts)
+
+                                                                                               (15)
+                                                          "
+                         + Nsteps expert × B × E       × M × Hr
+
+                         + Lr × 8 × M × Hr2 + 4 × M 2 × Hr + 4 × M × Hr × Drff
+
+                                                       #
+                         + 2 × M × Hr × V + 3 × M × V          ×E     (Eq. 16: Shading data for experts)
+
+                                                                                               (16)
+
+In the above formula:
+
+        • Equations 15 and 13 correspond to the total training FLOPs for E experts and E routers
+          respectively.
+        • Equations 16 and 14 represents the inference cost of E routers on B batches with a prefix
+          length M used to partition the data for experts and routers respectively.
+
+Table 3 presents the training and inference costs for our proposed mixture of language models com-
+pared to the dense baseline LLMs.
+
+
+                                                19
+Published as a conference paper at ICLR 2025
+
+
+The expert balancing during training introduces only a negligible computational overhead relative
+to both training and inference costs. Therefore, it is excluded from our FLOPs calculations.
+
+   Model                   Perplexity              Training cost               Inference cost
+   335M (dense)              11.78                    31.02                         0.79
+   335M (4 experts)      10.78 ↓ 8.49%        31.02 + 0.22 ↑ 0.07%          0.79 + 0.01 ↑ 1.27%
+   335M (dense)              11.25                    62.03                         0.79
+   335M (8 experts)      10.20 ↓ 9.33%        62.03 + 0.75 ↑ 1.20%          0.79 + 0.02 ↑ 2.53%
+   335M (dense)               10.80                  124.06                         0.79
+   335M (16 experts)     9.64 ↓ 10.74%       124.06 + 2.71 ↑ 2.19%          0.79 + 0.04 ↑ 5.06%
+   335M (dense)               10.5                   248.12                         0.79
+   335M (32 experts)     9.07 ↓ 13.62%       248.12 + 10.28 ↑ 4.14%        0.79 + 0.08 ↑ 10.13%
+   1.3B (dense)                9.10                  221.33                         2.81
+   1.3B (4 experts)       8.75 ↓ 3.85%       221.33 + 0.36 ↑ 0.16%          2.81 + 0.01 ↑ 0.36%
+   1.3B (dense)               8.48                   885.32                         2.81
+   1.3B (16 experts)     7.42 ↓ 12.53%       885.32 + 4.87 ↑ 0.55%          2.81 + 0.04 ↑ 1.42%
+   1.3B (dense)               8.20                  1770.65                         2.81
+   1.3B (32 experts)     6.76 ↓ 17.56%      1770.65 + 18.94 ↑ 1.07%         2.81 + 0.08 ↑ 2.85%
+
+Table 3: Performance gain versus computational overhead. The table compares performance
+improvements and computational costs for models with 335M (trained with 4, 8, 16, and 32 experts)
+and 1.3B parameters (trained with 4, 16, and 32) experts. Training cost is measured in 1019 FLOPs,
+inference cost is measured in 1012 FLOPs. The dense baselines and corresponding mixture models
+were trained on the same data volume.
+
+
+Regarding Computational Overhead As demonstrated in Table 3, the 1.3B parameter model
+with 32 experts achieves significant performance improvements almost cost-free, gaining nearly
+18% in perplexity compared to the dense baseline while incurring only 1% additional cost during
+training and less than 3% during inference. Furthermore, a 335M parameter mixture of 32 experts
+reaches the same performance level as the 1.3B parameter model, but with a comparable training
+budget and three times lower inference cost. Despite the 335M parameter model incurring a higher
+percentage cost during inference, this computational overhead is not the definitive minimum neces-
+sary for effective routing: as detailed in § 3.4, our results indicate that the routing overhead can be
+significantly reduced by utilizing smaller routers and shorter prefix sizes. This suggests that further
+reductions in computational costs, without compromising routing quality, are feasible and present a
+valuable direction for future research.
+
+A.4   C OMMUNICATION OVERHEAD
+
+In this section, we provide an estimate of the communication overhead involved in our model train-
+ing compared to a dense baseline trained with standard distributed data parallelism. We quantify
+both the volume of data transmitted and the frequency of communication required during training.
+For simplicity of computation, we assume that all collective communications are bandwidth-optimal,
+meaning that the total number of bytes transferred per node is approximately 2K, where K is the
+size of the message (Thakur et al., 2005; Patarasuk & Yuan, 2009).
+
+Mixture of LLMs Every router performs all gather operation to share the loss on the dataset chunk
+approximately every T = 45M training tokens, as outlined in 3.2. This frequency was primarily
+determined by implementation specifics related to data storage.
+We can define the number of tokens processed per step by a router as Ntokens per step , which can be
+calculated as:
+                                   Ntokens per step ≤ S × Br
+
+
+                                                  20
+Published as a conference paper at ICLR 2025
+
+
+This leads to the minimum number of steps between communications, Nsteps per com , given by:
+                                                           T
+                                      Nsteps per com ≥
+                                                         S × Br
+
+The maximum number of communication events, Ncomm , during the router’s training can then be
+estimated as:
+                             Nsteps router    Nsteps router × S × Br
+                    Ncomm ≤                 =
+                            Nsteps per comm               T
+
+As shown in App. Table 2 we train routers for 128, 000 steps with batch size 32. We use context
+size 1024. Therefore, Ncomm ≈ 94 < 1 × 102 .
+The total amount of data sent and received by each node (router) can be calculated as the total
+number of sequences multiplied by the number of bytes per sequence. We consider that the loss is
+transferred in float16, which requires 2 bytes per element. The total number of sequences can be
+estimated as T ×N
+                S .
+Each router needs to send and receive the loss values for each sequence to and from other routers,
+resulting in a factor of 2 for the data sent and received. Therefore, the data per router can be
+approximated as:
+                                                            T ×E
+                                 Data per router ≈ 2 × 2 ×
+                                                              S
+Given T = 45 × 106 – training tokens per router between communication steps, E ≤ 32 – number
+of experts and S = 1,024 – sequence length, we can estimated the data transferred per node as:
+                                          T ×E     45 × 106 × 32
+              Data per router ≤ 2 × 2 ×        =4×               = 5.625MB
+                                            S          1,024
+
+Once routers are fully trained, they communicate only when necessary, such as when experts require
+new data for training.
+For instance, consider that the message size is K bytes, equivalent to loss array of K/2 sequences in
+float16 precision. The frequency of communication after routers are fully trained is determined
+by the batch size of the expert B and the number of experts E. Specifically, the number of steps
+each expert makes between communications can be estimated as:
+                                                         K
+                                   Nsteps per comm ≈
+                                                       2×B×E
+                                                            K
+Thus, communication can be scheduled approximately every 4×B×E   expert’s training steps. Assum-
+         31
+ing K = 2 − 1 bytes, B = 128 as used in the majority of our experiments, and E ∈ {4, 8, 16, 32}
+(see Appendix 2), the communication interval becomes:
+                           231 − 1     223
+                                     ≈     ≤ 218          ∀E ∈ {4, 8, 16, 32}                   (17)
+                         2 × 128 × E    E
+
+Comparison with Distributed Training Let us assume that we train a model with a batch size of
+B on a single host, where W represents the model size in parameters. For simplicity, we consider
+only data parallelism and assume that the model weights can fit on one GPU. To compare commu-
+nication costs, we examine the additional expense incurred when increasing throughput by a factor
+of E, i.e., utilizing E hosts instead of one.
+In regular distributed training, scaling to E hosts necessitates copying all weights to each host and
+performing gradient synchronization at every training step. Assuming each parameter is represented
+by 32 bits (as optimizers typically operate in float32), the amount of data transferred to and from
+each node during gradient synchronization can be calculated using the bandwidth-optimal algorithm:
+                                   Data per node = 2 × W × 4
+Here, W × 4 represent the size of the model gradients in bytes.
+
+
+                                                 21
+Published as a conference paper at ICLR 2025
+
+
+If W = 1.3 × 109 parameters, then the amount of data transferred per node per training step is:
+                          Data per node = 2 × 1.3 × 109 × 4 = 10.4GB
+Therefore, in regular distributed training, each node must send and receive gigabytes of data at
+every step. In contrast, our approach offers flexible communication strategies. We can transfer large
+volumes of data only a few times during training (see Equation 17), or optimise for more frequent
+communications with smaller data sizes. This flexibility allows us to adapt based on network latency
+and other infrastructure constraints.
+
+B    D OWNSTREAM EVALUATION
+For the evaluation, we utilized the lm-eval-harness software (Gao et al., 2024). For the computa-
+tion of perplexity, we compute the perplexity using the format: “Question: {question}. Answer:
+{answer}.”
+
+                Task                                   32 experts, 2T     dense, 2T
+                mmlu abstract algebra                      0.1400          0.2300
+                mmlu astronomy                            0.3553           0.2829
+                mmlu business ethics                       0.4900          0.5300
+                mmlu college computer science              0.2500          0.2900
+                mmlu college mathematics                  0.1500           0.1400
+                mmlu computer security                     0.3500          0.3800
+                mmlu elementary mathematics               0.2672           0.2487
+                mmlu formal logic                         0.3016           0.2937
+                mmlu global facts                         0.3100           0.2800
+                mmlu high school geography                0.3586           0.3586
+                mmlu high school macroeconomics           0.3128           0.2872
+                mmlu high school microeconomics           0.3193           0.3193
+                mmlu high school statistics               0.2917           0.2593
+                mmlu human aging                          0.4081           0.3857
+                mmlu human sexuality                      0.3969           0.3893
+                mmlu international law                    0.2314           0.2314
+                mmlu logical fallacies                    0.3067           0.2945
+                mmlu machine learning                      0.2589          0.2679
+                mmlu medical genetics                     0.3900           0.3500
+                mmlu moral disputes                        0.2803          0.2890
+                mmlu moral scenarios                      0.2380           0.2380
+                mmlu nutrition                            0.3039           0.2516
+                mmlu prehistory                           0.4167           0.3858
+                mmlu professional accounting              0.2872           0.2518
+                mmlu professional medicine                0.3566           0.2904
+                mmlu professional psychology              0.3203           0.3186
+                mmlu world religions                      0.5731           0.4503
+                mmlu anatomy                              0.4667           0.3926
+                mmlu clinical knowledge                   0.3434           0.2755
+                mmlu college biology                      0.4028           0.3819
+                mmlu college chemistry                    0.2800           0.2600
+                mmlu college medicine                     0.2832           0.2659
+                mmlu college physics                       0.1863          0.1961
+                mmlu conceptual physics                   0.3787           0.3787
+
+Table 4: Downstream Evaluation Results (Part 1). This table presents a comparison in accuracy on
+downstream tasks between a 1.3B-parameter, 32-expert model and a 1.3B-parameter dense model.
+Both models were trained using the 2T tokens and nearly the same training FLOPs, with only a 1%
+difference. The inference cost of the expert model increased by less than 3% compared to the dense
+baseline FLOPs.
+
+
+                                                 22
+Published as a conference paper at ICLR 2025
+
+
+             Task                                                           32 experts, 2T       dense, 2T
+             mmlu econometrics                                                 0.2719             0.2018
+             mmlu electrical engineering                                        0.2552            0.2621
+             mmlu high school biology                                          0.3290             0.3097
+             mmlu high school chemistry                                        0.2167             0.1970
+             mmlu high school computer science                                 0.2400             0.2400
+             mmlu high school european history                                  0.2848            0.3212
+             mmlu high school government and politics                          0.4093             0.3834
+             mmlu high school mathematics                                      0.1519             0.1444
+             mmlu high school physics                                          0.2980             0.2715
+             mmlu high school psychology                                       0.4642             0.4330
+             mmlu high school us history                                       0.3382             0.3137
+             mmlu high school world history                                     0.2827            0.2996
+             mmlu jurisprudence                                                0.2407             0.2222
+             mmlu management                                                    0.3786            0.3981
+             mmlu marketing                                                    0.4915             0.4915
+             mmlu miscellaneous                                                0.5121             0.4994
+             mmlu philosophy                                                    0.2958            0.3119
+             mmlu professional law                                             0.2634             0.2536
+             mmlu public relations                                              0.3545            0.4273
+             mmlu security studies                                             0.3224             0.3020
+             mmlu sociology                                                    0.2786             0.2786
+             mmlu us foreign policy                                             0.3300            0.3400
+             arc challenge                                                     0.3200             0.2892
+             arc easy                                                          0.6780             0.6549
+             hellaswag                                                         0.4912             0.4663
+             sciq                                                               0.8950            0.9130
+
+                        Table 5: Downstream Evaluation Results (Part 2)
+
+
+C    A DDITIONAL R ESULTS
+Effect of Prefix Length on Routing Performance We also conducted experiments by partitioning
+the data using a shorter prefix length of M = 32 tokens during training, whereas in our main results
+(see § 3), we used a prefix length of M = 256 tokens.
+We observed that training with a smaller pre-
+fix length resulted in better expert performance                       10
+when routing during inference was done using
+a small number of tokens (see Figure 6). This
+suggests that using a shorter prefix during train-                      9
+ing enhances the router’s ability to make effec-
+                                                          Perplexity
+
+
+tive decisions with limited context.
+                                                                        8
+We did not take any action to make sure that
+the router models could extrapolate to longer se-
+quences than seen in training (e.g. interpolating                       7
+                                                                                prefix 256
+                                                                                prefix 32
+positional encodings, using ALiBi (Press et al.,                                dense
+2022), etc.). As expected, we observe a perfor-
+                                                                            8        16      32        64    128   256
+mance degradation when making routing deci-                                                  Prefix length
+sions for sequences longer than the ones used for
+training.
+                                                      Figure 6: Test perplexity as a function of routing
+                                                      prefix length during inference for 1.3B parameter
+                                                      models with 16 experts. The orange curve repre-
+                                                      sents a prefix length of 32, while the blue curve
+                                                      corresponds to a prefix length of 256.
+
+
+                                                     23

@@ -1,0 +1,1373 @@
+Under review as a conference paper at ICLR 2025
+
+
+000
+001
+      LazyLLM: DYNAMIC T OKEN P RUNING FOR E FFICIENT
+002   L ONG C ONTEXT LLM I NFERENCE
+003
+004
+005                                              Anonymous authors
+006                                        Paper under double-blind review
+007
+008
+009
+010                                                    A BSTRACT
+011
+012                The inference of transformer-based large language models consists of two sequen-
+013                tial stages: 1) a prefilling stage to compute the KV cache of prompts and generate
+014
+                   the first token, and 2) a decoding stage to generate subsequent tokens. For long
+                   prompts, the KV cache must be computed for all tokens during the prefilling stage,
+015
+                   which can significantly increase the time needed to generate the first token. Con-
+016
+                   sequently, the prefilling stage may become a bottleneck in the generation process.
+017                An open question remains whether all prompt tokens are essential for generating
+018                the first token. To answer this, we introduce a novel method, LazyLLM, that se-
+019                lectively computes the KV for tokens important for the next token prediction in
+020                both the prefilling and decoding stages. Contrary to static pruning approaches that
+021                prune the prompt at once, LazyLLM allows language models to dynamically se-
+022                lect different subsets of tokens from the context in different generation steps, even
+023                though they might be pruned in previous steps. Extensive experiments on standard
+024                datasets across various tasks demonstrate that LazyLLM is a generic method that
+025
+                   can be seamlessly integrated with existing language models to significantly ac-
+                   celerate the generation without fine-tuning. For instance, in the multi-document
+026
+                   question-answering task, LazyLLM accelerates the prefilling stage of the LLama
+027
+                   2 7B model by 2.34× while maintaining accuracy.
+028
+029
+030   1       I NTRODUCTION
+031
+032   Standard prompt-based LLM inference has two sequential stages: prefilling and decoding, as shown
+033   in Figure 1. During the prefilling stage, the model computes and saves the KV cache of each token
+034   from the prompt, and predicts the first token. We refer to the time taken during prefilling stage as
+035   “time-to-first-token” (TTFT). Following the prefilling stage is the decoding stage, where the model
+036   reuses cached KVs to decode the next token iteratively until the stop criteria are met.
+037   During the prefilling stage, all tokens from the prompt are used by all transformer layers. For long
+038   prompts, TTFT could be slow because state-of-the-art transformer-based LLMs are both deep and
+039   wide (Pope et al., 2023; Kim et al., 2023; Aminabadi et al., 2022), and the cost of computing at-
+040   tention increases quadratically with the number of tokens in the prompts. For instance, Llama 2
+041   (Touvron et al., 2023), with 7 billion parameters, stacks 32 transformer layers with a model dimen-
+042   sion of 4096. In this scenario, TTFT requires 21× the walltime of each subsequent decoding step,
+043
+      and accounts for approximately 23% of the total generation time on the LongBench benchmark1
+      (Bai et al., 2023). Therefore, optimizing TTFT is a critical path toward efficient LLM inference
+044
+      (NVIDIA, 2024).
+045
+046   While optimizing LLM inference is an active area of research, many methods (Leviathan et al.,
+047   2023; Cai et al., 2024; Zhang et al., 2024; Bhendawade et al., 2024; Li et al., 2024) have focused on
+048   improving inference speed during the decoding stage. Yet, there is little attention given to improving
+049
+      TTFT. We note that some compression-based works implicitly improve the TTFT by reducing the
+      size of LLMs (Frantar et al., 2022; Sun et al., 2023; Ma et al., 2023). However, an orthogonal line of
+050
+      research(Li et al., 2023; Jiang et al., 2023; Dao et al., 2022) investigates how TTFT can be improved
+051
+      given a static transformer architecture. Within this line of research, a natural question arises: Are all
+052   prompt tokens essential for generating the first token?
+053
+          1
+              The average LongBench prompt length is 3376 tokens and the average generation length is 68 tokens.
+
+
+                                                              1
+      Under review as a conference paper at ICLR 2025
+
+
+054
+          KV Cache                Input            KV Cache                Input             KV Cache              Input           KV Cache               Input
+055                      LazyLLM is a                                                                                           LazyLLM is a training
+           <empty>                              LazyLLM is a training    negligible       LazyLLM is a training   performance                           loss
+                         training free token                                                                                    free token pruning
+056                      pruning technique to
+                                                free token pruning                        free token pruning
+                                                                                                                                technique to improve
+                                                technique to improve                      technique to improve
+                         improve LLM                                                                                            LLM inference with
+057                      inference with
+                                                LLM inference with                        LLM inference with
+                                                                                                                                negligible
+                                                                                          negligible
+                                                                                                                                performance
+058
+059
+060
+                                                                Decoding                                  Decoding                              Decoding
+                     Prefilling
+061                                                              Step #1                                   Step #2                               Step #3
+
+062
+              time-to-first-token (TTFT)
+063
+                                                                        Overall Generation Time
+064
+065
+066
+      Figure 1: Prompt-based LLM inference can be divided into two sequential stages: prefilling and
+067
+      decoding. For long prompts, the first token generation during prefilling stage could be slow. As an
+068
+      example, for Llama 2 7B model (Touvron et al., 2023), on average, the time to generate the first
+069   token requires 21× the walltime of each subsequent decoding step and accounts for 23% of the total
+070   generation time in the LongBench benchmark.
+071
+072
+073   LLM profiling on the LongBench benchmark (Bai et al., 2023) in Figure 2 reveals that the attention
+074   scores of input tokens w.r.t. to the first generated token are very sparse, indicating that many tokens
+075   in the input prompt are redundant and can be removed without affecting the next token prediction.
+076   To this end, we propose LazyLLM, a novel, simple, yet effective technique tailored for speeding up
+077
+      prefilling. As depicted in Figure 3, in each generation step, LazyLLM selectively computes the KV
+      for tokens important for the next token prediction and “lazily” defers the computation of remaining
+078
+      tokens to later steps when they become relevant. We propose using the attention score of the prior
+079
+      transformer layer to measure the importance of tokens and progressively prune tokens along the
+080   depth of the transformer. In contrast to prompt compression works (Li et al., 2023; Jiang et al.,
+081   2023; Xu et al., 2023), which permanently reduce the prompt for all the following generation steps,
+082   our method allows the model to revive previously pruned tokens, which we found crucial to retain
+083   accuracy. Extending progressive token pruning to all generation steps is non-trivial. Specifically, if
+084   a token is pruned at generation step t, and is revived at generation step t′ > t, some hidden states
+085   would need to be recomputed during step t′ . To avoid such repetitive computation, we employ an
+086   additional caching mechanism, Aux Cache, to cache the hidden states of pruned tokens. This enables
+087   a computationally efficient pathway to revive pruned tokens, and ensures that the worst runtime of
+088
+      LazyLLM is never slower than the baseline.
+089   In summary, the advantages of LazyLLM are: (1) Universal: LazyLLM can be seamlessly integrated
+090   with any existing transformer-based LLM to improve inference speed, (2) Training-free: LazyLLM
+091   doesn’t require any finetuning and can be directly integrated without any parameter modification,
+092   (3) Effective: Empirical results on 16 standard datasets across 6 different language tasks shows
+093   LazyLLM can improve the inference speed of the LLM during both prefilling and decoding stages.
+094
+095   2      R ELATED W ORK
+096
+097   The increase in the scale of large language models (LLMs) has greatly enhanced their performance
+098   but also introduced challenges with respect to their inference efficiency. The inference of generative
+099   LLMs consists of two distinct stages as depicted in Figure 1. In particular, extensive computation
+100   is needed under long context scenarios to calculate the full KV cache during the prefilling stage,
+101   resulting in a long time-to-first-token (TTFT). This delay causes users to wait several seconds after
+102   submitting a prompt before receiving any response from the agent, leading to a poor user experience.
+103   Efficient Long Context Inference. Extensive work (Merth et al., 2024; Chen et al., 2023; Beltagy
+104   et al., 2020; Kitaev et al., 2020) has been proposed to improve inference efficiency for long context
+105   applications by reducing the memory footprint and total computations. Some works have focused
+106   on tailoring the architecture of the transformer for long context input. For instance, (Beltagy et al.,
+107   2020) introduces a drop-in replacement for standard self-attention and combines local windowed
+      attention with task-motivated global attention. In parallel, Reformer (Kitaev et al., 2020) replaces
+
+
+                                                                                      2
+      Under review as a conference paper at ICLR 2025
+
+
+108                  0                                                       0.02                         0.35
+109                                                                                                                                                0.35
+
+                     5                                                                                    0.30
+110                                                                                                                                                0.30
+
+                                                                             0.01
+111                                                                                                       0.25                                     0.25
+                    10
+
+
+                                                                                                                                 Attention Score
+112                                                                                                                                                0.20
+
+
+                                                                                        Attention Score
+      Layer Index
+
+
+
+                                                                                                          0.20                                     0.15
+113                 15                                                       0.01                                                                  0.10
+114                                                                                                       0.15
+                                                                                                                                                   0.05
+
+115                 20
+                                                                                                          0.10                                     0.00
+                                                                                                                                                            0     5     10          15       20     25   30
+116                                                                          0.01                                                                                              Token Index
+                    25
+                                                                                                          0.05
+117
+118                 30                                                                                    0.00
+119                      0      600     1200       1800    2400       3000                                       0         500                            1000      1500            2000          2500    3000
+                                          Token Index                                                                                                            Token Index
+120                            (a) An Example of Attention Sparsity                                                  (b) Distribution Input Tokens’ Attention Scores
+121
+122
+123   Figure 2: We visualize the attention scores of input tokens in the prompt w.r.t. to the next token for
+124   each layer of Llama 2 7BTouvron et al. (2023). We also plot the distribution of the average attention
+125   score across all transformer layers. Result reveals that the attention scores of input tokens w.r.t. to
+126   the next token are very sparse, indicating that many tokens in the input prompt are redundant and
+127   can be safely removed without affecting the next token prediction.
+128
+129
+      dot-product attention by one that uses locality-sensitive hashing to reduce its computational com-
+130
+      plexity. Though the above methods can speed up long context inference, they require significant
+131   model architecture change and re-training. This drawback makes them impractical to be applied to
+132   existing pre-trained LLMs. Closer to our work are efficient techniques that optimize the KV cache
+133   (Zhang et al., 2024; Li et al., 2024; Anagnostidis et al., 2024; Nawrot et al., 2024) by minimizing the
+134   KV cache size and data transfer. However, these works only focus on accelerating decoding steps,
+135   which are not applicable to reducing TTFT.
+136
+      Token Pruning. Previous studies on the sentence classification task (Kim et al., 2022; Anagnos-
+137   tidis et al., 2024; He et al., 2021) has shown that not all tokens (i.e. words) in an input sequence
+138   are necessary to make a successful prediction. This provides several possibilities for token pruning,
+139   which minimizes computational demands by selectively removing less important tokens during in-
+140   ference. For example, (Kim et al., 2022) presents Learned Token Pruning which adaptively removes
+141   unimportant tokens as an input sequence passes through transformer layers. In parallel, (He et al.,
+142   2021) proposes to reduce width-wise computation via token pruning for transformer-based models
+143   such as BERT (Devlin et al., 2018). These aforementioned approaches were designed for tasks re-
+144   quiring only a single iteration of processing, such as text classification. In this work, we extend the
+145
+      idea of token pruning to generative LLMs. Specifically, our method allows the model to dynamically
+      choose different sets of tokens at each generation step, which is crucial to retaining the performance.
+146
+      Furthermore, we also introduce Aux Cache to ensure that each token is computed at most once along
+147
+      the whole generation, and ensure the worst runtime of our method is not slower than the baseline.
+148
+149
+150   3                  LazyLLM
+151
+152   3.1                    BACKGROUND ON LLM I NFERENCE
+153
+      Generative LLM inference consists of two stages: prefilling and decoding (see Figure 1). In the
+154
+      prefilling stage, the model receives the prompt (a sequence of tokens) T = {ti }N      i=1 of length N,
+155
+      where ti denotes a token and N denotes the length of the prompt, then computes and saves the KV
+156   cache of each token, and produces the first token tn+1 . The transformer architecture commonly
+157   used in LLMs is a stack of layers where each layer shares the same architecture with a multiple-
+158   head self-attention mechanism followed by a multi-layer perception (MLP). The time of prefilling is
+159   referred to as time-to-first-token (a.k.a. TTFT). Following the prefilling is the decoding steps, where
+160   the model appends the generated token tn+1 to the input, and subsequently decodes the following
+161   token. The decoding step is repeatedly performed until the stop criteria are met. While the formula
+      of each decoding step is similar to prefilling, the amount of its computation is significantly lower
+
+
+                                                                                    3
+      Under review as a conference paper at ICLR 2025
+
+
+162
+                black: generated token   red: token in computation   yellow: retrieved from KV cache     green: saved in KV cache but not used     : not yet computed
+163
+                                                                                                                                                   Accumulated # of Token Computed
+164             Iteration #1 (Prefilling) LazyLLM is a training free token pruning technique to improve LLM inference with negligible                               13
+165   LLM       Iteration #2             LazyLLM is a training free token pruning technique to improve LLM inference with negligible performance                    14
+166             Iteration #3             LazyLLM is a training free token pruning technique to improve LLM inference with negligible performance loss               15
+167
+168             Iteration #1 (Prefilling) LazyLLM                                              improve        inference with negligible                             4
+
+169   LazyLLM   Iteration #2             LazyLLM                                               improve LLM inference with negligible performance                    6
+
+170             Iteration #3             LazyLLM                                               improve LLM inference with negligible performance loss               7
+
+171
+172
+173   Figure 3: Comparison between standard LLM and LazyLLM. Instead of computing the KV cache
+174   of all input tokens at the prefilling stage, LazyLLM only selectively computes the tokens that are
+175   important to the next token prediction, deferring the computation of remaining tokens to later steps.
+176   LazyLLM significantly optimizes TTFT by reducing the amount of computation during prefilling.
+177   Moreover, as some tokens in the prompt are never selected by LazyLLM during the whole generation
+178   process (even though theoretically the model could use all tokens in the prompt), LazyLLM also
+179   reduces the total amount of computation and accelerates the overall generation.
+180
+181
+182
+      thanks to the KV cache. Specifically, with saved KV cache from prefilling, all the previous tokens
+      do not need to pass any linear layers in the model.
+183
+184
+185   3.2   I NFERENCE WITH LazyLLM
+186
+187   The overview of the proposed LazyLLM framework is illustrated in Figure 4. LazyLLM starts with
+188
+      the full context and progressively prunes tokens to gradually reduce the number of computations
+      towards the end of the model. Note, LazyLLM allows the model to select different subsets of tokens
+189
+      from the context in different generation steps, even though some of them may be pruned in previous
+190
+      steps. Compared to static pruning which prunes all the tokens at once, dynamic pruning optimizes
+191   the next token prediction in each generation step, which is crucial to retaining the performance.
+192
+193   Progressive Token Pruning. Prior to this work, token pruning has been successfully applied to
+194
+      optimize LLM inference (Zhang et al., 2024; Li et al., 2024; Adnan et al., 2024; Nawrot et al., 2024).
+      However, these approaches require accumulating the full attention maps of predicting the first few
+195
+      tokens to profile the importance of prompt tokens before starting pruning. Consequently, they are
+196
+      not applicable to reduce TTFT as they still require computing all the KV cache at the prefilling stage.
+197
+198   In contrast, LazyLLM only “lazily” computes the tokens that are important to predict the next token
+199   by starting from the first iteration of the inference (the prefilling step). A key challenge to pruning
+200
+      tokens in the first iteration is determining their importance. Inspired by the early exiting work
+      (Elhoushi et al., 2024) which shows the token hidden states gradually evolve through the transformer
+201
+      layers, we apply layer-wise token pruning in each generation step. Specifically, we use the attention
+202
+      map of the layer Al ∈ RH×N ×N to determine the importance of input token ti w.r.t. the next token
+203   to be predicted as
+204
+                                                                                          H
+205                                                                               1 X l
+                                                                        sli =        Ah,i,N                                                                                   (1)
+206                                                                               H
+                                                                                        h=1
+207
+208   where H denotes number of attention heads, N is the sequence length, and Ah,i,j is the attention
+209   probability of the token tj attending to token ti at hth head.
+210   After computing the confidence scores of tokens, it is challenging to determine the threshold value
+211   to prune the token. Concretely, the threshold can change as the distribution of the attention scores
+212   varies between different layers and different tasks. We address this challenge by using the top-
+213   k percentile selection strategy to prune tokens. Specifically, token ti is pruned at layer l + 1 if its
+214   confidence score sli is smaller than k l th percentile among the input tokens. Once the token is pruned,
+215   it is excluded from the computation of all successive layers. In other words, the tokens used in the
+      later layers will be a subset of previous layers.
+
+
+                                                                                         4
+      Under review as a conference paper at ICLR 2025
+
+
+216
+      Our study in Section 5.5 shows the performance changes with different locations of pruning layers
+217   and the number of tokens pruned. In particular, when pruning at the same transformer layer, the
+218   model’s performance gradually decreases as fewer tokens are kept. We also found pruning at later
+219   transformer layers consistently has better performance than pruning at earlier layers, suggesting that
+220   later layers are less sensitive to token pruning. To achieve a better balance of speedup and accuracy,
+221   as shown in Figure 4, we apply progressive pruning that keeps more tokens at earlier transformer
+222   layers and gradually reduces the number of tokens towards the end of the transformer.
+223   Reviving Tokens. The key difference between LazyLLM and previous token pruning work Li et al.
+224   (2023); Jiang et al. (2023); Xu et al. (2023); Kim et al. (2022); He et al. (2021) that permanently
+225   reduce prompt is LazyLLM allows the model to select different subsets of input tokens at each
+226   generation step. Since some input tokens pruned at one generation step might become important
+227   in subsequent steps, reviving these tokens is crucial for maintaining accuracy. Efficiently reviving
+228   pruned tokens during generation is non-trivial. Suppose a token ti is pruned at one generation step
+229   and revived at a later one, a naive implementation to revive ti requires three steps: 1) updating the
+230   keys and values of all previously computed tokens with smaller position IDs than the revived token,
+231
+      2) computing the keys and values of the revived token, and 3) updating the keys and values of all
+      previously computed tokens with larger position IDs than the revived token. This process leads to
+232
+      multiple updates for the same token, ultimately slowing down generation.
+233
+234   To address this challenge, our implementation skips the first and third steps of updating the keys
+235   and values of existing tokens and only computes the revived tokens. Specifically, LazyLLM appends
+236   the revived tokens to the end of the sequence and uses their position IDs to preserve their original
+237
+      positional information. Consequently, the revived tokens can attend to all tokens selected in previous
+      generation steps, even though these tokens may have later position IDs in the sequence. We found
+238
+      that this implementation is simple yet effective, avoiding repetitive updates of the same tokens and
+239
+      empirically resulting in a negligible performance drop.
+240
+241   Aux Cache. In the prefilling stage, there is no KV cache and every token is represented by hidden
+242   states. Thus, progressive token pruning can be implemented by removing pruned tokens’ hidden
+243
+      states. However, extending the progressive token pruning to the following decoding steps is non-
+      trivial. This is because each decoding step leverages the KV cache computed in the prefilling to
+244
+      compute attention. As the LazyLLM performs progressive token pruning at the prefilling stage, the
+245
+      KV of tokens pruned at layer l (e.g. T 4 in Figure 4) will not exist in the KV cache of layer l + 1.
+246   As a reminder, the LazyLLM framework allows each generation step to pick a different subset set
+247   of tokens from the full input token sequences in every step, regardless of whether they are pruned
+248   in previous generation steps or not. For example, during the following decoding steps, those pruned
+249   tokens (e.g. T 4) that do not exist in the KV cache of layer l + 1 may be re-selected to compute
+250   attention. In such cases, the model can not retrieve the KV cache of these tokens. An intuitive
+251   solution is to pass those tokens again from the beginning of the transformer. However, that would
+252   cause repetitive computation for the same token, and eventually slow down the whole generation.
+253   To tackle this challenge, we introduce Aux Cache in addition to the original KV cache, which stores
+254   the hidden states of those pruned tokens (e.g. T 4 and T 7 in Figure 4) if their KV is not present in
+255   the following layer’s KV cache, which could be potentially retrieved for the following iterations. As
+256   shown in Figure 4, in each decoding step, each transformer layer (e.g. layer l + 1) first retrieves the
+257   KV cache of past tokens if they exist (e.g. T 1 and T 8). For those tokens that do not exist in the
+258   KV cache (e.g. T 3), we could retrieve their hidden states from the Aux Cache of its previous layer
+259   directly instead of passing through previous layers again. The introduction of Aux Cache ensures
+260
+      that each token is computed at most once in every transformer layer, and ensures the worst runtime
+      of LazyLLM is not slower than the baseline. It is worth noting that a token resides either in the KV
+261
+      cache or the Aux Cache, ensuring that the overall cache size does not exceed that of the baseline.
+262
+263
+264   4       I MPLEMENTATIONS D ETAILS
+265
+266
+      We implement LazyLLM on Llama 2 (Touvron et al., 2023) and XGen (Nijkamp et al., 2023) and
+267
+      evaluate it on the LongBench (Bai et al., 2023) using HuggingFace2 . We follow the official GitHub
+268
+269
+          2
+              https://github.com/huggingface/transformers/
+
+
+                                                        5
+      Under review as a conference paper at ICLR 2025
+
+
+270
+              Full Input Sequence with N tokens                                   Token in KV Cache                                Token in Aux Cache                          Token in Hidden States
+271                                                                             (No Computing Needed)                              (Needs Computing)                            (Needs Computing)
+
+                                                  Append
+272                                                                                                                       Previous Layers
+
+273             Transformer
+                                                                                         Layer l
+                                   30% Layers                                                                        Transformer Layer
+274
+275
+276                                                                                      T1        T2     T3         T4           T5      T6        T7        T8         T9                     Layer l
+                                                                                                                                                                                               Aux Cache
+                                Prune 30% tokens                                                                                                                                                (T2 T3)
+277                                                                                                            Attention Matrix
+                                                                                                               from Last Layer         Keep TopK Percentile
+278
+279                                30% Layers                                            T1               T3                      T5                          T8         T9
+                                                                                                                                                                                 Update
+280                                                                                                               add to                           add to                                       Layer l
+                                                                                                                Aux Cache                        Aux Cache                                     Aux Cache
+281                                                                                                                                                                                          (T2 T3 T4 T7)
+                                                           N Iterations
+                                Prune 30% tokens
+282                                                                                                      Layer l+1
+
+283                                                                                                      T1          T3           T5        T8      T9
+
+284
+                                   30% Layers                                                 Retrieve
+285                                                                          Layer l+1                   T1          T3           T5        T8      T9
+                                                                             KV Cache
+286                                                                           (T1 T8)
+                                                                                                                                                                     Retrieve hidden states
+287                             Prune 30% tokens
+                                                                                                         T1          T3           T5        T8      T9             of tokens that missing KV
+
+288
+289
+                                   10% Layers                                                                         Transformer Layer
+290                                                                                            Update
+                                                                             Layer l+1
+291                                                                          KV Cache
+                         Next Token                                       (T1 T8 T3 T5 T9)
+                                                                                                                      Following Layers
+292
+                  (a) LazyLLM Inference                                                                        (b) Layer-wise Token Prune
+293
+294
+295   Figure 4: Overview of the LazyLLM framework. LazyLLM starts with the full context and progres-
+296   sively prunes tokens to gradually reduce the number of computations towards the end of the model.
+297   LazyLLM allows the model to select different subsets of tokens from the context in different gener-
+298   ation steps, which is crucial to retaining the performance.
+299
+300
+301   repository3 of LongBench for data preprocessing and prompting in all experiments. The LongBench
+302   benchmark consists of multiple datasets in different tasks, where each task may have different met-
+303   rics, including ROUGE-L, F1, Accuracy, and Edit Sim. Following the official evaluation pipeline,
+304   we categorize all results over major task categories by computing the macro-average score.
+305   As previously noted, the proposed LazyLLM doesn’t require any training. Thus, LazyLLM uses
+306   the exact same existing checkpoints as the baseline, for all models. For inference, we conduct all
+307   experiments on NVIDIA A100 GPUs. We measure and report the speedup based on the empirical
+308   walltime improvement. Specifically, for TTFT Speedup, we measure the empirical walltime between
+309   when the prompt is fed to the model, and when the model generates the first token. For Generation
+310   Speedup, we measure the empirical walltime between when the prompt is fed to the model, and
+311   when the model finished generating all output tokens. We add 5 warmup runs for each experiment
+312   before starting the time measurement to remove the noise such as loading model parameters.
+313
+314
+315
+      5       E XPERIMENTS
+316
+317   We examine our method using two large language models: Llama 2 7B and XGen 7B. We compare
+318   our method with baselines using the same publicly released pretrained checkpoints, without employ-
+319   ing any additional training. We perform experiments using LongBench, a multi-task benchmark for
+320
+      long content understanding. The LongBench comprises 16 datasets and covers 6 tasks including
+      single-doc QA, multi-doc QA, summarization, few-shot learning, synthetic tasks, and code comple-
+321
+      tion.
+322
+323
+          3
+              https://github.com/THUDM/LongBench
+
+
+                                                                                                    6
+      Under review as a conference paper at ICLR 2025
+
+
+324
+      For the metrics, we primarily evaluate the effectiveness and efficiency of each method in the TTFT
+325   speedup vs. accuracy trade-off. Following LongBench, the accuracy (score) denotes the macro-
+326   averaged scores across datasets in each task. The TTFT speedup measures the wall time improve-
+327   ment w.r.t. to the baseline for generating the first token. In analysis, we also assess the impact of
+328   our method on % of Prompt Token Computed and Generation speedup. The % of Prompt Token
+329   Computed measures the accumulated percent of prompt tokens computed at the end of the genera-
+330   tion, which indicates the save of total computation. The Generation speedup measures the walltime
+331   change w.r.t. to the baseline for completing the entire generation process.
+332
+333                                                                 Llama 2                     XGen
+            Tasks                      Method
+334                                                     Score       TTFT Speedup (×)   Score   TTFT Speedup (×)
+335
+                                        Baseline        25.79            1.00          25.19        1.00
+336
+                                 Random Token Drop      20.05            1.20          18.32        1.58
+337         Single-Document QA   Static Token Pruning   21.89            1.18          19.30        1.61
+338                              Prompt Compression     22.88            0.12          15.31        0.20
+339                                LazyLLM (Ours)       25.59            1.36          25.00        1.96
+340                                     Baseline        22.43            1.00          20.71        1.00
+341                              Random Token Drop      16.77            1.19          14.86        1.37
+342         Multi-Document QA    Static Token Pruning   19.93            2.16          17.23        2.11
+                                 Prompt Compression      8.42            0.13          11.56        0.19
+343
+                                   LazyLLM (Ours)       22.31            2.34          20.68        2.65
+344
+                                        Baseline        24.65            1.00          24.85        1.00
+345                              Random Token Drop      24.39            1.39          24.47        1.70
+346         Summarization        Static Token Pruning   24.59            1.33          24.46        1.65
+347                              Prompt Compression     25.16            0.12          24.57        0.17
+348                                LazyLLM (Ours)       24.75            1.46          24.74        1.91
+349                                     Baseline        62.90            1.00          56.40        1.00
+350                              Random Token Drop      53.93            1.19          46.35        1.62
+            Few-shot Learning    Static Token Pruning   56.54            2.16          51.93        3.17
+351
+                                 Prompt Compression     24.18            0.10          23.72        0.15
+352
+                                   LazyLLM (Ours)       62.81            2.19          56.12        3.42
+353                                     Baseline         4.97            1.00           5.40        1.00
+354                              Random Token Drop       3.57            1.18           2.53        1.13
+355         Synthetic            Static Token Pruning    2.81            2.15           3.00        4.14
+356                              Prompt Compression      3.20            0.12           1.42        0.17
+357                                LazyLLM (Ours)       4.98             2.89          5.66         4.77
+358                                     Baseline        55.18            1.00          36.49        1.00
+359                              Random Token Drop      44.92            1.23          32.34        1.57
+            Code Completion      Static Token Pruning   37.51            1.84          32.27        2.97
+360
+                                 Prompt Compression     17.45            0.49          11.38        0.69
+361                                LazyLLM (Ours)       53.30            1.94          36.47        3.47
+362
+363   Table 1: Comparisons of TTFT speedup vs. accuracy on various tasks. Without requiring any train-
+364   ing/finetuning, LazyLLM consistently achieves better TTFT speedup with negligible accuracy drop.
+365   Note that the prompt compression approach fails at improving TTFT because the overhead of run-
+366   ning LLMs to compress the prompt is very computationally expensive.
+367
+368
+369   5.1     R ESULTS
+370
+      Table 1 presents the TTFT speedup vs. accuracy comparisons between LazyLLM, standard LLM,
+371
+      and other baselines. In the table, the “baseline” refers to the standard LLM inference. The “random
+372   token drop” baseline is based on (Yao et al., 2022) that randomly prunes the prompt tokens before
+373   feeding them to the LLMs. We report the average metrics across 5 runs for the “random token drop”
+374   baseline. Our “static token pruning” baseline prunes input tokens at once based on their attention
+375   score of the first few transformer layers during the prefilling stage. We also compare with the prompt
+376   compression method (Li et al., 2023) which pruning redundancy in the input context using LLMs.
+377   Table 1 shows LazyLLM consistently achieves better TTFT speedup with negligible accuracy drop
+      across multiple tasks. It is worth noting that the overhead of running LLMs to compress the prompt
+
+
+                                                                7
+      Under review as a conference paper at ICLR 2025
+
+
+378
+      is very computationally expensive. Even though the inference on the reduced prompt is faster, the
+379   actual TTFT of the “prompt compression” baseline is longer than the baseline.
+380
+381
+382
+      5.2   TTFT S PEEDUP vs. ACCURACY
+383
+      The inference efficiency of LazyLLM is controlled using three parameters: 1) the number of pruning
+384
+      layers, 2) the locations of these pruning layers, and 3) the number of tokens pruned within these
+385   layers. Increasing the number of pruning layers and pruning more tokens optimize computation
+386   by processing fewer tokens, and pruning tokens at earlier layers can save the computations for the
+387   successive layers. Prompting these factors will give more overall computation reduction, and offer
+388   better TTFT speedup. As a side effect, excessively pruning tokens may cause information loss and
+389   eventually lead to performance degradation. Similarly, the TTFT speedup and accuracy of baselines
+390   can vary with different hyperparameters.
+391   We compare TTFT speedup vs. accuracy in Figure 6 with different hyperparameters. The visual-
+392   ization shows that, without any training, the proposed LazyLLM retains the accuracy better than
+393   baselines under the same TTFT speedup. For example, our method can offer 2.34× TTFT speedup
+394   in the multi-document question-answering task with negligible (≤ 1%) performance loss. By con-
+395   trolling the pruning parameters, LazyLLM provides a good trade-off between accuracy and inference
+396   speed as compared to baseline methods. For instance, LazyLLM can achieve 3.0× TTFT speedup
+397   in the multi-document question-answering task with ≤ 10% degradation in accuracy. On the other
+398   hand, baseline methods accuracy degrades significantly for similar TTFT speed-up. Note that the
+399
+      prompt compression approaches fail at improving TTFT because of the compression overhead.
+400
+401   5.3   I MPACT ON OVERALL G ENERATION S PEED
+402
+403   To evaluate the impact of the proposed method on the overall generation process, we also profile
+404   the % of Prompt Token Computed and Generation speedup in Table 2. We can find the % of Token
+405
+      Computed of LazyLLM is less than 100%, indicating that not all tokens in the prompt are selected
+      by LazyLLM at the end of the generation, even though theoretically the model could use all tokens.
+406
+      Computations in the FFN layers increase linearly, while those in the attention layers grow quadrati-
+407
+      cally with the % of Token Computed. A lower % of Token Computed indicates LazyLLM reduces the
+408   total computation, consequently offering additional speedup to the overall generation process across
+409   diverse tasks.
+410
+411
+      5.4   I MPACT ON M EMORY AND C OMPUTING C OST
+412
+413
+      By progressively pruning tokens across the transformer
+414   layers, LazyLLM reduces the size of the attention maps,                                              100
+
+415   thereby decreasing the overall memory footprint. Since
+                                                                      Relative Score w.r.t. Baseline (%)
+
+
+                                                                                                            80
+416   all tokens are utilized in the initial layers, the peak mem-
+417   ory usage remains equivalent to that of the baseline.                                                 60
+
+418
+      Regarding computational cost, we adopt the methodol-                                                  40
+419
+      ogy from Chen et al. (2024) to calculate the total FLOPs
+420   reduction ratio compared to the baseline. Varying the                                                 20
+
+                                                                                                                                 LazyLLM
+421   parameters of LazyLLM influences both the FLOPs re-                                                    0
+      duction ratio and the model’s performance. To illustrate
+                                                                                                                 20     40          60            80
+422                                                                                                                   FLOPs Reduction Ratio (%)
+
+423   this, we present the FLOPs-performance trade-off curve         Figure 5: FLOPs-Performance Trade-
+424   in Figure 5. The results indicate that LazyLLM can sig-        off Curve of LazyLLM for Llama 2 7B
+425   nificantly lower computational costs with negligible per-      evaluated on the Average LongBench
+426   formance drop.                                                 Metric.
+427
+428   5.5   D ROP R ATE IN D IFFERENT L AYERS
+429
+430   In this section, we analyze the effect of the locations of pruning layers, and the number of tokens
+431   pruned. In particular, we report a series of experiments using a simplified version of LazyLLM that
+      prunes tokens just once within the transformer. For each trial, we position the pruning layer at var-
+
+
+                                                         8
+      Under review as a conference paper at ICLR 2025
+
+
+432                                                                             Single-Doc QA                                                                                           Multi-Document QA                                                                                                            Summarization
+                                                                                                                                                                                                                                                                               100
+433                                              100
+                                                                                                                                                                     100
+
+434   Relative Score w.r.t. Baseline (%)
+
+
+                                                                                                                                                                                                                                      Relative Score w.r.t. Baseline (%)
+                                                                                                                         Relative Score w.r.t. Baseline (%)
+                                                  80                                                                                                                                                                                                                               80
+                                                                                                                                                                      80
+435
+                                                  60                                                                                                                                                                                                                               60
+                                                                                                                                                                      60
+436
+                                                  40                                                                                                                                                                                                                               40
+437                                                                             LazyLLM
+                                                                                                                                                                      40
+                                                                                                                                                                                             LazyLLM                                                                                                                 LazyLLM
+                                                                                Random Tokne Dropping                                                                                        Random Tokne Dropping                                                                                                   Random Tokne Dropping
+438                                               20                            Static Pruning                                                                        20                     Static Pruning                                                                        20                                Static Pruning
+                                                                                Prompt Compression                                                                                           Prompt Compression                                                                                                      Prompt Compression
+439                                                0
+                                                                                Baseline
+                                                                                                                                                                       0
+                                                                                                                                                                                             Baseline
+                                                                                                                                                                                                                                                                                    0
+                                                                                                                                                                                                                                                                                                                     Baseline
+
+                                                    0.00       0.50      1.00       1.50      2.00      2.50   3.00                                                     0.00   0.50   1.00       1.50      2.00      2.50   3.00                                                     0.00       0.50          1.00        1.50      2.00      2.50   3.00
+440                                                                              TTFT Speedup                                                                                                 TTFT Speedup                                                                                                             TTFT Speedup
+
+
+441                                                                         Few-shot Learning                                                                                                Synthetic Task                                                                                                          Code Completion
+                                                                                                                                                                     160
+442                                              100                                                                                                                                                                                                                               100
+
+                                                                                                                                                                     140
+443
+            Relative Score w.r.t. Baseline (%)
+
+
+                                                                                                                                Relative Score w.r.t. Baseline (%)
+
+
+                                                                                                                                                                                                                                              Relative Score w.r.t. Baseline (%)
+                                                  80                                                                                                                                                                                                                                80
+                                                                                                                                                                     120
+
+444                                                                                                                                                                  100
+                                                  60                                                                                                                                                                                                                                60
+
+445                                                                                                                                                                   80
+
+                                                  40                                                                                                                  60                                                                                                            40
+446                                                                             LazyLLM                                                                                                      LazyLLM                                                                                                                 LazyLLM
+                                                                                Random Tokne Dropping                                                                 40                     Random Tokne Dropping                                                                                                   Random Tokne Dropping
+447                                               20                            Static Pruning                                                                                               Static Pruning
+                                                                                                                                                                                             Prompt Compression
+                                                                                                                                                                                                                                                                                    20                               Static Pruning
+                                                                                                                                                                                                                                                                                                                     Prompt Compression
+                                                                                Prompt Compression                                                                    20
+                                                                                Baseline                                                                                                     Baseline                                                                                                                Baseline
+448                                                0                                                                                                                   0                                                                                                             0
+                                                       0.00     0.50     1.00       1.50      2.00      2.50   3.00                                                     0.00   0.50   1.00       1.50      2.00      2.50   3.00                                                         0.50          1.00           1.50       2.00        2.50    3.00
+449                                                                              TTFT Speedup                                                                                                 TTFT Speedup                                                                                                             TTFT Speedup
+
+
+450
+451
+452                                                           Figure 6: TTFT speedup vs. accuracy comparison for Llama 2 7B across different tasks.
+453
+454
+                                                                                                                      % OF P ROMPT T OKEN C OMPUTED                                                                         OVERALL G ENERATION S PEEDUP
+455                                                                    TASKS
+456                                                                                                                   L LAMA 2                                                          XG EN                               L LAMA 2                                                                    XG EN
+
+457                                                                    S INGLE -D OCUMENT QA                           87.31                                                            89.16                                  1.34                                                                       1.33
+458                                                                    M ULTI -D OCUMENT QA                            63.94                                                            69.60                                  1.56                                                                       1.70
+                                                                       S UMMARIZATION                                  99.59                                                            96.11                                  1.02                                                                       1.09
+459
+                                                                       F EW- SHOT L EARNING                            69.98                                                            65.30                                  1.28                                                                       1.59
+460                                                                    S YNTHETIC                                      63.73                                                            40.54                                  1.79                                                                       3.16
+461                                                                    C ODE C OMPLETION                               68.57                                                            72.61                                  1.01                                                                       1.16
+462
+463   Table 2: The % of Prompt Token Computed and Generation speedup of LazyLLM on various tasks.
+464   Reported values are based on the same setting as Table 1. A lower % of Token Computed indicates
+465   LazyLLM reduces the total computation, consequently offering additional speedup to the overall
+466   generation process across diverse tasks.
+467
+468
+469
+      ious levels of the transformer stack and apply different pruning ratios. We perform the experiments
+470
+      for both Llama 2 and XGen, and visualize the results in Figure 7.
+471
+472   The results show both models share a similar trend. As expected, when pruning at the same trans-
+473   former layer, the model’s performance gradually decreases as fewer tokens are kept. Furthermore,
+474   pruning at later transformer layers consistently yields better performance compared to pruning at
+475
+      earlier layers, suggesting that later layers are less sensitive to token pruning. Based on these ob-
+      servations, we propose progressive token pruning in Section 3.2, which strategically prunes more
+476
+      tokens in later layers while preserving more in the earlier layers, optimizing the balance between
+477
+      efficiency and performance retention.
+478
+479
+480   5.6                                                     P ROGRESSIVE KV G ROWTH
+481
+482   In this section, we characterize the internals of the model with the token pruning logic. Specifically,
+483   we seek to understand what fractions of prompt tokens are cumulatively used and, inversely, not
+484   used. This “cumulative token usage” can be equivalently defined as the KV cache size at each given
+485   step. Figure 8 presents these cumulative prompt token usage numbers for each of the stages of the
+      LazyLLM.
+
+
+                                                                                                                                                                                              9
+      Under review as a conference paper at ICLR 2025
+
+
+486
+                        30
+487                                                                                                                                25
+
+488                     25
+                                                                                                                                   20
+489                     20
+
+490
+
+                Score
+
+
+                                                                                                                           Score
+                                                                                                                                   15
+                        15
+491                                                                                            keep 10% tokens                                                                             keep 10% tokens
+                                                                                                                                   10
+                                                                                               keep 30% tokens                                                                             keep 30% tokens
+492                     10
+                                                                                               keep 50% tokens                                                                             keep 50% tokens
+                                                                                               keep 70% tokens                                                                             keep 70% tokens
+493                      5
+                                                                                               keep 90% tokens
+                                                                                                                                    5
+                                                                                                                                                                                           keep 90% tokens
+                                                                                               Baseline                                                                                    Baseline
+494                      0                                                                                                          0
+                             5                                10      15          20      25           30                                5          10            15          20      25           30
+495                                                                 Pruning Layer Index                                                                         Pruning Layer Index
+                                                                    (a) Llama 2                                                                                  (b) XGen
+496
+497
+498
+      Figure 7: Effect of the locations of pruning layers, and the number of tokens pruned. The results of
+      both Llama 2 7B Touvron et al. (2023) and XGen 7B Nijkamp et al. (2023) share a similar trend: 1)
+499
+      when pruning at the same transformer layer, the model’s performance gradually decreases as fewer
+500
+      tokens are kept, and 2) Pruning at later transformer layers consistently has better performance than
+501   pruning at earlier layers, suggesting that later layers are less sensitive to token pruning.
+502
+503
+504
+505
+                                                              100
+506
+507
+                                                               80
+508
+                                 % of Prompt Token Computed
+
+
+509
+510                                                            60
+                                                                                                                                                  Layer 1-9
+511                                                                                                                                               Layer 10-19
+                                                                                                                                                  Layer 20-28
+512                                                            40                                                                                 Layer 29-32
+                                                                                                                                                  Baseline
+513
+514                                                            20
+515
+516
+                                                                      0             5            10              15                 20       25             30                35
+517                                                                                               Generation Time Step (absolute)
+518
+519   Figure 8: Statistics on number of tokens processed during generation using our LazyLLM technique
+520   with Llama 2 7B (Touvron et al., 2023). We visualize the statistics of 1000 samples randomly
+521   sampled from LongBench. The x-axis represents the (absolute) generation time step, and the y-axis
+522   represents the number of prompt tokens processed at that time step (normalized by the prompt size).
+523   We visualize these statistics for various stages within the network. Note that cumulative token usage
+524   is upper-bounded by the baseline (evident with early layers).
+525
+526
+527   Our analysis supports the hypothesis that many tokens are never selected by the model (even though
+528   theoretically the model could use all tokens in the prompt). Since this model retains accuracy on the
+529
+      task(s), we can conclude that the model effectively drops the tokens which do not affect the output
+      quality.
+530
+531
+532   6   C ONCLUSION
+533
+534   In this work, we proposed a novel LazyLLM technique for efficient LLM inference, in particular
+535   under long context scenarios. LazyLLM selectively computes the KV for tokens important for the
+536   next token prediction and “lazily” defers the computation of remaining tokens to later steps, when
+537   they become relevant. We carefully examine LazyLLM on various tasks, where we observed the
+538   proposed method effectively reduces TTFT with negligible performance loss. It is worth noting that
+539   our method can be seamlessly integrated with existing transformer-based LLMs to improve their
+      inference speed without requiring any fine-tuning.
+
+
+                                                                                                                      10
+      Under review as a conference paper at ICLR 2025
+
+
+540
+      R EFERENCES
+541
+542   Muhammad Adnan, Akhil Arunkumar, Gaurav Jain, Prashant J Nair, Ilya Soloveychik, and Pu-
+543    rushotham Kamath. Keyformer: Kv cache reduction through key tokens selection for efficient
+544    generative inference. arXiv preprint arXiv:2403.09054, 2024.
+545   Reza Yazdani Aminabadi, Samyam Rajbhandari, Ammar Ahmad Awan, Cheng Li, Du Li, Elton
+546     Zheng, Olatunji Ruwase, Shaden Smith, Minjia Zhang, Jeff Rasley, et al. Deepspeed-inference:
+547     enabling efficient inference of transformer models at unprecedented scale. In SC22: International
+548     Conference for High Performance Computing, Networking, Storage and Analysis, pp. 1–15. IEEE,
+549     2022.
+550
+      Sotiris Anagnostidis, Dario Pavllo, Luca Biggio, Lorenzo Noci, Aurelien Lucchi, and Thomas Hof-
+551
+        mann. Dynamic context pruning for efficient and interpretable autoregressive transformers. Ad-
+552     vances in Neural Information Processing Systems, 36, 2024.
+553
+554   Yushi Bai, Xin Lv, Jiajie Zhang, Hongchang Lyu, Jiankai Tang, Zhidian Huang, Zhengxiao Du,
+555     Xiao Liu, Aohan Zeng, Lei Hou, et al. Longbench: A bilingual, multitask benchmark for long
+556     context understanding. arXiv preprint arXiv:2308.14508, 2023.
+557   Iz Beltagy, Matthew E Peters, and Arman Cohan. Longformer: The long-document transformer.
+558      arXiv preprint arXiv:2004.05150, 2020.
+559
+560   Nikhil Bhendawade, Irina Belousova, Qichen Fu, Henry Mason, Mohammad Rastegari, and Mah-
+561     yar Najibi. Speculative streaming: Fast llm inference without auxiliary models. arXiv preprint
+562
+        arXiv:2402.11131, 2024.
+563   Tianle Cai, Yuhong Li, Zhengyang Geng, Hongwu Peng, Jason D Lee, Deming Chen, and Tri
+564     Dao. Medusa: Simple llm inference acceleration framework with multiple decoding heads. arXiv
+565     preprint arXiv:2401.10774, 2024.
+566
+      Liang Chen, Haozhe Zhao, Tianyu Liu, Shuai Bai, Junyang Lin, Chang Zhou, and Baobao Chang.
+567
+        An image is worth 1/2 tokens after layer 2: Plug-and-play inference acceleration for large vision-
+568
+        language models. arXiv preprint arXiv:2403.06764, 2024.
+569
+570   Yukang Chen, Shengju Qian, Haotian Tang, Xin Lai, Zhijian Liu, Song Han, and Jiaya Jia. Longlora:
+571     Efficient fine-tuning of long-context large language models. arXiv preprint arXiv:2309.12307,
+572     2023.
+573
+      Tri Dao, Dan Fu, Stefano Ermon, Atri Rudra, and Christopher Ré. Flashattention: Fast and memory-
+574     efficient exact attention with io-awareness. Advances in Neural Information Processing Systems,
+575     35:16344–16359, 2022.
+576
+577   Jacob Devlin, Ming-Wei Chang, Kenton Lee, and Kristina Toutanova. Bert: Pre-training of deep
+578     bidirectional transformers for language understanding. arXiv preprint arXiv:1810.04805, 2018.
+579   Mostafa Elhoushi, Akshat Shrivastava, Diana Liskovich, Basil Hosmer, Bram Wasti, Liangzhen Lai,
+580    Anas Mahmoud, Bilge Acun, Saurabh Agarwal, Ahmed Roman, et al. Layer skip: Enabling early
+581    exit inference and self-speculative decoding. arXiv preprint arXiv:2404.16710, 2024.
+582
+583
+      Elias Frantar, Saleh Ashkboos, Torsten Hoefler, and Dan Alistarh. Gptq: Accurate post-training
+        quantization for generative pre-trained transformers. arXiv preprint arXiv:2210.17323, 2022.
+584
+585   Xuanli He, Iman Keivanloo, Yi Xu, Xiang He, Belinda Zeng, Santosh Rajagopalan, and Trishul
+586     Chilimbi. Magic pyramid: Accelerating inference with early exiting and token pruning. arXiv
+587     preprint arXiv:2111.00230, 2021.
+588
+      Huiqiang Jiang, Qianhui Wu, Chin-Yew Lin, Yuqing Yang, and Lili Qiu. Llmlingua: Compressing
+589
+        prompts for accelerated inference of large language models. arXiv preprint arXiv:2310.05736,
+590
+        2023.
+591
+592   Sehoon Kim, Sheng Shen, David Thorsley, Amir Gholami, Woosuk Kwon, Joseph Hassoun, and
+593     Kurt Keutzer. Learned token pruning for transformers. In Proceedings of the 28th ACM SIGKDD
+        Conference on Knowledge Discovery and Data Mining, pp. 784–794, 2022.
+
+
+                                                      11
+      Under review as a conference paper at ICLR 2025
+
+
+594
+      Sehoon Kim, Coleman Hooper, Thanakul Wattanawong, Minwoo Kang, Ruohan Yan, Hasan Genc,
+595     Grace Dinh, Qijing Huang, Kurt Keutzer, Michael W Mahoney, et al. Full stack optimization of
+596     transformer inference: a survey. arXiv preprint arXiv:2302.14017, 2023.
+597
+598   Nikita Kitaev, Łukasz Kaiser, and Anselm Levskaya. Reformer: The efficient transformer. arXiv
+599     preprint arXiv:2001.04451, 2020.
+600   Yaniv Leviathan, Matan Kalman, and Yossi Matias. Fast inference from transformers via speculative
+601     decoding. In International Conference on Machine Learning, pp. 19274–19286. PMLR, 2023.
+602
+603   Yucheng Li, Bo Dong, Chenghua Lin, and Frank Guerin. Compressing context to enhance inference
+604     efficiency of large language models. arXiv preprint arXiv:2310.06201, 2023.
+605   Yuhong Li, Yingbing Huang, Bowen Yang, Bharat Venkitesh, Acyr Locatelli, Hanchen Ye, Tianle
+606     Cai, Patrick Lewis, and Deming Chen. Snapkv: Llm knows what you are looking for before
+607     generation. arXiv preprint arXiv:2404.14469, 2024.
+608
+609   Xinyin Ma, Gongfan Fang, and Xinchao Wang. Llm-pruner: On the structural pruning of large
+610
+        language models. Advances in neural information processing systems, 36:21702–21720, 2023.
+611   Thomas Merth, Qichen Fu, Mohammad Rastegari, and Mahyar Najibi. Superposition prompt-
+612     ing: Improving and accelerating retrieval-augmented generation. 2024. URL https://api.
+613     semanticscholar.org/CorpusID:269033436.
+614
+615
+      Piotr Nawrot, Adrian Łańcucki, Marcin Chochowski, David Tarjan, and Edoardo M Ponti. Dy-
+        namic memory compression: Retrofitting llms for accelerated inference. arXiv preprint
+616
+        arXiv:2403.09636, 2024.
+617
+618   Erik Nijkamp, Tian Xie, Hiroaki Hayashi, Bo Pang, Congying Xia, Chen Xing, Jesse Vig,
+619     Semih Yavuz, Philippe Laban, Ben Krause, et al. Xgen-7b technical report. arXiv preprint
+620     arXiv:2309.03450, 2023.
+621
+      NVIDIA. NVIDIA L40S: Unparalleled AI and graphics performance for the data center. https:
+622
+       //resources.nvidia.com/en-us-l40s/l40s-datasheet-28413, 2024. [On-
+623    line; accessed 31-May-2024].
+624
+625   Reiner Pope, Sholto Douglas, Aakanksha Chowdhery, Jacob Devlin, James Bradbury, Jonathan
+626     Heek, Kefan Xiao, Shivani Agrawal, and Jeff Dean. Efficiently scaling transformer inference.
+627     Proceedings of Machine Learning and Systems, 5, 2023.
+628   Mingjie Sun, Zhuang Liu, Anna Bair, and J Zico Kolter. A simple and effective pruning approach
+629    for large language models. arXiv preprint arXiv:2306.11695, 2023.
+630
+631   Hugo Touvron, Louis Martin, Kevin Stone, Peter Albert, Amjad Almahairi, Yasmine Babaei, Niko-
+632     lay Bashlykov, Soumya Batra, Prajjwal Bhargava, Shruti Bhosale, et al. Llama 2: Open founda-
+633
+        tion and fine-tuned chat models. arXiv preprint arXiv:2307.09288, 2023.
+634   Zhaozhuo Xu, Zirui Liu, Beidi Chen, Yuxin Tang, Jue Wang, Kaixiong Zhou, Xia Hu, and An-
+635     shumali Shrivastava. Compress, then prompt: Improving accuracy-efficiency trade-off of llm
+636     inference with transferable prompt. arXiv preprint arXiv:2305.11186, 2023.
+637
+638
+      Zhewei Yao, Xiaoxia Wu, Conglong Li, Connor Holmes, Minjia Zhang, Cheng Li, and Yuxiong
+        He. Random-ltd: Random and layerwise token dropping brings efficient training for large-scale
+639
+        transformers. arXiv preprint arXiv:2211.11586, 2022.
+640
+641   Zhenyu Zhang, Ying Sheng, Tianyi Zhou, Tianlong Chen, Lianmin Zheng, Ruisi Cai, Zhao Song,
+642     Yuandong Tian, Christopher Ré, Clark Barrett, et al. H2o: Heavy-hitter oracle for efficient gen-
+643     erative inference of large language models. Advances in Neural Information Processing Systems,
+644     36, 2024.
+645
+646
+647
+
+
+
+                                                      12
+      Under review as a conference paper at ICLR 2025
+
+
+648
+      Algorithm 2 Pseudocode of LazyLLM
+649
+650
+      Require: Input tokens T = {ti }N    i=1 , transformer model with L layers
+
+651
+      Require: Pruning thresholds {kl }L    l=1 for each layer
+       1: Initialize KV Cache and Aux Cache as empty
+652
+       2: Initialize active tokens A0 ← T
+653
+       3: Initialize previous attention scores si0 ← 1 for all tokens
+654       {Progressive Token Pruning with Selective Aux Cache Updates}
+655    4: for layer l = 1 to L do
+656    5:    if l is pruning layer then
+657    6:       Use attention scores sil−1 from previous layer for pruning decision
+658    7:       Find kl -th percentile threshold θl of sil−1
+659    8:       Al ← {ti ∈ Al−1 |sil−1 ≥ θl } {Keep top-k tokens}
+660    9:
+661   10:      missing tokens ← {ti ∈ Al |ti ∈/ KV Cache ∧ ti ∈
+                                                              / hidden states}
+662   11:      Retrieve missing tokens from Aux Cache
+663   12:
+664   13:      pruned tokens ← Al−1 \ Al {Identify pruned tokens}
+665   14:      cacheable tokens ← {ti ∈ pruned tokens|ti ∈                / missing tokens ∧ ti         ∈
+666
+               hidden states}
+      15:      Add cacheable tokens to Aux Cache
+667
+      16:   else
+668
+      17:      Al ← Al−1
+669   18:   end if
+670   19:   Compute layer outputs for tokens in Al
+671   20:   Compute current layer attention scores sil using Eq.(1) for tokens in Al
+672   21:   Update KV Cache for tokens in Al
+673   22: end for
+674   23: return Final hidden states for tokens in AL
+675
+676
+677   A     A PPENDIX
+678
+679   A.1   P SEUDOCODE
+680
+681   Algorithm 1 presents presents LazyLLM’s progressive token pruning strategy enhanced with an aux-
+682   iliary caching mechanism. For each transformer layer, the algorithm first uses attention scores from
+683   the previous layer to make pruning decisions, maintaining only the most relevant tokens. After
+684   pruning, it identifies tokens missing from both KV Cache and hidden states, retrieving them from
+685   the Auxiliary Cache when needed.
+686
+687
+688
+      B     V ISUAL E XAMPLE
+689
+690   To better illustrate how LazyLLM operates, we present a detailed walkthrough of our method in Fig-
+691   ure 9. Consider a simple example where the model processes the input “LazyLLM is a training free
+692
+      token pruning technique to improve LLM inference with” and generates subsequent tokens “negli-
+      gible performance loss”. The visualization demonstrates how LazyLLM evolves through different
+693
+      stages of generation.
+694
+695   During the prefilling stage, instead of computing all tokens in the prompt, methodname selec-
+696   tively processes only those tokens deemed important for the next token prediction. In our example,
+697   methodname initially processes only 13 tokens compared to the baseline’s full sequence processing.
+698
+      Notably, when generating the first token “negligible”, methodname focuses on key contextual to-
+      kens like “LazyLLM”, “improve”, and “inference”, while deferring the computation of less relevant
+699
+      tokens.
+700
+701   In subsequent decoding steps (Step #2 and Step #3), methodname continues to operate efficiently
+      by:
+
+
+                                                       13
+      Under review as a conference paper at ICLR 2025
+
+
+702
+           1. Reusing previously computed KV cache values when possible
+703
+704
+           2. Selectively computing only newly important tokens that were deferred earlier
+705        3. Maintaining the ability to revive previously pruned tokens if they become relevant
+706
+707
+      This dynamic approach results in significantly reduced computation, compared to the baseline which
+      processes all tokens at every step. The visualization clearly shows how tokens in red indicate active
+708
+      computation, and green denotes retrieved from KV cache.
+709
+710   This example demonstrates how LazyLLM achieves substantial computational savings without sac-
+711   rificing model performance. The method’s ability to dynamically adjust token selection at each
+712   generation step, while maintaining efficiency through strategic caching, represents a key advance-
+713
+      ment over static pruning approaches.
+714
+715
+716
+717
+718
+719
+720
+721
+722
+723
+724
+725
+726
+727
+728
+729
+730
+731
+732
+733
+734
+735
+736
+737
+738
+739
+740
+741
+742
+743
+744
+745
+746
+747
+748
+749
+750
+751
+752
+753
+754
+755
+
+
+
+                                                       14
+      Under review as a conference paper at ICLR 2025
+
+
+756
+757
+758
+759       Method - Example Explained
+760       Prefilling Stage
+761
+762        LazyLLM is a training free token pruning technique to improve LLM inference with
+
+
+                                                                                                                                                             LazyLLM is a
+763                                                                                                                                           Update         training free token
+                                                                                                                                                             pruning technique
+                                              30% Layers
+                                                                                                                                                             to improve LLM
+764                                                                                                                                                          inference with
+                                                                                                                                     KV Cache (30% Layers)
+                                                                                                                                                                                                                   Update
+765               LazyLLM is a token pruning technique to improve LLM inference with                                                                                                                                              training, free
+
+
+766                                                                                                                                           Update
+                                                                                                                                                             LazyLLM is a token
+                                                                                                                                                             pruning technique
+                                                                                                                                                                                                            Aux Cache (30%th Layer)
+                                              30% Layers                                                                                                     to improve LLM
+767                                                                                                                                                          inference with
+
+                                                                                                                                     KV Cache (30% Layers)
+768                         LazyLLM is a technique to improve inference with                                                                                                                                       Update         token, pruning,
+                                                                                                                                                                                                                                  LLM
+769                                                                                                                                           Update
+                                                                                                                                                             LazyLLM is a
+                                                                                                                                                             technique to                                   Aux Cache (60%th Layer)
+                                              30% Layers
+770                                                                                                                                                          improve inference
+                                                                                                                                                             with
+
+                                                                                                                                     KV Cache (30% Layers)
+771                                 LazyLLM improve inference with                                                                                                                                                 Update
+                                                                                                                                                                                                                                  a, technique, to
+
+772
+                                                                                                                                                             LazyLLM improve                                Aux Cache (90%th Layer)
+                                                                                                                                              Update
+773                                           10% Layers                                                                                                     inference with
+
+
+
+774                                             negligible
+                                                                                                                                     KV Cache (10% Layers)
+
+
+775
+776
+777
+778
+          Method - Example Explained
+779       Generation Stage - Step 1
+780
+           LazyLLM is a training free token pruning technique to improve LLM inference with negligible
+
+781                                                                                                                                                           LazyLLM is a
+                                                                                                               LazyLLM is a
+                                                                                                                                                              training free token
+                                                                                                               training free token
+782                                               30% Layers                                                   pruning technique
+                                                                                                               to improve LLM
+                                                                                                                                              Update          pruning technique
+                                                                                                                                                              to improve LLM
+                                                                                                                                                              inference with +
+                                                                                                               inference with
+783                                                                                                                                   KV Cache (30% Layers)
+                                                                                                                                                              negligible
+                                                                                                                                                                                                                   Update
+                       a token pruning technique to improve LLM inference with negligible                                                                                                training, free                           training, free
+784
+                                                                                                                                                              LazyLLM is a token                            Aux Cache (30%th Layer)
+                                                                                                               LazyLLM is a token
+785                                               30% Layers                                                   pruning technique
+                                                                                                               to improve LLM
+                                                                                                                                              Update          pruning technique
+                                                                                                                                                              to improve LLM
+                                                                                                                                                              inference with +
+                                                                                                               inference with
+                                                                                                                                                              negligible
+786                                                                                                                                   KV Cache (30% Layers)
+                                technique improve LLM inference with negligible
+                                                                                                                                                                                                                   Update
+787                                                                                                                                                                                      token, pruning,
+                                                                                                                                                                                         LLM
+                                                                                                                                                                                                                                  token, pruning
+
+                                                                                                                                                              LazyLLM is a
+788                                               30% Layers
+                                                                                                               LazyLLM is a
+                                                                                                               technique to
+                                                                                                                                              Update          technique to
+                                                                                                                                                              improve inference
+                                                                                                                                                                                                            Aux Cache (60%th Layer)
+                                                                                                               improve inference
+                                                                                                                                                              with + LLM
+789                                                                                                            with
+                                                                                                                                                              negligible
+                                                                                                                                      KV Cache (30% Layers)
+                                         LLM inference with negligible                                                                                                                                             Update
+790                                                                                                                                                                                      a, technique, to                         a, technique, to
+
+
+791                                               10% Layers                                                   LazyLLM improve
+                                                                                                                                                              LazyLLM improve                               Aux Cache (90%th Layer)
+                                                                                                                                              Update          inference with +
+                                                                                                               inference with
+                                                                                                                                                              LLM negligible
+792
+                                                                                                                                      KV Cache (10% Layers)
+793                                               performance
+
+
+
+794
+795
+796       Method - Example Explained
+797
+          Generation Stage - Step 2
+798
+799       LazyLLM is a training free token pruning technique to improve LLM inference with negligible performance
+
+
+800                                                                                                                 LazyLLM is a
+                                                                                                                    training free token
+                                                                                                                                                              LazyLLM is a training
+                                                                                                                                                              free token pruning
+                                                         30% Layers                                                 pruning technique           Update        technique to improve
+801                                                                                                                 to improve LLM
+                                                                                                                    inference with +
+                                                                                                                                                              LLM inference with +
+                                                                                                                                                              negligible + performance
+                                                                                                                    negligible
+                                                                                                                                          KV Cache (30% Layers)
+802                        a pruning technique improve LLM inference with negligible performance                                                                                         training, free
+                                                                                                                                                                                                                   Update
+                                                                                                                                                                                                                                  training, free
+
+
+803                                                                                                                 LazyLLM is a token
+                                                                                                                    pruning technique
+                                                                                                                                                                  LazyLLM is a token
+                                                                                                                                                                  pruning technique                         Aux Cache (30%th Layer)
+                                                         30% Layers                                                 to improve LLM              Update            to improve LLM
+804                                                                                                                 inference with +
+                                                                                                                    negligible +
+                                                                                                                                                                  inference with +
+                                                                                                                                                                  negligible +
+                                                                                                                    performance                                   performance
+805                                technique improve inference with negligible performance
+                                                                                                                                          KV Cache (30% Layers)
+                                                                                                                                                                                                                   Update
+                                                                                                                                                                                         token, pruning                           token, pruning
+806                                                                                                                                                               LazyLLM is a
+                                                                                                                    LazyLLM is a
+                                                                                                                                                                  training to improve                       Aux Cache (60%th Layer)
+                                                         30% Layers                                                 training to improve         Update
+807                                                                                                                 inference with +
+                                                                                                                    technique LLM
+                                                                                                                                                                  inference with +
+                                                                                                                                                                  technique LLM
+                                                                                                                                                                  negligible +
+                                                                                                                    negligible
+                                                                                                                                                                  performance
+808                                       improve inference negligible performance
+                                                                                                                                          KV Cache (30% Layers)
+                                                                                                                                                                                                                   Update
+                                                                                                                                                                                         a, technique, to                         a, technique, to
+809
+                                                                                                                                                                  LazyLLM improve                           Aux Cache (90%th Layer)
+                                                                                                                    LazyLLM improve
+                                                         10% Layers                                                                                               inference with +
+                                                                                                                    inference with +            Update            LLM negligible +
+                                                                                                                    LLM negligible
+                                                                                                                                                                  performance
+
+                                                                                                                                          KV Cache (10% Layers)
+                                                             loss
+
+
+                                                                                                                                 15
+
+                                                                                                Figure 9: Visual Example

@@ -1,0 +1,1546 @@
+Under review as a conference paper at ICLR 2025
+
+
+000
+001
+      ME-S WITCH : A M EMORY-E FFICIENT E XPERT S WITCH -
+002   ING F RAMEWORK FOR L ARGE L ANGUAGE M ODELS
+003
+004
+005    Anonymous authors
+006    Paper under double-blind review
+007
+008
+009                                                     A BSTRACT
+010
+011                The typical process for LLM’s development involves pre-training a general founda-
+012                tion model on massive data, followed by fine-tuning on task-specific data to obtain
+013                a series of specialized experts. Serving these experts can pose significant memory
+014                challenges, as loading all experts onto devices is impractical, and frequent switch-
+015                ing between experts in response to user requests can incur substantial I/O costs.
+016
+                   Previous approaches decompose the expert weights as the pre-trained weights plus
+                   delta weights, followed by quantizing the delta weights using output channel-wise
+017
+                   step sizes to reduce the model size. However, these methods overlook the fact that
+018
+                   certain input channels of delta weights can cause significant quantization errors at
+019                extremely low bitwidths. To this end, we introduce ME-Switch, a memory-efficient
+020                expert switching framework tailored for serving multiple LLMs. To condense the
+021                number of bits required for describing the delta weights, we propose a salient-
+022                aware delta compression method that first identifies which input channels of delta
+023                weights are salient based on reconstruction error and then employs mixed-precision
+024                quantization that selectively quantizes non-salient input channels of delta weights
+025                to extremely low bits while keeping the salient ones intact, significantly reducing
+026                storage demand while maintaining performance. Extensive experiments show the
+027
+                   promising memory efficiency and accuracy of ME-Switch. For example, when
+                   serving three models from the Mistral-7B family, ME-Switch reduces the model
+028
+                   size by 2.04× and maintains nearly lossless performance on instruction, mathemat-
+029
+                   ical reasoning, and code generation tasks. Furthermore, our method can efficiently
+030                serve 16 Mistral-7B models on an NVIDIA A100 GPU.
+031
+032
+033   1       I NTRODUCTION
+034
+035   Large language models (LLMs) such as GPT-4 (Achiam et al., 2023) and Gemini (Team et al.,
+036   2023), have achieved significant advancements in natural language processing (NLP). Following a
+037   pretrain-finetune paradigm (Touvron et al., 2023a;b; Dubey et al., 2024), these models are first trained
+038
+      on large-scale text datasets to develop a broad foundation of language understanding, enabling them
+      to excel in tasks requiring common-sense knowledge. To acquire task-specific knowledge, these
+039
+      pre-trained models are further fine-tuned on specialized tasks, enabling their adaptation or alignment
+040
+      for diverse applications such as interactive agents (Touvron et al., 2023b; Jiang et al., 2023), code
+041   generation (Luo et al., 2023b; Lozhkov et al., 2024), and mathematical problem solving (Luo et al.,
+042   2023a; Lozhkov et al., 2024), demonstrating the remarkable versatility of LLMs. For instance, even
+043   high-capacity LLMs like the MoE model Mixtral-8x22B 1 are fine-tuned on instruction-following
+044   data to create specialized variants such as Mixtral-8x22B-Instruct-v0.1 2 , enhancing their ability to
+045   follow human instructions. While LLMs are powerful, fine-tuning for a specific task to enhance
+046   performance is generally more practical and efficient than multitask fine-tuning that often encounters
+047   conflicting objectives, mode collapse, and demands meticulous data mixing along with substantial
+048   training resources (Team et al., 2023; Touvron et al., 2023b). For example, DeepSeek-Coder-V2-
+049
+      Base (Zhu et al., 2024), a 236B-parameter MoE code model, is fine-tuned from DeepSeek-V2 (Liu
+      et al., 2024a) to achieve significantly improved performance in the code domain but demonstrating
+050
+      reduced effectiveness in general question-answering tasks. This highlights the necessity of obtaining
+051
+      multiple task-specific LLMs.
+052
+          1
+053           https://huggingface.co/mistralai/Mixtral-8x22B-v0.1
+          2
+              https://huggingface.co/mistralai/Mixtral-8x22B-Instruct-v0.1
+
+
+                                                               1
+      Under review as a conference paper at ICLR 2025
+
+
+054
+055
+056
+057
+058
+059
+060
+061
+062
+063
+064
+      Figure 1: An illustration of the input channel-wise maximum and minimum values for the delta
+065   weights of Speechless-Code-Mistral-7B. The variability across input channels highlights that certain
+066   salient channels, irrespective of their magnitude, can cause significant quantization errors when
+067   quantized with ultra low-bitwidth, which underscores their critical role in preserving performance.
+068
+069   However, serving multiple models poses several major challenges. First, even with a relatively small
+070
+      number of models, the storage demands are significant due to the extensive number of parameters each
+      model contains. For example, three LLaMA-2-70B models would collectively require over 384GB of
+071
+      storage, calculated as 128GB per model times three. Second, the substantial memory requirements of
+072
+      these models may make it impractical to load all of them into GPU memory simultaneously. While
+073   dynamically swapping model weights in and out of GPU memory as needed is feasible, the large
+074   size of the models makes this process slow and inefficient, significantly delaying response times and
+075   adversely affecting user experience.
+076
+      To address the above challenges, existing methods (Liu et al., 2024b; Yao & Klimovic, 2023)
+077
+      decompose the weights of fine-tuned models into pre-trained weights and delta weights introduced
+078
+      during fine-tuning. While low-rank approximation (Hu et al., 2022) can compress these delta weights,
+079   it falls short for full fine-tuned models whose delta weights lack low-rank properties (Liu et al., 2024b;
+080   Lialin et al., 2024; Hao et al., 2024). As a result, prior work has adopted per-tensor quantization (Liu
+081   et al., 2024b) as an alternative, significantly reducing storage needs and facilitating efficient sharing
+082   of the base model’s storage across multiple models. Nevertheless, this method ignores the distinction
+083   in delta weight values across different input and output channels, resulting in substantial quantization
+084   error. To mitigate this, output channel-wise quantization (Xiao et al., 2023; Wei et al., 2023; Liu et al.,
+085   2024d) where each output channel is allocated its own learnable step size, still neglects input channel
+086   variations, as shown in Figure 1. To further mitigate information loss, rescaling input channels before
+087
+      quantization can be employed, but this provides only limited alleviation at extremely low bitwidths.
+088   In this paper, we propose ME-Switch, a memory-efficient expert switching framework tailored for
+089   LLMs. To reduce the quantization error while simultaneously reducing storage needs, we develop a
+090   mixed-precision quantization method that quantizes non-salient input channels of delta weights to
+091   extremely low bits while preserving those salient ones, which could substantially increase quantization
+092   errors when quantized at very low bitwidths, in full precision. Since the number of salient input
+093
+      channels is relatively small, incorporating a limited amount of high-precision delta weights incurs
+      negligible memory overhead and inference cost. To identify the important input channels of delta
+094
+      weights, one may select based on their magnitudes (Dettmers et al., 2022), as shown in Figure 2(a),
+095
+      which however fails to capture those leading to high quantization error. In contrast, our approach
+096   identifies salient input channels of delta weights based on their impact on reconstruction errors in the
+097   output activations, as illustrated in Figure 2(b).
+098
+099
+      Our contributions can be summarized as follows. 1) We introduce ME-Switch, a memory-efficient
+      framework designed for serving multiple LLMs. It only stores a single full-precision pre-trained
+100
+      model and dynamically loads the appropriate compressed delta model weights in response to user
+101
+      queries. 2) We develop a mixed-precision quantization method that significantly reduces the storage
+102   demands of serving multiple LLMs while maintaining performance, which is achieved by selectively
+103   quantizing the non-salient input channels of delta weights and leaving the salient ones unchanged. 3)
+104   We conduct extensive experiments demonstrating the promising memory efficiency and accuracy of
+105   ME-Switch. Remarkably, when serving three models from the Mistral-7B family, ME-Switch not
+106   only delivers near-lossless performance on instruction, mathematical reasoning, and code generation
+107   tasks but also reduces the model size by 2.04×. More impressively, our method is able to serves up
+      to 16 Mistral-7B models on a single NVIDIA A100 GPU without running out of memory.
+
+
+                                                          2
+      Under review as a conference paper at ICLR 2025
+
+
+108
+      2   R ELATED W ORK
+109
+110
+      Efficient LLM serving. LLMs can be efficiently deployed on GPUs for high-throughput serving
+111   using several inference frameworks, such as vLLM (Kwon et al., 2023) and Orca (Yu et al., 2022).
+112   Given that a single LLM cannot excel across all domains, it is crucial to serve multiple LLMs
+113   simultaneously to handle diverse user queries effectively. To determine which model to use during
+114   inference, Zooter (Lu et al., 2023) utilizes a task-level router to load different LLMs based on the
+115   incoming task requirements. This approach, however, introduces significant memory challenges, as
+116   hosting all LLMs on a GPU simultaneously can excessively strain the available VRAM. One solution
+117   is to serve multiple Low-Rank Adaptation (LoRA) modules within a multi-tenant serving system,
+118   such as Punica (Chen et al., 2023) and S-LoRA (Sheng et al., 2023a). However, these methods fail
+119
+      to accommodate full fine-tuned models because such models typically do not display the low-rank
+      characteristics necessary for LoRA approximation. Another viable strategy to address the above
+120
+      issue involves dynamically loading different LLMs from CPU memory to GPU memory as needed,
+121
+      thereby reducing peak GPU memory utilization. Nevertheless, this dynamic loading competes for
+122   GPU memory bandwidth with model-swapping operations, presenting a significant bottleneck. To
+123   mitigate these challenges, techniques like Deltazip (Yao & Klimovic, 2023) and BitDelta (Liu et al.,
+124   2024b) have been developed to compress the delta parameters. These methods allow task-specific
+125   delta parameters to be loaded into GPU memory on-demand, ensuring that only a single pre-trained
+126   model’s parameters reside permanently in GPU memory. This approach aims to achieve low-latency
+127   inference while minimizing the costs associated with maintaining numerous fine-tuned models in
+128   GPU memory. Our approach stands out by serving multiple LLMs with a minimal memory footprint
+129   with nearly lossless performance, which is achieved through an advanced delta weights quantization.
+130   Delta compression. In recent years, numerous approaches have focused on reducing the storage
+131   overhead for maintaining different task-specific models through delta parameter compression. Model
+132   merging strategies often incorporate multiple tasks’ delta parameters (Ding et al., 2023) into the
+133   pretrained parameters to minimize the number of parameters needed for multi-task operations. To
+134   address the parameter conflicts that often arise during model merging, Yu et al. (Yu et al., 2023a)
+135   proposed a method involving massive unstructured random pruning (achieving 90% sparsity) of
+136
+      delta parameters and subsequent rescaling. This approach ensures that the accuracy of downstream
+      tasks is not compromised. In a similar vein, Ties-merging (Yadav et al., 2024) developed a pruning
+137
+      strategy based on the magnitude and sign of delta parameters to further reduce conflicts and storage
+138
+      needs. Additionally, the LoRA-based PEFT methods (Hu et al., 2021; Valipour et al., 2022; Ping
+139   et al., 2024) introduce a novel approach by learning one or several low-rank matrices to represent the
+140   delta parameters. ZipLoRA (Shah et al., 2023) explores the sparsity within these low-rank matrices,
+141   allowing the fusion of low-rank matrices from different tasks to further reduce the spatial overhead of
+142   multi-task models. However, these methods struggle to accurately approximate delta parameters in
+143   full fine-tuned models, as these models usually lack low-rank properties (Liu et al., 2024b; Lialin
+144   et al., 2024; Hao et al., 2024). Conversely, some studies focus solely on compressing delta parameters
+145   for each task without merging, thereby mitigating performance degradation across multiple tasks.
+146   For example, Ryu et al. (Ryu et al., 2023) and Isik et al. (Isik et al., 2023) combine quantization and
+147
+      low-rank estimation techniques to reduce the storage size of delta parameters. Liu et al. (Liu et al.,
+      2024b) push this further by quantizing each task’s delta parameters to 1 bit, achieving more than a
+148
+      tenfold compression. However, these quantization methods often lack robust handling of outliers,
+149
+      resulting in performance declines compared to uncompressed delta parameters. Moreover, models
+150   that do not integrate multi-task delta parameters require manual activation of specific delta parameters
+151   for each task, which reduces the model’s applicability in multi-task environments.
+152
+153
+154   3   P RELIMINARIES
+155
+156   For simplicity, we employ uniform quantization (Jacob et al., 2018) to compress the models. Given a
+157
+      matrix X with floating-point values (e.g., BF16), the quantization process can be expressed as:
+158                           X̂ = quant(X) = clamp ⌊ X
+
+                                                             s ⌉, −QN , QP × s,
+                                                                                                      (1)
+159
+160   where the function clamp(V, Vmin , Vmax ) clamps all elements in V within the range [Vmin , Vmax ],
+161   the operator ⌊·⌉ rounds a given value to the nearest integer, and s is a learnable quantization step
+      size initialized by max(|X|)/(2b−1 − 1). Here, QN and QP denote the number of negative and
+
+
+                                                         3
+      Under review as a conference paper at ICLR 2025
+
+
+162                                              Salient Weights            Non-salient Weights
+163
+164        0.8   1.1    0.2           2.1          1.0    1.0    0.0         0.5        0.8    1.1    0.2        0.003       1.0   1.0    0.0
+
+165        1.4   -0.4   -1.6          3.4          1.0    0.0    -2.0        2.0        1.4    -0.4   -1.6        0.6        1.4   -0.4   -1.6
+
+166       -2.8   -1.7   0.4           4.9          -2.8   -1.7   0.4         2.2        -2.8   -1.7   0.4        0.05       -2.0   -2.0   0.0
+167
+           0.1   2.2    -0.9          3.2          0.0    1.0    -1.0        0.1        0.1    2.2    -0.9       0.02        0.0   1.0    -1.0
+168
+          Delta Weights          Delta Weight     Compressed                Inputs     Delta Weights         Delta Weight   Compressed
+169                               Importance      Delta Weights                                               Importance    Delta Weights
+170                     (a) Magnitude-based selection                        (b) Our reconstruction-error-based selection
+171
+172
+173   Figure 2: An illustration comparison between the magnitude-based selection of salient delta weights
+174   and our reconstruction-error-based selection method. Given a delta weight matrix ∆ ∈ Rm×n ,
+175   its quantized version ∆,ˆ and input x ∈ Rm , where m and n denote the number of input and
+176   output channels, respectively, our method measures the importance of each input delta channel by
+      Pn                   ˆ 2
+177      j=1 ∥xi ∆ij − xi ∆ij ∥2 .
+178
+179   positive quantization levels, respectively. For b-bit quantized weights, QN and QP are set to 2b−1 and
+180   2b−1 − 1, respectively. Since the rounding function is not differentiable, we use the straight-through
+181   estimator (STE) (Esser et al., 2020) for gradient approximation following (Esser et al., 2020). For
+182   binary quantization, we use the quantization method following (Rastegari et al., 2016).
+183   Recent studies (Liu et al., 2024b; Yao & Klimovic, 2023) have shown that the weights of a fine-tuned
+184   model can be decomposed into the weights of the pre-trained model and the delta weights introduced
+185   during fine-tuning. Let W ∈ Rm×n and WFT ∈ Rm×n be the weight matrices of the pre-trained
+186   model and the fine-tuned model, respectively, where m represents the number of input channels
+187   and n denotes the output number of channels. The delta weight is defined as ∆ = WFT − W. To
+188   reduce storage requirements, one can perform quantization using Eq. (1) to compress ∆. However,
+189   this method often results in significant performance degradation because it assumes all delta weight
+190
+      channels are equally sensitive to quantization noise.
+191
+192   4      P ROPOSED M ETHOD
+193
+194   In this section, we propose ME-Switch, a memory-efficient expert switching framework designed to
+195   optimize the deployment of multiple LLMs. ME-Switch reduces memory demands while maintaining
+196   performance by using mixed-precision quantization, which quantizes non-salient weights to extremely
+197   low bitwidths while keeping salient weights intact.
+198
+199   4.1        S ALIENT-AWARE D ELTA C OMPRESSION
+200
+201
+      In this section, we introduce our salient-aware delta compression approach, which specifically targets
+      the preservation of salient input channels during quantization. While quantization methods with
+202
+      learnable step sizes for each output channel can handle variations in output channels effectively (Xiao
+203
+      et al., 2023; Liu et al., 2024d), variations in input channels pose a significant challenge to maintaining
+204   model performance, as shown in Figure 1. Some salient input channels of delta weights, regardless
+205   of their magnitude, can cause substantial information loss and degrade model performance when
+206   quantized to a very low bitwidth. To address this, rescaling the input channels of delta weights before
+207   quantization (Lin et al., 2024) offers a solution to mitigate some of the quantization error, which
+208   however provides only limited alleviation under the context of extremely low-bit quantization.
+209
+      Salient-aware delta selection. To protect salient input channels of delta weights, we develop a
+210   mixed-precision quantization method, where the majority of input channels of delta weights are
+211   quantized to low-bit precision, while only a small number of critical input channels are represented in
+212   their original precision. This approach achieves significant reductions in storage requirements with
+213   minimal performance loss. The remaining challenge lies in identifying these salient input channels.
+214   A naive approach might involve selecting the input channels with large magnitudes as the salient
+215   delta weights (Dettmers et al., 2022), as shown in Figure 2(a). However, this method neglects the
+      influence of input activations on the outputs, failing to identify channels that lead to high quantization
+
+
+                                                                        4
+      Under review as a conference paper at ICLR 2025
+
+
+216
+      error. To address this, inspired by the pruning metric (Sun et al., 2024), we introduce a salient delta
+217   weights selection metric based on reconstruction errors in the outputs, considering both weights and
+218   input activations, as shown in Figure 2(b). Specifically, given an input x ∈ Rm , the reconstruction
+219   error for the input channel i can be calculated by
+220                                         Pn                  ˆ 2
+221                                            j=1 ∥xi ∆ij − xi ∆ij ∥2 ,                                  (2)
+222           ˆ is the quantized delta weights and n denotes the output channel number. With the recon-
+      where ∆
+223   struction error defined, we choose those input channels with the top-k largest reconstruction errors as
+224   the salient ones and retain them in 16-bit representation to maintain performance.
+225
+226
+      Efficient distillation. The quantization step size in Eq. (1) plays an important role in the final
+      performance. To learn the quantization step size, we employ knowledge distillation to guide the
+227
+      alignment of the output logits of the quantized model with those of the full-precision fine-tuned
+228
+      model following (Liu et al., 2024b). To reduce training overhead, we freeze the delta weights and
+229   focus solely on optimizing the quantization step size s using a small calibration dataset X by solving
+230
+231                                           arg mins ∥f (X ) − fˆ(X ; s)∥22 ,                          (3)
+232
+      where f (·) and fˆ(·) denote the output logits of the fine-tuned and quantized models, respectively.
+233   Thanks to the reduced number of trainable parameters, this training process is highly efficient.
+234
+235   On-demand swapping. The extremely low-bit compression for delta weights significantly reduces
+236
+      the model size, alleviating storage demands. This approach enables us to maintain a single pre-trained
+      model while storing multiple sets of compressed delta weights, facilitating efficient on-demand
+237
+      swapping. In this scenario, the pre-trained model remains in GPU memory, and the corresponding
+238
+      compressed delta weights are loaded dynamically based on the user query. Compared with directly
+239   serving multiple models, our method is more GPU memory-efficient. Since LLM decoding is
+240   memory-bound (Liu et al., 2023; Sheng et al., 2023b) due to the auto-regressive nature, reducing
+241   model size effectively decreases the parameter loading time, thereby improving decoding latency. To
+242   achieve fast inference, we decouple the matrix multiplication during inference into two components:
+243                                                                         ˜
+                                     y = xWFT = x(W + ∆) ≈ xW + x∆,                                       (4)
+244
+245   where ∆  ˜ represents the compressed delta weights, including both the quantized unsalient and
+246   the full-precision salient delta weights. For xW, the computation is performed using a BF16
+247   batched GEMM kernel. For x∆,    ˜ we implement an efficient Triton kernel (Tillet et al., 2019) that
+248   fuses dequantization and matrix multiplication for efficient computation, reducing intermediate
+249   memory operations and eliminating unnecessary data transfers. The reduced memory footprint of the
+250   compressed delta weights enables our method to perform batched forward passes across multiple
+251   models simultaneously. This batching at the model level significantly enhances efficiency compared
+252
+      to the traditional approach, which processes each model individually—especially beneficial when
+      serving multiple models (See Figure 7). The pseudo codes of our Triton kernel can be found at
+253
+      Section C of the appendix.
+254
+255
+      4.2       M ODEL SIZE REDUCTION ANALYSIS
+256
+257   Let Ψ be the model size of an BF16 pre-trained model. When storing M BF16 models, the total
+258   model size is M Ψ. In contrast, using our method, we store a single base model and M compressed
+259   delta models. The total model size is Ψ + M Ψ̃, where Ψ̃ represents the size of the compressed delta
+260   model. Therefore, the compression ratio can be computed by M Ψ/(Ψ + M Ψ̃). For example, when
+261   serving 9 LLaMA-2-13B models, our method achieves a compression ratio of 3.85×. Empirical
+262   studies on compression ratios for varying model numbers are shown in Figures 5 and 6.
+263
+264
+      5       E XPERIMENTS
+265
+266
+      Candidate LLMs. We apply our ME-Switch to three model families, Mistral-7B (Jiang et al., 2023),
+267   LLaMA-2-13B (Touvron et al., 2023b), and LLaMA-3-8B (Dubey et al., 2024). For the Mistral
+268   family, we include Dolphin-2.2.1-Mistral-7B 3 as the instruction expert, Speechless-Code-Mistral-
+269
+          3
+              https://huggingface.co/cognitivecomputations/dolphin-2.2.1-mistral-7b
+
+
+                                                              5
+      Under review as a conference paper at ICLR 2025
+
+
+270
+      7B 4 as the code expert, and MetaMath-Mistral-7B 5 as the math expert. To show how our method
+271
+      generalizes, we further include BioMistral-7B 6 as an medical expert and Saul-7B-Base 7 as an legal
+272   expert. Both models are fine-tuned from Mistral-7B-Instruct-v0.1 8 . For the LLaMA-2-13B family,
+273   LLaMA-2-13B-Chat (Touvron et al., 2023b) serves as the instruction expert, MetaMath-13B 9 as the
+274   math expert, and LLaMA2-Chinese-13B-Chat 10 as the Chinese expert. For the LLaMA-3-8B family,
+275   we include LLaMA-3-8B-Instruct 11 as the instruction expert and LLaMA-8B-Chinese-Chat 12 as the
+276   Chinese expert. The above models are fine-tuned based on pre-trained backbones. All pre-trained
+277   models used in our experiments are converted to BF16.
+278   Training and testing datasets. We collect a diverse set of instruction samples from various open-
+279   source datasets, including Alpaca (Taori et al., 2023) for the instruction domain, MetaMathQA (Yu
+280   et al., 2023b) for the mathematics domain, Code-74k-ShareGPT 13 for the code domain, BioIn-
+281   structQA 14 for the medical domain, LegalBench-Instruct 15 for the legal domain, and Chinese
+282   Alpaca 16 for the Chinese domain. To measure the performance of the resulting LLMs, we report
+283   accuracy on several benchmarks across different domains: MMLU (Hendrycks et al., 2021a) for the
+284   instruction, GSM8K (Cobbe et al., 2021) and MATH (Hendrycks et al., 2021b) for the mathematics,
+285   HumanEval (Chen et al., 2021) and MBPP (Austin et al., 2021) for the code, and C-Eval (Huang
+286
+      et al., 2024b) and C-MMLU (Li et al., 2023) for the Chinese. We use the WizardCoder toolbox to
+      evaluate on HumanEval and MBPP, and the OpenCompass toolbox (Contributors, 2023) to evaluate
+287
+      on other datasets. For MMLU, we report accuracy based on 5-shot in-context learning. To determine
+288
+      the answer for each question, we assess the perplexity of various response options and select the
+289   one with the lowest perplexity. For GSM8K and MATH, we adopt a 4-shot Chain of Thought (CoT)
+290   methodology to obtain the final answer following (Wei et al., 2022). For the HumanEval and MBPP
+291   datasets, we employ a 0-shot configuration and generate answers using greedy decoding. We assess
+292   the functional correctness using the pass@1 metric following (Liu et al., 2024c). For the medical and
+293   legal domains, we evaluate model performance using the respective subsets of the MMLU dataset.
+294
+      Implementation details. For salient-aware delta compression, we construct a calibration set from
+295   each domain-specific dataset and use these sets to compress the delta weights for each respective
+296   domain. Each calibration set consists of 1600 randomly sampled sequences, each with a length of 128
+297   tokens. The bitwidth b and the number of BF16 input channels k are set to 2 and 8, respectively. We
+298   use the AdamW optimizer (Loshchilov & Hutter, 2019) with a learning rate of 10−5 and a mini-batch
+299   size of 4 for training over 1 epoch. Delta weights compression experiments for the Mistral-7B and
+300   LLaMA-3-8B familes are conducted on two NVIDIA A100 80G GPUs, while for the LLaMA-2-13B
+301   model, we use four NVIDIA A100 80G GPUs.
+302
+303   5.1    M AIN R ESULTS
+304   To evaluate the efficacy of our proposed model, we apply ME-Switch to the Mistral-7B, LLaMA-3-
+305   8B and LLaMA-2-13B model families. The experimental results, detailed in Tables 1, 2, 3 and 4,
+306   demonstrate that ME-Switch, even with extremely compressed delta weights, achieves performance
+307   comparable to that of the respective unquantized expert models across various downstream tasks.
+308   For the Mistral-7B family, on MMLU, ME-Switch lags behind the math expert by just 0.22% in
+309   mathematical reasoning tasks. Notably, ME-Switch consistently outperforms the code expert in code
+310   generation tasks. The performance improvements over uncompressed expert models are primarily
+311
+      attributed to additional training through efficient distillation, which improves the models’ task-specific
+312
+         4
+313        https://huggingface.co/uukuguy/speechless-code-mistral-7b-v1.0
+         5
+314        https://huggingface.co/meta-math/MetaMath-Mistral-7B
+         6
+315        https://huggingface.co/BioMistral/BioMistral-7B
+         7
+           https://huggingface.co/Equall/Saul-7B-Base
+316      8
+           https://huggingface.co/mistralai/Mistral-7B-Instruct-v0.1
+317      9
+           https://huggingface.co/meta-math/MetaMath-13B-V1.0
+318     10
+           https://huggingface.co/FlagAlpha/Llama2-Chinese-13b-Chat
+319     11
+           https://huggingface.co/meta-llama/Meta-Llama-3-8B-Instruct
+320     12
+           https://huggingface.co/shenzhi-wang/Llama3-8B-Chinese-Chat
+        13
+321        https://huggingface.co/datasets/ajibawa-2023/Code-74k-ShareGPT
+        14
+322        https://huggingface.co/datasets/BioMistral/BioInstructQA
+        15
+323        https://huggingface.co/datasets/Equall/legalbench instruct
+        16
+           https://huggingface.co/datasets/hfl/alpaca zh 51k
+
+
+                                                          6
+      Under review as a conference paper at ICLR 2025
+
+
+324
+325                               Table 1: Main results for Mistral-7B and LLaMA-2-13B families.
+326
+                                                            MMLU (%) ↑                           Mathematical Reasoning (%) ↑                    Code Generation (%) ↑
+327                  Model
+                                           STEM          Hums.     Social    Other      Avg.     GSM8K          Math            Avg.      HumanEval              MBPP         Avg.
+328
+        Dolphin-2.2.1-Mistral-7B              52.05      68.83     73.42     65.43     63.43       63.68        12.80       38.24              42.70             54.90       48.80
+329       MetaMath-Mistral-7B                 50.45      66.82     71.63     64.60     61.87       73.92        20.62       47.27               0.00             21.60       10.80
+330    Speechless-Code-Mistral-7B             51.82      68.35     73.74     65.69     63.36       61.18        13.52       37.35              51.20             60.40       55.80
+331              ME-Switch                    53.17      69.09     73.88     65.40     63.95       73.62        20.48       47.05              51.80             60.70       56.25
+332                                                         MMLU (%) ↑                           Mathematical Reasoning (%) ↑                           Chinese (%) ↑
+                     Model
+333                                        STEM          Hums.     Social    Other      Avg.     GSM8K          Math            Avg.           C-Eval          C-MMLU         Avg.
+334       LLaMA-2-13B-Chat                    44.26      59.79     63.20     56.57     54.60       43.75        5.20        24.48              36.13             38.71       37.42
+335         MetaMath-13B                      37.81      52.77     56.00     50.05     47.84       69.14        8.48        38.81              33.62             32.70       33.16
+336    LLaMA2-Chinese-13B-Chat                45.24      60.01     62.47     55.92     54.67       38.89        4.54        21.72              40.28             39.16       39.72
+337              ME-Switch                    44.57      60.87     64.00     58.04     55.45       70.05        13.20       41.63              40.13             39.91       40.02
+338
+339   Table 2: Main results for LLaMA-3-8B family. “BF16                                                            Table 3: Results on the legal domain
+340   Baseline” refers to the performance metrics of experts                                                        for the Mistral-7B family.
+341   without compression.
+342                                                                                                                             Method          BF16 Baseline       ME-Switch
+                                           MMLU (%) ↑                                 Chinese (%) ↑
+343         Method                                                                                                       International Law             74.38             75.76
+                          STEM        Hums.     Social     Other      Avg.   C-Eval      C-MMLU          Avg.
+344                                                                                                                        Jurisprudence               71.30             67.59
+345    BF16 Baseline      57.30       71.64      77.83     71.13     68.05    51.99        52.25        52.12             Professional law             43.02             43.68
+        ME-Switch         57.12       70.89      78.60     70.92     67.93    52.67        52.70        52.69                   Avg.                   62.90             62.34
+346
+347
+348
+                                Table 4: Results on the medical domain for the Mistral-7B family.
+349
+350         Method        Clinical Knowledge           Medical Genetics      Anatomy       Professional Medicine           College Biology          College Medicine         Avg.
+351    BF16 Baseline               64.53                     69.00             57.89                   57.72                      58.33                   58.38              60.98
+352     ME-Switch                  62.26                     68.00             48.89                   57.72                      63.89                   61.27              60.34
+
+353
+354   Table 5: Comparisons between fixed-precision quanti-                                                         Table 6: Effect of different BF16
+355   zation and mixed-precision quantization for MetaMath-                                                        input channel numbers k for
+356   Mistral-7B and Speechless-Code-Mistral-7B.                                                                   Speechless-Code-Mistral-7B.
+357                                                                                                                     Model     Model Size (GB)    HumanEval      MBPP         Avg.
+                                              Mathematical Reasoning (%) ↑       Code Generation (%) ↑
+            Method       Model Size (GB)                                                                                BF16           13.48             51.20       60.40       55.80
+358                                           GSM8K       Math       Avg.     HumanEval        MBPP     Avg.           k=8              2.13             51.80       60.70       56.25
+359    BF16 Baseline          13.48            73.92     20.62       47.27      51.20          60.40   55.80           k = 16           2.15             49.40       61.90       55.65
+360    Fixed-precision        2.11             73.31     20.44       46.88      47.00          59.10   53.05           k = 32           2.19             51.20       61.20       56.20
+       Mixed-precision        2.13             73.62     20.48       47.05      51.80          60.70   56.25           k = 64           2.26             51.20       61.60       56.40
+361
+362
+363   performance by optimizing the quantization step size. Similar phenomena are also observed in many
+364   quantization literature (Esser et al., 2020; Yamamoto, 2021; Liu et al., 2022).
+365
+366   5.2      A BLATION S TUDIES
+367
+368   Fixed-precision quantization vs. Mixed-precision quantization. To validate the effect of mixed-
+369
+      precision quantization, we compress the delta weights of MetaMath-Mistral-7B and Speechless-
+      Code-Mistral-7B using both fixed-precision quantization and our salient-aware mixed-precision
+370
+      quantization. We evaluate their performance on mathematical reasoning and code generation tasks,
+371
+      respectively. The bitwidth b and the number of BF16 input channels k are set to default values as
+372   specified in the implementation details. The results in Table 5 indicate that despite retaining a minimal
+373   number of BF16 channels, the model size of the mixed-precision model (2.13 GB) is nearly identical
+374   compared to fixed-precision model (2.11 GB). However, introducing a small number of BF16 channels
+375   significantly improves performance. For example, our compressed Speechless-Code-Mistral-7B,
+376   with a model size reduced by 6.33×, even outperforms the full-precision counterpart by 0.45% in
+377   the average accuracy on code generation tasks. This underscores the capability of salient-aware
+      mixed-precision quantization to minimize model size while preserving model performance.
+
+
+                                                                                         7
+      Under review as a conference paper at ICLR 2025
+
+
+378
+      Low-rank adaptation vs. our salient-aware delta compression. In addition to mixed-precision
+379   quantization, we can also employ low-rank adaptation (LoRA) to compress delta weights. Specifically,
+380   we decompose the delta weights as ∆ p       = UΣV and p     approximate delta weights using low-rank
+381                    ˜
+      approximation ∆ = AB where A = Ũ Σ̃ and B = Σ̃Ṽ. Subsequently, A and B are refined
+382
+      using our efficient distillation mentioned in Section 4.1. To compare the effectiveness of LoRA against
+383   mixed-precision quantization, we apply both methods to the delta weights of Dolphin-2.2.1-Mistral-
+384   7B and MetaMath-Mistral-7B and evaluate performance on instructional and mathematical reasoning
+385   tasks. For LoRA, we set the rank to 512. The results are detailed in Table 7. Our approach with a
+386   much smaller model size outperforms LoRA, especially on Math. These results reveal that LoRA
+387   cannot accurately approximate delta weights for full fine-tuned models like Dolphin-2.2.1-Mistral-7B
+388   and MetaMath-Mistral-7B. To show the underlying reason, we show the cumulative energy of delta
+389   weights for MetaMath-Mistral-7B in Figure 3, using squared singular values to measure the “energy”
+390   of the projection matrix. The results show that all projection layers consistently exhibit a similar
+391
+      trend and possess a relatively high rank. Therefore, due to the absence of low-rank properties, LoRA
+      cannot accurately approximate the delta weights of full fine-tuned models.
+392
+393                                                    Layer 1                                                         Layer 4                                                        Layer 22                                                        Layer 32
+394                                        1.0                                                             1.0                                                             1.0                                                             1.0
+                      Accumulated Energy
+
+
+                                                                                                                                                                                                                      Accumulated Energy
+                                                                                      Accumulated Energy
+
+
+                                                                                                                                                      Accumulated Energy
+395                                        0.8                                                             0.8                                                             0.8                                                             0.8
+                                           0.6                                                             0.6                                                             0.6                                                             0.6
+396
+      Self_attn.v_proj                     0.4                                                             0.4                                                             0.4                                                             0.4
+397                                        0.2                                                             0.2                                                             0.2                                                             0.2
+398                                        0.0                                                             0.0                                                             0.0                                                             0.0
+                                                 0   200    400   600     800 1000                               0   200    400   600     800 1000                               0   200    400   600    800 1000                                0   200    400   600    800 1000
+399                                                           Rank                                                            Rank                                                            Rank                                                            Rank
+                                           1.0                                                             1.0                                                             1.0                                                             1.0
+400
+                                                                                      Accumulated Energy
+
+
+                                                                                                                                                                                                                      Accumulated Energy
+                      Accumulated Energy
+
+
+                                                                                                                                                      Accumulated Energy
+
+
+                                           0.8                                                             0.8                                                             0.8                                                             0.8
+401                                        0.6                                                             0.6                                                             0.6                                                             0.6
+402    FFN.up_proj                         0.4                                                             0.4                                                             0.4                                                             0.4
+403                                        0.2                                                             0.2                                                             0.2                                                             0.2
+                                           0.0                                                             0.0                                                             0.0                                                             0.0
+404                                              0   1000     2000      3000   4000                              0   1000     2000      3000   4000                              0   1000     2000      3000   4000                              0   1000     2000      3000   4000
+                                                              Rank                                                            Rank                                                            Rank                                                            Rank
+405
+                                           1.0                                                             1.0                                                             1.0                                                             1.0
+406
+                                                                                                                                                      Accumulated Energy
+
+
+                                                                                                                                                                                                                      Accumulated Energy
+                      Accumulated Energy
+
+
+                                                                                      Accumulated Energy
+
+
+                                           0.8                                                             0.8                                                             0.8                                                             0.8
+407                                        0.6                                                             0.6                                                             0.6                                                             0.6
+      FFN.down_proj                        0.4                                                             0.4                                                             0.4                                                             0.4
+408
+                                           0.2                                                             0.2                                                             0.2                                                             0.2
+409
+                                           0.0                                                             0.0                                                             0.0                                                             0.0
+410                                              0   1000     2000      3000   4000                              0   1000     2000      3000   4000                              0   1000     2000      3000   4000                              0   1000     2000      3000   4000
+                                                              Rank                                                            Rank                                                            Rank                                                            Rank
+411                                        1.0                                                             1.0                                                             1.0                                                             1.0
+                                                                                                                                                                                                                      Accumulated Energy
+                      Accumulated Energy
+
+
+                                                                                                                                                      Accumulated Energy
+                                                                                      Accumulated Energy
+
+
+412                                        0.8                                                             0.8                                                             0.8                                                             0.8
+                                           0.6                                                             0.6                                                             0.6                                                             0.6
+413
+      FFN.gate_proj                        0.4                                                             0.4                                                             0.4                                                             0.4
+414                                        0.2                                                             0.2                                                             0.2                                                             0.2
+415                                        0.0                                                             0.0                                                             0.0                                                             0.0
+                                                 0   1000     2000      3000   4000                              0   1000     2000      3000   4000                              0   1000     2000      3000   4000                              0   1000     2000      3000   4000
+416                                                           Rank                                                            Rank                                                            Rank                                                            Rank
+
+417   Figure 3: An illustration showing the cumulative energy of delta weights for MetaMath-Mistral-7B
+418   model derived through Singular Value Decomposition (SVD).
+419
+420   Effect of different number of BF16 channels. To assess the impact of varying BF16 input channel
+421   counts k, we compress the delta weights of Speechless-Code-Mistral-7B and evaluate performance on
+422
+      code generation tasks. The bitwidth b is set at 2. From Table 6, our method already achieves lossless
+      performance with k = 8. Increasing k further yields no significant performance improvements,
+423
+      indicating that performance has plateaued. Therefore, we set k to 8 by default.
+424
+425   Effect of different quantization bitwidths. To investigate the impact of varying bitwidths b, we
+426   compress the delta weights of Speechless-Code-Mistral-7B and evaluate the performance on a code
+427   generation task. Table 8 shows that increasing b from 1 to 2 significantly improve performance,
+428
+      achieving lossless results. Given that further increasing b lead to negligible performance differences
+      due to saturation, we set b to 2 as the default.
+429
+430   Performance comparisons with other weight-only quantization methods. To demonstrate the
+431   promising performance of our salient-aware delta compression, we include the following weight-only
+      quantization methods: AWQ: we use AWQ (Lin et al., 2024) to rescale input channels of delta
+
+
+                                                                                                                                        8
+      Under review as a conference paper at ICLR 2025
+
+
+432
+433   Table 7: Performance comparisons between LoRA and our                                                                                                      Table 8: Effect of different
+434   salient-aware delta compression for Dolphin-2.2.1-Mistral-7B                                                                                               bitwidths b for Speechless-
+435   and MetaMath-Mistral-7B.                                                                                                                                   Code-Mistral-7B.
+436                                                                                                                                                                Model       HumanEval       MBPP      Avg.
+                                                                       MMLU (%) ↑                           Mathematical Reasoning (%) ↑
+       Model                         Model Size (GB)                                                                                                               BF16          51.20         60.40     55.80
+437                                                    STEM         Hums.       Social   Other     Avg.     GSM8K        Math                     Avg.
+                                                                                                                                                                   b=1           49.40         49.90     49.65
+438    LoRA                               2.99         52.16        68.38        73.15   65.52    63.33      73.62      17.30                     45.46            b=2           51.80         60.70     56.25
+439    Ours                               2.11         53.17        69.09        73.88   65.40    63.95      73.62      20.48                     47.05            b=4           51.80         60.20     56.00
+440
+441
+442
+443
+444
+445
+446
+447
+448
+449                                      Instruction Domain                                            Mathematics Domain                                                      Code Domain
+450   Figure 4: Average accuracy vs. delta weights size across different domains. “Baseline” refers to the
+451   fixed-precision quantization baseline. The dashed line indicates the full-precision counterpart.
+452
+453   weights before quantization to mitigate quantization errors. Random: using our salient-aware delta
+454   compression, we randomly select some input channels from the delta weights as important channels.
+455
+      Wanda: leveraging our salient-aware delta compression, we select important input channels of
+      delta weights using the pruning metric from Wanda (Sun et al., 2024). Magnitude: within our
+456
+      salient-aware delta compression framework, we select sensitive input channels of delta weights based
+457
+      on their weight magnitude, following the method proposed by (Dettmers et al., 2022). Slim-LLM:
+458   using the saliency metric in Slim-LLM (Huang et al., 2024a) to select the important channels. We
+459   also include fixed-precision quantization for comparisons. We applied all methods to compress the
+460   delta weights of Dolphin-2.2.1-Mistral-7B, MetaMath-Mistral-7B, and Speechless-Code-Mistral-7B,
+461   using bitwidths b = 1 and b = 2. The results are shown in Figure 4. The detailed number of
+462   different methods can be found at Section E of the appendix. From the results, we observe that
+463   AWQ achieves comparable performance to the 1-bit baseline on code domain, highlighting the
+464   limitations of rescaling in extremely low-bitwidth quantization. In contrast, keeping the salient delta
+465   input channels performs favourably against the rescaling input channel counterpart. Moreover, our
+466
+      salient channel selection demonstrates superior performance than Random, Wanda, Slim-LLM and
+      Magnitude metrics across various bitwidths and tasks. For example, for b = 2, our salient-aware delta
+467
+      compression outperforms Wanda by 1.0% on the average accuracy on code domain, underscoring the
+468
+      effectiveness and superiority of our approach in selecting the salient delta weights.
+469
+470                         120                BF16                                                                                      200             BF16
+                                               Ours                                                                                                      Ours
+        Total Model Size (GB)
+
+
+                                                                                                                     Total Model Size (GB)
+
+
+471                         100
+472                             80                                                                                                       150
+473
+                                60                                                                                                       100
+474
+                                40                                                             3.72x                                                                                                   3.85x
+475                                                         2.79x               3.32x                                                        50                        2.87x           3.43x
+                                20             2.04x                                                                                                     2.08x
+476
+                                 0                                                                                                            0
+477                                        3            5                   7              9                                                         3             5               7               9
+                                                             # Model                                                                                                    # Model
+478
+479   Figure 5: Model size reduction results in terms of                                                          Figure 6: Model size reduction results in terms
+480   Mistral-7B family. The model sizes for the a sin-                                                           of LLaMA-2-13B family. The model sizes for a
+481   gle 16-bit floating-point model and a compressed                                                            single BF16 model and a compressed model are
+482   model are 13.48 GB and 2.13 GB, respectively.                                                               24.23 GB and 3.60 GB, respectively.
+483
+484   Model size reduction analysis. To investigate the model size reduction as discussed in Section 4.2,
+485   we compare the total storage requirements of full-precision models with those of our compressed
+      models for the Mistral-7B and LLaMA-2-13B families across varying model counts, as shown in
+
+
+                                                                                                              9
+      Under review as a conference paper at ICLR 2025
+
+
+
+                                                                                                 250
+486                  600         Naive
+487
+                                 Ours                                                            200
+                                                                                                           I/O
+
+
+                                                                                  Latency (ms)
+                     500
+
+
+          Latency (ms)
+                                                                                                           Dequantization
+                                                                                                 150
+488                  400                                                                                   Multiplication
+
+489                  300                                                                         100
+
+
+490                  200                                                                          50
+
+491                  100
+                                                        OOM       OOM                              0
+                                                                                                       1          2         4     8   16
+                         0   1           2      4             8     16
+492                                                                                                                    # Models
+                                             # Models
+493
+                                                                              Figure 8: Latency decomposition of our
+494   Figure 7: Decoding latency for Mistral-7B.
+                                                                              method for Mistral-7B on a single NVIDIA
+495   “Naive” denotes the naive inference with M
+                                                                              A100 80G GPU. We show the latency of xW
+496   fine-tuned models. “Ours” represents batch                                     ˆ (I/O, dequantization, and multiplica-
+      inference with our method. Out-of-memory                                and x∆
+497
+      scenarios are indicated as “OOM”.                                       tion).
+498
+499
+500   Figures 5 and 6. As the number of models increases, the compression ratios improve substantially.
+501
+      For instance, with nine models, our method achieves a 3.72× reduction compared to full-precision
+      models for Mistral-7B family. These savings become even more pronounced with larger model sizes,
+502
+      reaching up to a 3.85× reduction for LLaMA-2-13B family.
+503
+504   Latency analysis. To assess the latency improvements from delta weights compression, we measured
+505   the end-to-end decoding latency of the Mistral-7B model with an input sequence length of 128
+506   on a single NVIDIA A100. Decoding latency is critical, as it typically dominates processing time
+507
+      in LLM operations (Lin et al., 2024; Liu et al., 2023). Our efficient Triton kernel, which enables
+      batched matrix multiplication between multiple compressed weight matrices and high-precision
+508
+      input activations, is compared against the conventional approach of individually processing multiple
+509
+      models. Results depicted in Figure 7 illustrate that while our method may perform slightly slower
+510   than the naive approach for a small number of models due to additional dequantization overhead, it
+511   provides lower latency as the number of models is greater than 4. These results show that our method
+512   scales more efficiently than the naive inference method. In the naive method, each xW is computed
+513   independently during the forward pass, requiring a distinct W for each user in the batch. As the
+514   number of models grows (>= 4), this approach results in substantial I/O costs due to loading of large
+515   weight matrices. In contrast, our method leverages shared pre-trained model weights W along with a
+516                        ˆ significantly reducing the inference I/O burden. More importantly, unlike the
+      set of small deltas ∆,
+517   naive approach, our method is able to simultaneously serve 16 models on GPUs without running into
+518   out-of-memory (OOM) issues, demonstrating better scalability and efficiency in high-load scenarios.
+519   We further provide a detailed breakdown of decoding times for Mistral-7B model in Figure 8. We
+520   observe that the dequantization cost is very small across different model numbers. Initially, latency is
+521   dominated by I/O operations because LLM decoding is a memory-bound process when the batch size
+522   is small (Lin et al., 2024; Liu et al., 2023). However, as the number of models grows, compute-related
+523   operations, such as matrix multiplications, begin to dominate the overall latency. Notably, as the
+524   number of models increases, the increased latency attributed to x∆    ˜ exceeds that of xW, primarily
+525   due to the increased multiplication cost of the more compressed delta weights.
+526
+527
+528   6          C ONCLUSION AND F UTURE W ORK
+529
+530
+531
+      In this paper, we have introduced ME-Switch, a memory-efficient expert switching framework
+      designed for LLMs. Our method has addressed the critical challenge of balancing model performance
+532
+      with storage efficiency. The core of our ME-Switch lies in a novel mixed-precision quantization
+533
+      method that selectively compresses non-salient delta weights to extremely low-bit precision while
+534   preserving salient delta weights. Extensive experiments on Mistral-7B, LLaMA-2-13B, and LLaMA-
+535   3-8B families have demonstrated that ME-Switch achieves performance comparable to unquantized
+536   expert models across various tasks while significantly reducing model size. In terms of limitations,
+537   quantizing the base model itself could further reduce the overall model size. This approach would
+538   require careful consideration of the combined effects of quantizing both the base model and the delta
+539   weights to ensure performance is maintained. Furthermore, reducing the bitwidth of the KV Cache
+      could accelerate the decoding speed, offering additional efficiency improvements.
+
+
+                                                                         10
+      Under review as a conference paper at ICLR 2025
+
+
+540
+      R EFERENCES
+541
+542   Josh Achiam, Steven Adler, Sandhini Agarwal, Lama Ahmad, Ilge Akkaya, Florencia Leoni Aleman,
+543     Diogo Almeida, Janko Altenschmidt, Sam Altman, Shyamal Anadkat, et al. Gpt-4 technical report.
+544     arXiv preprint arXiv:2303.08774, 2023.
+545
+      Jacob Austin, Augustus Odena, Maxwell Nye, Maarten Bosma, Henryk Michalewski, David Dohan,
+546     Ellen Jiang, Carrie Cai, Michael Terry, Quoc Le, et al. Program synthesis with large language
+547     models. arXiv preprint arXiv:2108.07732, 2021.
+548
+549   Jinze Bai, Shuai Bai, Yunfei Chu, Zeyu Cui, Kai Dang, Xiaodong Deng, Yang Fan, Wenbin Ge,
+550      Yu Han, Fei Huang, Binyuan Hui, Luo Ji, Mei Li, Junyang Lin, Runji Lin, Dayiheng Liu, Gao Liu,
+551
+         Chengqiang Lu, Keming Lu, Jianxin Ma, Rui Men, Xingzhang Ren, Xuancheng Ren, Chuanqi Tan,
+         Sinan Tan, Jianhong Tu, Peng Wang, Shijie Wang, Wei Wang, Shengguang Wu, Benfeng Xu, Jin
+552
+         Xu, An Yang, Hao Yang, Jian Yang, Shusheng Yang, Yang Yao, Bowen Yu, Hongyi Yuan, Zheng
+553
+         Yuan, Jianwei Zhang, Xingxuan Zhang, Yichang Zhang, Zhenru Zhang, Chang Zhou, Jingren Zhou,
+554      Xiaohuan Zhou, and Tianhang Zhu. Qwen technical report. arXiv preprint arXiv:2309.16609,
+555      2023.
+556
+557   Lequn Chen, Zihao Ye, Yongji Wu, Danyang Zhuo, Luis Ceze, and Arvind Krishnamurthy. Punica:
+558     Multi-tenant lora serving. arXiv preprint arXiv:2310.18547, 2023.
+559
+      Mark Chen, Jerry Tworek, Heewoo Jun, Qiming Yuan, Henrique Ponde de Oliveira Pinto, Jared
+560    Kaplan, Harri Edwards, Yuri Burda, Nicholas Joseph, Greg Brockman, et al. Evaluating large
+561    language models trained on code. arXiv preprint arXiv:2107.03374, 2021.
+562
+563   Karl Cobbe, Vineet Kosaraju, Mohammad Bavarian, Mark Chen, Heewoo Jun, Lukasz Kaiser,
+564     Matthias Plappert, Jerry Tworek, Jacob Hilton, Reiichiro Nakano, et al. Training verifiers to solve
+565     math word problems. arXiv preprint arXiv:2110.14168, 2021.
+566   OpenCompass Contributors. Opencompass: A universal evaluation platform for foundation models.
+567     https://github.com/open-compass/opencompass, 2023.
+568
+569   Tim Dettmers, Mike Lewis, Younes Belkada, and Luke Zettlemoyer. Gpt3. int8 (): 8-bit matrix
+570     multiplication for transformers at scale. NeurIPS, 35:30318–30332, 2022.
+571
+      Ning Ding, Yujia Qin, Guang Yang, Fuchao Wei, Zonghan Yang, Yusheng Su, Shengding Hu, Yulin
+572     Chen, Chi-Min Chan, Weize Chen, et al. Parameter-efficient fine-tuning of large-scale pre-trained
+573     language models. Nature Machine Intelligence, 5(3):220–235, 2023.
+574
+575   Abhimanyu Dubey, Abhinav Jauhri, Abhinav Pandey, Abhishek Kadian, Ahmad Al-Dahle, Aiesha
+576     Letman, Akhil Mathur, Alan Schelten, Amy Yang, Angela Fan, et al. The llama 3 herd of models.
+577     arXiv preprint arXiv:2407.21783, 2024.
+578   Steven K. Esser, Jeffrey L. McKinstry, Deepika Bablani, Rathinakumar Appuswamy, and Dharmen-
+579     dra S. Modha. Learned step size quantization. In ICLR, 2020.
+580
+581   William Fedus, Barret Zoph, and Noam Shazeer. Switch transformers: Scaling to trillion parameter
+582    models with simple and efficient sparsity. JMLR, 23(120):1–39, 2022.
+583
+      Yongchang Hao, Yanshuai Cao, and Lili Mou. Flora: Low-rank adapters are secretly gradient
+584     compressors. In ICML, 2024.
+585
+586   Dan Hendrycks, Collin Burns, Steven Basart, Andy Zou, Mantas Mazeika, Dawn Song, and Jacob
+587     Steinhardt. Measuring massive multitask language understanding. In ICLR, 2021a.
+588
+      Dan Hendrycks, Collin Burns, Saurav Kadavath, Akul Arora, Steven Basart, Eric Tang, Dawn Song,
+589
+        and Jacob Steinhardt. Measuring mathematical problem solving with the MATH dataset. In
+590     NeurIPS, 2021b.
+591
+592   Edward J Hu, Yelong Shen, Phillip Wallis, Zeyuan Allen-Zhu, Yuanzhi Li, Shean Wang, Lu Wang,
+593     and Weizhu Chen. Lora: Low-rank adaptation of large language models. arXiv preprint
+        arXiv:2106.09685, 2021.
+
+
+                                                      11
+      Under review as a conference paper at ICLR 2025
+
+
+594
+      Edward J Hu, yelong shen, Phillip Wallis, Zeyuan Allen-Zhu, Yuanzhi Li, Shean Wang, Lu Wang,
+595     and Weizhu Chen. LoRA: Low-rank adaptation of large language models. In ICLR, 2022.
+596
+597   Wei Huang, Haotong Qin, Yangdong Liu, Yawei Li, Xianglong Liu, Luca Benini, Michele Magno,
+598    and Xiaojuan Qi. Slim-llm: Salience-driven mixed-precision quantization for large language
+599    models. arXiv preprint arXiv:2405.14917, 2024a.
+600   Yuzhen Huang, Yuzhuo Bai, Zhihao Zhu, Junlei Zhang, Jinghan Zhang, Tangjun Su, Junteng Liu,
+601     Chuancheng Lv, Yikai Zhang, Yao Fu, et al. C-eval: A multi-level multi-discipline chinese
+602     evaluation suite for foundation models. NeurIPS, 36, 2024b.
+603
+604   Berivan Isik, Hermann Kumbong, Wanyi Ning, Xiaozhe Yao, Sanmi Koyejo, and Ce Zhang. GPT-zip:
+605
+        Deep compression of finetuned large language models. In ICMLW, 2023.
+606   Benoit Jacob, Skirmantas Kligys, Bo Chen, Menglong Zhu, Matthew Tang, Andrew Howard, Hartwig
+607     Adam, and Dmitry Kalenichenko. Quantization and training of neural networks for efficient
+608     integer-arithmetic-only inference. In CVPR, pp. 2704–2713, 2018.
+609
+610
+      Albert Q Jiang, Alexandre Sablayrolles, Arthur Mensch, Chris Bamford, Devendra Singh Chaplot,
+        Diego de las Casas, Florian Bressand, Gianna Lengyel, Guillaume Lample, Lucile Saulnier, et al.
+611
+        Mistral 7b. arXiv preprint arXiv:2310.06825, 2023.
+612
+613   Albert Q Jiang, Alexandre Sablayrolles, Antoine Roux, Arthur Mensch, Blanche Savary, Chris
+614     Bamford, Devendra Singh Chaplot, Diego de las Casas, Emma Bou Hanna, Florian Bressand, et al.
+615     Mixtral of experts. arXiv preprint arXiv:2401.04088, 2024.
+616
+      Woosuk Kwon, Zhuohan Li, Siyuan Zhuang, Ying Sheng, Lianmin Zheng, Cody Hao Yu, Joseph E.
+617    Gonzalez, Hao Zhang, and Ion Stoica. Efficient memory management for large language model
+618    serving with pagedattention. In SOSP, 2023.
+619
+620   Haonan Li, Yixuan Zhang, Fajri Koto, Yifei Yang, Hai Zhao, Yeyun Gong, Nan Duan, and Timothy
+621     Baldwin. Cmmlu: Measuring massive multitask language understanding in chinese. arXiv preprint
+622
+        arXiv:2306.09212, 2023.
+623   Vladislav Lialin, Sherin Muckatira, Namrata Shivagunde, and Anna Rumshisky. ReloRA: High-rank
+624     training through low-rank updates. In ICLR, 2024.
+625
+626   Ji Lin, Jiaming Tang, Haotian Tang, Shang Yang, Wei-Ming Chen, Wei-Chen Wang, Guangxuan
+627
+         Xiao, Xingyu Dang, Chuang Gan, and Song Han. Awq: Activation-aware weight quantization for
+         llm compression and acceleration. In MLSys, 2024.
+628
+629   Aixin Liu, Bei Feng, Bin Wang, Bingxuan Wang, Bo Liu, Chenggang Zhao, Chengqi Dengr, Chong
+630     Ruan, Damai Dai, Daya Guo, et al. Deepseek-v2: A strong, economical, and efficient mixture-of-
+631     experts language model. arXiv preprint arXiv:2405.04434, 2024a.
+632
+      James Liu, Guangxuan Xiao, Kai Li, Jason D Lee, Song Han, Tri Dao, and Tianle Cai. Bitdelta: Your
+633
+        fine-tune may only be worth one bit. arXiv preprint arXiv:2402.10193, 2024b.
+634
+635   Jiawei Liu, Chunqiu Steven Xia, Yuyao Wang, and Lingming Zhang. Is your code generated by
+636      chatgpt really correct? rigorous evaluation of large language models for code generation. NeurIPS,
+637      36, 2024c.
+638
+      Jing Liu, Ruihao Gong, Xiuying Wei, Zhiwei Dong, Jianfei Cai, and Bohan Zhuang. QLLM: Accurate
+639
+         and efficient low-bitwidth quantization for large language models. In ICLR, 2024d.
+640
+641   Zechun Liu, Kwang-Ting Cheng, Dong Huang, Eric P Xing, and Zhiqiang Shen. Nonuniform-to-
+642     uniform quantization: Towards accurate quantization via generalized straight-through estimation.
+643     In CVPR, pp. 4942–4952, 2022.
+644
+      Zichang Liu, Jue Wang, Tri Dao, Tianyi Zhou, Binhang Yuan, Zhao Song, Anshumali Shrivastava,
+645     Ce Zhang, Yuandong Tian, Christopher Re, et al. Deja vu: Contextual sparsity for efficient llms at
+646     inference time. In ICML, pp. 22137–22176, 2023.
+647
+      Ilya Loshchilov and Frank Hutter. Decoupled weight decay regularization. In ICLR, 2019.
+
+
+                                                      12
+      Under review as a conference paper at ICLR 2025
+
+
+648
+      Anton Lozhkov, Raymond Li, Loubna Ben Allal, Federico Cassano, Joel Lamy-Poirier, Nouamane
+649    Tazi, Ao Tang, Dmytro Pykhtar, Jiawei Liu, Yuxiang Wei, et al. Starcoder 2 and the stack v2: The
+650     next generation. arXiv preprint arXiv:2402.19173, 2024.
+651
+652   Keming Lu, Hongyi Yuan, Runji Lin, Junyang Lin, Zheng Yuan, Chang Zhou, and Jingren Zhou.
+653     Routing to the expert: Efficient reward-guided ensemble of large language models. arXiv preprint
+654
+        arXiv:2311.08692, 2023.
+655   Haipeng Luo, Qingfeng Sun, Can Xu, Pu Zhao, Jianguang Lou, Chongyang Tao, Xiubo Geng,
+656     Qingwei Lin, Shifeng Chen, and Dongmei Zhang. Wizardmath: Empowering mathematical
+657     reasoning for large language models via reinforced evol-instruct. arXiv preprint arXiv:2308.09583,
+658     2023a.
+659
+      Ziyang Luo, Can Xu, Pu Zhao, Qingfeng Sun, Xiubo Geng, Wenxiang Hu, Chongyang Tao, Jing
+660
+        Ma, Qingwei Lin, and Daxin Jiang. Wizardcoder: Empowering code large language models with
+661     evol-instruct. arXiv preprint arXiv:2306.08568, 2023b.
+662
+663   Bowen Ping, Shuo Wang, Hanqing Wang, Xu Han, Yuzhuang Xu, Yukun Yan, Yun Chen, Baobao
+664     Chang, Zhiyuan Liu, and Maosong Sun. Delta-come: Training-free delta-compression with
+665     mixed-precision for large language models. arXiv preprint arXiv:2406.08903, 2024.
+666   Mohammad Rastegari, Vicente Ordonez, Joseph Redmon, and Ali Farhadi. Xnor-net: Imagenet
+667    classification using binary convolutional neural networks. In ECCV, pp. 525–542, 2016.
+668
+669   Simo Ryu, Seunghyun Seo, and Jaejun Yoo. Efficient storage of fine-tuned models via low-rank
+670
+        approximation of weight residuals. arXiv preprint arXiv:2305.18425, 2023.
+671   V Sanh. Distilbert, a distilled version of bert: Smaller, faster, cheaper and lighter. arXiv preprint
+672     arXiv:1910.01108, 2019.
+673
+674   Viraj Shah, Nataniel Ruiz, Forrester Cole, Erika Lu, Svetlana Lazebnik, Yuanzhen Li, and Varun
+675
+        Jampani. Ziplora: Any subject in any style by effectively merging loras. arXiv preprint
+        arXiv:2311.13600, 2023.
+676
+677   Ying Sheng, Shiyi Cao, Dacheng Li, Coleman Hooper, Nicholas Lee, Shuo Yang, Christopher Chou,
+678     Banghua Zhu, Lianmin Zheng, Kurt Keutzer, et al. S-lora: Serving thousands of concurrent lora
+679     adapters. arXiv preprint arXiv:2311.03285, 2023a.
+680
+      Ying Sheng, Lianmin Zheng, Binhang Yuan, Zhuohan Li, Max Ryabinin, Beidi Chen, Percy Liang,
+681
+        Christopher Ré, Ion Stoica, and Ce Zhang. Flexgen: High-throughput generative inference of large
+682     language models with a single gpu. In ICML, pp. 31094–31116, 2023b.
+683
+684   Sainbayar Sukhbaatar, Olga Golovneva, Vasu Sharma, Hu Xu, Xi Victoria Lin, Baptiste Rozière,
+685     Jacob Kahn, Daniel Li, Wen-tau Yih, Jason Weston, et al. Branch-train-mix: Mixing expert llms
+686     into a mixture-of-experts llm. arXiv preprint arXiv:2403.07816, 2024.
+687   Mingjie Sun, Zhuang Liu, Anna Bair, and J Zico Kolter. A simple and effective pruning approach for
+688    large language models. In ICLR, 2024.
+689
+690   Rohan Taori, Ishaan Gulrajani, Tianyi Zhang, Yann Dubois, Xuechen Li, Carlos Guestrin, Percy
+691
+        Liang, and Tatsunori B. Hashimoto. Stanford alpaca: An instruction-following llama model.
+        https://github.com/tatsu-lab/stanford_alpaca, 2023.
+692
+693   Gemini Team, Rohan Anil, Sebastian Borgeaud, Yonghui Wu, Jean-Baptiste Alayrac, Jiahui Yu, Radu
+694     Soricut, Johan Schalkwyk, Andrew M Dai, Anja Hauth, et al. Gemini: a family of highly capable
+695     multimodal models. arXiv preprint arXiv:2312.11805, 2023.
+696
+      Philippe Tillet, Hsiang-Tsung Kung, and David Cox. Triton: an intermediate language and compiler
+697
+        for tiled neural network computations. In Proceedings of the 3rd ACM SIGPLAN International
+698
+        Workshop on Machine Learning and Programming Languages, pp. 10–19, 2019.
+699
+700   Hugo Touvron, Thibaut Lavril, Gautier Izacard, Xavier Martinet, Marie-Anne Lachaux, Timothée
+701     Lacroix, Baptiste Rozière, Naman Goyal, Eric Hambro, Faisal Azhar, et al. Llama: Open and
+        efficient foundation language models. arXiv preprint arXiv:2302.13971, 2023a.
+
+
+                                                       13
+      Under review as a conference paper at ICLR 2025
+
+
+702
+      Hugo Touvron, Louis Martin, Kevin Stone, Peter Albert, Amjad Almahairi, Yasmine Babaei, Nikolay
+703     Bashlykov, Soumya Batra, Prajjwal Bhargava, Shruti Bhosale, et al. Llama 2: Open foundation
+704     and fine-tuned chat models. arXiv preprint arXiv:2307.09288, 2023b.
+705
+706   Mojtaba Valipour, Mehdi Rezagholizadeh, Ivan Kobyzev, and Ali Ghodsi. Dylora: Parameter
+707    efficient tuning of pre-trained models using dynamic search-free low-rank adaptation. arXiv
+708
+       preprint arXiv:2210.07558, 2022.
+709   Jason Wei, Xuezhi Wang, Dale Schuurmans, Maarten Bosma, Fei Xia, Ed Chi, Quoc V Le, Denny
+710     Zhou, et al. Chain-of-thought prompting elicits reasoning in large language models. NeurIPS, 35:
+711     24824–24837, 2022.
+712
+713
+      Xiuying Wei, Yunchen Zhang, Yuhang Li, Xiangguo Zhang, Ruihao Gong, Jinyang Guo, and
+        Xianglong Liu. Outlier suppression+: Accurate quantization of large language models by equivalent
+714
+        and effective shifting and scaling. In EMNLP, pp. 1648–1665, 2023.
+715
+716   Guangxuan Xiao, Ji Lin, Mickael Seznec, Hao Wu, Julien Demouth, and Song Han. Smoothquant:
+717    Accurate and efficient post-training quantization for large language models. In ICML, pp. 38087–
+718     38099, 2023.
+719
+      Prateek Yadav, Derek Tam, Leshem Choshen, Colin A Raffel, and Mohit Bansal. Ties-merging:
+720
+        Resolving interference when merging models. NeurIPS, 36, 2024.
+721
+722   Kohei Yamamoto. Learnable companding quantization for accurate low-bit neural networks. In
+723     CVPR, pp. 5029–5038, 2021.
+724
+      Xiaozhe Yao and Ana Klimovic. Deltazip: Multi-tenant language model serving via delta compression.
+725
+        arXiv preprint arXiv:2312.05215, 2023.
+726
+727   Gyeong-In Yu, Joo Seong Jeong, Geon-Woo Kim, Soojeong Kim, and Byung-Gon Chun. Orca: A
+728     distributed serving system for {Transformer-Based} generative models. In OSDI, pp. 521–538,
+729     2022.
+730
+      Le Yu, Bowen Yu, Haiyang Yu, Fei Huang, and Yongbin Li. Language models are super mario:
+731     Absorbing abilities from homologous models as a free lunch. arXiv preprint arXiv:2311.03099,
+732     2023a.
+733
+734   Longhui Yu, Weisen Jiang, Han Shi, Jincheng Yu, Zhengying Liu, Yu Zhang, James T Kwok, Zhenguo
+735     Li, Adrian Weller, and Weiyang Liu. Metamath: Bootstrap your own mathematical questions for
+736
+        large language models. arXiv preprint arXiv:2309.12284, 2023b.
+737   Qihao Zhu, Daya Guo, Zhihong Shao, Dejian Yang, Peiyi Wang, Runxin Xu, Y Wu, Yukun Li,
+738     Huazuo Gao, Shirong Ma, et al. Deepseek-coder-v2: Breaking the barrier of closed-source models
+739     in code intelligence. arXiv preprint arXiv:2406.11931, 2024.
+740
+741
+742
+743
+744
+745
+746
+747
+748
+749
+750
+751
+752
+753
+754
+755
+
+
+
+                                                      14
+      Under review as a conference paper at ICLR 2025
+
+
+756
+                                                    Appendix
+757
+758
+759   A    M ODEL - LEVEL ROUTING
+760
+      In public-facing applications or open-ended systems, user inputs may vary widely in content and
+761   intent, often lacking clear contextual information. This makes it particularly challenging to determine
+762   the appropriate model for queries in advance. Therefore, we explore a simple yet effective approach as
+763   a possible solution to determine the appropriate model for a given user query. Consider a set of LLMs
+764   represented as F = {f1 , f2 , · · · , fM }, where M denotes the number of models. Given a user query
+765   q, we aim to find the most suitable LLM by solving the following problem arg maxf ∈F P (q, f (q)),
+766   where P is a function that measures the quality or performance of the LLM response. To simplify the
+767   routing process, we assume that each LLM in F specializes in distinct and non-overlapping domains
+768   such as code generation or mathematical problem solving. This setup allows us to treat the routing
+769
+      challenge as a multiple-choice question-answering task, where each option corresponds to a specific
+      domain, thereby transforming the problem into a domain classification problem. For the challenging
+770
+      problem of overlapping domains, extending the current setup to a multi-label classification framework
+771
+      would be necessary, and we consider this a promising direction for future work. Note that dialogue
+772   LLMs like Qwen1.5-1.8B-Chat (Bai et al., 2023) exhibit capabilities in following instructions, which
+773   inspires us to utilize a small pre-trained LLM as a model-level router. As illustrated in Figure A,
+774   we first prompt the router with the user’s question using a template designed to elicit domain
+775   classification. Specifically, when a user query is received, it is embedded into the prompt template
+776   to form a structured question, as shown in Table A. This structured question is then processed by
+777   the router to perform domain classification. Based on the router’s response, we then dynamically
+778   load the corresponding compressed delta weights for the selected domain-specific model, such as a
+779   mathematical model, to generate outputs.
+780
+781                                      Prompted                 Model
+782                Question              Question                 Choice
+783
+784                            Prompt
+          User                                      Router                 ❌      ❌       ✅             Answer
+785                           Template
+786   Figure A: An illustration of the model-level routing. We first prompt the model-level router with the
+787   user query using a template (See Table A for more details) that presents a list of potential domains.
+788   The router then assesses these options and selects the most relevant domain by answering a multiple-
+789   choice question, effectively classifying the query into the corresponding category.
+790
+791                             Table A: Prompt template for model-level routing.
+792
+       P ROMPT TEMPLATE FOR MODEL - LEVEL ROUTING
+793    Classify the query based on the required expertise. Route the query to the appropriate model for a precise
+794    response. Only output the letter corresponding to the best category (A, B, C, . . . , F).
+795    Query: {Insert the user’s query here. }
+796    Options: A) Instruct - For general guidance, explanations, or broad advice. B) Code - For programming-related
+797    queries, like debugging or coding. C) Math - For mathematical inquiries, such as problems or theories. D)
+798    Chinese Language Expert - For inquiries related to the Chinese language, including translation, grammar, and
+799    usage. . . . F) {Specify additional categories and their descriptions here.}
+800    Response should be only ‘A’, ‘B’, ‘C’, . . . or ‘F’, with no additional text.
+801
+802
+803   Since the router is not explicitly trained for query domain classification, its initial routing performance
+804   may be suboptimal. To improve the routing performance, we construct a multiple-choice question-
+805   answering dataset tailored for our routing problem. We collect instruction-following data from
+806
+      various domains and insert the query into the prompt template as shown in Figure A. The responses
+      are constructed by considering the correct domain-specific model choice. We then fine-tune the router
+807
+      with our constructed dataset using supervised fine-tuning to further improve the routing accuracy.
+808
+809   Comparisons with routing in Mixture of Experts (MoE). Besides model-level routing, another
+      approach to handle diverse user queries efficiently is to construct a MoE using a set of pre-trained
+
+
+                                                             15
+      Under review as a conference paper at ICLR 2025
+
+
+810
+      expert models. This can be achieved by integrating the feedforward layers from all pre-trained
+811   LLMs into a single MoE module at each attention-FFN block, and merging other layers, such as
+812   self-attention layers, by simply averaging their weights (Sukhbaatar et al., 2024). An additional
+813   gate network is introduced for each MoE module to perform token-level routing. However, this
+814   approach requires extensive fine-tuning of the entire network parameters and the gating network, as
+815   there is a significant gap between MoE experts and pre-trained LLMs. For example, training an MoE
+816   using existing Math, Code, and Wikipedia experts requires over 900 GPU days (Sukhbaatar et al.,
+817   2024). Notably, each expert in an MoE tends to become a generalist across all domains due to the
+818   load balancing loss, which encourages an even distribution of the workload among experts (Fedus
+819
+      et al., 2022; Jiang et al., 2024). This contrasts with pre-trained expert models, which are typically
+      specialized for specific domains. Compared with MoE, our model-level routing has a significantly
+820
+      lower training cost, as we only need to train a router while keeping the expert models frozen.
+821
+822
+823   B      I MPLEMENTATION DETAILS OF MODEL - LEVEL ROUTING
+824
+825   We use Qwen1.5-1.8B-Chat (Bai et al., 2023) as the model-level router. We construct the training
+826   data using samples from various domains, as mentioned in Section A. To balance the dataset, we
+827   extract an equal number of samples from each domain-specific dataset. This constructed dataset is
+828   used to fine-tune model-level router through supervised fine-tuning for 4 epochs on a machine with 8
+829   × A100 GPUs. We use the AdamW optimizer with β1 = 0.9 and β2 = 0.95, setting the learning rate
+830   to 3 × 10−4 and applying a linear learning rate warmup. The weight decay is set to 0.01. We set the
+831   per-device mini-batch size to 8 and use gradient accumulation steps of 2.
+832
+833
+      C      P SEUDO - CODES OF OUR T RITON KERNEL
+834
+835
+836
+      We show the core PyTorch style pseudo-codes of the Triton kernel in Figure B.
+837
+838   D      R ESULTS OF MODEL - LEVEL ROUTING
+839
+840
+      We present the results of model-level routing in Table B. The results indicate that model-level
+841
+      routing achieves nearly lossless performance when applied to both BF16 models and our ME-Switch
+842   compressed models. For instance, for Mistral-7B family, combining ME-Switch with model-level
+843   routing achieves lossless performance on the Code domain and results in only a 0.2% accuracy drop
+844   in the Mathematical domain. These results demonstrate the effectiveness of model-level routing in
+845   accurately handling user queries.
+846
+847
+848                        Table B: Routing results for Mistral-7B and LLaMA-2-13B families.
+849
+                                               MMLU (%) ↑                    Mathematical Reasoning (%) ↑      Code Generation (%) ↑
+850               Model
+                                    STEM    Hums.   Social   Other   Avg.    GSM8K     Math      Avg.       HumanEval       MBPP       Avg.
+851
+        Dolphin-2.2.1-Mistral-7B    52.05   68.83   73.42    65.43   63.43    63.68    12.80     38.24        42.70         54.90     48.80
+852
+          MetaMath-Mistral-7B       50.45   66.82   71.63    64.60   61.87    73.92    20.62     47.27         0.00         21.60     10.80
+853    Speechless-Code-Mistral-7B   51.82   68.35   73.74    65.69   63.36    61.18    13.52     37.35        51.20         60.40     55.80
+854       BF16 Baseline w/ Router   52.05   68.83   73.42    65.43   63.43    74.15    20.72     47.44        51.20         60.40     55.80
+855           ME-Switch             53.17   69.09   73.88    65.40   63.95    73.62    20.48     47.05        51.80         60.70     56.25
+856        ME-Switch w/ Router      51.49   68.37   73.60    66.08   63.32    73.39    20.30     46.85        51.80         60.70     56.25
+857                                            MMLU (%) ↑                    Mathematical Reasoning (%) ↑             Chinese (%) ↑
+                  Model
+858                                 STEM    Hums.   Social   Other   Avg.    GSM8K     Math      Avg.        C-Eval       C-MMLU       Avg.
+859       LLaMA-2-13B-Chat          44.26   59.79   63.20    56.57   54.60    43.75    5.20      24.48        36.13         38.71     37.42
+860         MetaMath-13B            37.81   52.77   56.00    50.05   47.84    69.14    8.48      38.81        33.62         32.70     33.16
+861    LLaMA2-Chinese-13B-Chat      45.24   60.01   62.47    55.92   54.67    38.89    4.54      21.72        40.28         39.16     39.72
+
+862       BF16 Baseline w/ Router   44.17   59.73   63.20    56.57   54.55    68.61    8.52      38.57        40.28         39.16     39.72
+863           ME-Switch             44.57   60.87   64.00    58.04   55.45    70.05    13.20     41.63        40.13         39.91     40.02
+           ME-Switch w/ Router      44.51   60.87   64.00    58.04   55.43    69.90    13.14     41.52        40.13         39.84     39.99
+
+
+
+                                                                      16
+      Under review as a conference paper at ICLR 2025
+
+
+864
+      def twobit dequant bmm scale kernel(a ptr, b ptr, c ptr, scales ptr, M, N, K, stride am, stride ak, stride bk, stride bn,
+865          stride cm, stride cn, stride scales, stride batch a, stride batch b, stride batch c, stride batch scale, BLOCK SIZE M: tl.
+             constexpr, BLOCK SIZE N: tl.constexpr, BLOCK SIZE K: tl.constexpr, GROUP SIZE M: tl.constexpr, ACTIVATION: tl.constexpr,
+866   ):
+867       """Kernel for computing the matmul C = A x B.
+          A has shape (B, M, K), float
+868       B has shape (B, K//n bits, N), int, packed boolean
+          C has shape (B, M, N),
+869       scales is of shape (N) float16
+          """
+870       # −−−−−−−−−−−−−−−−−−−−−−−−−−−−−−−−−−−−−−−−−−−−−−−−−−−−−−−−−−−
+871       # Map program ids ‘pid‘ to the block of C it should compute. This is done in a grouped ordering to promote L2 data reuse.
+                  See above ‘L2 Cache Optimizations‘ section for details.
+872       pid = tl.program id(axis=0)
+          pid batch = tl.program id(axis=1)
+873
+         num pid m = tl.cdiv(M, BLOCK SIZE M)
+874      num pid n = tl.cdiv(N, BLOCK SIZE N)
+         num pid k = tl.cdiv(K, BLOCK SIZE K)
+875
+876      num pid in group = GROUP SIZE M ∗ num pid n
+         group id = pid // num pid in group
+877      first pid m = group id ∗ GROUP SIZE M
+         group size m = min(num pid m − first pid m, GROUP SIZE M)
+878
+         pid m = first pid m + (pid % group size m)
+879      pid n = (pid % num pid in group) // group size m
+880
+         offs m = (pid m ∗ BLOCK SIZE M + tl.arange(0, BLOCK SIZE M)) % M
+881      offs n = (pid n ∗ BLOCK SIZE N + tl.arange(0, BLOCK SIZE N)) % N
+
+882      offs am = tl.max contiguous(tl.multiple of(offs m, BLOCK SIZE M), BLOCK SIZE M)
+         offs bn = tl.max contiguous(tl.multiple of(offs n, BLOCK SIZE N), BLOCK SIZE N)
+883      offs k = tl.arange(0, BLOCK SIZE K)
+884
+         a ptrs = a ptr + (offs am[:, None] ∗ stride am + offs k[None, :] ∗ stride ak) + pid batch ∗ stride batch a
+885
+         # Adapted from GPTQ−Triton (https://github.com/fpgaminer/GPTQ−triton)
+886      # b ptrs is set up such that it repeats elements along the K axis n bits times
+         b ptrs = b ptr + ((offs k[:, None] // 16) ∗ stride bk + offs bn[None, :] ∗ stride bn) + pid batch ∗ stride batch b
+887      scales ptrs = scales ptr + offs bn ∗ stride scales + pid batch ∗ stride batch scale
+888
+         # (BLOCK SIZE K, BLOCK SIZE N)
+889      # shifter is used to extract each bit of each element in the int matrix
+         shifter = (offs k % 16) ∗ 2
+890      scales = tl.load(scales ptrs)
+891      # −−−−−−−−−−−−−−−−−−−−−−−−−−−−−−−−−−−−−−−−−−−−−−−−−−−−−−−−−−−
+         # Iterate to compute a block of the C matrix.
+892      # We accumulate into a ‘[BLOCK SIZE M, BLOCK SIZE N]‘ block
+893      # of bf32 values for higher accuracy.
+         # ‘accumulator‘ will be converted back to bf16 after the loop.
+894      accumulator = tl.zeros((BLOCK SIZE M, BLOCK SIZE N), dtype=tl.float32)
+         for k in range(0, num pid k):
+895          # Load the next block of A and B, generate a mask by checking the K dimension.
+             # If it is out of bounds, set it to 0.
+896          a = tl.load(a ptrs)
+897          # b = tl.load(b ptrs, mask=offs k[:, None] < K − k ∗ BLOCK SIZE K, other=0)
+             b = tl.load(b ptrs) # (BLOCK SIZE N,)
+898
+             # Convert B from int to a.dtype
+899          # b: (BLOCK SIZE K, BLOCK SIZE N)
+             b = (b >> shifter[:, None]) & 0x3
+900          b = (b − 2).to(a.dtype)
+901          b = b ∗ scales[None, :] # BF16
+             # b = b.to(a.dtype)
+902
+             # We accumulate along the K dimension.
+903          accumulator += tl.dot(a, b)
+             # Advance the ptrs to the next K block.
+904          a ptrs += BLOCK SIZE K ∗ stride ak
+905          # b ptrs += BLOCK SIZE K ∗ stride bk
+             b ptrs += (BLOCK SIZE K // 16) ∗ stride bk
+906      # You can fuse arbitrary activation functions here
+         # while the accumulator is still in BF32!
+907      # if ACTIVATION == "leaky relu":
+         # accumulator = leaky relu(accumulator)
+908      c = accumulator.to(tl.float16)
+909      # −−−−−−−−−−−−−−−−−−−−−−−−−−−−−−−−−−−−−−−−−−−−−−−−−−−−−−−−−−−
+910      # Write back the block of the output matrix C with masks.
+         offs cm = pid m ∗ BLOCK SIZE M + tl.arange(0, BLOCK SIZE M)
+911      offs cn = pid n ∗ BLOCK SIZE N + tl.arange(0, BLOCK SIZE N)
+         c ptrs = (
+912          c ptr
+             + stride cm ∗ offs cm[:, None]
+913          + stride cn ∗ offs cn[None, :]
+914          + pid batch ∗ stride batch c
+         )
+915      c mask = (offs cm[:, None] < M) & (offs cn[None, :] < N)
+         tl.store(c ptrs, c, mask=c mask)
+916
+917
+          Figure B: PyTorch style pseudo codes of channel disassembly and assembly during runtime.
+
+                                                                     17
+      Under review as a conference paper at ICLR 2025
+
+
+918
+      E    M ORE PERFORMANCE COMPARISONS WITH DIFFERENT WEIGHT- ONLY
+919
+           QUANTIZATION METHODS
+920
+921
+      We present the detailed results of Figure 4 in Table C. A comprehensive analysis is available in
+922
+      Section 5.2.
+923
+924          Table C: Performance comparisons with different weight-only quantization methods.
+925
+926                 Domain              Dataset          BF16      1-bit     AWQ        Random       Wanda          Slim-LLM         Magnitude   Ours
+
+927               Instruct (%) ↑        MMLU             63.43     63.14     63.32       63.19           63.19       63.26             63.04     63.43
+928                                    GSM8K             73.92     53.45     53.75       54.66           58.07       57.16             54.89     59.14
+929                Math (%) ↑           Math             20.62      1.50      1.72       1.82             2.14        2.00              1.64     1.74
+                                        Avg.             47.27     27.48     27.74       28.24           30.11       29.58             28.27     30.44
+930
+                                   HumanEval             51.20     47.00     47.00       46.30           48.20       48.20             48.20     47.60
+931
+                   Code (%) ↑        MBPP                60.40     58.40     58.10       58.60           58.60       58.40             58.90     60.70
+932                                  Avg.                55.80     52.70     52.55       52.45           53.40       53.30             53.55     54.15
+933                 Domain              Dataset          BF16      2-bit     AWQ        Random       Wanda          Slim-LLM         Magnitude   Ours
+934
+                  Instruct (%) ↑        MMLU             63.43     63.72     63.65       63.71           63.90       63.68             63.94     63.95
+935
+                                       GSM8K             73.92     73.31     73.24       73.01           72.71       72.93             73.16     73.62
+936                Math (%) ↑           Math             20.62     20.44     19.98       20.52           20.64       20.16             20.08     20.48
+937                                     Avg.             47.27     46.88     46.61       46.77           46.68       46.55             46.62     47.05
+938                                HumanEval             51.20     47.00     47.00       48.80           50.60       48.20             50.00     51.80
+939                Code (%) ↑        MBPP                60.40     59.10     60.20       59.60           59.90       59.60             60.20     60.70
+                                     Avg.                55.80     53.05     53.60       54.20           55.25       53.90             55.10     56.25
+940
+941
+942
+943   F   E FFECT OF SUPERVISED FINE - TUNING IN MODEL - LEVEL ROUTING
+944
+945   To investigate the effect of supervised fine-tuning (SFT) on model-level routing, we evaluate the
+946   domain classification performance of the router (i.e., Qwen1.5-1.8B-Chat) across four domains:
+947   instruction, mathematics, code, and Chinese. As shown in Figure C, the pre-trained router performs
+948   poorly in domain classification without fine-tuning, achieving a Top-1 accuracy of only 5.80% on
+949
+      C-Eval. However, with SFT, the router’s performance improves significantly, reaching nearly 100%
+      accuracy across all domains. This demonstrates that supervised fine-tuning greatly enhances the
+950
+      instruction-following capabilities of the router, thereby improving its routing performance.
+951
+952                                                                      Without SFT                       With SFT
+953
+                                                                    99.92                100.00     100.00       100.00      99.91
+954                                           100         99.73                99.70
+                                   Accuracy (%)
+
+
+955
+                                                                                       62.80
+956
+                                                  50                        37.16
+                                                                                                                          45.30
+957
+958                                                    15.18
+                                                                  4.09                            3.70       5.80
+                                                   0
+                                                                      al PP   al
+959
+                                                         LU  8K th                  LU
+960                                                    MM GSM Ma manEv MB C-Ev C-MM
+961                                                               Hu
+962   Figure C: Effect of supervised fine-tuning (SFT) in model-level routing. We assess the performance
+963   of routing by measuring the accuracy on a 4-domain classification task (instruction, mathematics,
+964   code, and Chinese).
+965
+966
+967   G    BERT vs. SMALL LLM FOR MODEL - LEVEL ROUTING
+968
+969   In addition to smaller LLMs, we can also use BERT for domain classification given user queries.
+970   Specifically, we employ DistillBERT (Sanh, 2019) as the backbone and fine-tune it on our collected
+971   dataset (described in Section A) with just the queries and corresponding domain labels. We show the
+      router accuracy in Table D and the latency comparisons in Table E. From the results, DistillBERT
+
+
+                                                                                    18
+       Under review as a conference paper at ICLR 2025
+
+
+972
+       with a faster response time performs well across most datasets, except for MMLU where its limited
+973    capacity struggles with complex data. In contrast, our method consistently achieves good performance
+974    across all datasets, demonstrating its effectiveness even in complex scenarios. Moreover, our router’s
+975    inference latency is just 17.60ms for sequence lengths of 128, which is less than 7% of the inference
+976    time for expert models. Therefore, we continue to leverage Qwen1.5-1.8B-Chat for its proven
+977    effectiveness in challenging scenarios.
+978
+979
+                                   Table D: Router performance comparisons.
+980
+981
+                    Model         MMLU      GSM8K         Math   HumanEval      MBPP     C-Eval   C-MMLU
+982
+983             DistillBERT        73.29     100.00   99.80           96.34     100.00    99.97   100.00
+984           Qwen1.5-1.8B-Chat    99.73     99.92    99.70          100.00     100.00   100.00    99.91
+985
+986
+987                                 Table E: Router latency (ms) comparisons.
+988
+989                                     Sequence Length      128      256     512
+990                                     DistillBERT          3.70     3.80    4.90
+991                                   Qwen1.5-1.8B-Chat      17.60    18.30   19.10
+992
+993
+994
+995
+996
+997
+998
+999
+1000
+1001
+1002
+1003
+1004
+1005
+1006
+1007
+1008
+1009
+1010
+1011
+1012
+1013
+1014
+1015
+1016
+1017
+1018
+1019
+1020
+1021
+1022
+1023
+1024
+1025
+
+
+
+                                                            19

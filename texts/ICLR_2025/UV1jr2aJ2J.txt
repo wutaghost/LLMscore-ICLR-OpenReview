@@ -1,0 +1,1770 @@
+Under review as a conference paper at ICLR 2025
+
+
+000
+001
+      ACCO: ACCUMULATE WHILE YOU C OMMUNICATE ,
+002   H IDING C OMMUNICATIONS IN D ISTRIBUTED LLM
+003
+004   T RAINING
+005
+006
+       Anonymous authors
+007
+       Paper under double-blind review
+008
+009
+010
+011                                               A BSTRACT
+012
+013            Training Large Language Models (LLMs) relies heavily on distributed implemen-
+014            tations, employing multiple GPUs to compute stochastic gradients on model repli-
+015
+               cas in parallel. However, synchronizing gradients in data parallel settings induces
+               a communication overhead increasing with the number of distributed workers,
+016
+               impeding the efficiency gains of parallelization. To address this challenge, lo-
+017
+               cal optimization algorithms such as the ones used in Federated Learning have
+018            emerged. While effective in minimizing communication overhead, they incur
+019            significant memory costs, hindering scalability: in addition to extra momentum
+020            variables, optimizer’s states cannot be partitioned among workers as communi-
+021            cations are only allowed between rounds of local optimization steps. To conceal
+022            communication costs, we propose instead to synchronize delayed gradients while
+023            computing new ones between each model’s update and introduce ACcumulate
+024            while COmmunicate (ACCO), a memory-efficient optimization algorithm tailored
+025            for distributed training of LLMs. Accumulating local gradients on the workers un-
+026
+               til the communication finishes naturally reduces the idle time of GPUs and even
+               allows the use of heterogeneous hardware. However, we show that the one-step
+027
+               delay inherent in parallel execution of gradient computations and communications
+028
+               has drastic impacts on Transformers’ convergence. To compensate this delay we
+029            introduce a novel technique which leads to training dynamics aligned with stan-
+030            dard distributed optimization. Compared to ZeRO, our implementation and ex-
+031            periments on several LLMs pre-training and fine-tuning tasks demonstrates that
+032            ACCO reduces the learning time up to 87% and successfully allows both sharding
+033            optimizer states across workers and the use of heterogeneous hardware.
+034
+035
+036   1   I NTRODUCTION
+037
+038   Training Large Language Models (LLMs) with billions of parameters requires thousands of GPUs
+039
+      running in parallel (Touvron et al., 2023). This relies on a distributed version of the backpropagation
+      algorithm (Li et al., 2020) with a gradient-based optimizer such as Adam (Kingma & Ba, 2015) or
+040
+      AdamW (Loshchilov & Hutter, 2019). However at this scale, the communication overhead neces-
+041
+      sary to synchronize gradients between workers in the data parallel setting can dominate the time to
+042   compute the model updates (Ortiz et al., 2021), and it has been estimated that this will remain the
+043   case even if models and hardware evolve (Pati et al., 2023), hindering the benefits of parallelization.
+044   Moreover, as all workers are synchronized through gradient communication, the training only pro-
+045   ceeds at the speed of the slowest machine (straggler) (Dutta et al., 2021; Mishchenko et al., 2022a).
+046
+      To alleviate this issue, distributed optimization algorithms reducing the amount of communication
+047
+      between workers have been developed, such as local optimization methods (Stich, 2019; Wang et al.,
+048   2020b) which are especially used in Federated Learning (McMahan et al., 2017; Konecný et al.,
+049   2016). These methods authorize performing multiple optimization steps locally before communi-
+050   cating and synchronizing the distributed workers, reducing the communication overhead. As com-
+051   munication rounds can last longer than a local gradient computation (see Fig. 3), they also naturally
+052   allow to hide the cost of communications in the training time by running them in parallel to several
+053   consecutive local computation steps (Wang et al., 2020a; Shen et al., 2019; Zhang et al., 2015; Sun
+      et al., 2024). Moreover, on heterogeneous hardware, the number of computation steps can be tuned
+
+
+                                                        1
+      Under review as a conference paper at ICLR 2025
+
+
+054
+      locally to the worker’s speed so that slow ones compute less than fast ones, maxing out workers’
+055   usage (Diskin et al., 2021; Maranjyan et al., 2022).
+056
+057   However, this comes at a drastic memory cost. Indeed, in the standard data parallel setting, most of
+058
+      the memory consumption of model states comes from storing the optimizer’s parameters, especially
+      when training with mixed precision. To avoid the replication of redundant optimizer states across
+059
+      the workers, methods such as ZeRO (Rajbhandari et al., 2020a) shard them. Due to limited GPU
+060
+      memory and large models’ size, all frameworks used in practice nowadays to train LLMs at scale use
+061   a form of partitioning method (Rasley et al., 2020; Andonian et al., 2023). However these sharding
+062   methods rely heavily on the fact that each mini-batch gradient is averaged over all the workers
+063   during the backward step. This is no longer the case with local optimization algorithms: if it were,
+064   then an averaging would happen at each step, defeating the purpose of the local method. This forces
+065   each worker to host a full copy of the optimizer’s parameters, drastically increasing the memory
+066   requirements. Moreover, to prevent local steps from reducing the accuracy of the resulting model,
+067   local methods often introduce an outer optimizer step at each communication, which comes with
+068   additional momentum terms (Wang et al., 2020b; Sun et al., 2024). Hence, to store these variables,
+069
+      the latest state-of-the-art method CO2 (Sun et al., 2024) needs a memory overhead of 4 model copies
+      compared to a standard distributed Adam, which itself uses an order of magnitude more memory
+070
+      than its sharded version (Rajbhandari et al., 2020a). This raises the following question:
+071
+072     Is it possible to design a memory-efficient optimization algorithm that hides the communication
+073             cost of distributed training of LLMs and accommodates heterogeneous hardware?
+074
+075   To hide the communication cost while being memory-efficient, making sharded optimizers compat-
+076
+      ible with the idea of overlapping gradient computations and communications seems natural. The
+      concept of running two parallel processes is already present in the sharded optimization literature,
+077
+      but for a different purpose. ZeRO-Offload (Ren et al., 2021) introduces the ”Delayed Parameter
+078
+      Update” (DPU) which allows running the optimizer on the CPU while computing and averaging
+079   gradients on the GPU. By running these processes in parallel, the gradients computed during one
+080   step are on a version of the model parameters that are no longer up to date, as they have been up-
+081   dated by the optimizer concurrently. In practice, this one-step staleness hurts convergence, and the
+082   method can only be used after sufficiently many warmup steps of non-delayed optimization (Ren
+083   et al., 2021).
+084
+085   Contributions. We introduce ACcumulate while COmmunicate (ACCO), a memory-efficient op-
+086   timization algorithm that (1) allows to shard the optimizer parameters across workers, (2) over-
+087   laps gradients computations and communications, hiding the communication overhead while (3)
+088
+      maximizing GPU usage, even with heterogeneous hardware. (4) We introduce a novel method to
+      compensate for the one-step delay induced by parallel execution of the gradient computations and
+089
+      communications, removing the need for warmup steps and (5) perfectly matching the training dy-
+090
+      namics of standard distributed optimization. Our experiments across multiple LLMs training and
+091   fine-tuning tasks consistently show that ACCO allows for significant time gains. (6) We will release
+092   an open-source parallel implementation of ACCO with the final version of the paper.
+093
+094                        Compute estimates                   Compute     ↑       Comm. buffer → params    ↓      buffer → comm. buffer
+
+095                         acc.
+              GPU slow
+
+
+                         stream
+096
+                         comm.
+                                   Reduce-       Sharded     All-Gather        ↑↓       Reduce-       Sharded     All-Gather           ↑↓
+097                      stream
+                                   Scatter       Opt. step                              Scatter       Opt. step
+
+098
+099                         acc.
+              GPU fast
+
+
+                         stream
+100
+                         comm.
+                                   Reduce-
+                                   Scatter
+                                               Sharded
+                                               Opt. step
+                                                             All-Gather   ↑↓            Reduce-
+                                                                                        Scatter
+                                                                                                   Sharded        All-Gather     ↑↓ . . .
+                                                                                                   Opt. step
+101                      stream
+
+102                                                                                                                                        Time
+103
+104
+      Figure 1: ACCO with a slow and a fast worker running in parallel, showing no idle time on both
+105
+      and hiding communications. The delayed update is compensated by splitting the mini-batch in two,
+106   leading to two steps in our timeline. The first uses half of the mini-batch to estimate ”next step”
+107   parameters, and the second uses the full mini-batch to update them.
+
+
+                                                                               2
+      Under review as a conference paper at ICLR 2025
+
+
+108
+      2   R ELATED WORK
+109
+110
+      Local optimization methods. Local optimization methods perform several local model updates
+111
+      between periodic averaging. With the SGD optimizer, these algorithms predate the deep learning
+112
+      era (Zinkevich et al., 2010; McDonald et al., 2010), and their convergence properties are still in-
+113   vestigated nowadays (Zhou & Cong, 2018; Stich, 2019; Woodworth et al., 2020; Mishchenko et al.,
+114   2022b). Due to their practical and efficient communication scheme, they have since been used for the
+115   Distributed Training of Deep Neural Networks (DNNs) with methods such as EASGD (Zhang et al.,
+116   2015), SlowMo (Wang et al., 2020b) or Post-local SGD (Lin et al., 2020; Ortiz et al., 2021), and
+117   are ubiquitous in Federated Learning (McMahan et al., 2017; Konecný et al., 2016; Li et al., 2019),
+118   broadening the choice of optimizers beyond SGD (Reddi et al., 2021; Karimireddy et al., 2020; Chen
+119   et al., 2020). By overlapping communications over consecutive steps of local computations, they al-
+120   low to hide communication bottlenecks, resulting in algorithms such as Overlap local-SGD (Wang
+121
+      et al., 2020a), COCO-SGD (Shen et al., 2019) or CO2 (Sun et al., 2024). Moreover, with heteroge-
+      neous hardware, they can adapt their local computation rate to their hardware capacity (Diskin et al.,
+122
+      2021; Maranjyan et al., 2022). However this comes at the price of additional memory requirements:
+123
+      due to their local nature, not only do these methods prevent the use of sharded optimizers such as
+124   ZeRO (Rajbhandari et al., 2020a), but they also introduce additional control variables (Wang et al.,
+125   2020b; Mishchenko et al., 2022b; Sun et al., 2024), hindering their scalability as shown in Tab. 1.
+126   Moreover, catering for heterogeneous hardware is not straightforward, as using different numbers of
+127   local updates leads to models shifting at different speeds, requiring extra care to counter this effect
+128   (Maranjyan et al., 2022). On the contrary, ACCO does not lead to such disparities: it just affects how
+129   the required batch size is reached.
+130
+131   Overlap decentralized optimization. The communication complexity being a core concern in
+132   decentralized optimization (Yuan et al., 2016; Gorbunov et al., 2022), strategies have been devised to
+133   reduce communication overheads. For synchronous methods, works focus on designing algorithms
+134   with accelerated communication rates, leveraging Chebyshev polynomials (Scaman et al., 2017;
+135   Kovalev et al., 2020; Song et al., 2023). For the asynchronous ones, they rely on the properties of
+136   the graph resistance (Even et al., 2021; Nabli & Oyallon, 2023; Nabli et al., 2023). Alternatively,
+137
+      some approaches overlap gradient and communication steps, either explicitly (Assran et al., 2019),
+      or by modeling them with independent stochastic processes (Nabli & Oyallon, 2023; Nabli et al.,
+138
+      2023). However, none of these works focus on memory efficiency. Thus, they introduce additional
+139
+      variables and do not consider sharding the optimizer states. Moreover, they do not study optimizers
+140   other than SGD, and extending their beneficial properties to adaptive methods commonly used for
+141   DNN training such as Adam is still an ongoing research topic (Assran et al., 2020).
+142
+143
+      Memory-efficient distributed training of LLMs. The activation memory overhead required for
+144
+      training Transformers (Vaswani et al., 2017) can be mitigated for an extra computational cost by
+145   reconstructing the input with reversible architectures (Jacobsen et al., 2018; Mangalam et al., 2022),
+146   or recomputing the activations via checkpointing (Chen et al., 2016). Efficient LLM training also
+147   combines parallelism methods. Classical data parallelism (DP) (Dean et al., 2012) suffers both from
+148   a high communication volume and a linear increase in memory due to the model replicas. ZeRO-
+149   DP (Rajbhandari et al., 2020b) and Fully-Sharded DP (Zhao et al., 2023b) avoid this issue by shard-
+150   ing the model states (i.e., the optimizer states, gradients, and parameters) between workers. This
+151   comes at the cost of further increasing the synchronization between workers and the communication
+152   volume, which can be mitigated by compression (Wang et al., 2023), memory trade-offs (Zhang
+153
+      et al., 2022), or delayed gradients (Fournier & Oyallon, 2024). The memory can be even more re-
+      duced using expensive CPU-GPU communications to unload states on the CPU (Ren et al., 2021;
+154
+      Rajbhandari et al., 2021). On the other hand, model parallelism partitions the DNN components for
+155
+      parallelization, either with tensor parallelism (Shoeybi et al., 2019) by slicing a layer’s computation
+156   on several workers, or with pipeline parallelism, which divides a model into sets of layers trained in
+157   parallel on mini-batch slices. Popularized by Huang et al. (2019), this method leaves some workers
+158   idling and an inefficient memory overhead (Fan et al., 2021). Allowing delay in the gradients avoids
+159   worker idleness (Narayanan et al., 2019; Zhuang et al., 2020) but exacerbates the memory overhead,
+160   which can be partially mitigated with gradient accumulation (Narayanan et al., 2021; Zhuang et al.,
+161   2021) and activation checkpointing (Kim et al., 2020; Liu et al., 2023). Combining these frameworks
+      results in the effective 3D parallelism (Smith et al., 2022).
+
+
+                                                        3
+      Under review as a conference paper at ICLR 2025
+
+
+162
+      Delayed updates. Delays being intrinsic to distributed asynchronous optimization, there is a rich
+163   literature studying them. In the case of distributed SGD in a parameter server setting, while early
+164   analysis showed convergence rates depending on the maximal delay (Agarwal & Duchi, 2011; Stich
+165   & Karimireddy, 2020b), recent lines of work improved these dependencies (Koloskova et al., 2024;
+166   Wu et al., 2022; Feyzmahdavian & Johansson, 2023), proving that asynchronous SGD beats standard
+167   mini-batch SGD even with unbounded delays (Mishchenko et al., 2022a). However, they only study
+168   plain SGD, which is hardly used for DNN training. In this context, some work focused on the
+169   interplay between SGD with momentum and delays (Mitliagkas et al., 2016; Zhang & Mitliagkas,
+170   2019), while delay compensation schemes such as re-scaling updates (Zheng et al., 2017; Xie et al.,
+171
+      2020) or buffering them (Nguyen et al., 2022) were proposed for Federated Learning. But still, they
+      only study versions of SGD and not adaptive methods commonly used for LLMs training such as
+172
+      Adam (Kingma & Ba, 2015) or AdamW (Loshchilov & Hutter, 2019). Closer to our work, DPU
+173
+      was introduced as a memory-efficient way to train LLMs by running the optimizer on the CPU
+174   while gradients are computed on the GPU (Ren et al., 2021), inducing a one-step delay between
+175   the gradients computed and the corresponding optimizer step. To mitigate it, they advise starting
+176   training by warming up for several steps with a standard method with no delay. Perhaps surprisingly,
+177   we find in our experiments that this one-step delay has a noticeable influence on the convergence
+178   of LLMs training, even when using warmup steps. Contrary to DPU, we remove the need for
+179   them, with no impact on the convergence of our training. Moreover, as it is not its purpose, DPU
+180   still runs communications in the gradient computation stream, and is thus impacted both by the
+181   communication overhead of scaling and hardware heterogeneity. Finally, in pipeline parallelism,
+182
+      gradient delays also affect computation, and simple weight prediction methods have been proposed
+      to mitigate their effect (Chen et al., 2019; Yang et al., 2021). More elaborate predictions have been
+183
+      proposed for SGD to further reduce the impact of the delay (Kosson et al., 2021; Yang et al., 2020).
+184
+185
+186   Table 1: Characteristics and memory consumption of several methods. Ψ: number of parameters in
+187   the model. N : number of workers. K: memory multiplier of the optimizer (Adam or AdamW). For
+188   SlowMo (Wang et al., 2020b) and CO2 (Sun et al., 2024), no mention of mixed precision training is
+189   made. We assume they use it and that their additional terms are stored in half precision. While no
+190   additional momentum is required for our method, we still need a communication buffer.
+191
+                    Method                   No comm.        Handle hetero.       Sharded    No add.       Memory consumed       K = 12, N = 64,
+192                                          overhead          hardware             Opt.    momentum         per worker             Ψ = 7.5B
+193    Baseline DDP (Li et al., 2020)           ✗                    ✗              ✗          ✓             (2+2+K)×Ψ               120 GB
+       ZeRO-1 (Rajbhandari et al., 2020a)       ✗                    ✗              ✓          ✓            (2+2+ K
+                                                                                                                  N )×Ψ               31 GB
+194    SlowMo (Wang et al., 2020b)              ∼                    ✗              ✗          ✗          (2+2+2×2+K)×Ψ              150 GB
+195    CO2 (Sun et al., 2024)                   ✓                    ✗              ✗          ✗          (2+2+4×2+K)×Ψ              180 GB
+       ACCO (Ours)                              ✓                    ✓              ✓          ✓           (2+2+2+ K
+                                                                                                                   N )×Ψ              46 GB
+196
+197
+198
+      3    M ETHOD
+199
+200
+      In this section, we describe our method, including the approach to compensate for the delayed
+201   update. The algorithm will be described from the point of view of each worker i ∈ {1, ..., N }.
+202
+203   Delayed Parameter Update. First, we explain the presence of a delay by re-purposing the ”De-
+204   layed Parameter Update” (DPU) (Ren et al., 2021) to fit in our framework. Contrary to the original
+205   DPU, we run gradient communications in the same stream as the optimizer step, in parallel to the
+206   gradient computations. To prevent GPU i from being idle at step t, gradients are accumulated over
+207                           (t)
+      as many mini-batches Ni ≥ 1 as necessary until the communication process finishes, which varies
+208   depending on the speed of the worker as shown in Fig. 1. Each worker i starts from the same neural
+209   network parameters θ(0) ∈ Rd . F : Rd → R is the differentiable loss computed by our work-
+210   ers. A random mini-batch (modeled through the random variable ξ ∈ Ξ following some law P) is
+                                                                                                       (0)
+211   drawn from the local data shard Di to initialize the stochastic gradient gi (−1) = ∇F (θ(0) , ξi ) and
+212     (−1)
+      Ni     = 1. Then, for t ∈ [[0, T ]] we repeat the following, the left and right sides running in parallel:
+213
+                                      (t)
+214                                Ni                                                                                    !
+                                                                                                           P    (t−1)
+                           (t)
+                                    X
+                                                    (t)      (t)              (t+1)                (t)        g
+215                       gi =              ∇F (θ         , ξi,k )   ,   θ            = Opt θ            , P i i (t−1)       ,           (DPU)
+                                    k=1                                                                     i Ni
+
+
+                                                                              4
+      Under review as a conference paper at ICLR 2025
+
+
+216
+      where Opt is the optimizer of our choice (e.g. Adam or AdamW for LLM training). Note that the
+217   right side combines both the gradient averaging (communications) and the optimizer step, which
+218   runs in parallel to the gradient computations to the left. Remark that, except at the first step t = 0,
+219   the gradients used by Opt are computed on parameters θ(t−1) which differ from θ(t) , the ones we
+220   apply them to. This is inherently due to the parallel nature of our execution, and what we denote by
+221   ”delayed update”. We show in Sec. 5.2 that this has drastic impacts on the convergence in practice.
+222
+223   Toward ACCO. To counter this, we estimate what would be the parameters θ(t+2) in addition to
+224   computing θ(t+1) . This allows the gradients at the next round to be computed on these estimates
+225   rather than the parameters of the last step. We denote this rule by ”Weight Prediction” (WP). We
+                                                       (0)   (0)
+226   initialize a common θ(0) , g˜i (0) = ∇F (θ(0) , ξi ), Ni = 1 and θ̃(1) = Est(•), where Est is our
+227   estimation function that could take any argument at this point. This leads to the following:
+228
+229
+                          (t+1)
+                      Ni                                                               (t)
+                                                                                                 !
+230
+                                                                              P
+         (t+1)                                   (t+1)                             i g̃i
+                          X
+231    g̃i     =                  ∇F (θ̃(t+1) , ξi,k ) , θ(t+1) = Opt   θ(t) , P           (t)
+                                                                                                     , θ̃(t+2) = Est(•) . (WP)
+232                       k=1                                                  i Ni
+
+233   Thanks to Est, the optimizer now applies to the parameters θ(t) the gradients that were computed
+234   on an estimated version θ̃(t) , compensating the one-step delay. Akin to the idea of Chen et al.
+235   (2019) to counter delays in pipelining, a simple estimation function could be
+                                                                                   to re-use the gradients
+
+236                                                                                                             P
+                                                                                                                        g̃
+                                                                                                                             (t)
+      just received and apply a second optimizer step, i.e. using θ̃(t+2) = Opt θ(t+1) , P iNi(t) . We
+237                                                                                                               i      i
+
+238   investigate this method (denoted by ACCO-wp) in Sec. 5.2, but found that its training dynamic
+239   differs from the baseline, whereas ACCO, the algorithm we present next, perfectly matches it. The
+240
+241                acc.
+                stream
+242
+         GPU
+
+
+243            comm./opt.
+                 stream
+244
+245                             Init.        Step 1            Step 2                 Step 3                   Step 4
+246
+247
+248                 Figure 2: ACCO’s two-stage mechanism 1-2 to compensate the delayed updates.
+249
+      crux of ACCO is to split the computation of the mini-batch gradients into two successive stages,
+250
+      where the first half of the mini-batch is used to estimate θ̃(t+1) while θ(t+1) is computed using
+251
+      the full mini-batch. This is motivated by the fact that gradient accumulation is often used to reach
+252
+      the extremely large batch sizes required to train LLMs (Zhao et al., 2023a), and if gradients are
+253   computed sequentially on a worker, we can leverage this to produce our estimate. Thus, starting
+254                                                       (0)        (0)
+      with an initialized θ(0) , g˜i (0) = ∇F (θ(0) , ξi ) and Ni = 1, the two stages illustrated in Fig. 2
+255
+      are (left and right side running in parallel):
+256
+                                (t)
+257                          Ni                                                   P (t) !
+                       (t)
+                             X                  (t)                                   g̃
+258                   gi =          ∇F (θ(t) , ξi,k )      , θ̃(t+1) = Opt θ(t) , P i i (t) ,               (1)
+259                          k=1                                                   i Ñi
+260                              (t)                                                                    !
+                             Ñi
+                                                                                  P (t)          (t)
+                                            (t+1) ˜(t+1)                             i gi + g̃i
+                              X
+261                 (t+1)                                      (t+1)         (t)
+                g˜i        =         ∇F (θ̃      , ξi,k ) , θ         = Opt θ , P                   (t)
+                                                                                                          . (2)
+                                                                                         (t)
+262                           k=1                                                    N
+                                                                                   i i       + Ñ i
+263
+      We describe the different components of our two-stage mechanism as follows:
+264
+265            1 The gradient computation stream uses the second half of the mini-batch to compute the
+                             (t)
+266              gradients gi with respect to parameters θ(t) while the communication stream estimates
+267                                                                                              (t)
+                 what would be the next steps parameters θ̃(t+1) using the estimated gradients g̃i .
+268
+269
+               2 The computation stream uses the first half of the mini-batch to estimate what would be the
+                             (t+1)
+                 gradients g̃i     of the next parameters θ(t+1) using estimated parameters θ̃(t+1) while the
+
+
+                                                                 5
+      Under review as a conference paper at ICLR 2025
+
+
+270
+               communication stream computes θ(t+1) using the full mini-batch. Note that it starts from
+271                                                                                   (t)
+               the same version of the parameters θ(t) as in step 1. The first half g̃i was estimated at step
+272                                                        (t)
+273            2 of the last round, while the second half gi was just computed in 1.
+274
+275
+      Theoretical discussion. We can view DPU (with SGD as the optimizer Opt) as a parallel imple-
+      mentation of a Delayed-SGD (D-SGD) with a one-step delay. This algorithm with a delay of one has
+276
+      been studied in the convex setting, and is shown to converge at the same rate as SGD for quadratics
+277
+      (Arjevani et al., 2020) as well as for strongly and quasi convex functions (Stich & Karimireddy,
+278   2020a). Thus, one could hope that it would generalize to adaptive optimizers and non-convex func-
+279   tions such as the ones met when training DNNs. However in practice, when training LLMs with
+280   AdamW, our experiments in Sec. 5.2 reveal that this one-step delay drastically hurts performances.
+281   To remove the impact of staleness, ACCO avoids using delayed gradients. Indeed, with SGD as
+282   optimizer and learning rate γ > 0, the parameter update of equation 2 reads
+283                                              (t)                PÑi(t)
+                                        N PNi            (t) (t)                  (t) ˜(t)
+284                                            k=1 ∇F (θ , ξi,k ) +    k=1 ∇F (θ̃ , ξi,k )
+                                       X
+                       (t+1)    (t)
+                     θ       =θ −γ                                     (t)
+                                                                                           .
+285                                                           (t)
+                                       i=1                  Ni + Ñi
+286
+287
+      This can be interpreted as a form of plain SGD with no delay, and a potentially variable batch-size
+                                 (t)   (t)
+288   (modeled through the Ni , Ñi ) split in two parts. While ACCO uses a mix of stochastic gradients
+289   ∇F (θ(t) ), ∇F (θ̃(t) ), they are not delayed compared to the parameters updated θ(t) (see Fig. 2 for
+290   details). We verify experimentally this interpretation in Sec. 5 by showing that training LLMs with
+291   ACCO and standard distributed AdamW with the same batch-size leads to the same losses.
+292
+293   4   E MPIRICAL MOTIVATION AND CLUSTER SETTING
+294
+295   We empirically motivate the need for methods miti-
+296   gating communication overhead in Distributed Data       8
+297   Parallel (DDP) (Li et al., 2020). Our goal is to illus-
+298   trate that the time spent communicating gradients       6                            comp./comm.
+                                                            t (s)
+
+
+299
+      can quickly trump the one used for computing them                                        computation
+      when using DDP to train LLMs. For that, we mea-         4                              All-Reduce
+300
+      sure the time necessary to perform a forward and
+301                                                           2
+      backward pass on a Llama-2 model (Touvron et al.,
+302   2023) with 7B parameters hosted on a single GPU,        0
+303   using a batch size maxing out its memory. We com-           8 16 24 32       64                   128
+304   pare this to the time necessary to compute an All-                         # workers
+305   Reduce on those gradients with the NCCL backend,
+306   varying the number of distributed workers. On all
+307   the following, we experiment on our local cluster of Figure 3: Time (per worker) spent comput-
+308   NVIDIA A100-80GB GPUs with 8 GPUs per node ing and averaging gradients of a Llama-2 7B
+309   and an Omni-PAth interconnection network at 100 model for different numbers of GPUs.
+310
+      Gb/s for inter-node connections, intra-node connections being done with NVLink 300 GB/s. Each
+      distributed worker is hosted on a single GPU. We observe in Fig. 3 that when we communicate out-
+311
+      side of a GPU node in our cluster, the time needed to average the gradients across workers can take
+312
+      more than four times the one spent on the whole forward and backward step. As DDP only partially
+313   hides communications during the backward (Li et al., 2020), this means that our GPUs remain idle
+314   the majority of the time when we use more than 24 distributed workers, motivating the need for
+315   methods leveraging this time to compute instead.
+316
+317
+318
+      5   E XPERIMENTS
+319
+      In this section, we lay down our experiments. First in Sec. 5.1, we detail the common setup for all
+320
+      our experiments. Second, in Sec. 5.2, we illustrate the failings of DPU and ACCO-wp that we hinted
+321   at in Sec. 3, which led us to crafting ACCO. For this first exploration, we focus on small language
+322   models and datasets, using TinyStories (Eldan & Li, 2023) as our test-bed. Then in Sec. 5.3,
+323   we verify that ACCO allows to efficiently train LLMs at scale by considering a 125M parameters
+      GPT-Neo architecture (Black et al., 2021) and the OpenWebText dataset (Gokaslan et al., 2019).
+
+                                                        6
+      Under review as a conference paper at ICLR 2025
+
+
+324
+                                 GPU0            GPUi             Finally in Sec. 5.4, we consider even larger
+                                                                    GPUN-1
+325                                                               models by using ACCO for an instruction fine-
+      Baseline
+                        ...                  ...
+326                                                               tuning task with a 2.7B parameters GPT-Neo,
+327                                                               which accentuates the effects of the inter-node
+      ZeRO-1
+
+
+
+328                                                               communication bottlenecks and highlights all
+                        ...                  ...
+329                                                               the more the benefits of our method. They
+330                                                               are further displayed in Sec. 5.5 where we
+                                                                  compare between ACCO and DDP on hetero-
+      Acco
+
+
+331                     ...                  ...
+332                                                               geneous hardware. Our method allows faster
+333          Parameters    Gradients Comm. buffer Optimizer State
+                                                                  GPUs to accumulate while they wait for the
+                                                                  slowest worker instead of remaining idle as in
+334
+                                                                  DDP, thus allowing us to compute gradients for
+335   Figure 4: Memory requirements of ACCO vs DDP large batch sizes faster than the baseline, result-
+336   and ZeRO-1, see Tab.1 for quantitative details.             ing in quicker convergence in wall-clock time.
+337
+338
+      5.1                  E XPERIMENTAL SETUP
+339
+340   All of our experiments are performed on the GPU cluster described in Sec. 4. A detailed pseudo-
+341   code for ACCO can be found in Appendix B.2. Our code is in Pytorch (Paszke et al., 2019), and
+342   we verified that our implementation produces two different CUDA streams running in parallel for
+343   the computations and communications using NVIDIA’s Nsight System to profile it, as shown in Fig.
+344   13. We trained all our models with AdamW (Loshchilov & Hutter, 2019), using mixed precision:
+345   our model parameters, gradient accumulation buffer, and communication buffers are in bfloat16
+346
+      (Kalamkar et al., 2019) while our sharded optimizer states are in single precision, as shown in Fig.
+      4. As nowadays all distributed frameworks training LLMs at scale use a form of partitioning due to
+347
+      GPU memory constraints (Rasley et al., 2020; Andonian et al., 2023), our main baseline is Pytorch’s
+348
+      Distributed Data Parallel (DDP) (Li et al., 2020) with ZeRO-1 (Rajbhandari et al., 2020a) to shard
+349   the optimizer’s state. As justified in Tab. 1, local optimization methods cannot be realistically
+350   considered for memory reasons. To compare in good faith DPU to ACCO in terms of wall-clock
+351   time, we also implemented our own version of DPU, as the available implementation (Ren et al.,
+352   2022) solves a different problem than ours. The original algorithm does not run parallel computation
+353   and communications as it is designed to host the optimizer on the CPU, and is slower than ZeRO
+354   due to recurrent memory transfers between CPU and GPU (Ren et al., 2021).
+355
+356   5.2                  C RAFTING ACCO ON T INY S TORIES
+357
+358
+      Here, we experiment with small language models on the TinyStories dataset (Eldan & Li, 2023),
+      following the configuration and training hyper-parameters of their paper (Eldan & Li, 2023) to the
+359
+      best of our abilities. Hence, we use a 36M parameters GPT-Neo based (Black et al., 2021) decoder-
+360
+      only transformer architecture. To match the 10k vocabulary they used, we trained our own BPE
+361   tokenizer on the TinyStories dataset. For our experiments, we used 8 workers on a single node.
+362
+363
+364                                                            Method                                                        Method
+                             8                                ACCO                         8                                ACCO
+365                                                           DDP                                                           DDP
+                 Training loss
+
+
+                                                                               Training loss
+
+
+366                          6                                DPU                          6                                DPU-warmup 500
+367                                                           DPU-warmup 40
+                                                              DPU-warmup 500
+368                          4                                                             4
+369
+370                          2                                                             2
+371
+                                    0   10000    20000    30000     40000                      0      20000    40000    60000     80000
+372                                             # minibatch                                                   # minibatch
+373                (a) Training with the specified amount in (Eldan &                      (b) Training for twice the specified amount.
+374                Li, 2023).
+375
+376
+377
+                           Figure 5: Impact of the delayed update and the amount of warmup steps on the training
+
+
+
+                                                                               7
+      Under review as a conference paper at ICLR 2025
+
+
+378
+      Impact of delayed updates. First, we investigate the impact of using delayed updates, re-
+379   purposing DPU (Ren et al., 2021) as described in Sec. 3. We run three variants of this algorithm:
+380   (1) with no warmup, (2) with 40 warmup steps of non-delayed optimization step before switching
+381   to DPU (recommended recipe in (Ren et al., 2021)), and (3) with 500 steps of warmup. We report
+382   in Fig. 5 our training losses on 8 distributed workers averaged over 3 runs. We remark that using
+383   delayed updates greatly hurts convergence, especially when no or too few warmup steps are per-
+384   formed. Surprisingly, the number of warmup steps given in (Ren et al., 2021) does not work here,
+385   hinting that it is a sensitive hyper-parameter to tune for each use-case. If we train for twice as long
+386   than specified in Eldan & Li (2023), then the DPU training curve approaches the baseline one, with-
+387
+      out totally catching it. Contrary to this, the training curve of our algorithm ACCO perfectly matches
+      DDP’s one from the beginning.
+388
+389
+390
+391
+      A simple approach to compensate delays. To                                              Method
+392   mitigate the detrimental impact of using delayed       8                                 ACCO
+393   updates, we test a first approach to mitigate it:                                        DDP
+
+
+                                                            Training loss
+394   ACCO-wp, the Weight Prediction method described        6                                 ACCO-wp
+395   in Sec. 3. This method applies two consecutive
+396   optimizer steps, re-using the same mini-batch of       4
+397   gradients twice. The first step produces the usual
+398   updated parameters, while the second predicts the      2
+399   parameters of the next step so that gradients can be
+      computed on this estimate rather than on a stale ver-     0      10000   20000    30000   40000
+400
+      sion of the model. In Fig. 6 we compare the training                    # minibatch
+401
+      curves of this delay-compensation method to ours.
+402
+      We remark that, while ACCO perfectly matches the Figure 6: Comparison of ACCO with its
+403   DDP baseline at all times, ACCO-wp displays worse Weight Prediction version on TinyStories.
+404   behavior, especially at the beginning of the training.
+405   Thus, we dismiss this method and keep ours for the remaining of the experiments.
+406
+407
+408
+409   5.3   PASSING THE SCALING TEST: TRAINING GPT-N EO ON O PEN W EB T EXT
+410
+411
+412
+      To assess how ACCO scales with larger mod-              Table 2: Perplexity of our trained LLMs
+      els and more data, we pre-trained a model           Method     LAMBADA (ppl ↓) OpenWebText (ppl ↓)
+413
+      equivalent to GPT-2 (Radford et al., 2019) with     ACCO 1x8          47.1                24.2
+414
+      both ACCO and DDP with a ZeRO optimizer.            DDP 1x8           47.5                24.3
+415   Specifically, we used the GPT-Neo architecture      ACCO 4x8          45.5                22.5
+416   (Black et al., 2021) with 125 million parameters    DDP 4x8           44.1                21.7
+417   and the OpenWebText dataset (Gokaslan et al.,
+418   2019), which contains 40 GB of text. We used the GPT-Neo tokenizer, pre-trained on the Pile
+419   dataset (Gao et al., 2020). The models were trained on sequences of 1024 tokens, with documents
+420   concatenated using end-of-sequence tokens. To assess the impact of using different hardware, the
+421   experiment was repeated on 2 different clusters. The first was conducted on 8 H100-PCIe 80GB on
+422   a single node. The second was on 32 A100-80G GPU distributed on 4 nodes. We maxed out the
+423
+      memory of our GPUs with a local mini-batch size of 24. To reach a sufficiently large overall batch
+      size, we used 1 step of gradient accumulation for DDP, and none for ACCO as our method naturally
+424
+      accumulates over 1 step, resulting for the first and second experiments in respectively 400K and
+425
+      1.5M tokens per effective batch for both ACCO and DDP. In Tab. 3, we report additional experimen-
+426   tal details, and notice that training with ACCO allows for a 25% speedup on this pre-training task,
+427   which is additionally illustrated in Fig. 7. We also report that our implementation of ACCO adap-
+428   tively scheduled 315 supplementary accumulation steps over the whole training to prevent GPUs
+429   from idling while waiting for communications. Further details and results for the H100 experiment
+430   can be found in Appendix A. Tab. 2 reports the perplexity of trained language models with both
+431   methods. We evaluate the perplexity of language models on LAMBADA (Paperno et al., 2016) and
+      a test split of OpenWebText, and report similar results for both methods.
+
+
+                                                        8
+      Under review as a conference paper at ICLR 2025
+
+
+432
+433                  10                                       Method                             10                                      Method
+434                                                                 ACCO                                                                    ACCO
+                                                                    DDP                                                                     DDP
+        Training loss
+
+
+                                                                                 Training loss
+435                        8                                                                     8
+436
+437                        6                                                                     6
+438
+                           4                                                                     4
+439
+440
+                               0.0    0.5        1.0        1.5            2.0                        0       1000      2000      3000    4000     5000
+441                                          # minibatch                   1e6                                              Time (s)
+442          (a) Evolution of the loss over the whole training. (b) Focus on the first part of the training w.r.t time.
+443
+444
+445                  Figure 7: Training curves for ACCO and DDP with 32 workers trained for 50B tokens.
+446
+447
+      5.4          A DVANTAGES OF USING ACCO FOR INSTRUCTION FINE - TUNING
+448
+449   In previous sections, we compared ACCO against DDP with ZeRO in the pre-training stage. To
+450   further validate our algorithm, we consider the GPT-Neo 2.7B model (Black et al., 2021) pre-trained
+451   on the Pile dataset (Gao et al., 2020) and finetuned it on the Alpaca dataset (Taori et al., 2023)
+452   containing 52k pairs of instruction/answer. We fine-tuned the model using two configurations: 8
+453   A100-80G on a single node, and 8 A100-80G distributed equally across 2 nodes. Samples are
+454   padded to match the longest sequence in the mini-batch. We fixed the mini-batch size at 4, leading
+455   to a total batch size of 128 for all methods. For DDP and DPU, we used a gradient accumulation of
+456
+      4, while for ACCO , a gradient accumulation of 2 to account for the ACCO accumulation described
+      in Sec. 1. The learning rate was set to 2 × 10−5 for all methods with a warmup of 50 steps, for DPU.
+457
+458
+459
+                                                                  Method                                                                  Method
+460
+                        1.20                                            ACCO                                                                 ACCO
+                                                                                             1.3
+         Validation loss
+
+
+                                                                               Validation loss
+
+
+461                                                                     DDP                                                                  DDP
+462                                                                     DPU
+463                     1.15                                                                 1.2
+464
+465
+466
+                        1.10                                                                 1.1
+467                              0     200         400            600                                     0          2000        4000      6000
+468                                            Time (s)                                                                     Time (s)
+469
+470   Figure 8: Validation curve with 8 workers on 1 node (left), and 4 workers/node on 2 nodes (right).
+471
+472   In this setting, padding to the longest sequence in the mini-batch induces more variability in the
+473   number of tokens per mini-batch. This results in more variability in the computational load for each
+474   worker, leading to increased wait times for synchronization. We observe in Fig. 8 that ACCO hits
+475   a low validation loss faster than DDP on both settings. Note that the difference between ACCO and
+476   DDP is accentuated when workers are distributed on multiple nodes, leading to a 87% speedup for
+477
+      ACCO (see Tab. 3) and highlighting the impact of communication bottlenecks on standard methods.
+478
+479     Table 3: Pre-training and finetuning time speedup with ACCO against DDP on various setups.
+480
+        Stage                        Model                 GPUs          #tokens                   DDP w/ ZeRO-1               ACCO         (∆T )
+481
+482                                                        1x8           6B                        4h41min                     4h25min      (−5.69%)
+        Pre-training                 GPT-Neo-125M
+                                                           4x8           50B                       14h41min                    10h55min     (−25.65%)
+483
+484                                                        1x8           80M                       43min                       25min        (−41.86%)
+        Finetuning                   GPT-Neo-2.7B
+485                                                        2x4           80M                       3h46min                     29min        (−87.17%)
+
+
+
+                                                                                 9
+      Under review as a conference paper at ICLR 2025
+
+
+486
+      5.5   E XPERIMENT U SING H ETEROGENEOUS D EVICES
+487
+488   To witness the impact of using heterogeneous devices, we run ACCO and compare it to DDP in a four
+489   workers setting, with one of the GPU four times slower than the other three. The training setting is
+490   the same as in Sec. 5.2. As we experiment on a A100 GPUs cluster, we simulate the heterogeneity
+491   of the hardware using the time.sleep() python command. First, we measure the time that
+492   a standard forward-backward step takes, and make one of the four GPUs idle for three times this
+493   amount after each forward-backward pass. In this context, DDP is only as fast as the slowest worker:
+494
+      3 out of the 4 workers are idle 3/4 of the time. With ACCO, the other workers accumulate during
+      the time they are waiting for the slow one to finish. Thus, ACCO allows to compute gradients for
+495
+      large batch sizes faster than standard baselines, resulting in faster convergence in terms of wall-clock
+496
+      time, as displayed in Fig. 9.
+497
+498                                                                       4
+                                                   Method
+499                       8                           ACCO                                                                        300
+                                                                          3
+
+
+                                                             # acc. / round
+                                                      DDP
+              Training loss
+
+
+500
+                          6                                                                                                       200
+
+
+                                                                                                                                      t (ms) /
+501
+
+
+                                                                                  t (ms)
+                                                                          2                #            #            #
+502                       4
+503                                                                       1                                                       100
+
+
+                                                                                               t (ms)
+
+
+                                                                                                            t (ms)
+
+
+                                                                                                                         t (ms)
+                          2                                                   #
+504
+                                                                          0                                                       0
+505                           0   500       1000   1500                           0            1            2            3
+506                                     Time (s)                                               GPU rank
+507
+508             Figure 9: Training curves with 3 normal workers and 1 slow worker (4× slower).
+509
+510
+511   6     L IMITATIONS
+512
+513   Experiments mainly on one cluster environment. Due to the lack of variety in the compute
+514   environments we have access to, the majority of our experiments were performed on a single cluster,
+515   described in Sec. 4. This is a communication-constrained setting, as our hardware is not the most
+516   cutting-edge in that regard as discussed in Sec. 4. However, to mitigate this one-sidedness, we also
+517   run a small pre-training study on one of the fastest hardware available today, and report in Tab. 3
+518   that even in that case, ACCO leads to a 5% time gain.
+519
+520
+      Communication cost only hidden, not reduced. While local optimization methods tackle the
+      communication overhead problem with scarce communications, here we only hide them. Thus, our
+521
+      method does not lead to energy savings, nor question the cost of highly synchronized infrastructure.
+522
+      However, ACCO naturally maximizes the hardware throughput, allowing to reduce their use time.
+523
+524
+      Further memory savings avenue not explored. Due to the parallel nature of ACCO, removing the
+525   reliance on communication and gradient buffers seems hardly possible, questioning the feasibility
+526   of further memory savings if all executions are kept on the GPU. But, akin to ZeRO-Offload (Ren
+527   et al., 2021), the communication and optimizer stream could entirely be run on CPU, which would
+528   allow significant memory gains. We did not experiment with this idea, and let it for future work.
+529
+530
+      C ONCLUSION
+531
+532
+      We propose ACCO, a novel algorithm that jointly addresses the memory and communication chal-
+533
+      lenges inherent in training LLMs on distributed systems. By allowing for parallel computation and
+534   communication of gradients while partitioning the optimizer states, ACCO effectively reduces com-
+535   munication overhead in a memory-efficient fashion. We introduce a novel two-stage mechanism to
+536   compensate for the delayed update inherent to this parallel setting, which ensures consistent conver-
+537   gence dynamics with the standard optimization algorithm for large-scale distributed LLM training
+538   without the need for warmup steps. We empirically confirm the benefits of our methods over sev-
+539   eral pre-training and finetuning tasks, reporting drastically reduced training times compared to our
+      baseline, especially in multi-node settings or with heterogeneous devices.
+
+
+                                                             10
+      Under review as a conference paper at ICLR 2025
+
+
+540
+      R EFERENCES
+541
+542   Alekh Agarwal and John C Duchi.        Distributed delayed stochastic optimization. In
+543     J. Shawe-Taylor, R. Zemel, P. Bartlett, F. Pereira, and K.Q. Weinberger (eds.), Ad-
+544     vances in Neural Information Processing Systems, volume 24. Curran Associates, Inc.,
+545
+        2011. URL https://proceedings.neurips.cc/paper_files/paper/2011/
+        file/f0e52b27a7a5d6a1a87373dffa53dbe5-Paper.pdf.
+546
+547   Alex Andonian, Quentin Anthony, Stella Biderman, Sid Black, Preetham Gali, Leo Gao, Eric
+548     Hallahan, Josh Levy-Kramer, Connor Leahy, Lucas Nestler, Kip Parker, Michael Pieler, Jason
+549     Phang, Shivanshu Purohit, Hailey Schoelkopf, Dashiell Stander, Tri Songz, Curt Tigges, Ben-
+550     jamin Thérien, Phil Wang, and Samuel Weinbach. GPT-NeoX: Large Scale Autoregressive Lan-
+551     guage Modeling in PyTorch, 9 2023. URL https://www.github.com/eleutherai/
+552     gpt-neox.
+553   Yossi Arjevani, Ohad Shamir, and Nathan Srebro. A tight convergence analysis for stochastic gradi-
+554     ent descent with delayed updates. In Aryeh Kontorovich and Gergely Neu (eds.), Proceedings of
+555     the 31st International Conference on Algorithmic Learning Theory, volume 117 of Proceedings
+556     of Machine Learning Research, pp. 111–132. PMLR, 08 Feb–11 Feb 2020.
+557
+558
+      By Mahmoud Assran, Arda Aytekin, Hamid Reza Feyzmahdavian, Mikael Johansson, and
+        Michael G. Rabbat. Advances in asynchronous parallel and distributed optimization. Proceedings
+559
+        of the IEEE, 108(11):2013–2031, 2020. doi: 10.1109/JPROC.2020.3026619.
+560
+561   Mahmoud Assran, Nicolas Loizou, Nicolas Ballas, and Mike Rabbat. Stochastic gradient push for
+562    distributed deep learning. In Kamalika Chaudhuri and Ruslan Salakhutdinov (eds.), Proceedings
+563    of the 36th International Conference on Machine Learning, volume 97 of Proceedings of Machine
+564    Learning Research, pp. 344–353. PMLR, 09–15 Jun 2019.
+565   Sid Black, Gao Leo, Phil Wang, Connor Leahy, and Stella Biderman. GPT-Neo: Large Scale Au-
+566     toregressive Language Modeling with Mesh-Tensorflow, March 2021. URL https://doi.
+567     org/10.5281/zenodo.5297715.
+568
+569   Chi-Chung Chen, Chia-Lin Yang, and Hsiang-Yun Cheng. Efficient and robust parallel dnn training
+570
+        through model parallelism on multi-gpu platform, 2019.
+571   Tianqi Chen, Bing Xu, Chiyuan Zhang, and Carlos Guestrin. Training deep nets with sublinear
+572     memory cost, 2016.
+573
+574   Xiangyi Chen, Xiaoyun Li, and P. Li. Toward communication efficient adaptive gradient method.
+575
+        Proceedings of the 2020 ACM-IMS on Foundations of Data Science Conference, 2020. URL
+        https://api.semanticscholar.org/CorpusID:224805256.
+576
+577   Jeffrey Dean, Greg Corrado, Rajat Monga, Kai Chen, Matthieu Devin, Mark Mao, Marc' au-
+578      relio Ranzato, Andrew Senior, Paul Tucker, Ke Yang, Quoc Le, and Andrew Ng. Large
+579      scale distributed deep networks. In F. Pereira, C.J. Burges, L. Bottou, and K.Q. Weinberger
+580      (eds.), Advances in Neural Information Processing Systems, volume 25. Curran Associates, Inc.,
+581      2012. URL https://proceedings.neurips.cc/paper_files/paper/2012/
+582      file/6aca97005c68f1206823815f66102863-Paper.pdf.
+583   Michael Diskin, Alexey Bukhtiyarov, Max Ryabinin, Lucile Saulnier, Quentin Lhoest, Anton
+584    Sinitsin, Dmitry Popov, Dmitriy Pyrkin, Maxim Kashirin, Alexander Borzunov, Albert Villanova
+585    del Moral, Denis Mazur, Ilia Kobelev, Yacine Jernite, Thomas Wolf, and Gennady Pekhimenko.
+586    Distributed deep learning in open collaborations. In A. Beygelzimer, Y. Dauphin, P. Liang, and
+587    J. Wortman Vaughan (eds.), Advances in Neural Information Processing Systems, 2021. URL
+588    https://openreview.net/forum?id=FYHktcK-7v.
+589
+      Sanghamitra Dutta, Jianyu Wang, and Gauri Joshi. Slow and stale gradients can win the race. IEEE
+590
+        Journal on Selected Areas in Information Theory, 2(3):1012–1024, 2021. doi: 10.1109/JSAIT.
+591     2021.3103770.
+592
+593   Ronen Eldan and Yuanzhi Li. Tinystories: How small can language models be and still speak
+        coherent english?, 2023.
+
+
+                                                     11
+      Under review as a conference paper at ICLR 2025
+
+
+594
+      Mathieu Even, Raphaël Berthier, Francis Bach, Nicolas Flammarion, Hadrien Hendrikx, Pierre Gail-
+595    lard, Laurent Massoulié, and Adrien Taylor. A continuized view on nesterov acceleration for
+596    stochastic gradient descent and randomized gossip. In A. Beygelzimer, Y. Dauphin, P. Liang, and
+597    J. Wortman Vaughan (eds.), Advances in Neural Information Processing Systems, 2021.
+598
+599   Shiqing Fan, Yi Rong, Chen Meng, Zongyan Cao, Siyu Wang, Zhen Zheng, Chuan Wu, Guoping
+600
+        Long, Jun Yang, Lixue Xia, et al. Dapple: A pipelined data parallel approach for training large
+        models. In Proceedings of the 26th ACM SIGPLAN Symposium on Principles and Practice of
+601
+        Parallel Programming, pp. 431–445, 2021.
+602
+603   Hamid Reza Feyzmahdavian and Mikael Johansson. Asynchronous iterations in optimization: New
+604     sequence results and sharper algorithmic guarantees. Journal of Machine Learning Research, 24
+605     (158):1–75, 2023. URL http://jmlr.org/papers/v24/22-0555.html.
+606
+      Louis Fournier and Edouard Oyallon. Cyclic data parallelism for efficient parallelism of deep neural
+607
+        networks, 2024.
+608
+609   Leo Gao, Stella Biderman, Sid Black, Laurence Golding, Travis Hoppe, Charles Foster, Jason
+610     Phang, Horace He, Anish Thite, Noa Nabeshima, et al. The pile: An 800gb dataset of diverse text
+611     for language modeling. arXiv preprint arXiv:2101.00027, 2020.
+612
+      Aaron Gokaslan, Vanya Cohen, Ellie Pavlick, and Stefanie Tellex. Openwebtext corpus. http:
+613     //Skylion007.github.io/OpenWebTextCorpus, 2019.
+614
+615   Eduard Gorbunov, Alexander Rogozin, Aleksandr Beznosikov, Darina Dvinskikh, and Alexander
+616     Gasnikov. Recent Theoretical Advances in Decentralized Distributed Convex Optimization, pp.
+617     253–325. Springer International Publishing, Cham, 2022. ISBN 978-3-031-00832-0. doi: 10.
+618
+        1007/978-3-031-00832-0 8.
+619   Yanping Huang, Youlong Cheng, Ankur Bapna, Orhan Firat, Dehao Chen, Mia Chen, HyoukJoong
+620     Lee, Jiquan Ngiam, Quoc V Le, Yonghui Wu, et al. Gpipe: Efficient training of giant neural
+621     networks using pipeline parallelism. Advances in neural information processing systems, 32,
+622     2019.
+623
+      Jörn-Henrik Jacobsen, Arnold W.M. Smeulders, and Edouard Oyallon. i-revnet: Deep invertible
+624
+         networks. In International Conference on Learning Representations, 2018. URL https://
+625
+         openreview.net/forum?id=HJsjkMb0Z.
+626
+627   Dhiraj Kalamkar, Dheevatsa Mudigere, Naveen Mellempudi, Dipankar Das, Kunal Banerjee,
+628     Sasikanth Avancha, Dharma Teja Vooturi, Nataraj Jammalamadaka, Jianyu Huang, Hector Yuen,
+629     Jiyan Yang, Jongsoo Park, Alexander Heinecke, Evangelos Georganas, Sudarshan Srinivasan,
+630     Abhisek Kundu, Misha Smelyanskiy, Bharat Kaul, and Pradeep Dubey. A study of bfloat16 for
+631
+        deep learning training, 2019.
+632   Sai Praneeth Karimireddy, Martin Jaggi, Satyen Kale, Mehryar Mohri, Sashank J. Reddi, Sebas-
+633     tian U. Stich, and Ananda Theertha Suresh. Mime: Mimicking centralized stochastic algorithms
+634     in federated learning. ArXiv, abs/2008.03606, 2020.
+635
+636
+      Chiheon Kim, Heungsub Lee, Myungryong Jeong, Woonhyuk Baek, Boogeon Yoon, Ildoo Kim,
+        Sungbin Lim, and Sungwoong Kim. torchgpipe: On-the-fly pipeline parallelism for training giant
+637
+        models, 2020.
+638
+639   Diederik Kingma and Jimmy Ba. Adam: A method for stochastic optimization. In International
+640     Conference on Learning Representations (ICLR), San Diega, CA, USA, 2015.
+641
+642
+      Anastasia Koloskova, Sebastian U. Stich, and Martin Jaggi. Sharper convergence guarantees for
+        asynchronous sgd for distributed and federated learning. In Proceedings of the 36th International
+643
+        Conference on Neural Information Processing Systems, NIPS ’22, Red Hook, NY, USA, 2024.
+644
+        Curran Associates Inc. ISBN 9781713871088.
+645
+646   Jakub Konecný, H. B. McMahan, Daniel Ramage, and Peter Richtárik. Federated optimization:
+647     Distributed machine learning for on-device intelligence. ArXiv, abs/1610.02527, 2016. URL
+        https://api.semanticscholar.org/CorpusID:2549272.
+
+
+                                                      12
+      Under review as a conference paper at ICLR 2025
+
+
+648
+      Atli Kosson, Vitaliy Chiley, Abhinav Venigalla, Joel Hestness, and Urs Köster. Pipelined backprop-
+649     agation at scale: Training large models without batches, 2021.
+650
+651   Dmitry Kovalev, Adil Salim, and Peter Richtarik. Optimal and practical algorithms for smooth
+652    and strongly convex decentralized optimization. In H. Larochelle, M. Ranzato, R. Hadsell, M.F.
+653    Balcan, and H. Lin (eds.), Advances in Neural Information Processing Systems, volume 33, pp.
+654    18342–18352. Curran Associates, Inc., 2020.
+655   Shen Li, Yanli Zhao, Rohan Varma, Omkar Salpekar, Pieter Noordhuis, Teng Li, Adam Paszke,
+656     Jeff Smith, Brian Vaughan, Pritam Damania, and Soumith Chintala. Pytorch distributed: experi-
+657     ences on accelerating data parallel training. Proc. VLDB Endow., 13(12):3005–3018, aug 2020.
+658     ISSN 2150-8097. doi: 10.14778/3415478.3415530. URL https://doi.org/10.14778/
+659     3415478.3415530.
+660
+661
+      Tian Li, Anit Kumar Sahu, Manzil Zaheer, Maziar Sanjabi, Ameet Talwalkar, and Virginia Smith.
+        Federated optimization for heterogeneous networks. In ICML Workshop on Adaptive & Multitask
+662
+        Learning: Algorithms & Systems, 2019. URL https://openreview.net/forum?id=
+663
+        SkgwE5Ss3N.
+664
+665   Tao Lin, Sebastian U. Stich, Kumar Kshitij Patel, and Martin Jaggi. Don’t use large mini-batches,
+666     use local sgd. In International Conference on Learning Representations, 2020.
+667
+      Yuliang Liu, Shenggui Li, Jiarui Fang, Yanjun Shao, Boyuan Yao, and Yang You. Colossal-auto:
+668
+        Unified automation of parallelization and activation checkpoint for large-scale models, 2023.
+669
+670   Ilya Loshchilov and Frank Hutter. Decoupled weight decay regularization. In International Confer-
+671      ence on Learning Representations, 2019. URL https://openreview.net/forum?id=
+672      Bkg6RiCqY7.
+673
+674
+      Karttikeya Mangalam, Haoqi Fan, Yanghao Li, Chao-Yuan Wu, Bo Xiong, Christoph Feichtenhofer,
+        and Jitendra Malik. Reversible vision transformers. In Proceedings of the IEEE/CVF Conference
+675
+        on Computer Vision and Pattern Recognition, pp. 10830–10840, 2022.
+676
+677   Artavazd Maranjyan, Mher Safaryan, and Peter Richtárik. Gradskip: Communication-accelerated
+678     local gradient methods with better computational complexity, 2022.
+679
+680
+      Ryan McDonald, Keith Hall, and Gideon Mann. Distributed training strategies for the structured
+        perceptron. In Human Language Technologies: The 2010 Annual Conference of the North Amer-
+681
+        ican Chapter of the Association for Computational Linguistics, HLT ’10, pp. 456–464, USA,
+682
+        2010. Association for Computational Linguistics. ISBN 1932432655.
+683
+684   Brendan McMahan, Eider Moore, Daniel Ramage, Seth Hampson, and Blaise Aguera y Ar-
+685     cas. Communication-Efficient Learning of Deep Networks from Decentralized Data. In
+686     Aarti Singh and Jerry Zhu (eds.), Proceedings of the 20th International Conference on Artifi-
+687     cial Intelligence and Statistics, volume 54 of Proceedings of Machine Learning Research, pp.
+688     1273–1282. PMLR, 20–22 Apr 2017. URL https://proceedings.mlr.press/v54/
+689
+        mcmahan17a.html.
+690   Konstantin Mishchenko, Francis Bach, Mathieu Even, and Blake Woodworth. Asynchronous SGD
+691     beats minibatch SGD under arbitrary delays. In Alice H. Oh, Alekh Agarwal, Danielle Belgrave,
+692     and Kyunghyun Cho (eds.), Advances in Neural Information Processing Systems, 2022a. URL
+693     https://openreview.net/forum?id=4XP0ZuQKXmV.
+694
+695
+      Konstantin Mishchenko, Grigory Malinovsky, Sebastian Stich, and Peter Richtárik. Proxskip: Yes!
+        local gradient steps provably lead to communication acceleration! finally! arXiv preprint
+696
+        arXiv:2202.09357, 2022b.
+697
+698   Ioannis Mitliagkas, Ce Zhang, Stefan Hadjis, and Christopher Ré. Asynchrony begets momen-
+699     tum, with an application to deep learning. In 2016 54th Annual Allerton Conference on
+700     Communication, Control, and Computing (Allerton), pp. 997–1004. IEEE Press, 2016. doi:
+701     10.1109/ALLERTON.2016.7852343. URL https://doi.org/10.1109/ALLERTON.
+        2016.7852343.
+
+
+                                                      13
+      Under review as a conference paper at ICLR 2025
+
+
+702
+      Adel Nabli and Edouard Oyallon. DADAO: Decoupled accelerated decentralized asynchronous op-
+703     timization. In Andreas Krause, Emma Brunskill, Kyunghyun Cho, Barbara Engelhardt, Sivan
+704     Sabato, and Jonathan Scarlett (eds.), Proceedings of the 40th International Conference on Ma-
+705     chine Learning, volume 202 of Proceedings of Machine Learning Research, pp. 25604–25626.
+706     PMLR, 23–29 Jul 2023.
+707
+708   Adel Nabli, Eugene Belilovsky, and Edouard Oyallon. $\textbf{A}ˆ2\textbf{CiD}ˆ2$: Accelerat-
+709     ing asynchronous communication in decentralized deep learning. In Thirty-seventh Conference on
+710
+        Neural Information Processing Systems, 2023. URL https://openreview.net/forum?
+        id=YE04aRkeZb.
+711
+712
+      Deepak Narayanan, Aaron Harlap, Amar Phanishayee, Vivek Seshadri, Nikhil R Devanur, Gre-
+713     gory R Ganger, Phillip B Gibbons, and Matei Zaharia. Pipedream: Generalized pipeline par-
+714     allelism for dnn training. In Proceedings of the 27th ACM Symposium on Operating Systems
+715     Principles, pp. 1–15, 2019.
+716
+717   Deepak Narayanan, Amar Phanishayee, Kaiyu Shi, Xie Chen, and Matei Zaharia. Memory-efficient
+718     pipeline-parallel dnn training. In International Conference on Machine Learning, pp. 7937–7947.
+719     PMLR, 2021.
+720
+      John Nguyen, Kshitiz Malik, Hongyuan Zhan, Ashkan Yousefpour, Mike Rabbat, Mani Malek, and
+721
+        Dzmitry Huba. Federated learning with buffered asynchronous aggregation. In Gustau Camps-
+722     Valls, Francisco J. R. Ruiz, and Isabel Valera (eds.), Proceedings of The 25th International Con-
+723     ference on Artificial Intelligence and Statistics, volume 151 of Proceedings of Machine Learning
+724     Research, pp. 3581–3607. PMLR, 28–30 Mar 2022. URL https://proceedings.mlr.
+725     press/v151/nguyen22b.html.
+726
+727   Jose Javier Gonzalez Ortiz, Jonathan Frankle, Mike Rabbat, Ari Morcos, and Nicolas Ballas. Trade-
+728     offs of local sgd at scale: An empirical study. In NeurIPS 2020 OptML Workshop, 2021.
+729
+      Denis Paperno, Germán Kruszewski, Angeliki Lazaridou, Ngoc Quan Pham, Raffaella Bernardi,
+730
+        Sandro Pezzelle, Marco Baroni, Gemma Boleda, and Raquel Fernandez. The LAMBADA
+731
+        dataset: Word prediction requiring a broad discourse context. In Proceedings of the 54th An-
+732     nual Meeting of the Association for Computational Linguistics (Volume 1: Long Papers), pp.
+733     1525–1534, Berlin, Germany, August 2016. Association for Computational Linguistics. URL
+734     http://www.aclweb.org/anthology/P16-1144.
+735
+736   Adam Paszke, Sam Gross, Francisco Massa, Adam Lerer, James Bradbury, Gregory Chanan, Trevor
+737     Killeen, Zeming Lin, Natalia Gimelshein, Luca Antiga, Alban Desmaison, Andreas Köpf, Ed-
+738     ward Yang, Zach DeVito, Martin Raison, Alykhan Tejani, Sasank Chilamkurthy, Benoit Steiner,
+739
+        Lu Fang, Junjie Bai, and Soumith Chintala. Pytorch: an imperative style, high-performance deep
+        learning library. In Proceedings of the 33rd International Conference on Neural Information
+740
+        Processing Systems, Red Hook, NY, USA, 2019. Curran Associates Inc.
+741
+742   Suchita Pati, Shaizeen Aga, Mahzabeen Islam, Nuwan Jayasena, and Matthew D. Sinclair. Compu-
+743     tation vs. communication scaling for future transformers on future hardware, 2023.
+744
+745   Alec Radford, Jeff Wu, Rewon Child, David Luan, Dario Amodei, and Ilya Sutskever. Language
+746     models are unsupervised multitask learners. 2019.
+747
+748
+      Samyam Rajbhandari, Jeff Rasley, Olatunji Ruwase, and Yuxiong He. Zero: memory optimizations
+        toward training trillion parameter models. In Proceedings of the International Conference for
+749
+        High Performance Computing, Networking, Storage and Analysis, SC ’20. IEEE Press, 2020a.
+750
+        ISBN 9781728199986.
+751
+752   Samyam Rajbhandari, Jeff Rasley, Olatunji Ruwase, and Yuxiong He. Zero: Memory optimizations
+753     toward training trillion parameter models, 2020b.
+754
+755   Samyam Rajbhandari, Olatunji Ruwase, Jeff Rasley, Shaden Smith, and Yuxiong He. Zero-infinity:
+        Breaking the gpu memory wall for extreme scale deep learning, 2021.
+
+
+                                                      14
+      Under review as a conference paper at ICLR 2025
+
+
+756
+      Jeff Rasley, Samyam Rajbhandari, Olatunji Ruwase, and Yuxiong He. Deepspeed: System opti-
+757      mizations enable training deep learning models with over 100 billion parameters. In Proceedings
+758      of the 26th ACM SIGKDD International Conference on Knowledge Discovery & Data Mining,
+759      KDD ’20, pp. 3505–3506, New York, NY, USA, 2020. Association for Computing Machinery.
+760      ISBN 9781450379984. doi: 10.1145/3394486.3406703.
+761
+762
+      Sashank J. Reddi, Zachary Charles, Manzil Zaheer, Zachary Garrett, Keith Rush, Jakub Konečný,
+        Sanjiv Kumar, and Hugh Brendan McMahan. Adaptive federated optimization. In International
+763
+        Conference on Learning Representations, 2021. URL https://openreview.net/forum?
+764
+        id=LkFG3lB13U5.
+765
+766   Jie Ren, Samyam Rajbhandari, Reza Yazdani Aminabadi, Olatunji Ruwase, Shuangyan Yang, Min-
+767      jia Zhang, Dong Li, and Yuxiong He. Zero-offload: Democratizing billion-scale model training,
+768      2021.
+769
+      Jie Ren, Samyam Rajbhandari, Reza Yazdani Aminabadi, Olatunji Ruwase, Shuangyan Yang, Min-
+770      jia Zhang, Dong Li, and Yuxiong He. https://github.com/microsoft/deepspeed/discussions/2461,
+771      2022.
+772
+773   Kevin Scaman, Francis Bach, Sébastien Bubeck, Yin Tat Lee, and Laurent Massoulié. Optimal algo-
+774
+        rithms for smooth and strongly convex distributed optimization in networks. In Doina Precup and
+        Yee Whye Teh (eds.), Proceedings of the 34th International Conference on Machine Learning,
+775
+        volume 70 of Proceedings of Machine Learning Research, pp. 3027–3036. PMLR, 06–11 Aug
+776
+        2017.
+777
+778   Shuheng Shen, Linli Xu, Jingchang Liu, Xianfeng Liang, and Yifei Cheng. Faster distributed deep
+779     net training: computation and communication decoupled stochastic gradient descent. In Proceed-
+780     ings of the 28th International Joint Conference on Artificial Intelligence, pp. 4582–4589. AAAI
+781     Press, 2019. ISBN 9780999241141.
+782   Mohammad Shoeybi, Mostofa Patwary, Raul Puri, Patrick LeGresley, Jared Casper, and Bryan
+783    Catanzaro. Megatron-lm: Training multi-billion parameter language models using model par-
+784    allelism. arXiv preprint arXiv:1909.08053, 2019.
+785
+786   Shaden Smith, Mostofa Patwary, Brandon Norick, Patrick LeGresley, Samyam Rajbhandari, Jared
+787
+        Casper, Zhun Liu, Shrimai Prabhumoye, George Zerveas, Vijay Korthikanti, et al. Using deep-
+        speed and megatron to train megatron-turing nlg 530b, a large-scale generative language model.
+788
+        arXiv preprint arXiv:2201.11990, 2022.
+789
+790   Zhuoqing Song, Lei Shi, Shi Pu, and Ming Yan. Optimal gradient tracking for decentral-
+791     ized optimization. Mathematical Programming, Jul 2023. ISSN 1436-4646. doi: 10.1007/
+792     s10107-023-01997-7.
+793
+      Sebastian U. Stich. Local SGD converges fast and communicates little. In International Confer-
+794     ence on Learning Representations, 2019. URL https://openreview.net/forum?id=
+795     S1g2JnRcFX.
+796
+797   Sebastian U. Stich and Sai Praneeth Karimireddy. The error-feedback framework: better rates for
+798     sgd with delayed gradients and compressed updates. J. Mach. Learn. Res., 21(1), January 2020a.
+799
+        ISSN 1532-4435.
+800   Sebastian U. Stich and Sai Praneeth Karimireddy. The error-feedback framework: better rates for
+801     sgd with delayed gradients and compressed updates. Journal of Machine Learning Research, 21
+802     (1), jan 2020b. ISSN 1532-4435.
+803
+804
+      Weigao Sun, Zhen Qin, Weixuan Sun, Shidi Li, Dong Li, Xuyang Shen, Yu Qiao, and Yiran Zhong.
+       CO2: Efficient distributed training with full communication-computation overlap. In The Twelfth
+805
+       International Conference on Learning Representations, 2024. URL https://openreview.
+806
+       net/forum?id=ZO5cn4IfaN.
+807
+808   Rohan Taori, Ishaan Gulrajani, Tianyi Zhang, Yann Dubois, Xuechen Li, Carlos Guestrin, Percy
+809     Liang, and Tatsunori B. Hashimoto. Stanford alpaca: An instruction-following llama model.
+        https://github.com/tatsu-lab/stanford_alpaca, 2023.
+
+
+                                                     15
+      Under review as a conference paper at ICLR 2025
+
+
+810
+      Hugo Touvron, Louis Martin, Kevin Stone, Peter Albert, Amjad Almahairi, Yasmine Babaei, Niko-
+811     lay Bashlykov, Soumya Batra, Prajjwal Bhargava, Shruti Bhosale, Dan Bikel, Lukas Blecher,
+812     Cristian Canton Ferrer, Moya Chen, Guillem Cucurull, David Esiobu, Jude Fernandes, Jeremy
+813     Fu, Wenyin Fu, Brian Fuller, Cynthia Gao, Vedanuj Goswami, Naman Goyal, Anthony Hartshorn,
+814     Saghar Hosseini, Rui Hou, Hakan Inan, Marcin Kardas, Viktor Kerkez, Madian Khabsa, Isabel
+815     Kloumann, Artem Korenev, Punit Singh Koura, Marie-Anne Lachaux, Thibaut Lavril, Jenya Lee,
+816     Diana Liskovich, Yinghai Lu, Yuning Mao, Xavier Martinet, Todor Mihaylov, Pushkar Mishra,
+817     Igor Molybog, Yixin Nie, Andrew Poulton, Jeremy Reizenstein, Rashi Rungta, Kalyan Saladi,
+818     Alan Schelten, Ruan Silva, Eric Michael Smith, Ranjan Subramanian, Xiaoqing Ellen Tan, Binh
+819
+        Tang, Ross Taylor, Adina Williams, Jian Xiang Kuan, Puxin Xu, Zheng Yan, Iliyan Zarov, Yuchen
+        Zhang, Angela Fan, Melanie Kambadur, Sharan Narang, Aurelien Rodriguez, Robert Stojnic,
+820
+        Sergey Edunov, and Thomas Scialom. Llama 2: Open foundation and fine-tuned chat models,
+821
+        2023.
+822
+823   Ashish Vaswani, Noam Shazeer, Niki Parmar, Jakob Uszkoreit, Llion Jones, Aidan N Gomez,
+824     Ł ukasz Kaiser, and Illia Polosukhin. Attention is all you need. In I. Guyon, U. Von
+825     Luxburg, S. Bengio, H. Wallach, R. Fergus, S. Vishwanathan, and R. Garnett (eds.), Ad-
+826     vances in Neural Information Processing Systems, volume 30. Curran Associates, Inc.,
+827     2017. URL https://proceedings.neurips.cc/paper_files/paper/2017/
+828     file/3f5ee243547dee91fbd053c1c4a845aa-Paper.pdf.
+829
+      Guanhua Wang, Heyang Qin, Sam Ade Jacobs, Connor Holmes, Samyam Rajbhandari, Olatunji
+830
+        Ruwase, Feng Yan, Lei Yang, and Yuxiong He. Zero++: Extremely efficient collective commu-
+831     nication for giant model training, 2023.
+832
+833   Jianyu Wang, Hao Liang, and Gauri Joshi. Overlap local-sgd: An algorithmic approach to hide
+834      communication delays in distributed sgd. In ICASSP 2020 - 2020 IEEE International Con-
+835      ference on Acoustics, Speech and Signal Processing (ICASSP). IEEE, May 2020a. doi: 10.
+836      1109/icassp40776.2020.9053834. URL http://dx.doi.org/10.1109/ICASSP40776.
+837      2020.9053834.
+838
+      Jianyu Wang, Vinayak Tantia, Nicolas Ballas, and Michael Rabbat. Slowmo: Improving
+839
+         communication-efficient distributed sgd with slow momentum. In International Conference
+840      on Learning Representations, 2020b. URL https://openreview.net/forum?id=
+841      SkxJ8REYPH.
+842
+843   Blake Woodworth, Kumar Kshitij Patel, Sebastian Stich, Zhen Dai, Brian Bullins, Brendan Mcma-
+844     han, Ohad Shamir, and Nathan Srebro. Is local SGD better than minibatch SGD? In Hal Daumé
+845     III and Aarti Singh (eds.), Proceedings of the 37th International Conference on Machine Learn-
+846     ing, volume 119 of Proceedings of Machine Learning Research, pp. 10334–10343. PMLR, 13–18
+847
+        Jul 2020. URL https://proceedings.mlr.press/v119/woodworth20a.html.
+848
+      Xuyang Wu, Sindri Magnusson, Hamid Reza Feyzmahdavian, and Mikael Johansson. Delay-
+849     adaptive step-sizes for asynchronous learning. In Kamalika Chaudhuri, Stefanie Jegelka, Le Song,
+850     Csaba Szepesvari, Gang Niu, and Sivan Sabato (eds.), Proceedings of the 39th International
+851     Conference on Machine Learning, volume 162 of Proceedings of Machine Learning Research,
+852     pp. 24093–24113. PMLR, 17–23 Jul 2022. URL https://proceedings.mlr.press/
+853     v162/wu22g.html.
+854
+855   Cong Xie, Sanmi Koyejo, and Indranil Gupta. Asynchronous federated optimization. In NeurIPS
+856
+        2020 OptML Workshop, 2020.
+857
+      Bowen Yang, Jian Zhang, Jonathan Li, Christopher Ré, Christopher R. Aberger, and Christopher De
+858
+        Sa. Pipemare: Asynchronous pipeline parallel dnn training, 2020.
+859
+860   Bowen Yang, Jian Zhang, Jonathan Li, Christopher Re, Christopher Aberger, and Christopher
+861     De Sa. Pipemare: Asynchronous pipeline parallel dnn training. In A. Smola, A. Dimakis,
+862     and I. Stoica (eds.), Proceedings of Machine Learning and Systems, volume 3, pp. 269–
+863     296, 2021. URL https://proceedings.mlsys.org/paper_files/paper/2021/
+        file/9412531719be7ccf755c4ff98d0969dc-Paper.pdf.
+
+
+                                                     16
+      Under review as a conference paper at ICLR 2025
+
+
+864
+      Kun Yuan, Qing Ling, and Wotao Yin. On the convergence of decentralized gradient descent. SIAM
+865     Journal on Optimization, 26(3):1835–1854, 2016. doi: 10.1137/130943170.
+866
+867   Jian Zhang and Ioannis Mitliagkas. Yellowfin and the art of momentum tuning. In A. Talwalkar,
+868      V. Smith, and M. Zaharia (eds.), Proceedings of Machine Learning and Systems, volume 1, pp.
+869      289–308, 2019. URL https://proceedings.mlsys.org/paper_files/paper/
+870
+         2019/file/b205b525b7ce002baae53228bab6d26b-Paper.pdf.
+871   Sixin Zhang, Anna Choromanska, and Yann LeCun. Deep learning with elastic averaging sgd. In
+872     Proceedings of the 28th International Conference on Neural Information Processing Systems -
+873     Volume 1, NIPS’15, pp. 685–693, Cambridge, MA, USA, 2015. MIT Press.
+874
+875
+      Zhen Zhang, Shuai Zheng, Yida Wang, Justin Chiu, George Karypis, Trishul Chilimbi, Mu Li, and
+        Xin Jin. Mics: Near-linear scaling for training gigantic model on public cloud, 2022.
+876
+877   Wayne Xin Zhao, Kun Zhou, Junyi Li, Tianyi Tang, Xiaolei Wang, Yupeng Hou, Yingqian Min,
+878    Beichen Zhang, Junjie Zhang, Zican Dong, Yifan Du, Chen Yang, Yushuo Chen, Zhipeng Chen,
+879    Jinhao Jiang, Ruiyang Ren, Yifan Li, Xinyu Tang, Zikang Liu, Peiyu Liu, Jian-Yun Nie, and
+880    Ji-Rong Wen. A survey of large language models, 2023a.
+881
+      Yanli Zhao, Andrew Gu, Rohan Varma, Liang Luo, Chien-Chin Huang, Min Xu, Less Wright,
+882
+        Hamid Shojanazeri, Myle Ott, Sam Shleifer, Alban Desmaison, Can Balioglu, Pritam Damania,
+883     Bernard Nguyen, Geeta Chauhan, Yuchen Hao, Ajit Mathews, and Shen Li. Pytorch fsdp: Expe-
+884     riences on scaling fully sharded data parallel, 2023b.
+885
+886   Shuxin Zheng, Qi Meng, Taifeng Wang, Wei Chen, Nenghai Yu, Zhi-Ming Ma, and Tie-Yan
+887     Liu. Asynchronous stochastic gradient descent with delay compensation. In Proceedings of
+888
+        the 34th International Conference on Machine Learning - Volume 70, ICML’17, pp. 4120–4129.
+        JMLR.org, 2017.
+889
+890   Fan Zhou and Guojing Cong. On the convergence properties of a k-step averaging stochastic gra-
+891     dient descent algorithm for nonconvex optimization. In Proceedings of the Twenty-Seventh Inter-
+892     national Joint Conference on Artificial Intelligence, IJCAI-18, pp. 3219–3227. International Joint
+893     Conferences on Artificial Intelligence Organization, 7 2018. doi: 10.24963/ijcai.2018/447. URL
+894     https://doi.org/10.24963/ijcai.2018/447.
+895
+      Huiping Zhuang, Zhiping Lin, and Kar-Ann Toh. Accumulated decoupled learning: Mitigating
+896     gradient staleness in inter-layer model parallelization. arXiv preprint arXiv:2012.03747, 2020.
+897
+898   Huiping Zhuang, Yi Wang, Qinglai Liu, and Zhiping Lin. Fully decoupled neural network learning
+899     using delayed gradients. IEEE transactions on neural networks and learning systems, 33(10):
+900     6013–6020, 2021.
+901   Martin Zinkevich, Markus Weimer, Lihong Li, and Alex Smola. Parallelized stochastic gradi-
+902    ent descent. In J. Lafferty, C. Williams, J. Shawe-Taylor, R. Zemel, and A. Culotta (eds.),
+903    Advances in Neural Information Processing Systems, volume 23. Curran Associates, Inc.,
+904    2010. URL https://proceedings.neurips.cc/paper_files/paper/2010/
+905    file/abea47ba24142ed16b7d8fbf2c740e0d-Paper.pdf.
+906
+907
+908
+909
+910
+911
+912
+913
+914
+915
+916
+917
+
+
+
+                                                      17
+      Under review as a conference paper at ICLR 2025
+
+
+918
+      A       E XPERIMENTAL D ETAILS AND F URTHER R ESULTS
+919
+920
+      A.1     P RE - TRAINING ON T INY S TORIES
+921
+922   For experiments in Sec. 5.2, we used the configuration available on the Huggingface Hub 1 . We
+923   trained our own 10k vocabulary tokenizer on the dataset. We also report in Fig. 10 the results of our
+924   study on the impact of halving the batch size for DPU by not performing any gradient accumulation
+925   (i.e., performing an optimizer’s step at each communication).
+926
+927                                                                          Method
+928                                    8                                   ACCO
+929
+                                                                           DDP
+                           Training loss
+                                                                           DPU-warmup 40
+930                                    6                                   DPU-warmup 40 bs/2
+931
+932
+                                       4
+933
+934
+935                                    2
+936
+                                            0    5000   10000 15000 20000 25000 30000 35000
+                                                             # minibatch
+937
+938
+939
+940   Figure 10: Comparison between running DPU on 8 GPUs with 2 steps of gradient accumulation on
+941   each (to match the standard batch-size) and DPU with only 1 gradient accumulation step. Doing so
+942   allows to double the number of optimizer’s step per minibatch, but divides the effective batch size
+943   by 2. This leads to faster convergence early in the training, but worse training loss in the end.
+944
+945   A.2     P RE - TRAINING ON O PEN W EB T EXT
+946
+947   For all pre-training experiments on OpenWebText, the configuration used to instantiate the GPTNeo
+948   125M is available on the Huggingface Hub2 . We only changed the ”max position embeddings”
+949   parameter from 2048 to 1024. More details are displayed in Tab. 4. We used the OpenWebText
+950   dataset available on Huggingface3 . We also report in Fig. 11 further results for the pre-training on
+951
+      H100 GPUs.
+952
+953                                        101                                 Method
+954                                                                                 ACCO
+                                                                                    DDP
+                           Training loss
+
+
+955
+956                                    6 × 100
+957
+958
+959                                    4 × 100
+960
+961                                    3 × 100
+962                                              0      50000 100000 150000 200000 250000
+963                                                            # minibatch
+964
+965       Figure 11: Training loss during training on OpenWebText with 8 H100 GPUs and 6B tokens.
+966
+967       1
+          Tiny Stories Available at:        https://huggingface.co/datasets/roneneldan/
+968   TinyStories
+969     2
+          GPT-neo 125M Configuration Available at:   https://huggingface.co/EleutherAI/
+970   gpt-neo-125m/blob/main/config.json
+        3
+971       OpenWebText Dataset Available at: https://huggingface.co/datasets/Skylion007/
+      openwebtext
+
+
+                                                               18
+       Under review as a conference paper at ICLR 2025
+
+
+972
+973                   Table 4: Training hyperparameters for ACCO and DDP configurations.
+974                        Hyperparameter             8 H100          32 A100
+975                        mini-batch size               24              24
+976                        n grad accumulation ACCO: -DDP: 1 ACCO: -DDP: 1
+977                        sequence len                 1024            1024
+978
+                           #tokens batch                400K           1.5M
+                           optimizer                  AdamW           AdamW
+979
+                           learning rate                6e-4            6e-4
+980
+                           weight decay                  0.1             0.1
+981                        adam beta1                    0.9             0.9
+982                        adam beta2                   0.95            0.95
+983                        nb steps tot                50000           50000
+984                        scheduler                   cosine          cosine
+985                        n warmup steps                 0               0
+986
+987
+988    A.3      I NSTRUCTION F INE -T UNING
+989
+990    For all fine-tuning experiments, we used the pre-trained GPT-neo 2.7B available on the Huggingface
+991    Hub4 and the associated tokenizer. We used the Alpaca dataset available on Huggingface5 . More
+992
+       details are displayed in Tab. 5.We also report in Fig. 12 further results on the experiment described
+       in Sec. 5.4.
+993
+994
+995                                                                          Method
+996                                       1.20                                  ACCO
+                            Validation loss
+
+
+997                                                                             DDP
+998                                                                             DPU
+999
+                                          1.15
+1000
+1001
+1002
+                                          1.10
+1003
+1004                                             0   5000   10000    15000     20000
+1005                                                        # minibatch
+1006
+1007
+                           Figure 12: Validation curve with 8 workers on a single node.
+1008
+1009
+1010
+1011              Table 5: Finetuning hyperparameters for ACCO, DDP and DPU configurations.
+1012                          Hyperparameter         ACCO       DDP       DPU
+1013                          mini-batch size            4        4         4
+1014                          n grad accumulation        2        4         4
+1015
+                              total batch size         128      128       128
+                              optimizer             AdamW AdamW AdamW
+1016
+                              learning rate            2e-5     2e-5      2e-5
+1017
+                              weight decay              0.0      0.0       0.0
+1018                          adam beta1                0.9      0.9       0.9
+1019                          adam beta2               0.95     0.95      0.95
+1020                          nb steps tot           50000     50000     50000
+1021                          scheduler              cosine    cosine    cosine
+1022                          n warmup steps             0        0        50
+1023
+1024
+          4
+1025          GPT-neo 2.7B Available at: https://huggingface.co/EleutherAI/gpt-neo-2.7B
+          5
+              Alpaca Dataset Available at: https://huggingface.co/datasets/tatsu-lab/alpaca
+
+
+                                                            19
+       Under review as a conference paper at ICLR 2025
+
+
+1026
+       B         I MPLEMENTATION D ETAILS
+1027
+1028
+       B.1            P ROFILING R ESULTS
+1029
+1030
+1031
+1032
+1033
+1034
+1035
+1036
+1037                                                                                                                    Cuda kernels on ∇
+                                                                                                                        accumula on stream
+1038
+1039                                                                                                Communica on
+1040                                                                                                streams
+1041
+1042
+1043
+1044                                                                                                               ∇ accumula on stream
+1045
+1046
+1047
+1048                  ti   ti
+                           ti
+
+
+1049
+1050                                  All reduce the                               All gather the
+                                      grad counter                                 params on the
+1051                                             Reduce sca er the
+                                                                                   bu er
+                                                 accumulated gradients
+1052                                             on the bu er
+
+1053
+1054
+1055
+1056
+                                                                                                                       Cuda kernels on ∇
+1057                                                                                                                   accumula on stream
+1058
+1059                                                                                                Communica on
+                                                                                                    streams
+1060
+1061
+1062
+1063
+                                                                                                                   ∇ accumula on stream
+1064                            Clone op mizer           Divide the gradients by
+                                                         the number of gradient
+                                                                                           Clone bu er to
+                                                                                           op mizer state
+                                state to bu er
+                                                         steps
+1065
+                                            Load the grads from the           Copy the params to
+1066                                        bu er to op mizer                 bu er
+
+
+1067    ti
+        ff   ti
+             ff
+              fftt
+                ff
+                 ti   ti   ti
+                           ti
+
+
+1068
+1069   Figure 13: Nsight system profile of our implementation of ACCO: our two steams do run in parallel.
+1070   In this Figure, the computation take more time than the communication because we only profiled
+1071   small scale experiments with 8 workers, and small number of parameters (36M as we profiled on our
+1072   TinyStories Eldan & Li (2023) setting). This changes when using larger models and more workers,
+1073   as seen in 4.
+1074
+1075
+       B.2            A LGORITHM P SEUDO -C ODE
+1076
+1077
+1078
+1079
+
+
+
+                                                                                                        20
+       Under review as a conference paper at ICLR 2025
+
+
+1080
+1081
+1082
+1083
+1084   Algorithm 1 Training with ACCO in parallel for a worker i
+1085    1: Input: Model with differentiable loss F , number of models N , initial parameters θ (0) , training
+1086         steps T , dataset shards Di .
+                                                        (0)                                  (−1)
+1087    2: Initialize: gradients gi (−1) = ∇F (θ (0) , ξi ) and number of gradients Ni               =1
+1088    3: # Computation CUDA stream
+1089    4: while t < T do
+1090    5:   Stage 1.
+1091    6:   while not Ready for Stage 2 do
+                  (t)
+1092    7:      ξi ← Di
+                   (t)       (t)             (t)
+1093    8:         gi ← gi + ∇F (θ(t) , ξi )
+1094                  (t)     (t)
+        9:         Ni ← Ni + 1
+1095   10:     θ̃(t+1) ← Bufferi
+1096                            (t) (t)
+       11:     Bufferi ← (Ni , gi )
+1097   12:     Stage 2.
+1098   13:     while not Ready for Stage 1 do
+1099                 (t)
+       14:         ξi ← Di
+1100                 (t)   (t)                (t)
+       15:         g̃i ← g̃i + ∇F (θ̃(t+1) , ξi )
+1101                  (t)     (t)
+1102
+       16:         Ñi ← Ñi + 1
+       17:         t←t+1
+1103
+       18:     θ(t+1) ← Bufferi
+1104                            (t) (t)
+       19:     Bufferi ← (Ñi , g̃i )
+1105
+       20:
+1106
+       21: # Communication CUDA stream
+1107   22: while True do
+1108   23:   Stage 1.
+1109            (t) (t)
+       24:   (Ñi , g̃i ) ← Bufferi
+1110           P     (t)                 (t)
+       25:       i Ñi   ← All  Reduce(Ñi )
+1111                     P (t)                      (t)
+1112   26:     Shardi      i gi  ← Reduce Scatter(g̃i )
+                                                                                       P
+1113                                                                                         (t)
+                                                                                         i g̃i
+                             (t+1)                               (t)
+
+1114   27:     Shardi θ̃      ← ShardedOpt Shardi θ                        , Shardi   P        (t)
+                                                                                       i  Ñ i
+1115
+
+       28:     Bufferi ← All Gather(Shardi θ̃(t+1) )
+1116
+                  (t)
+1117   29:     Ni ← 0
+1118   30:     Ready for Stage 2 ← True
+1119   31:     Ready for Stage 1 ← False
+1120   32:     Stage 2.
+                   (t) (t)
+1121   33:     (N , g ) ← Bufferi
+               P i (t)i      (t)               (t)   P (t)
+1122   34:        i Ni  + Ñi ← All Reduce(Ni + i Ñi )
+1123                      P (t)     (t)                     (t) P (t)
+       35:     Shardi      i gi + g̃i   ← Reduce Scatter(gi + i g̃i )
+1124                                                                P
+                                                                          (t)  (t)
+                                                                         gi +g̃i
+1125   36:     Shardi θ(t+1) ← ShardedOpt Shardi θ(t) , Shardi P i (t)           (t)
+1126                                                                  i Ni +Ñi
+                                               (t+1)
+
+1127   37:     Bufferi ← All Gather(Shardi θ           )
+                 (t)
+1128   38:     Ñi ← 0
+1129   39:     Ready for Stage 1 ← True
+1130   40:     Ready for Stage 2 ← False
+1131
+1132
+1133
+
+
+
+                                                          21

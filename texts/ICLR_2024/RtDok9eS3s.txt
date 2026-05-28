@@ -1,0 +1,1824 @@
+Published as a conference paper at ICLR 2024
+
+
+S IMPLIFYING T RANSFORMER B LOCKS
+ Bobby He & Thomas Hofmann∗
+ Department of Computer Science, ETH Zurich
+
+
+                                             A BSTRACT
+            A simple design recipe for deep Transformers is to compose identical building
+            blocks. But standard transformer blocks are far from simple, interweaving atten-
+            tion and MLP sub-blocks with skip connections & normalisation layers in precise
+            arrangements. This complexity leads to brittle architectures, where seemingly mi-
+            nor changes can significantly reduce training speed, or render models untrainable.
+            In this work, we ask if the standard transformer block can be simplified? Com-
+            bining signal propagation theory and empirical observations, we motivate modi-
+            fications that allow many block components to be removed with no loss of train-
+            ing speed, including skip connections, projection or value parameters, sequen-
+            tial sub-blocks and normalisation layers. In experiments on both autoregressive
+            decoder-only and BERT encoder-only models, our simplified transformers emu-
+            late the per-update convergence speed and performance of standard transformers,
+            while enjoying 16% faster training throughput, & using 15% fewer parameters.
+
+
+1       I NTRODUCTION
+The transformer architecture (Vaswani et al., 2017) is arguably the workhorse behind many recent
+successes in deep learning. A simple way to construct a deep transformer architecture is by stacking
+multiple identical transformer “blocks” one after another in sequence. Each block, however, is more
+complicated and consists of many different components, which need to be combined in specific
+arrangements in order to achieve good performance. Surprisingly, the base transformer block has
+changed very little since its inception, despite attracting the interest of many researchers.
+In this work, we study whether the standard transformer block can be simplified. More specifically,
+we probe the necessity of several block components, including skip connections, projection/value
+matrices, sequential sub-blocks and normalisation layers. For each considered component, we ask
+if it can be removed without loss of training speed (both in terms of per-update step & runtime), and
+what architectural modifications need to be made to the transformer block in order to do so.
+We believe the problem of simplifying transformer blocks without compromising training speed is
+an interesting research question for several reasons. First, modern neural network (NN) architectures
+have complex designs with many components, and it is not clear the roles played by these different
+components in NN training dynamics, nor how they interact with each other. This is particularly
+pertinent given the existing gap between theory and practice in deep learning, where theorists work-
+ing to understand the mechanisms of deep learning often only consider simplified architectures due
+to convenience, not necessarily reflective of modern architectures used in practice. Simplifying the
+NN architectures used in practice can help towards bridging this divide.
+On a related theoretical note, our work highlights both strengths and current limitations of signal
+propagation: a theory that has proven influential due to its ability to motivate practical design choices
+in deep NN architectures. Signal propagation (Poole et al., 2016; Schoenholz et al., 2017; Hayou
+et al., 2019) studies the evolution of geometric information in an NN at initialisation, captured
+through inner products of layerwise representations across inputs, and has inspired many impressive
+results in training deep NNs (Xiao et al., 2018; Brock et al., 2021; Martens et al., 2021; Zaidi et al.,
+2023). However, the current theory only considers a model at initialisation, and often considers
+only the initial forward pass. As such, signal propagation at present is unable to shed light on many
+intricacies of deep NN training dynamics, for example the benefits of skip connections for training
+speed. Though signal propagation is crucial in motivating our modifications, we would not have
+arrived at our simplified transformer blocks from theory alone, and relied also on empirical insights.
+    ∗
+        Correspondence to: bobby.he@inf.ethz.ch.
+
+
+                                                    1
+Published as a conference paper at ICLR 2024
+
+
+                          Pre-LN                       Ours
+                                                           Hx
+                                    MLP Out
+                                                               Shaped Attention            MLP Out
+                                     NonLin                                                NonLin
+
+                                     MLP In                      Q          K              MLP In
+
+                                      Norm
+
+
+
+                                                       Parallel
+                                      Proj
+                                                                     Proj
+                           Hx
+                                                      Hx
+                                Attention                                                  MLP Out
+                                                           Attention
+                                                                                           NonLin
+
+                                Q       K     V            Q          K         V          MLP In
+
+
+                                      Norm                                          Norm
+
+
+Figure 1: Comparison between different Transformer blocks. (Left) The standard Pre-LN block. (Top Right)
+Our most simplified block. (Bottom Right) The parallel block (Zhao et al., 2019; Wang & Komatsuzaki, 2021).
+Like the parallel block, our block eschews the need for sequential sub-blocks, but we additionally remove all
+skip connections and normalisation layers, as well as value and projection parameters. Here, ⊗ denotes a matrix
+multiplication, and ⊕ denotes a (potentially weighted) sum.
+
+Finally, on the practical side, given the cost of training and deploying large transformer models
+nowadays, any efficiency gains in the training and inference pipelines for the transformer architec-
+ture represent significant potential savings. Simplifying the transformer block by removing non-
+essential components both reduces the parameter count and increases throughput in our models. In
+particular, we show that it is possible to remove skip connections, value parameters, projection pa-
+rameters and sequential sub-blocks, all while matching the standard transformer in terms of training
+speed and downstream task performance. As a result, we reduce parameter count by up to 16% and
+observe throughput increases of 16% at both train and inference time.
+Our starting point to simplify Transformer blocks is He et al. (2023), who show that respecting
+signal propagation principles allows one to train deep Transformers without skip connections or
+normalisation layers, but at significantly reduced convergence speeds per parameter update. We first
+show that regulating the updates to values and projection parameters (Sec. 4.1), or in fact removing
+them entirely (Sec. 4.2), improves the performance of skipless attention sub-blocks, and recovers the
+lost per-update training speed reported by He et al. (2023). This removes half of the parameters and
+matrix-multiplications in the attention sub-block. In Sec. 4.3, we show our simplifications combine
+profitably with parallel sub-blocks (Zhao et al., 2019; Wang & Komatsuzaki, 2021), allowing us to
+remove all remaining skip connections and sequential sub-blocks without compromising per-update
+training speed, whilst further boosting the throughput increase to be 16%, in our implementation.
+Finally, in Sec. 5, we show that our simplified blocks improve when scaled to larger depths, work
+well in both encoder-only and decoder-only architectures, and that our findings also hold when
+scaling training length. We conclude with a discussion of limitations and future work in Sec. 6.
+
+2    R ELATED W ORK
+Simplifying deep NNs by removing block components has received a lot of attention, both in trans-
+formers and other architectures. In these works, signal propagation theory often acts as inspiration.
+For a pair of inputs x, x′ , mapped to a pair of representation/activations vectors xl , x′l ∈
+Rd at layer l, signal propagation theory studies the evolution of activation inner products
+1 ⊤ ′ 1 ⊤           1 ′⊤ ′
+d xl xl , d xl xl , d xl xl at initialisation, which can be tracked with their large d limits (Lee et al.,
+2018; Matthews et al., 2018; Yang, 2019). Several pathologies afflicting poorly designed deep NNs
+can be identified as a result (Schoenholz et al., 2017; Hayou et al., 2019; Yang et al., 2019; Dong
+et al., 2021; Martens et al., 2021). For example, the activation norms d1 x⊤
+                                                                           l xl may blow up or vanish,
+or the cross products d1 x⊤    ′                                                          ′
+                            l xl may converge to a value independent of the inputs x, x at large l, in
+which case deeper layers of the model are unable to identify different inputs. Avoiding such degen-
+eracies is important to allow for good training dynamics and generalisation in deep NNs (Balduzzi
+et al., 2017; Xiao et al., 2018; 2020; Hayou et al., 2021; Martens et al., 2021; Noci et al., 2022).
+
+
+                                                      2
+Published as a conference paper at ICLR 2024
+
+
+It has been shown that judicious use of weight initialisations and architectural tools, like skip connec-
+tions and normalisation layers, can improve signal propagation degeneracies and the trainability of
+deep NNs. Such considerations have motivated principled modifications with simpler architectures.
+De & Smith (2020) show that an implicit mechanism of Pre-LN skip connections is to downweight
+the residual branch relative to the skip branch, leading to better signal propagation. They also show
+that explicitly downweighting the residual branch allows normalisation layers to be removed with-
+out affecting performance. The idea of downweighting residuals for improved signal propagation
+& trainability has been studied extensively in the literature (Zhang et al., 2018; Hanin & Rolnick,
+2018; Tarnowski et al., 2019; Zhang et al., 2019; Arpit et al., 2019; Xu et al., 2020; Bachlechner
+et al., 2021; Touvron et al., 2021; Hayou et al., 2021; Hayou & Yang, 2023; Martens et al., 2021;
+Davis et al., 2021; Noci et al., 2022; Wang et al., 2022a; Huang et al., 2020; Wang et al., 2022b).
+For skip connections (He et al., 2016), it has been shown that transforming non-linear activation
+functions in MLPs and CNNs to be more linear according to a given deep architecture can enable
+good signal propagation even without skip connections (Martens et al., 2021; Zhang et al., 2022; Li
+et al., 2022). He et al. (2023) apply similar considerations to the self-attention mechanism, where
+the key insight is that attention matrices need to be more identity-like in order to prevent signal
+degradation in skipless transformers. However, these works find that skipless architectures suffer
+from significant losses in training speed compared to their residual counterparts, when using stan-
+dard optimisers like SGD or Adam. Such differences were not observed with stronger optimisers
+like K-FAC (Martens & Grosse, 2015) on CNNs, and this inability to explain training phenom-
+ena highlights a current limitation of signal propagation theory. Ding et al. (2021; 2023) design
+a CNN, RepVGG, that can be trained like a residual architecture for fast per-update convergence,
+but reparameterised to be skipless at test time for significantly higher inference throughput. This
+reparameterisation is related to our considerations of value and projection parameters in Sec. 4.
+Many works have considered simplifications or improvements specific to the transformer. Most
+relevant to our work is the parallel block (Zhao et al., 2019; Wang & Komatsuzaki, 2021) (pictured
+Fig. 1, bottom right), which computes the MLP and attention sub-blocks in parallel for efficiency
+gains, with minimal performance loss. Trockman & Kolter (2023) observe that the product of value
+and projection parameters often has a large identity component in trained transformers, and design
+an initialisation mimicking this to improve performance in standard transformers on small datasets.
+We find these matrices can be fixed to the identity without loss of performance, which removes
+them from our simplified architecture. Other works have considered reducing the frequency of MLP
+sub-blocks (Sridhar et al., 2022; Pires et al., 2023) or efficient replacements to softmax attention
+(Katharopoulos et al., 2020; Schlag et al., 2021; Choromanski et al., 2021). Sukhbaatar et al. (2019)
+remove the MLP by integrating it into the attention sub-block, augmented with persistent memory.
+
+3    P RELIMINARIES
+A deep transformer architecture of depth L is formed by sequentially stacking L transformer blocks.
+The most common block is Pre-LN, depicted in Fig. 1 (left), which we treat as a baseline for com-
+paring training speed, both in terms of per-update and runtime. It differs from the original Post-LN
+block only in the position of the normalisation layers relative to the skip connections, but is more
+popular as the Post-LN block suffers from poor training stability and signal propagation in deep
+layers (Xiong et al., 2020; Liu et al., 2020; Noci et al., 2022; He et al., 2023).
+Transformer blocks take representations of sequences as inputs. For an input sequence representa-
+tion Xin ∈ RT ×d , with T tokens and dimension d, the Pre-LN block outputs Xout , where:
+    Xout = αFF X̂ + βFF MLP(Norm(X̂)),         where X̂ = αSA Xin + βSA MHA(Norm(Xin )).             (1)
+
+with scalar gain weights αFF , βFF , αSA , βSA fixed to 1 by default. Here, “MHA” stands for Multi-
+Head Attention (detailed below), and “Norm” denotes a normalisation layer (Ba et al., 2016; Zhang
+& Sennrich, 2019). In words, we see that the Pre-LN transformer block consists of two sequential
+sub-blocks (one attention and one MLP), with normalisation layers and residual connections for both
+sub-blocks, and crucially the normalisation layers are placed within the residual branch. The MLP
+is usually single hidden-layer, with hidden dimension that is some multiple of d (e.g. 4 (Vaswani
+et al., 2017) or 8/3 (Touvron et al., 2023)), and acts on each token in the sequence independently.
+The MHA sub-block allows tokens to share information between one another using self-attention.
+For input sequence X, the self-attention mechanism outputs:
+
+
+                                                   3
+Published as a conference paper at ICLR 2024
+
+
+                                    V                                       1  Q K⊤ ⊤
+          Attn(X) = A(X)XW ,              where A(X) = Softmax             √ XW W X + M ,                      (2)
+                                                                            dk
+where WQ , WK ∈ Rd×dk and WV ∈ Rd×dv are trainable query, key and value parameters respec-
+tively. Here, the attention matrix A(X) ∈ RT ×T can be thought of as allowing different tokens to
+“mix” with each other. M ∈ RT ×T is a mask taking values in {0, −∞} that depend on the mod-
+elling task. For causal auto-regressive transformers like GPT, Mi,j = 0 iff i ≥ j, which prevents a
+token from obtaining information from future tokens. In bidirectional models like BERT, masking
+is typically applied at the token level and not in the attention mechanism (i.e. M is the zero matrix).
+The Multi-Head Attention name arises because it is typical in practice to apply self-attention on H
+                                                                 d
+different “heads” (with independent parameters) with dv = dk = H    , as follows:
+
+                             MHA(X) = Concat Attn1 (X), . . . , AttnH (X) WP ,
+
+                                                                                                               (3)
+where WP ∈ Rd×d denotes a trainable square projection matrix that combines different attention
+heads. If we let WnV denote the value parameters for head n, then the concatenated value weights
+WV = Concat(W1V , . . . , WH    V
+                                  ) ∈ Rd×d can be viewed as a square matrix. One of our key findings,
+in Sec. 4.2, is to show that fixing the value and projection parameters, WV and WP , to the identity
+matrix significantly improves per-update training speed in skipless transformer blocks (to speeds
+matching or even outperforming the standard Pre-LN block), whilst simultaneously significantly
+reducing the parameter count and matrix-multiplication FLOPs required, thus increasing throughput.
+
+4       S IMPLIFYING T RANSFORMER B LOCKS
+We now describe how we arrive at our simplest Transformer block, Fig. 1 (top right), starting from
+the Pre-LN block, using a combination of signal propagation theory and empirical observations.
+Each subsection here will remove one block component at a time without compromising training
+speed, and we aim to provide an intuitive account of our progress in simplifying the Pre-LN block.
+All experiments in this section use an 18-block 768-width causal decoder-only GPT-like model on
+the CodeParrot dataset,1 which is sufficiently large that we are in a single epoch regime with minimal
+generalisation gap (Fig. 2), allowing us to focus on training speed. We provide depth scaling, and
+non-causal encoder-only, experiments, in Sec. 5. We use a linear decay learning rate (LR) schedule2
+with AdamW (Loshchilov & Hutter, 2017), with linear warmup for the first 5% steps. The maximum
+LR is tuned on training loss, using a logarithmic grid. Additional experimental details are in App. D.
+
+4.1       R EMOVING THE ATTENTION SUB - BLOCK SKIP CONNECTION
+
+We first consider a skipless attention sub-block, whose output has the simple interpretation of
+adding, to each token, other token representations according to the attention matrix. In the nota-
+tion of Eq. (1) this corresponds to αSA = 0. Naively removing the attention skip leads to a signal
+degeneracy called rank collapse (Dong et al., 2021), which harms trainability (Noci et al., 2022).
+
+Setup He et al. (2023) outline modifications needed to the self-attention mechanism in order to
+correct these signal degeneracies at large depths, and train such deep skipless networks for the first
+time. One method they introduce, Value-SkipInit, modifies the self-attention matrix to compute:
+                                           A(X) ← (αIT + βA(X))                                                (4)
+with trainable scalars α, β initialised to 1 and 0 respectively, and IT ∈ RT ×T is the identity matrix.
+The key insight here is to initialise the self-attention matrix to have a dominant identity component
+that encourages a token to attend to itself more relative to other tokens, much in the same way that a
+Pre-LN skip upweights the skip branch relative to the residual branch for good signal propagation at
+large depths (De & Smith, 2020). We point out that these considerations only apply at initialisation.
+Noci et al. (2023) propose an extension, Shaped Attention, also motivated by signal propagation:
+                                        A(X) ← (αIT + βA(X) − γC).                                             (5)
+    1
+        Our setting is taken from https://huggingface.co/learn/nlp-course/chapter7/6.
+    2
+        We found linear decay to slightly outperform cosine decay for both our models and baselines (c.f. Fig. 12).
+
+
+                                                          4
+Published as a conference paper at ICLR 2024
+
+
+Here, α, β, γ are trainable, and C is a constant (not trained) centering matrix, set to be equal to
+                                                                    ⊤
+the values of A when the query-key dot product √1d XWQ WK X⊤ is zero3 . Like He et al.
+                                                      k
+(2023), we initialise queries WQ = 0, which exactly zeros the query-key dot product at ini-
+tialisation. Then, β = γ means that βA(X) − γC = 0 at initialisation, and α = 1 en-
+sures a dominant identity component, and good signal propagation. Ali et al. (2023) also cen-
+tre attention and show it helps prevent oversmoothing in vision transformers and graph NNs.
+                                                                                                       4.0
+We found Shaped Attention, Eq. (5), to slightly out-                         V-SkipInit ( SA = 0), train
+perform Eq. (4) (c.f. Fig. 13), and use it in our ex-       3.5              V-SkipInit ( SA = 0), eval
+
+
+                                                                           Cross-entropy Loss
+                                                                             Pre-LN, train
+periments on skipless attention sub-blocks, with β =        3.0
+                                                                             Pre-LN, eval
+γ = α = 1 at initialisation unless stated other-            2.5
+wise. We also use head-dependent scalars in Eq. (5),
+                                                            2.0
+αh , βh and γh , which provided a small additional per-
+                                                            1.5
+formance boost.      One final important implementa-
+tion detail is that for any skipless block we explic-       1.0
+                                                                0      10K     20K       30K        40K
+itly downweight the MLP branch by initialising train-                      Training step
+                   1
+able βFF = O( √L ) < 1 = αFF . This is moti- Figure 2: Loss of training speed in trans-
+vated through signal propagation theory (c.f. Stable formers without attention sub-block skip
+                                                        (He et al., 2023), even with Shaped Atten-
+ResNet, Hayou et al. (2021)), and accounts for the tion, Eq. (5), and MLP skips (α = 1).
+                                                                                             FF
+fact that removing skip connections (in either MLP or
+MHA sub-block) reduces the implicit downweighting effect of Pre-LN blocks (De & Smith,
+2020). For the depth L = 18 networks in this section, we initialise βFF = 0.1.
+                                                                                                       1.50
+Recovering lost training speed Despite allowing skip-
+                                                                           Eval Loss after 40K steps
+                                                                                                       1.45
+less transformers to train for the first time, He et al. (2023)                                        1.40
+reported a significant loss of training speed per step com-                                            1.35
+pared to the Pre-LN block. We verify this in Fig. 2.                                                   1.30
+                                                                                                              Orth Winit
+                                                                                                                    V , WP
+                                                                                                                         init
+To recover the lost training speed without attention skips,        1.25
+                                                                                                Identity Winit
+                                                                                                            V , WP
+                                                                                                                 init
+note that identity attention matrices make a deep trans-           1.20                         Pre-LN loss
+                                                                                                V-SkipInit loss
+former with no MLP sub-blocks act like a deep skipless             1.15
+                                           QL                           0.0 0.2      0.4     0.6         0.8          1.0
+                                                                               Residual weights V, P
+
+linear NN at initialisation,4 f (X)=X l=1 WlV WlP ,                                                            V          P
+where WlV , WlP are the value and projection weights in Figure 3: Restricting updates to W , W ,
+                                                              through smaller βV , βP , recovers training
+layer l. In He et al. (2023), they initialise WlV , WlP to be speed in skipless transformers (αSA = 0).
+independent random orthogonal matrices to avoid signal
+degeneracies from Gaussian initialisations (Saxe et al., 2013; Hu et al., 2020; Meterez et al., 2023).
+It is known that such deep skipless networks train slower than their residual counterparts (Martens
+et al., 2021). Moreover, it is also known that Pre-LN skips downweight residual branches (De &
+Smith, 2020), which is equivalent to reduced learning rates & downscaled parameter updates from
+initialisation in linear layers (e.g. Ding et al. (2023); we outline and empirically verify this duality in
+App. A). This motivates us to study a reparameterisation of the value/projection weights WV , WP :
+                   WV = αV Winit
+                            V
+                                 + βV ∆WV , and WP = αP Winit
+                                                         P
+                                                              + βP ∆WP ,                                                        (6)
+                  V
+with “skip” Winit    fixed to be random orthogonal to preserve the signal propagation achieved at
+initialisation, and “residual” ∆WV trainable and initialised to zero. We consider downweighting
+the residuals with fixed βV ≤ αV = 1, which biases the matrices WV , WP to stay closer to
+initialisation, and would expect βV = O( √1L ) to recover the benefits of skip connections (Hayou
+                                                    P
+et al., 2021).5 . Similar considerations apply for Winit , ∆WP , αP , βP .
+In Fig. 3, we find as expected that using smaller βV and βP with this reparameterisation, Eq. (6),
+already restores much of the training speed loss in skipless attention-blocks, using orthogonally
+              V       P
+initialised Winit , Winit . To close this gap further, we note that from a signal propagation perspective,
+               V       P
+initialising Winit , Winit  to be the identity matrix is equivalent to orthogonal initialisation when the
+   3
+     For example, when there is no masking, C becomes the uniform T × T stochastic matrix: T1 11⊤
+   4
+     We set aside the MLP sub-block here for simplicity, but point out that all of our experiments use MLPs so
+our findings carry over to the full setting.
+   5
+     Although the initial forward pass is identical regardless of βV , due to zero initialised ∆WV .
+
+
+                                                            5
+Published as a conference paper at ICLR 2024
+
+
+                                                                    V        P
+attention sub-block is skipless. With identity initialisation Winit    = Winit  = Id we see a consistent
+improvement over orthogonal initialisation, which essentially matches the Pre-LN block. One thing
+we can conclude from this experiment, is that restricting the updates to the values and projections
+from their initialisation replicates the effects of the attention sub-block skip connection, and recovers
+the lost per-update training speed. We investigate the difference in Fig. 3 of performance between
+identity and random orthogonal in the appendix (Fig. 15).
+4.2    R EMOVING VALUE AND P ROJECTION PARAMETERS
+
+In fact, we can also conclude from Fig. 3 that it is possible to completely remove the value and
+projection parameters WV , WP with minimal loss of per-update training speed. Namely, when
+                                             V       P
+βV = βP = 0 and identity-initialised Winit      = Winit  = I, we essentially match the Pre-LN block
+performance after equal numbers of training steps. In this case, we have WV = WP = I through-
+out training, i.e. the values and projection parameters are identity.
+To further verify this surprising observation, we consider                                           0.20
+                                                                                                                      Layer
+
+
+                                                                      Residual/Skip gain ratios, /
+                                                                                                            1   6          11         16
+reparameterised WV , WP , as in Eq. (6) with identity                                                       2   7          12         17
+   V      P                                                                                          0.15   3   8          13         18
+Winit , Winit , but now trainable scalars αV , βV , αP , βP .                                               4   9          14         Proj P/ P
+                                                                                                            5   10         15         Value V/ V
+From an initialisation of αV =αP =1 and βV =βP =0.2,                                                 0.10
+we plot the evolution of “residual-skip” ratios αβVV , αβPP in
+                                                                                                     0.05
+Fig. 4. Weight decay was not applied on αV , βV , αP , βP .
+We see that the residual-skip weight ratios αβVV , αβPP con-      0.00
+                                                                       0 5K 10K 15K 20K 25K 30K 35K 40K
+verge to 0 for the vast majority of layers, which indicates                       Training step
+that these reparameterised matrices WV , WP converge Figure 4:                 Residual-skip gain ratios
+to the identity during training. As a result, the extra ca- αβV , αβP converge to 0 during training.
+pacity to perform linear projections via WV , WP is not       V      P
+
+
+used. We plot the corresponding trajectories for other scalar parameters like βFF , in Figs. 17 to 20,
+which do not tend to 0. The model in Fig. 4 with trainable WV , WP achieved worse final evalua-
+tion loss than the model in Fig. 3 with identity WV , WP (1.194 vs. 1.178). Interestingly, this trend
+is reversed if the attention skip is re-added (Fig. 23).         3.00
+                                                                                                                     V-SkipInit (He et al. 2023)
+                                                                   2.75               Pre-LN
+We thus elect to remove values and projection parameters
+    V     P                                                        2.50               SAS (§4.2)
+                                                                     Eval Cross-entropy
+
+
+W , W in our skipless attention sub-blocks, by setting                                SAS-P (§4.3)
+them to the identity.6 We refer to the resulting sub-block         2.25               SAS-P, no norm (§4.4)
+                                                                                      Parallel (Wang et al, 2021)
+as the Simplified Attention Sub-block (SAS). Our full SAS          2.00
+
+block is depicted in Fig. 10 and we detail the mathemat-           1.75
+
+ical computation in Eq. (12). We note that SAS blocks              1.50
+
+use only half of the parameters as well as half the matrix-        1.25
+
+multiplications in the attention sub-block: only query and              0   2     4        6
+                                                                                 Runtime (hours)
+                                                                                                   8        10
+
+key parameters remain. This results in a 13% reduction
+                                                              Figure 5: Training speed in terms of run-
+in the total number of parameters (146M vs 167M for 18 time. We see our models match (or even
+blocks) in the models we consider in this section.7           slightly outperform) the Pre-LN block.
+In Fig. 5 we see that when comparing speed in terms of wall-clock runtime on an A5000 GPU, our
+SAS block already trains at speeds (slightly) outperforming the default Pre-LN transformer. The
+corresponding plot comparing speed in terms of training steps taken is provided in Fig. 26. A more
+detailed analysis of efficiency gains in our simplified blocks can be found in Sec. 5.
+Though we do not have a rigorous proof for why the training dynamics in skipless transformers
+forgo additional capacity by converging to identity value and projection parameters (Fig. 4), nor why
+fixing such matrices to the identity results in no performance degradation and in fact trains faster
+than having trainable values and projections (Fig. 3), we offer some half-explanations. First, the fact
+that WV , WP are simply linear projections of the input sequence representations X (as opposed to
+in the MLP sub-block where elementwise non-linearities are places between such matrices), could
+   6
+     The only exception is the first layer’s value parameters W1V , which is the only ratio above 0.05 in Fig. 4.
+We saw very minor performance gains by keeping W1V (c.f. Fig. 24), so keep it whilst removing all other
+WlV , WlP for l ≤ L
+   7
+     In general, the % of all parameters removed by WV ,WP depends on the ratio of width d to the MLP
+hidden width dFF , vocabulary size and depth. Here, we have width d = 768, MLP hidden width dFF = 3072 =
+4d, vocabulary size 50K and depth L = 18. In the large depth limit, only the ratio dFF /d matters.
+
+
+                                                       6
+Published as a conference paper at ICLR 2024
+
+
+mean that the additional capacity afforded by such matrices is not particularly substantial.8 This is
+corroborated by Trockman & Kolter (2023) who found in trained transformers the product WV WP
+often has a dominant identity component. Also, from a signal propagation perspective, there is no
+reason why initialising such matrices to be non-identity (e.g. orthogonal or Gaussian) would be
+preferred to identity initialisation, nor is it clear why they would be necessary in the first place,
+especially given the additional matrix-multiplication FLOPs they require.
+
+4.3      R EMOVING THE MLP SUB - BLOCK SKIP CONNECTION
+
+So far we have simplified the Pre-LN transformer block by removing, without loss of training speed,
+three key components: 1) the attention sub-block skip connection, as well as 2) value and 3) projec-
+tion matrices. We next turn to removing the remaining skip connection in the MLP sub-block.
+This proved more challenging. Like previous works (Martens et al., 2021; Zhang et al., 2022; He
+et al., 2023), we found that making activations more linear, motivated through signal propagation,
+still resulted in a significant loss of per-update training speed without MLP skips when using Adam,
+as shown in Fig. 25. We also experimented with variants of the Looks Linear initialisation (Balduzzi
+et al., 2017), with Gaussian, orthogonal or identity weights, to no avail. As such, we use standard
+activations (e.g. ReLU in this section) and initialisations in the MLP sub-block throughout our work.
+Instead, we turn to the idea of parallel MHA and MLP sub-blocks (Zhao et al., 2019; Wang &
+Komatsuzaki, 2021), which has proven popular in several recent large transformer models, such
+as PALM (Chowdhery et al., 2022) and ViT-22B (Dehghani et al., 2023). The parallel transformer
+block is depicted in Fig. 1 (bottom right), and mathematically, given input Xin it outputs Xout , where:
+                  Xout = αcomb Xin + βFF MLP(Norm(Xin )) + βSA MHA(Norm(Xin )),                             (7)
+
+with skip gain αcomb = 1, and residual gains βFF = βSA = 1 as default.
+In the parallel block, the MLP and MHA sub-blocks each take the same (normalised) input, af-
+fording more parallelisation compared to the standard Pre-LN block, which computes sub-blocks
+sequentially. The two sub-blocks are combined by summing their outputs, in conjunction with a
+single skip connection, with weight αcomb . This parallelisation, as well as the removal of one skip
+connection and one normalisation layer enables efficiency gains: Chowdhery et al. (2022) report the
+parallel block has 15% faster training speed compared to the standard “sequential” Pre-LN block.
+It is straightforward to combine our simplifications from Secs. 4.1 and 4.2 with the parallel block in
+Eq. (7): we simply 1) use our SAS attention sub-block, Eq. (12), 2) set fixed αcomb = 0 to remove all
+skip connections in the block, and 3) downweight βFF < 1. The resulting block is pictured in Fig. 11,
+and we refer to it as SAS-Parallel (SAS-P for short). We see in Fig. 5 that SAS-P trains even faster
+in terms of runtime compared to the SAS and Pre-LN blocks, and matches the training speed of the
+parallel block despite using 13% fewer parameters. Our intuition is that the combination of Shaped
+Attention and identity values/projections preserves signal between blocks throughout training and
+replaces the need for a skip connection in either sub-block. Moreover, we note that our attention
+sub-block is the identity function, Xout = Xin , at initialisation, so there is no difference between our
+sequential SAS (Fig. 10) and parallel SAS-P (Fig. 11) blocks at initialisation.
+
+4.4      R EMOVING N ORMALISATION LAYERS
+
+The final simplification we consider is removing normalisation layers, leaving us with our simplest
+block (Fig. 1, top right). From a signal propagation initialisation perspective, normalisation has been
+expendable at all stages of our simplifications in this section: the idea is that normalisation in Pre-LN
+blocks implicitly downweights residual branches, and this beneficial effect can be replicated without
+normalisation by another mechanism: either explicitly downweighting residual branches when skips
+are used, or biasing attention matrices to the identity/transforming MLP non-linearities to be “more”
+linear otherwise. As we account for these mechanisms in our modifications (downweighted MLP
+βFF & Shaped Attention), from an initialisation perspective there is no need for normalisation.
+Of course, these modifications have effects on training speeds and stability beyond initialisation,
+which are harder to predict from existing theory alone. In Fig. 5 we see that removing normalisa-
+   8
+       E.g., in single-head attention one can reparameterise WV , WP into one matrix with no expressivity loss.
+
+
+                                                        7
+Published as a conference paper at ICLR 2024
+
+
+tion allows even our simplest transformer block, which does not have skips, sequential sub-blocks,
+values, projections or normalisations, to match the training speed of the Pre-LN block in terms of
+runtime. Having said that, we do observe a slight degradation in training speed per iteration, as seen
+in Fig. 26, suggesting that normalisation layers have some beneficial properties for training speed
+beyond what is captured by signal propagation theory. We thus treat our SAS (Fig. 10) and SAS-P
+(Fig. 11) blocks, with normalisation, as our main approaches. On this note, we point out that De-
+hghani et al. (2023) found extra normalisation on the queries and keys to provide improved training
+stability in ViT-22B, going against the recent trend of researchers seeking to remove normalisation.
+
+5    F URTHER EXPERIMENTAL ANALYSIS
+Having introduced all of our simplifications in Sec. 4, we now provide further empirical analysis of
+our simplified blocks across a range of settings, as well as details of the efficiency gains afforded by
+our simplifications. In interest of space, additional experimental details can be found in App. D.
+Depth Scaling Given that signal propagation the-             4.0                   Pre-LN
+ory often focuses on large depths, where signal de-                                SAS (§4.2)
+                                                             3.5                   SAS-P (§4.3)
+
+
+                                                                  Eval Cross-Entropy
+generacies usually appear, it is natural to ask whether                            SAS-P, no norm (§4.4)
+the improved training speeds of our simplified trans-        3.0                   V-SkipInit (He et al. 2023)
+                                                                                   Depth=18
+former blocks also extend to larger depths. In Fig. 6,                             Depth=72
+                                                             2.5
+we see that scaling depth from 18 to 72 blocks leads
+to an increase in performance in our models as well          2.0
+as the Pre-LN transformer, indicating that our sim-
+                                                             1.5
+plified models are able to not only train faster but
+also to utilise the extra capacity that more depth pro-          0      5K       10K          15K         20K
+                                                                             Training step
+vides. Indeed, the per-update trajectories of our sim- Figure 6: Our models improve when deeper
+plified blocks and Pre-LN are near-indistinguishable (dashed, marked lines) vs. shallower (solid lines),
+across depths, when using normalisation.                unlike V-SkipInit (He et al., 2023).
+On the other hand, we see that Value-SkipInit (He et al., 2023) actually trains slower per update
+at depth 72 compared to 18 despite the increase in capacity and parameter count. Moreover, the
+gap in performance between Value-SkipInit and the other models increases with larger depth, which
+implies poor scalability of the previous method. We note that 72 blocks is already reasonably deep
+by publically-available modern standards (Hoffmann et al., 2022; Touvron et al., 2023).
+
+BERT Next, we demonstrate our simplified blocks’ performance extends to different datasets and
+architectures besides autoregressive decoder-only, as well as on downstream tasks. We choose the
+popular setting of the bidirectional encoder-only BERT model Devlin et al. (2018) for masked lan-
+guage modelling, with downstream GLUE benchmark.           4.5
+                                                                                             Crammed BERT (Pre-LN)
+In particular, we adopt the “Crammed” BERT setup                                      Parallel (Wang et al, 2021)
+                                                              4.0                     SAS (§4.2)
+of Geiping & Goldstein (2023), which asks how well                                    SAS-P (§4.3)
+                                                                                      SAS-P, no norm (§4.4)
+one can train a BERT model with a modest train-                                       V-SkipInit (He et al. 2023)
+                                                                  MLM loss
+
+
+                                                              3.5
+ing budget: 24 hours on a single consumer GPU.
+The authors provide an architecture, data pipeline            3.0
+and training setup that has been optimised for this
+low resource setting. We note that the Crammed ar-            2.5
+chitecture uses the Pre-LN block, and describe other
+setup details in App. D. We plug-in our simplified                0      5      10      15           20           25
+blocks, keeping the existing optimised hyperparam- Figure 7: MaskedRuntime          (hours)
+                                                                              language modelling loss vs
+eters, besides tuning learning rate and weight decay. runtime on a 2080Ti GPU for 24 hours.
+In Fig. 7, we see that our simplified blocks (especially with normalisation) match the pre-training
+speed on the masked language modelling task compared to the (Crammed) Pre-LN baseline within
+the 24 hour runtime. On the other hand, the removal of skip connections without modifying the
+values and projections (as in He et al. (2023)) once again leads to a significant loss of training speed.
+In Fig. 27, we provide the equivalent plot in terms of microbatch steps.
+Moreover in Table 1, we find that our methods match the performance of the Crammed BERT
+baseline after finetuning on the GLUE benchmark. We provide a breakdown over the downstream
+tasks in Table 2. We use the same finetuning protocol as Geiping & Goldstein (2023) (5 epochs,
+constant hyperparameters across tasks, dropout regularisation) for a fair comparison. Interestingly,
+
+
+                                                         8
+Published as a conference paper at ICLR 2024
+
+
+Value-SkipInit is largely able to recover from its poor pre-training in the fine-tuning phase. This,
+combined with the need for dropout when fine-tuning, suggests that factors besides pre-training
+speed are also important for fine-tuning. As the focus of our work primarily concerns training speed
+from random initialisations, we leave this to future work. Relatedly, we found removing normalisa-
+tions (Sec. 4.4) to cause instabilities when fine-tuning, where a small minority of sequences in some
+downstream datasets had NaN values in the initial forward pass from the pre-trained checkpoint.
+Efficiency Gains In Table 1, we also detail the pa- Table 1: GLUE benchmark & efficiency gains.
+rameter count and training speeds of models using Our SAS & SAS-P match the downstream perfor-
+                                                      mance of the Pre-LN baseline up to statistical sig-
+different Transformers blocks on the masked lan- nificance over 3 seeds, but use 16% fewer param-
+guage modelling task. We compute the speed as eters and enjoy up to 16% faster throughput.
+the ratio of the number of microbatch steps taken
+within the 24 hours of pre-training, relative to the Block                    GLUE Params Speed
+baseline Pre-LN Crammed BERT. We see that our Pre-LN (Crammed) 78.9±.7 120M                               1
+models use 16% fewer parameters, and SAS-P & Parallel                       78.5±.6 120M               1.05
+SAS are 16% & 9% faster per iteration, respectively, V-SkipInit             78.0±.3 120M               0.95
+compared to the Pre-LN block in our setting. We        SAS (Sec.  4.2)      78.4 ±.8      101M         1.09
+note that in our implementation the Parallel block SAS-P (Sec. 4.3)         78.3±.4 101M               1.16
+                                                       SAS-P, no norm               - 101M             1.20
+is only 5% faster than the Pre-LN block, whereas
+Chowdhery et al. (2022) observed 15% faster training speeds, suggesting that further through-
+out increases may be possible with a more optimised implementation. Our implementation, like
+Geiping & Goldstein (2023), uses automated operator fusion in PyTorch (Sarofeen et al., 2022)
+Longer training Finally, given the current trends of          2.0
+                                                                                            Pre-LN
+training smaller models for longer on more data (Hoff-        1.8
+                                                                                            SAS (§4.2)
+mann et al., 2022; Touvron et al., 2023), we investigate                                    SAS-P (§4.3)
+                                                                Eval Cross-entropy          3x tokens
+if our simplified blocks continue to match the training       1.6                           1x token
+speeds of the Pre-LN block with longer training. To do
+                                                              1.4
+this, we take our models from Fig. 5 on CodeParrot and
+train with 3× tokens. To be precise, we train for around      1.2
+120K (rather than 40K) steps with batch size 128 and se-
+                                                              1.0
+quence length 128, which results in around 2B tokens.              0   5   10    15    20    25     30
+In Fig. 8, we do indeed see that our simplified SAS and                     Runtime (hours)
+SAS-P blocks continue to match or outerperform the Pre- Figure 8: Training speeds continue to hold
+LN block in training speed when trained on more tokens. with longer training.
+
+6    D ISCUSSION
+Limitations and future work While we have demonstrated the efficacy of our simplifications
+across architectures, datasets, and tasks, the models we have considered (100-300M parameters) are
+small relative to the largest transformers. It would be interesting to investigate the performance of
+our simplified blocks at larger scales, especially because Chowdhery et al. (2022) report parallel
+blocks improve relative to Pre-LN blocks with scale. Our depth scaling experiments already show
+promise in this regard. On the theoretical side, though we were able to match the training speed of
+Pre-LN blocks with normalisation removed (Fig. 5), there are still unanswered questions regarding
+the benefits of normalisation for training speed and stability, and we were unable to remove normal-
+isation with good downstream task performance. Moreover, while we tuned key hyperparameters
+like learning rate, it is possible that many default hyperparameters and choices we inherited, e.g. the
+AdamW optimiser, or fine-tuning protocol, are overfit to the default Pre-LN block, and an exhaus-
+tive hyperparameter search for our simplified blocks would yield further improvements. Finally, on
+the practical side, we believe that a more hardware-specific implementation of our simplified blocks
+could give further improvements to training speed and performance.
+Conclusion In this work, we asked whether it is possible to simplify the standard Transformer
+block by removing unnecessary components. Combining signal propagation theory and empirical
+insights, we have shown that it is possible to remove skip connections, sequential sub-blocks, value
+and projection parameters, without loss of training speed or downstream task performance. As a
+result, our models have around 15% fewer parameters and 16% increased throughput. We believe
+our work can lead to simpler architectures being used in practice, thereby helping to bridge the gap
+between theory and practice in deep learning, and reducing the cost of large transformer models.
+
+
+                                                    9
+Published as a conference paper at ICLR 2024
+
+
+R EPRODUCIBILITY S TATEMENT
+Our code for experiments on auto-regressive transformers can be found at https://github.
+com/bobby-he/simplified_transformers.
+
+ACKNOWLEDGMENTS
+We would like to thank Sotiris Anagnostidis, Andrei Ivanov & Lorenzo Noci for helpful discussions
+in the initial stages of this project, and James Martens, John Martinis, Keivan Mohtashami, Tiago
+Pimentel & Imanol Schlag, as well as the anonymous reviewers, for constructive feedback on an
+early version of this manuscript.
+
+R EFERENCES
+Ameen Ali, Tomer Galanti, and Lior Wolf.          Centered self-attention layers.   arXiv preprint
+ arXiv:2306.01610, 2023.
+Devansh Arpit, Vı́ctor Campos, and Yoshua Bengio. How to initialize your network? robust initial-
+  ization for weightnorm & resnets. In H. Wallach, H. Larochelle, A. Beygelzimer, F. d'Alché-Buc,
+  E. Fox, and R. Garnett (eds.), Advances in Neural Information Processing Systems, volume 32.
+  Curran Associates, Inc., 2019.
+Jimmy Lei Ba, Jamie Ryan Kiros, and Geoffrey E Hinton. Layer normalization. arXiv preprint
+  arXiv:1607.06450, 2016.
+Thomas Bachlechner, Bodhisattwa Prasad Majumder, Henry Mao, Gary Cottrell, and Julian
+  McAuley. Rezero is all you need: Fast convergence at large depth. In Uncertainty in Artificial
+  Intelligence, pp. 1352–1361. PMLR, 2021.
+David Balduzzi, Marcus Frean, Lennox Leary, JP Lewis, Kurt Wan-Duo Ma, and Brian McWilliams.
+  The shattered gradients problem: If resnets are the answer, then what is the question? In Interna-
+  tional Conference on Machine Learning, pp. 342–350. PMLR, 2017.
+Andy Brock, Soham De, Samuel L Smith, and Karen Simonyan. High-performance large-scale
+  image recognition without normalization. In Marina Meila and Tong Zhang (eds.), Proceedings of
+  the 38th International Conference on Machine Learning, volume 139 of Proceedings of Machine
+  Learning Research, pp. 1059–1071. PMLR, 18–24 Jul 2021.
+Krzysztof Marcin Choromanski, Valerii Likhosherstov, David Dohan, Xingyou Song, Andreea
+  Gane, Tamas Sarlos, Peter Hawkins, Jared Quincy Davis, Afroz Mohiuddin, Lukasz Kaiser,
+  David Benjamin Belanger, Lucy J Colwell, and Adrian Weller. Rethinking attention with per-
+  formers. In International Conference on Learning Representations, 2021. URL https:
+  //openreview.net/forum?id=Ua6zuk0WRH.
+Aakanksha Chowdhery, Sharan Narang, Jacob Devlin, Maarten Bosma, Gaurav Mishra, Adam
+  Roberts, Paul Barham, Hyung Won Chung, Charles Sutton, Sebastian Gehrmann, et al. Palm:
+  Scaling language modeling with pathways. arXiv preprint arXiv:2204.02311, 2022.
+Yann N Dauphin, Angela Fan, Michael Auli, and David Grangier. Language modeling with gated
+  convolutional networks. In International conference on machine learning, pp. 933–941. PMLR,
+  2017.
+Jared Q Davis, Albert Gu, Krzysztof Choromanski, Tri Dao, Christopher Re, Chelsea Finn, and
+   Percy Liang. Catformer: Designing stable transformers via sensitivity analysis. In Marina Meila
+   and Tong Zhang (eds.), Proceedings of the 38th International Conference on Machine Learning,
+   volume 139 of Proceedings of Machine Learning Research, pp. 2489–2499. PMLR, 18–24 Jul
+   2021. URL https://proceedings.mlr.press/v139/davis21a.html.
+Soham De and Sam Smith. Batch normalization biases residual blocks towards the identity function
+  in deep networks. In H. Larochelle, M. Ranzato, R. Hadsell, M.F. Balcan, and H. Lin (eds.),
+  Advances in Neural Information Processing Systems, volume 33, pp. 19964–19975. Curran As-
+  sociates, Inc., 2020.
+
+
+                                                10
+Published as a conference paper at ICLR 2024
+
+
+Mostafa Dehghani, Josip Djolonga, Basil Mustafa, Piotr Padlewski, Jonathan Heek, Justin Gilmer,
+ Andreas Peter Steiner, Mathilde Caron, Robert Geirhos, Ibrahim Alabdulmohsin, et al. Scaling
+ vision transformers to 22 billion parameters. In International Conference on Machine Learning,
+ pp. 7480–7512. PMLR, 2023.
+
+Jacob Devlin, Ming-Wei Chang, Kenton Lee, and Kristina Toutanova. Bert: Pre-training of deep
+  bidirectional transformers for language understanding. arXiv preprint arXiv:1810.04805, 2018.
+
+Xiaohan Ding, Xiangyu Zhang, Ningning Ma, Jungong Han, Guiguang Ding, and Jian Sun. Repvgg:
+  Making vgg-style convnets great again. In Proceedings of the IEEE/CVF Conference on Com-
+  puter Vision and Pattern Recognition (CVPR), pp. 13733–13742, June 2021.
+
+Xiaohan Ding, Honghao Chen, Xiangyu Zhang, Kaiqi Huang, Jungong Han, and Guiguang Ding.
+  Re-parameterizing your optimizers rather than architectures. In The Eleventh International Con-
+  ference on Learning Representations, 2023. URL https://openreview.net/forum?
+  id=B92TMCG_7rp.
+
+Yihe Dong, Jean-Baptiste Cordonnier, and Andreas Loukas. Attention is not all you need: Pure
+  attention loses rank doubly exponentially with depth. In International Conference on Machine
+  Learning, pp. 2793–2803. PMLR, 2021.
+
+Leo Gao, Stella Biderman, Sid Black, Laurence Golding, Travis Hoppe, Charles Foster, Jason
+  Phang, Horace He, Anish Thite, Noa Nabeshima, et al. The pile: An 800gb dataset of diverse text
+  for language modeling. arXiv preprint arXiv:2101.00027, 2020.
+
+Jonas Geiping and Tom Goldstein. Cramming: Training a language model on a single GPU in one
+  day, 2023. URL https://openreview.net/forum?id=gUL6zYN4Uaf.
+
+Boris Hanin and David Rolnick. How to start training: The effect of initialization and architecture.
+  In Proceedings of the 32nd International Conference on Neural Information Processing Systems,
+  NIPS’18, pp. 569–579, Red Hook, NY, USA, 2018. Curran Associates Inc.
+
+Soufiane Hayou and Greg Yang. Width and depth limits commute in residual networks. arXiv
+  preprint arXiv:2302.00453, 2023.
+
+Soufiane Hayou, Arnaud Doucet, and Judith Rousseau. On the impact of the activation function
+  on deep neural networks training. In Kamalika Chaudhuri and Ruslan Salakhutdinov (eds.), Pro-
+  ceedings of the 36th International Conference on Machine Learning, volume 97 of Proceedings
+  of Machine Learning Research, pp. 2672–2680. PMLR, 09–15 Jun 2019.
+
+Soufiane Hayou, Eugenio Clerico, Bobby He, George Deligiannidis, Arnaud Doucet, and Judith
+  Rousseau. Stable resnet. In International Conference on Artificial Intelligence and Statistics, pp.
+  1324–1332. PMLR, 2021.
+
+Bobby He, James Martens, Guodong Zhang, Aleksandar Botev, Andrew Brock, Samuel L Smith,
+  and Yee Whye Teh. Deep transformers without shortcuts: Modifying self-attention for faithful
+  signal propagation. In The Eleventh International Conference on Learning Representations, 2023.
+  URL https://openreview.net/forum?id=NPrsUQgMjKK.
+
+Kaiming He, Xiangyu Zhang, Shaoqing Ren, and Jian Sun. Deep residual learning for image recog-
+  nition. In Proceedings of the IEEE conference on computer vision and pattern recognition, pp.
+  770–778, 2016.
+
+Jordan Hoffmann, Sebastian Borgeaud, Arthur Mensch, Elena Buchatskaya, Trevor Cai, Eliza
+  Rutherford, Diego de Las Casas, Lisa Anne Hendricks, Johannes Welbl, Aidan Clark, et al. Train-
+  ing compute-optimal large language models. arXiv preprint arXiv:2203.15556, 2022.
+
+Wei Hu, Lechao Xiao, and Jeffrey Pennington. Provable benefit of orthogonal initialization in op-
+ timizing deep linear networks. In International Conference on Learning Representations, 2020.
+ URL https://openreview.net/forum?id=rkgqN1SYvr.
+
+
+                                                 11
+Published as a conference paper at ICLR 2024
+
+
+Xiao Shi Huang, Felipe Perez, Jimmy Ba, and Maksims Volkovs. Improving transformer optimiza-
+  tion through better initialization. In Hal Daumé III and Aarti Singh (eds.), Proceedings of the 37th
+  International Conference on Machine Learning, volume 119 of Proceedings of Machine Learn-
+  ing Research, pp. 4475–4483. PMLR, 13–18 Jul 2020. URL https://proceedings.mlr.
+  press/v119/huang20f.html.
+Angelos Katharopoulos, Apoorv Vyas, Nikolaos Pappas, and François Fleuret. Transformers are
+  rnns: Fast autoregressive transformers with linear attention. In International conference on ma-
+  chine learning, pp. 5156–5165. PMLR, 2020.
+Jaehoon Lee, Jascha Sohl-dickstein, Jeffrey Pennington, Roman Novak, Sam Schoenholz, and
+  Yasaman Bahri. Deep Neural Networks as Gaussian Processes. In International Conference
+  on Learning Representations, 2018.
+Mufan Bill Li, Mihai Nica, and Daniel M Roy. The neural covariance sde: Shaped infinite depth-
+ and-width networks at initialization. arXiv preprint arXiv:2206.02768, 2022.
+Liyuan Liu, Xiaodong Liu, Jianfeng Gao, Weizhu Chen, and Jiawei Han. Understanding the diffi-
+  culty of training transformers. In Proceedings of the 2020 Conference on Empirical Methods in
+  Natural Language Processing (EMNLP), pp. 5747–5763, 2020.
+Ilya Loshchilov and Frank Hutter.        Decoupled weight decay regularization.        arXiv preprint
+   arXiv:1711.05101, 2017.
+James Martens and Roger Grosse. Optimizing neural networks with kronecker-factored approximate
+  curvature. In International conference on machine learning, pp. 2408–2417. PMLR, 2015.
+James Martens, Andy Ballard, Guillaume Desjardins, Grzegorz Swirszcz, Valentin Dalibard, Jascha
+  Sohl-Dickstein, and Samuel S Schoenholz. Rapid training of deep neural networks without skip
+  connections or normalization layers using deep kernel shaping. arXiv preprint arXiv:2110.01765,
+  2021.
+Alexander G de G Matthews, Mark Rowland, Jiri Hron, Richard E Turner, and Zoubin Ghahramani.
+  Gaussian Process Behaviour in Wide Deep Neural Networks. In International Conference on
+  Learning Representations, volume 4, 2018.
+Alexandru Meterez, Amir Joudaki, Francesco Orabona, Alexander Immer, Gunnar Rätsch, and Hadi
+  Daneshmand. Towards training without depth limits: Batch normalization without gradient ex-
+  plosion. arXiv preprint arXiv:2310.02012, 2023.
+Lorenzo Noci, Sotiris Anagnostidis, Luca Biggio, Antonio Orvieto, Sidak Pal Singh, and Aurelien
+  Lucchi. Signal propagation in transformers: Theoretical perspectives and the role of rank collapse.
+  arXiv preprint arXiv:2206.03126, 2022.
+Lorenzo Noci, Chuning Li, Mufan Bill Li, Bobby He, Thomas Hofmann, Chris Maddison, and
+  Daniel M Roy. The shaped transformer: Attention models in the infinite depth-and-width limit.
+  arXiv preprint arXiv:2306.17759, 2023.
+Telmo Pessoa Pires, António V Lopes, Yannick Assogba, and Hendra Setiawan. One wide feedfor-
+  ward is all you need. arXiv preprint arXiv:2309.01826, 2023.
+Ben Poole, Subhaneil Lahiri, Maithra Raghu, Jascha Sohl-Dickstein, and Surya Ganguli. Expo-
+  nential expressivity in deep neural networks through transient chaos. In D. Lee, M. Sugiyama,
+  U. Luxburg, I. Guyon, and R. Garnett (eds.), Advances in Neural Information Processing Systems,
+  volume 29. Curran Associates, Inc., 2016.
+Alec Radford, Jeff Wu, Rewon Child, David Luan, Dario Amodei, and Ilya Sutskever. Language
+  models are unsupervised multitask learners. 2019.
+Christian Sarofeen, Piotr Bialecki, Jie Jiang, Kevin Stephano, Masaki Kozuki,
+  Neal Vaidya, and Stas. Bekman.           Introducing nvFuser, a deep learning
+  compiler for PyTorch.         2022.       URL https://pytorch.org/blog/
+  introducing-nvfuser-a-deep-learning-compiler-for-pytorch/.
+
+
+                                                  12
+Published as a conference paper at ICLR 2024
+
+
+Andrew M Saxe, James L McClelland, and Surya Ganguli. Exact solutions to the nonlinear dynam-
+  ics of learning in deep linear neural networks. arXiv preprint arXiv:1312.6120, 2013.
+
+Imanol Schlag, Kazuki Irie, and Jürgen Schmidhuber. Linear transformers are secretly fast weight
+  programmers. In International Conference on Machine Learning, pp. 9355–9366. PMLR, 2021.
+
+Samuel S Schoenholz, Justin Gilmer, Surya Ganguli, and Jascha Sohl-Dickstein. Deep information
+  propagation. In International Conference on Learning Representations, 2017.
+
+Sharath Nittur Sridhar, Anthony Sarah, and Sairam Sundaresan. Trimbert: Tailoring bert for trade-
+  offs. arXiv preprint arXiv:2202.12411, 2022.
+
+Aleksandar Stanić, Dylan Ashley, Oleg Serikov, Louis Kirsch, Francesco Faccio, Jürgen Schmidhu-
+  ber, Thomas Hofmann, and Imanol Schlag. The languini kitchen: Enabling language modelling
+  research at different scales of compute. arXiv preprint arXiv:2309.11197, 2023.
+
+Sainbayar Sukhbaatar, Edouard Grave, Guillaume Lample, Herve Jegou, and Armand Joulin. Aug-
+  menting self-attention with persistent memory. arXiv preprint arXiv:1907.01470, 2019.
+
+Wojciech Tarnowski, Piotr Warchoł, Stanisław Jastrzebski, Jacek Tabor, and Maciej Nowak. Dy-
+ namical isometry is achieved in residual networks in a universal way for any activation function.
+ In The 22nd International Conference on Artificial Intelligence and Statistics, pp. 2221–2230.
+ PMLR, 2019.
+
+Hugo Touvron, Matthieu Cord, Alexandre Sablayrolles, Gabriel Synnaeve, and Hervé Jégou. Going
+  deeper with image transformers. In Proceedings of the IEEE/CVF International Conference on
+  Computer Vision, pp. 32–42, 2021.
+
+Hugo Touvron, Thibaut Lavril, Gautier Izacard, Xavier Martinet, Marie-Anne Lachaux, Timothée
+  Lacroix, Baptiste Rozière, Naman Goyal, Eric Hambro, Faisal Azhar, et al. Llama: Open and
+  efficient foundation language models. arXiv preprint arXiv:2302.13971, 2023.
+
+Asher Trockman and J Zico Kolter. Mimetic initialization of self-attention layers. arXiv preprint
+  arXiv:2305.09828, 2023.
+
+Ashish Vaswani, Noam Shazeer, Niki Parmar, Jakob Uszkoreit, Llion Jones, Aidan N Gomez,
+  Łukasz Kaiser, and Illia Polosukhin. Attention is all you need. Advances in neural informa-
+  tion processing systems, 30, 2017.
+
+Alex Wang, Amanpreet Singh, Julian Michael, Felix Hill, Omer Levy, and Samuel R. Bowman.
+  GLUE: A multi-task benchmark and analysis platform for natural language understanding. In
+  International Conference on Learning Representations, 2019. URL https://openreview.
+  net/forum?id=rJ4km2R5t7.
+
+Ben Wang and Aran Komatsuzaki. GPT-J-6B: A 6 Billion Parameter Autoregressive Language
+  Model. https://github.com/kingoflolz/mesh-transformer-jax, May 2021.
+
+Hongyu Wang, Shuming Ma, Li Dong, Shaohan Huang, Dongdong Zhang, and Furu Wei. Deepnet:
+  Scaling transformers to 1,000 layers. arXiv preprint arXiv:2203.00555, 2022a.
+
+Peihao Wang, Wenqing Zheng, Tianlong Chen, and Zhangyang Wang. Anti-oversmoothing in deep
+  vision transformers via the fourier domain analysis: From theory to practice. arXiv preprint
+  arXiv:2203.05962, 2022b.
+
+Lechao Xiao, Yasaman Bahri, Jascha Sohl-Dickstein, Samuel Schoenholz, and Jeffrey Pennington.
+  Dynamical isometry and a mean field theory of cnns: How to train 10,000-layer vanilla con-
+  volutional neural networks. In International Conference on Machine Learning, pp. 5393–5402.
+  PMLR, 2018.
+
+Lechao Xiao, Jeffrey Pennington, and Samuel Schoenholz. Disentangling trainability and general-
+  ization in deep neural networks. In International Conference on Machine Learning, pp. 10462–
+  10472. PMLR, 2020.
+
+
+                                               13
+Published as a conference paper at ICLR 2024
+
+
+Ruibin Xiong, Yunchang Yang, Di He, Kai Zheng, Shuxin Zheng, Chen Xing, Huishuai Zhang,
+  Yanyan Lan, Liwei Wang, and Tieyan Liu. On layer normalization in the transformer architecture.
+  In International Conference on Machine Learning, pp. 10524–10533. PMLR, 2020.
+Hongfei Xu, Qiuhui Liu, Josef van Genabith, Deyi Xiong, and Jingyi Zhang. Lipschitz constrained
+  parameter initialization for deep transformers. In Proceedings of the 58th Annual Meeting of the
+  Association for Computational Linguistics, pp. 397–402, 2020.
+Greg Yang. Wide feedforward or recurrent neural networks of any architecture are gaussian pro-
+  cesses. In H. Wallach, H. Larochelle, A. Beygelzimer, F. d'Alché-Buc, E. Fox, and R. Garnett
+  (eds.), Advances in Neural Information Processing Systems, volume 32. Curran Associates, Inc.,
+  2019.
+Greg Yang, Jeffrey Pennington, Vinay Rao, Jascha Sohl-Dickstein, and Samuel S. Schoenholz. A
+  mean field theory of batch normalization. In International Conference on Learning Representa-
+  tions, 2019. URL https://openreview.net/forum?id=SyMDXnCcF7.
+Sheheryar Zaidi, Michael Schaarschmidt, James Martens, Hyunjik Kim, Yee Whye Teh, Alvaro
+  Sanchez-Gonzalez, Peter Battaglia, Razvan Pascanu, and Jonathan Godwin. Pre-training via de-
+  noising for molecular property prediction. In The Eleventh International Conference on Learning
+  Representations, 2023. URL https://openreview.net/forum?id=tYIMtogyee.
+Biao Zhang and Rico Sennrich. Root mean square layer normalization. Advances in Neural Infor-
+  mation Processing Systems, 32, 2019.
+Biao Zhang, Ivan Titov, and Rico Sennrich. Improving deep transformer with depth-scaled initial-
+  ization and merged attention. In Proceedings of the 2019 Conference on Empirical Methods in
+  Natural Language Processing and the 9th International Joint Conference on Natural Language
+  Processing (EMNLP-IJCNLP), pp. 898–909, 2019.
+Guodong Zhang, Aleksandar Botev, and James Martens. Deep learning without shortcuts: Shaping
+  the kernel with tailored rectifiers. In International Conference on Learning Representations, 2022.
+Hongyi Zhang, Yann N Dauphin, and Tengyu Ma. Fixup initialization: Residual learning without
+  normalization. In International Conference on Learning Representations, 2018.
+Guangxiang Zhao, Xu Sun, Jingjing Xu, Zhiyuan Zhang, and Liangchen Luo. Muse: Parallel multi-
+  scale attention for sequence to sequence learning. arXiv preprint arXiv:1911.09483, 2019.
+
+
+                                                 14
+Published as a conference paper at ICLR 2024
+
+
+A    D UALITY BETWEEN DOWNWEIGHTED RESIDUALS AND RESTRICTING
+     UPDATES IN LINEAR LAYERS
+
+In Sec. 4.1, we motivated our reparameterisation of the value and projection parameters, Eq. (6),
+through a duality between downweighted residuals branches and restricting parameter updates (ma-
+terialised through smaller learning rates) in linear layers. This is a relatively simple argument, found
+elsewhere in the literature e.g. Ding et al. (2023), which we outline here for completeness.
+We suppose we have a (differentiable) loss function L(W ), which is a function of some parameter
+matrix W . We consider taking a gradient step to minimise L, with learning rate ηW from initialisa-
+tion W0 . This would give new parameters W1 :
+
+                                                        dL
+                                    W1 = W0 − η W                                                   (8)
+                                                        dW W =W0
+
+Now suppose we have a reparameterisation of the parameters to W ′ , with the same loss L(W ′ ) as
+before:
+
+
+                                           W ′ = U + βV                                          (9)
+for fixed scalar β, fixed matrix U and trainable parameter matrix V . We let V be initialised to V0 ,
+satisfying W0 = U + βV0 .
+If we take a gradient step in V with learning rate ηV , then we get new parameters V1 :
+
+                                             dL
+                             V1 = V0 − ηV
+                                             dV V =V0
+                                              dW ′       dL
+                                = V0 − ηV ·            ·
+                                               dV V =V0 dW ′ W ′ =W0
+                                               dL
+                                = V0 − ηV β
+                                              dW ′ W ′ =W0
+                                              dL
+                                = V0 − ηV β                                                        (10)
+                                              dW W =W0
+where in the last line we just relabelled the reparameterisation variable W ′ to W .
+Feeding Eq. (10) back into Eq. (9), we obtain:
+                              W1′ = U + βV1
+                                                             dL
+                                     = U + βV0 − ηV β 2
+                                                             dW W =W0
+                                                       dL
+                                     = W0 − η V β 2                                                (11)
+                                                       dW W =W0
+due to the equivalence of initialisations.
+To match W1′ , Eq. (11), with W1 , Eq. (8), we require:
+                                             ηW = ηV β 2 .
+
+Thus, any gradient step we take in the reparameterisation, W ′ = U + βV , corresponds to taking the
+same gradient step in original parameterisation, W , but with a learning rate scaled by β 2 . If β < 1,
+as is the case in Pre-LN residual branches, this corresponds to downscaling the learning rate.
+In the context of our reparameterisation of values and projection parameters Eq. (6), this is then
+equivalent to downscaling the learning rates of WV , WP by βV2 , βP2 , if using (stochastic) gradi-
+ent descent. With AdamW (Loshchilov & Hutter, 2017), one factor of β gets divided out by the
+preconditioner, so the reparameterisation acts as if we scale the learning rate by β not β 2 .
+
+
+                                                  15
+Published as a conference paper at ICLR 2024
+
+
+To verify this theoretical duality empirically, we plot the equivalent of Fig. 3 but where, instead of
+reparameterisation (Eq. (6)) with varied β, we reduce the learning rate of the value and projection
+parameters (keeping the learning rate of other parameters fixed). As expected, we see that reducing
+the ratio of learning rate for value/projection parameters compared to other parameters improves the
+training speed, just like the downweighted residual reparametersiation (Fig. 3).
+
+
+                                           1.50
+               Eval Loss after 40K steps   1.45
+                                           1.40
+                                           1.35
+                                           1.30
+                                                                                 Id Winit
+                                                                                      V , WP
+                                                                                             init
+                                           1.25
+                                                                                 Orth Winit
+                                                                                          V , WP
+                                                                                                  init
+                                           1.20                                  Pre-LN loss
+                                                                                 V-SkipInit loss
+                                           1.15
+                                                  0.0     0.2     0.4      0.6         0.8               1.0
+                                                   Ratio of LRs for W V, W P vs. other params
+Figure 9: Equivalent of Fig. 3 that empirically confirms the duality between downweighted residuals
+and reduced learning rates.
+
+
+B    B LOCK LAYOUTS
+In Fig. 10 and Fig. 11 we show the layouts of our SAS block (Sec. 4.2) and parallel SAS-P block
+(Sec. 4.3). These are the equivalent plots to the layouts in Fig. 1.
+Mathematically, our SAS attention sub-block computes (in the notation of Eq. (2)):
+
+      Xout = MHA(Norm
+                ]          1 (Xin )), where MHA(X) = Concat Attn1 (X), . . . , AttnH (X) ,
+                                              ]                    g               g
+
+                                                                                                      (12)
+
+                                                                                      1        ⊤
+    g h (X)=(αh IT +βh Ah (X)−γh C)Xh , and Ah (X)=SM
+    Attn                                                                             √ XWhQ WhK X⊤ +M .
+                                                                                      dk
+                                                                                                      (13)
+                       d
+Here, Xh ∈RT × H are column blocks of X∈RT ×d , i.e. X=Concat(X1 , . . . , XH ), & SM is Softmax.
+
+C    A DDITIONAL E XPERIMENTS
+In this section, we provide additional experiments and ablations on top of those provided in the main
+paper. The experiments in this section are ordered to follow the chronological order of where they
+are referenced (or most relevant) in the main paper.
+
+Linear vs Cosine decay LR schedule Fig. 12 compares linear and cosine decay LR schedule. We
+see that linear decay provides better final performance across both our models and baselines, and
+use linear decay throughout the rest of the paper.
+
+Shaped Attention vs Value-SkipInit Fig. 13 explains our reasons for using Shaped Attention
+Eq. (5) (Noci et al., 2023) over the modified attention matrix, αI + βA(X), Eq. (4), that was in-
+troduced by He et al. (2023) in Value-SkipInit. We see that Shaped Attention gives a small but
+
+
+                                                                    16
+Published as a conference paper at ICLR 2024
+
+
+                                               MLP Out
+
+                                                 NonLin
+
+                                                 MLP In
+
+                                                 Norm
+
+
+                                        Hx
+                                           Shaped Attention
+
+
+
+                                             Q            K
+
+
+                                                 Norm
+
+
+                  Figure 10: The SAS block that we obtain at the end of Sec. 4.2.
+
+
+                                  Hx
+                                    Shaped Attention             MLP Out
+
+                                                                 NonLin
+
+                                       Q         K               MLP In
+
+
+
+                                                          Norm
+
+
+
+      Figure 11: The SAS-P block, with normalisation, that we obtain at the end of Sec. 4.3.
+
+
+consistent gain throughout training. The experiments here follow the same training and hyperpa-
+rameter setup as those in Sec. 4.
+
+Sensitivity to MLP block gain initialisation In Sec. 4.1, we motivated downweighting the initial-
+isation of trainable MLP block weight βFF (c.f. Eqs. (1) and (7)) in skipless architectures to replicate
+the implicit downweighting mechanism of Pre-LN skips. Fig. 14 shows the sensitivity of final loss
+to our initialisation for trainable βFF .
+
+Figure 3 with tied orthogonals In Fig. 3, we observed that restricting the updates to value and
+projection parameters recovers nearly all of the lost training speed in Transformer blocks without
+attention sub-block skips. This phenomenon occurred for both random orthogonal and identity
+                  V      P
+initialisations Winit , Winit , but identity initialisation outperformed orthogonal, which may be a bit
+surprising as they should be identical from a signal propagation perspective.
+To investigate this, we consider two alternatives:
+
+
+                                                     17
+Published as a conference paper at ICLR 2024
+
+
+                                                                                                                                    1.50
+                              4.0
+                                                                                        Pre-LN, cosine                                                                  Pre-LN, cosine
+                                                                                        Pre-LN, linear                              1.45                                Pre-LN, linear
+    Eval Cross-entropy Loss
+
+
+                                                                                                          Eval Cross-entropy Loss
+                              3.5                                                       SAS, cosine                                                                     SAS, cosine
+                                                                                                                                    1.40
+                                                                                        SAS, linear                                                                     SAS, linear
+                              3.0                                                       SAS-P, cosine                               1.35                                SAS-P, cosine
+                                                                                        SAS-P, linear                                                                   SAS-P, linear
+                              2.5                                                                                                   1.30
+                              2.0                                                                                                   1.25
+
+                              1.5                                                                                                   1.20
+
+                                                                                                                                    1.15
+                                    0                     10K                 20K   30K          40K                                    20K    25K    30K         35K         40K
+                                                                        Training step                                                                Training step
+
+Figure 12: Comparing training performance with cosine and linear decay LR schedulers on Code-
+Parrot. The right plot is a zoomed-in version of the left. We see that linear decay consistently
+provides a better final performance than cosine decay, despite trailing for most of the steps towards
+the end of training.
+
+
+                                                                  4.0
+                                                                                                                  SAS-P, V-SkipInit attn
+                                                                                                                  SAS-P, shaped attn
+                                        Eval Cross-entropy Loss
+
+
+                                                                  3.5
+
+                                                                  3.0
+                                                                                                                  SAS, V-SkipInit attn
+                                                                                                                  SAS, shaped attn
+                                                                  2.5
+
+                                                                  2.0
+
+                                                                  1.5
+
+                                                                  1.0
+                                                                          0               10K            20K                                  30K           40K
+                                                                                                   Training step
+Figure 13: Shaped Attention (dashed lines) provides a small performance boost compared to the
+attention matrix of Value-SkipInit (solid lines), for both SAS and SAS-P blocks. All transformers
+are 18-Layer autoregressive GPT models, and the dataset is CodeParrot.
+
+
+                                                                                                         18
+Published as a conference paper at ICLR 2024
+
+
+                                           1.25
+
+
+               Eval Loss after 40K steps
+                                           1.24
+
+                                           1.23
+
+                                           1.22
+
+                                           1.21
+
+                                           1.20
+
+                                           1.19
+
+                                                  0.0   0.5    1.0         1.5   2.0   2.5   3.0
+                                                  Initialisation for MLP residual weights FF
+Figure 14: Final test loss achieved as a function of the initialisation for trainable MLP block gains
+βFF on CodeParrot.
+
+
+      1. “LL-tied” or last-layer tied: this is when we initialise all but the final layer projection ma-
+                                                                                                    P
+         trix as independent random orthogonals. Then for the final layer projection matrix Winit,L
+         (or rather its transpose), we tie the initialisation to the previous layers, as:
+                                                  L−1
+                                                                      !
+                                       P⊤
+                                                  Y
+                                                           V      P        V
+                                    Winit,L =          Winit,l Winit,l Winit,L  .
+                                                                     l=1
+                                                                                QL         V      P
+         The purpose of this is so that the combined product over all layers l=1 Winit,l      Winit,l is
+         the identity, which mimicks the functional output of the whole transformer with identity
+            V                P
+         Winit,l = I = Winit,l    (up to the MLP blocks, but we note that the MLP weights are
+         independently Gaussian initialised and so are rotationally invariant at initialisation, and are
+         also downweighted as they lie on a downweighted residual branch).
+                                                                                                     ⊤
+                                                                                      V            P
+      2. “All-tied”: this is when for each attention layer/sub-block l we have Winit,l      = Winit,l
+         with random orthogonal initialisation, which makes the value-projection product identity,
+            V      P
+         Winit,l Winit,l = I ∀l ≤ L, and hence matches the outputs of each attention sub-block
+         exactly as if we had identity values and projections at initialisation. This initialisation is
+         similar to that of Trockman & Kolter (2023), although here we are considering skipless
+         attention sub-blocks.
+
+Fig. 15 is the equivalent of Fig. 3 but with LL-tied (yellow line with diamond markers) and all-tied
+(blue line with star markers) included. In Fig. 15, we see that matching the functional output (as
+in LL tied) with orthogonal initialisation provides a slight improvement to close the gap between
+the random orthogonal (green line) and identity (purple line) initialisations. Matching the attention
+sub-block outputs (as in all-tied) further improves performance, but does not fully close the gap to
+identity initialisation. Interestingly, it seems like orthogonally initialised values and projections do
+benefit from being trainable (i.e. small but non-zero βV , βP ). We leave a further exploration of these
+observations to future work.
+
+Further scalar parameter trajectories In Fig. 4 we saw that residual-skip gain ratios on the
+values and projections αβVV , αβPP (from the reparameterisation in Eq. (6)) converge to zero during
+training for the vast majority of layers, in models without attention sub-block skip connections. In
+Fig. 16 we plot the corresponding plot to Fig. 4 but for a parallel block with no skip connections
+(i.e. SAS-P with reparameterisation Eq. (6) and trainable values and projections. Like before, we
+also initialise trainable βV , βP to 0.2, and αV , αP to 1). Again, we see that the vast majority of
+
+
+                                                                      19
+Published as a conference paper at ICLR 2024
+
+
+                                           1.50
+
+
+               Eval Loss after 40K steps
+                                           1.45
+
+                                           1.40
+
+                                           1.35
+
+                                           1.30                          Orth Winit
+                                                                                 V , WP
+                                                                                       init
+                                                                         Orth Winit
+                                                                                 V , W P , LL tied
+                                                                                       init
+                                           1.25                          Orth Winit
+                                                                                 V = W P , all tied
+                                                                                         init
+                                                                         Identity Winit
+                                                                                     V , WP
+                                                                                            init
+                                           1.20                          Pre-LN loss
+                                                                         V-SkipInit loss
+                                           1.15
+                                                  0.0   0.2    0.4     0.6          0.8           1.0
+                                                          Residual weights V, P
+               Figure 15: Equivalent of Fig. 3 but with tied orthogonal initialisations.
+
+
+β
+α ratios converge to 0, indicating that the value and projection parameters converge to the identity.
+Also, again we see that the first value matrix is the only ratio above 0.05 at the end of training.
+Figs. 17 to 20 plot the corresponding trajectories, of the model in Fig. 4, for various other train-
+able scalar parameters we have: namely, the three shaped attention parameters 1) α on the identity
+(Fig. 17), 2) β on the softmax attention output (Fig. 18), 3) γ on the centring matrix (Fig. 19), as well
+as 4) βFF on the MLP block (Fig. 20). We see that none of these other scalar parameters converge to
+zero. The shaped attention parameters have error bars denoting standard deviations across (the 12)
+heads.
+In Fig. 21, we plot the equivalent of Fig. 4 but for an attention skipless model with random orthog-
+onally initialiased (from the Haar measure) value and projection weights. Again, we see that the
+vast majority of residual/skip gain ratios converge from their initial value of 0.2 to 0 during training
+albeit with slightly more outliers than in Fig. 4.
+However, in Fig. 22 we plot the equivalent of Figs. 4 and 21 but for a Pre-LN model that has attention
+skip connection (and identity initialised values/projections). Now, we see that the introduction of
+the skip connection encourages many more residual/skip gain ratios in the value/projection weights
+to increase during training (notice the y-axis), i.e. encouraging the values/projections to leave their
+identity initialisation. Together, these results reaffirm the complex interactions between skip con-
+nections and value/projection weights in the standard transformer architecture highlighted by our
+work.
+
+Identity values and projections with default Pre-LN block In Sec. 4.2 we observed that re-
+moving values and projection parameters by setting them to the identity improves the convergence
+speed per parameter update of transformer blocks with skipless attention sub-blocks. This raises
+the question of whether the same would occur in the standard block that uses attention sub-blocks
+skip connections i.e. the Pre-LN block. In Fig. 23 we compare the default Pre-LN block to one
+with values and projections set to be identity. We see that in this case identity values and projec-
+tions actually slightly hurt performance in terms of loss reduction per update, in constrast to the
+skipless case. We also tried to downweight the attention block residual (βSA < 1 in the notation
+of Eq. (1)) with identity values and projections to see if the scale of the attention skip and residual
+was the reason for this difference, but this did not change the findings of Fig. 23. We do not have a
+satisfying explanation for this, but our intuition is that identity value and projections (as opposed to
+e.g. Gaussian/random orthogonal initialisation) with attention skip means that the two branches of
+the skip are no longer independent at initialisation and interfere with each other, though it is unclear
+that this would continue to hold during training.
+
+
+                                                                 20
+Published as a conference paper at ICLR 2024
+
+
+                                             0.20
+                                                                                    Layer
+              Residual/Skip gain ratios, /
+                                                             1           6              11          16
+                                                             2           7              12          17
+                                             0.15            3           8              13          18
+                                                             4           9              14          Proj P/ P
+                                                             5           10             15          Value V/ V
+                                             0.10
+
+
+                                             0.05
+
+
+                                             0.00
+                                                    0   5K   10K   15K        20K     25K    30K    35K   40K
+                                                                     Training step
+          Figure 16: Corresponding plot to Fig. 4 but for a parallel block with no skips.
+
+
+                                             2.0
+                                                                                        Layer
+                                             1.8                         1             6           11           15
+                                                                         2             7           12           16
+              Shaped Attn skip gain,
+
+
+                                             1.6
+                                                                         3             8           13           17
+                                             1.4                         4             9           14           18
+                                                                         5             10
+                                             1.2
+                                             1.0
+                                             0.8
+                                             0.6
+                                             0.4
+
+                                                   0    5K   10K   15K        20K     25K    30K    35K   40K
+                                                                     Training step
+                                             Figure 17: Trajectories for shaped attention α parameter.
+
+
+                                                                             21
+Published as a conference paper at ICLR 2024
+
+
+                                           2.0
+                                                                 Layer
+                                           1.8        1         6           11         15
+              Shaped Attn residual gain,   1.6        2         7           12         16
+                                                      3         8           13         17
+                                           1.4        4         9           14         18
+                                                      5         10
+                                           1.2
+                                           1.0
+                                           0.8
+                                           0.6
+                                           0.4
+
+                                                 0   5K   10K    15K     20K     25K   30K   35K   40K
+                                                                     Training step
+                                           Figure 18: Trajectories for shaped attention β parameter.
+
+
+                                           2.0
+                                                                 Layer
+                                           1.8        1         6           11         15
+              Shaped Attn centre gains,
+
+
+                                           1.6        2         7           12         16
+                                                      3         8           13         17
+                                           1.4        4         9           14         18
+                                                      5         10
+                                           1.2
+                                           1.0
+                                           0.8
+                                           0.6
+                                           0.4
+
+                                                 0   5K   10K    15K     20K     25K   30K   35K   40K
+                                                                     Training step
+                                           Figure 19: Trajectories for shaped attention γ parameter.
+
+
+                                                                       22
+Published as a conference paper at ICLR 2024
+
+
+                                             0.5
+                                                                    Layer
+                                                         1         6             11           15
+                                                         2         7             12           16
+              MLP residual gains, FF
+                                             0.4
+                                                         3         8             13           17
+                                                         4         9             14           18
+                                             0.3         5         10
+
+                                             0.2
+
+
+                                             0.1
+
+
+                                             0.0
+                                                   0    5K   10K    15K        20K     25K    30K   35K   40K
+                                                                        Training step
+                                               Figure 20: Trajectories for MLP block βFF parameter.
+
+
+                                                        Skipless with orthogonal Winit
+                                                                                  V , WP
+                                                                                       init
+                                             0.20                                    Layer
+              Residual/Skip gain ratios, /
+
+
+                                                             1            6              11         16
+                                                             2            7              12         17
+                                             0.15            3            8              13         18
+                                                             4            9              14         Proj P/ P
+                                                             5            10             15         Value V/ V
+                                             0.10
+
+
+                                             0.05
+
+
+                                             0.00
+                                                    0   5K   10K    15K        20K     25K    30K   35K   40K
+                                                                        Training step
+                                               Figure 21: Trajectories for MLP block βFF parameter.
+
+
+                                                                           23
+Published as a conference paper at ICLR 2024
+
+
+                                               1.0
+                                                                            Pre-LN (with skip)
+                                                                                            Layer
+                Residual/Skip gain ratios, /   0.8                1               6             11         16
+                                                                  2               7             12         17
+                                                                  3               8             13         18
+                                               0.6                4               9             14         Proj P/ P
+                                                                  5               10            15         Value V/ V
+                                               0.4
+
+                                               0.2
+
+                                               0.0
+                                                     0       5K   10K       15K        20K     25K   30K   35K   40K
+                                                                              Training step
+                                                 Figure 22: Trajectories for MLP block βFF parameter.
+
+
+                                           3.00
+
+                                           2.75                                W V, W P = I, Pre-LN
+              Eval Cross-entropy Loss
+
+
+                                                                               W V, W P I, Pre-LN
+                                           2.50
+
+                                           2.25
+
+                                           2.00
+
+                                           1.75
+
+                                           1.50
+
+                                           1.25
+                                                         0            10K               20K          30K         40K
+                                                                              Training step
+Figure 23: Pre-LN block performs worse when setting values and projections to identity, unlike in
+the skipless setting.
+
+
+                                                                                       24
+Published as a conference paper at ICLR 2024
+
+
+Using the first value matrix In Figs. 4 and 16 we see that the vast majority of value and projection
+parameters stay close to the identity during training when initialised to identity, even when they have
+the capacity to move away from initialisation. The first layer value matrix W1V is an exception to
+this rule. In Fig. 24 we see that allowing the first layer value parameters to be trainable provides a
+very small boost to training performance, when all other value and projection weights are fixed to
+the identity. Intuitively it makes sense that the first layer value parameters would be more important
+than others because they act directly on the input embedding at the beginning of the model. We thus
+choose to reincorporate trainable value parameters (using identity initialisation in Eq. (6)) in the first
+layer of our models using SAS and SAS-P blocks, but remove all other values WlV for l > 1, and
+all projections too WlP ∀l ≥ 1, by fixing to the identity.
+
+                                                                                                          1.50
+                              4.0
+                                                              SAS-P, W1V = I                                                              SAS-P, W1V = I
+                                                              SAS-P                                       1.45
+    Eval Cross-entropy Loss
+
+
+                                                                                Eval Cross-entropy Loss
+                                                                                                                                          SAS-P
+                              3.5                             SAS, W1V = I                                1.40                            SAS, W1V = I
+                                                              SAS                                                                         SAS
+                              3.0                                                                         1.35
+
+                              2.5                                                                         1.30
+
+                              2.0                                                                         1.25
+
+                              1.5                                                                         1.20
+
+                                                                                                          1.15
+                                    0   10K      20K      30K          40K                                    20K   25K    30K      35K         40K
+                                              Training step                                                               Training step
+
+
+Figure 24: Comparing training performance with trainable first layer values W1V vs with identity
+first layer values W1V , for models using our SAS and SAS-P blocks. All other values and projections
+are set to the identity. The right plot is a zoomed-in version of the left. We see that having trainable
+first layer values provides a (very small) boost in performance.
+
+
+Linearising MLP activations As stated in Sec. 4.3, we tried to use the recent idea of “linearising”
+activation functions in order to obtain better signal propagation (Martens et al., 2021; Zhang et al.,
+2022; Li et al., 2022) in deep NNs with skip connections, and recover lost training speed when the
+MLP skip is removed. In particular, Li et al. (2022) show for Leaky ReLU,
+                                                              LReLU(x) = max(x, sx),
+with negative slope s ∈ [0, 1], we need s = 1 − O( √1L ) to obtain well behaved signal propagation
+in MLPs at large depths L.
+In Fig. 25, we took our 18-block model trained with SAS block (Fig. 10), and assessed training
+performance without the MLP skip, αFF = 0. We tried 3 different activations: 1) standard ReLU, 2)
+LReLU with slope s = 0.2, and 3) LReLU with s = 0.8 ≈ 1 − √118 .
+We see that all blocks without MLP skip train significantly slower than our SAS block (which
+matches the training speed of the Pre-LN block). In fact, linearising ReLU into LReLU seemed to
+hurt training speed rather than help it. These findings are consistent with those of previous works
+with AdamW optimiser (Martens et al., 2021; Zhang et al., 2022; He et al., 2023). We note that a
+big reason behind this is that the architectures with skipless MLP sub-blocks required an order of
+magnitude smaller learning rate (1e − 4 vs 1e − 3) otherwise training was unstable.
+
+Loss vs training step In Fig. 26, we provide the equivalent plot to Fig. 5, but in terms of loss over
+the steps taken. Our SAS and SAS-P essentially match the Pre-LN model in terms of loss reduction
+per step, whilst removing normalisation slightly hurts performance.
+
+Crammed Bert loss vs training step In Fig. 27 we plot the MLM loss in the Crammed Bert
+setting on the Pile dataset, as a function of the number of microbatch steps taken. Because our
+models have higher throughput they are able to take more steps within the 24 hour allotted time.
+
+
+                                                                               25
+Published as a conference paper at ICLR 2024
+
+
+                                        4.0
+                                                            no MLP skip, LReLU slope=0.2
+                                                            no MLP skip, LReLU slope=0.8
+
+
+              Eval Cross-entropy Loss
+                                        3.5
+                                                            no MLP skip, ReLU
+                                        3.0                 with MLP skip
+                                        2.5
+
+                                        2.0
+
+                                        1.5
+
+                                        1.0
+                                              0      10K          20K          30K         40K
+                                                             Training step
+Figure 25: Removing MLP skips results in significant losses of training speed, even when linearising
+activations.
+
+
+                                   3.00
+                                                                   V-SkipInit (He et al. 2023)
+                                   2.75                            Pre-LN
+                                   2.50                            SAS (§4.2)
+              Eval Cross-entropy
+
+
+                                                                   SAS-P (§4.3)
+                                   2.25                            SAS-P, no norm (§4.4)
+                                                                   Parallel (Wang et al, 2021)
+                                   2.00
+
+                                   1.75
+
+                                   1.50
+
+                                   1.25
+                                              0       10K         20K          30K         40K
+                                                              Training step
+                                    Figure 26: Equivalent of Fig. 5 but with steps on the x-axis.
+
+
+GLUE breakdown In Table 2, we provide a breakdown of the GLUE results in Table 1 in terms
+of different tasks.
+
+Autoregressive Language Modelling We investigate if our findings hold in the next-token pre-
+diction language modelling domain. This also allows us to test at larger sequence lengths (512) than
+other experiments in this work (128). The task is autoregressive language modelling on the Languini
+Benchmark books dataset (Stanić et al., 2023), and we use the same codebase and tokeniser provided
+by the authors. Models have 12 layers with width 768, which gives 100M parameters (including
+tied embedding/unembedding) by default when MLP width is 3072 (4×768). Sequence length is
+512 and we train for 19K steps on batch size 128, giving 1.2B training tokens. Learning rate is lin-
+early warmed up for 500 steps to a maximum value that is tuned for all models separately (3e-3 for
+our simplified models, 1e-3 for the default blocks), before linear decay. ALiBi positional encoding
+
+
+                                                                 26
+Published as a conference paper at ICLR 2024
+
+
+                           4.5
+                                                                     Crammed BERT (Pre-LN)
+                                                                     Parallel (Wang et al, 2021)
+                           4.0                                       SAS (§4.2)
+                                                                     SAS-P (§4.3)
+                                                                     SAS-P, no norm (§4.4)
+                                                                     V-SkipInit (He et al. 2023)
+
+                MLM loss
+                           3.5
+
+
+                           3.0
+
+
+                           2.5
+
+
+                                  0      100K       200K      300K      400K     500K     600K
+                                                     Microbatch step
+Figure 27: MLM loss vs microbatch steps taken. Note that because the LR schedule depends on the
+total number of steps taken by a model, and is different in different models for the same number of
+steps taken, comparing models in terms of MLM loss at a given step is not so informative.
+
+      Table 2: Breakdown of GLUE results on different tasks. Results are the mean over 3 seeds.
+
+                                 GLUE     MNLI       SST-2      STSB     RTE    QNLI      QQP      MRPC    CoLA
+ Pre-LN (Crammed)            78.9±.7    81.2/81.6      89.9      87.6    56.3     88.9     87.1     88.3    49.4
+ Parallel                    78.5±.6    80.8/80.9      91.0      87.5    54.9     88.0     87.0     87.3    49.0
+ SAS (Sec. 4.2)              78.4±.8    79.7/80.1      90.3      84.7    58.4     87.5     86.8     87.5    50.6
+ SAS-P (Sec. 4.3)            78.3±.4    79.5/79.4      90.8      85.2    59.1     87.5     86.5     86.0    50.5
+ V-SkipInit                  78.0±.3    79.7/80.4      90.4      85.1    54.4     87.0     86.2     87.9    51.5
+
+
+
+and GeLU activations are used. Training takes place on a single RTX-2080Ti (with microbatches of
+size 16), and we use AdamW with weight decay 0.1.
+We plot a training speed comparison of our simplified blocks against default in Fig. 28 below, in
+terms of runtime on the x-axis and evaluation perplexity on the y-axis. We again see that our models
+are able to match the training speed of default Pre-LN and Parallel blocks. Moreover, our SAS block
+(orange curve with star markers) achieves the same final perplexity after 19K steps (22.37 vs 22.39)
+as the Parallel block (pink curve with diamond markers) despite using 15% fewer parameters.
+
+
+D      I MPLEMENTATION D ETAILS
+
+In this section we add remaining implementation details that were not discussed in the main paper.
+We break down our implementation details into two subsections, one for the next-token prediction
+task on CodeParrot and one for our Crammed BERT (Geiping & Goldstein, 2023) masked language
+modelling experiments pretrained on the Pile dataset (Gao et al., 2020) and fine-tuned to downstream
+GLUE benchmark (Wang et al., 2019). To avoid repetition, any details that are mentioned in one
+subsection but not the other are shared between both subsections. All runtime results on CodeParrot
+were run on a single A5000 GPU.
+
+D.1     C ODEPARROT NEXT- TOKEN PREDICTION
+
+As mentioned, much of our setup is derived from https://huggingface.co/learn/
+nlp-course/chapter7/6.
+
+
+                                                           27
+Published as a conference paper at ICLR 2024
+
+
+                                                                            SAS-P
+                                 50                                         SAS
+                                 45
+                                                                            Pre-LN
+                                                                            Parallel
+
+               Eval Perplexity
+                                 40
+
+                                 35
+
+                                 30
+
+                                 25
+
+                                      2    4        6         8        10        12
+                                               Runtime (hours)
+       Figure 28: Eval perplexity vs runtime on an autoregressive language modelling task.
+
+
+
+Model The model is a 18-layer GPT-style auto-regressive decoder-only transformer. We use width
+d = 768, and H = 12 heads in multi-head attention. We remove dropout entirely as our focus
+is on training speed, and we are always in a single-epoch regime so regularisation hurts training
+speed. The MLP uses ReLU activation unless stated otherwise, and we use MLP hidden dimension
+3072 = 4d. The only exception to this is in Fig. 6, where we reduce the MLP hidden dimension to
+1536 = 2d to account for the increased memory requirements of larger depths.
+For any of our simplified model we initialise βFF = 0.1 in Eq. (1) to account for the lack of skip,
+apart from the 18-layer models in Fig. 6, where βFF = 0.2 due to the narrower width.
+We use RMSNorm (Zhang & Sennrich, 2019) where applicable with epsilon 1e − 8, and add a
+final normalisation after the decoder. Sinusoidal positional encodings are used and added at the
+embedding level.
+
+
+Parameter Initialisation For the Pre-LN and parallel blocks, we initialise all weights (including
+the embedding layer) to have standard deviation 0.02 as is standard in GPT2 (Radford et al., 2019)
+and BERT (Devlin et al., 2018). This is a choice that is prevalent in the field, and is on the order of
+O( √1d ) for d = 768, that one would expect from signal propagation.
+
+For our models, we always initialise W Q = 0 like (He et al., 2023), which as discussed zeros
+the query-key dot product, and allows shaped attention to have a dominant identity component at
+initialisation. Also as discussed, we initialise trainable scalar parameters in shaped attention to 1 for
+simplicity; the same applies for the αV , βV we use in the first layer value parameters W1V . All other
+scalar parameters in the attention and MLP branches βSA , βFF (initialised to 1 and 0.1 resp.) are also
+trainable in our models, which we found to give a small boost in performance.
+
+
+Training We use AdamW optimiser (Loshchilov & Hutter, 2017) with weight decay 0.1 which
+we tuned on a small grid, and found to work well for both baselines and our models. We do not
+apply weight decay to any scalar gain parameter. We clip gradients with with clipping parameter 1,
+and use epsilon of 1e − 8 and default betas of (0.9, 0.999) in AdamW. As discussed, we use a linear
+decay rate with 5% of all steps used for linear warmup. The optimal learning rate was tuned in all
+cases, and for our best (SAS and SAS-P) models, was found to be 1e−3, which exactly matched that
+of the default Pre-LN. This held true also when we scaled to 72 layers. V-SkipInit needed a lower
+learning rate for the depth scaling experiments (3e − 4 and 1e − 4 for depths 18 and 72 respectively).
+We use batch size of 128 with microbatches of size 32.
+
+
+                                                   28
+Published as a conference paper at ICLR 2024
+
+
+Dataset The Codeparrot dataset is a large corpus of 20 million python files from GitHub. We
+take the dataset, pre-processing and tokeniser from https://huggingface.co/learn/
+nlp-course/chapter7/6. We use sequence length T = 128 throughout, and our tokeniser
+has 50K vocabulary size. Our base experiments train for around 43K steps on batch size 128 and
+sequence length 128 which is around 700M tokens. In Fig. 8 we scale this to 2B tokens.
+
+Task The model is trained on next-token prediction using cross-entropy loss.
+
+D.2     BERT ENCODER - ONLY
+
+As discussed in Sec. 5, we inherit much of our hyperparameters from the Cramming setup of Geiping
+& Goldstein (2023), and also base our implementation from their excellent codebase.9 We highlight
+important implementation details here.
+
+Model We use a 16-layer encoder only model, with width d = 768 and 12 heads. We use MLP
+width 3072 = 4d, but now we use GLU (Dauphin et al., 2017) with GeLU activation, which essen-
+tially halves the hidden dimension. We use LayerNorm (Ba et al., 2016) for normalisation where
+applicable with epsilon 1e − 12 as taken from Geiping & Goldstein (2023); we always use a final
+LN after all the layers. Again, we remove all dropout, and use a sequence length of 128. We found
+our simplified skipless models prefered smaller MLP block scales and initialise βFF = 0.05.
+
+Parameter Initialisation The initialisations are identical to those in Codeparrot, and are detailed
+above.
+
+Datasets Like Geiping & Goldstein (2023), we train on the Pile dataset (Gao et al., 2020), with a
+WordPiece tokeniser of vocabulary size 32768, and a sequence length of 128. Our fastest runs took
+around 600K steps with microbatch size 64 in 24 hours, which corresponds to around 5B tokens.
+
+Training We again trained with AdamW optimiser, with weight decay 0.1. AdamW had hypa-
+rameters [β1 , β2 ] = [0.9, 0.98], and epsilon 1e − 12. We used a microbatch of 64 (to fit on a
+RTX-2080Ti), and scale the batch size to reach 8192 linearly after 60% of total training like in
+Geiping & Goldstein (2023). We use the same aggressive learning rate as Geiping & Goldstein
+(2023), which increase linearly to max value after 75% of all training steps, before linear decay, and
+tune the maximum learning rate to 3e − 3 for our SAS and SAS-P models. This was slightly too
+large for the SAS-P model without normalisation, so we reduce to 2e − 3. We inherit the clipping
+parameter of 0.5 from Geiping & Goldstein (2023).
+
+Fine-tuning We followed the same protocol as Geiping & Goldstein (2023), In particular, we fine-
+tune for 5 epochs with fixed hyperparameters across tasks. We found dropout to be important for
+good downstream performane (unlike during pre-training), and set dropout probability p = 0.1. We
+use batch size 32, with a maximum learning of 1.5e − 4. We keep other hyperparameters, e.g. the
+choice of cosine decay and AdamW epsilon 1e − 6, like from Geiping & Goldstein (2023).
+
+Task The model is trained on the masked language modelling task with masking probability 0.25,
+as in Geiping & Goldstein (2023).
+
+
+   9
+       https://github.com/JonasGeiping/cramming
+
+
+                                                 29

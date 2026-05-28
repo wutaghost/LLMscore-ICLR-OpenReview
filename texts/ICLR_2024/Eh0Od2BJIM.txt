@@ -1,0 +1,1142 @@
+Published as a conference paper at ICLR 2024
+
+
+H YPER ATTENTION : L ONG - CONTEXT ATTENTION IN
+N EAR -L INEAR T IME
+ Insu Han                      Rajesh Jayaram                     Amin Karbasi
+ Yale University               Google Research                    Yale University, Google Research
+ insu.han@yale.edu             rkjayaram@google.com               amin.karbasi@yale.edu
+
+ Vahab Mirrokni                   David P. Woodruff                 Amir Zandieh
+ Google Research                  CMU, Google Research              Independent Researcher
+ mirrokni@google.com              dwoodruf@cs.cmu.edu               amir.zed512@gmail.com
+
+
+
+                                            A BSTRACT
+
+         We present an approximate attention mechanism named “HyperAttention” to ad-
+         dress the computational challenges posed by the growing complexity of long con-
+         texts used in Large Language Models (LLMs). Recent work suggests that in the
+         worst-case scenario, quadratic time is necessary unless the entries of the atten-
+         tion matrix are bounded or the matrix has low stable rank. We introduce two
+         parameters which measure: (1) the max column norm in the normalized attention
+         matrix, and (2) the ratio of row norms in the unnormalized attention matrix af-
+         ter detecting and removing large entries. We use these fine-grained parameters to
+         capture the hardness of the problem. Despite previous lower bounds, we are able
+         to achieve a linear time sampling algorithm even when the matrix has unbounded
+         entries or a large stable rank, provided the above parameters are small. HyperAt-
+         tention features a modular design that easily accommodates integration of other
+         fast low-level implementations, particularly FlashAttention. Empirically, employ-
+         ing Locality Sensitive Hashing (LSH) to identify large entries, HyperAttention
+         outperforms existing methods, giving significant speed improvements compared
+         to state-of-the-art solutions like FlashAttention. We validate the empirical perfor-
+         mance of HyperAttention on a variety of different long-context length datasets.
+         For example, HyperAttention makes the inference time of ChatGLM3 50% faster
+         on 32k context length while perplexity increases from 5.6 to 6.3. On larger context
+         length, e.g., 131k, with causal masking, HyperAttention offers 22-fold speedup on
+         a single attention layer.
+
+
+1   I NTRODUCTION
+Transformers (Vaswani et al., 2017) have been successfully applied to a wide variety of learning
+tasks in areas such as natural language processing (Devlin et al., 2018; Yang et al., 2019; Brown
+et al., 2020; Raffel et al., 2020), computer vision (Carion et al., 2020; Dosovitskiy et al., 2021),
+and time series forecasting (Zhou et al., 2021). Despite their success, these models face serious
+scalability limitations because naı̈ve exact computation of their attention layers incurs quadratic (in
+the sequence length) runtime and memory complexities. This presents a fundamental challenge for
+scaling transformer models to longer context lengths.
+Various approaches have been explored to tackle the quadratic-time attention layer, with one no-
+table direction focusing on approximating intermediate matrices in attention layers. Methods for
+doing this include approximations by sparse matrices (Kitaev et al., 2020; Daras et al., 2020; Roy
+et al., 2021; Sun et al., 2021; Ding et al., 2023; Han et al., 2023), low-rank matrices (Choromanski
+et al., 2021; Katharopoulos et al., 2020; Kacham et al., 2023), or a combination of both (Chen et al.,
+2021b; Zaheer et al., 2020; Chen et al., 2021a; Dass et al., 2022). These methods aim to provide
+faster approximation to various components of attention, but none of them provide end-to-end ap-
+proximations of the full dot-product attention. Moreover, none of these works support the use of
+causal masking, which is a crucial part of modern transformer architecture. In an ongoing work,
+
+
+                                                  1
+Published as a conference paper at ICLR 2024
+
+
+Kacham et al. (2023) bypass the hardness of softmax by switching to polynomial functions and ap-
+plying fast polynomial sketching methods (Ahle et al., 2020; Woodruff & Zandieh, 2020; 2022). On
+the negative side, recent theoretical bounds suggest that entry-wise approximations to the attention
+matrix are impossible in sub-quadratic time in general (Alman & Song, 2023).
+Nevertheless, recently, KDEFormer (Zandieh et al., 2023) has provided provable approximation in
+subquadratic time, under the assumption that the entries of the attention matrix are bounded. Theo-
+retically, KDEFormer runs in roughly Õ(n1.173 ) time; it employs kernel density estimation (KDE) to
+approximate column norms, allowing one to compute probabilities with which to sample columns
+of the attention matrix. However, the current algorithms for KDE are lacking practical efficiency
+(Charikar et al., 2020), and even in theory, there is a gap between the runtime of KDEFormer and the
+theoretically feasible O(n) time algorithms. In (Alman & Song, 2023), the authors demonstrated
+that under the same assumption of bounded entries, a nearly linear time O(n1+o(1) ) algorithm is
+possible. However, their algorithm also involves using the polynomial method to approximate the
+softmax and is likely impractical (e.g., it was not empirically evaluated by the authors). In this work,
+we provide an algorithm which achieves the best of both worlds, being both a (1) practically efficient
+algorithm that (2) achieves the best possible near-linear time guarantee. Additionally, our approach
+supports casual masking, which was not possible via previous works.
+
+1.1   P ROBLEM S TATEMENT
+
+The dot-product attention (Vaswani et al., 2017) involves processing three input matrices: Q
+(queries), K (keys), V (values), all of size n × d, where n is the number of tokens in the input
+sequence and d is the dimension of latent representations. This process outputs the following:
+                                          Att = D −1 AV
+Here, matrix A := exp QK ⊤ is defined as the element-wise exponential of QK ⊤ . Additionally,
+
+
+D is an n × n diagonal matrix derived from the sum of rows of A, Di,i = ∥Ai,: ∥1 for i ∈ [n].
+In this context, matrix A is referred to as the “attention matrix”, and D −1 A is called the “softmax
+matrix”. It is important to note that calculating the attention matrix A directly requires Θ(n2 d)
+operations, and storing it consumes Θ(n2 ) memory. Consequently, a straightforward computation
+of Att demands a runtime of Ω(n2 d) and Ω(n2 ) memory.
+Our objective is to efficiently approximate the output matrix Att while retaining its spectral prop-
+erties. Our strategy involves designing an efficient estimator for the diagonal scaling matrix D in
+near-linear time. Additionally, we aim to quickly approximate the matrix product of the softmax
+matrix D −1 A and value matrix V through subsampling. To be more specific, our objective is to
+find a sampling matrix S ∈ Rm×n with a limited number m = no(1) of rows, along with a diagonal
+matrix D e ∈ Rn×n , such that the following bound on the operator norm of the error is met:
+
+
+                             e −1 AS ⊤ · SV
+                       Att − D                         ≤ ε · D −1 A op ∥V ∥op .                     (1)
+                                                  op
+
+
+1.2   O UR C ONTRIBUTIONS
+
+We show that efficiently solving the matrix multiplication component of the attention approximation
+problem in Eq. (1) can be achieved by defining the sampling matrix S based on the row norms of
+V . The more challenging aspect lies in obtaining a reliable spectral approximation for the diagonal
+matrix D. In a recent result, Zandieh et al. (2023) effectively leverages fast KDE solvers to attain a
+high-quality approximation of D. However, we streamline the KDEformer procedure and demon-
+strate that uniform sampling is sufficient to achieve the desired spectral guarantee, eliminating the
+need for importance sampling based on kernel densities. This significant simplification allows us to
+develop a practical and provably linear time algorithm.
+In contrast to prior work (Alman & Song, 2023; Zandieh et al., 2023), our approach does not necessi-
+tate bounded entries or bounded stable rank. Furthermore, the fine-grained parameters we introduce
+to analyze the time complexity may remain small even when the entries in the attention matrix or
+the stable rank are large.
+
+
+                                                   2
+Published as a conference paper at ICLR 2024
+
+
+Our work is inspired by the hard instance of Alman & Song (2023) for showing quadratic time
+lower bounds. Such instances have one randomly placed large entry in each row of the attention
+matrix. Our algorithm has an initial phase where we find large entries of the attention matrix in a
+black box manner, such as by using Locality Sensitive Hashing (Kitaev et al., 2020), or a possibly
+learned CountSketch applied to the attention matrix (Charikar et al., 2002; Li et al., 2023a), or just a
+known heavy entry pattern (Chen et al., 2021a). We assume these procedures are fast, and that after
+removing the heavy entries, two parameters in the resulting attention matrix are small: (1) the max
+column ℓ2 -norm, and (2) the ratio of row norms in the un-normalized attention matrix.
+Prior work of Zandieh et al. (2023) used KDE to identify columns in the attention matrix with large
+norm and to perform approximate matrix product with the value matrix by sampling such columns.
+As mentioned, finding such columns requires at least O(n1.173 ) time. Instead, we observe that
+by doing a one-sided sampling from the squared row norms of V , we can avoid the use of KDEs
+and achieve the same spectral norm guarantee in terms of the stable rank. Although our algorithm
+is simple and just samples by the row norms of the value matrix (or even samples uniformly in
+practice), the main technical challenge is that we do not know the row norms of the attention matrix
+needed in order to normalize it and produce a proper factorization of it. This is reminiscent of the
+quadratic time hard instance of (Alman & Song, 2023) where we may not be able to find a heavy
+entry in a row easily, and thus cannot normalize by its norm in the attention matrix. Our parameters
+(1) and (2) above allow us to argue that the heavy entries, if they exist, are not distributed in the
+worst possible way.
+Empirically, HyperAttention demonstrates significant speed improvements, achieving over a 50×
+acceleration in forward and backward propagation for sequence lengths of n = 131k. When deal-
+ing with causal masking, the method still delivers a substantial 5× speedup. Moreover, when our
+approach is applied to pretrained LLMs, e.g., chatglm3-6b-32k (Du et al., 2022) and evaluated on
+long-context benchmark datasets, so-called LongBench (Bai et al., 2023), it maintains performance
+levels that closely match those of the original models, even without the need for fine-tuning. Fur-
+thermore, we investigate task-specific evaluations and discover summarization and code completion
+tasks are more robust to approximate attention layers than question answerings.
+
+
+2   P RELIMINARIES
+
+
+We make use of the Hamming sorted LSH, a variant of angular locality-sensitive hashing introduced
+in the work by Zandieh et al. (2023). In this variant, the hash buckets are arranged in order of
+their Hamming distances. This LSH variant is particularly well-suited for designing GPU-friendly
+algorithms aimed at identifying dominant entries within the attention matrix A. In the context of
+Hamming sorted LSH, if we let H : Rd → [B] be a hash function with B buckets drawn from
+an LSH family, then the collision probability PrH [H(q) = H(k)] is “roughly” proportional to
+⟨q, k⟩. A very useful property of this LSH variant is that its buckets are ordered in such a way that
+geometrically adjacent buckets have consecutive buckets. We provide the following definition.
+
+Definition 1 (Hamming sorted LSH, Definition 7.3 of (Zandieh et al., 2023)). For positive integer
+r, there exists an LSH function H : R d → [2r ], such that for any x, y ∈ R d its collision probability
+                                       r                                ⊤
+is Pr[H(x) = H(y)] = 1 − θ(x,y)   π     where θ(x, y) := cos−1 ∥x∥∥y∥x y
+                                                                           . Furthermore, this LSH
+function hashes similar points to adjacent buckets. Specifically, the probability that two points end
+                                                                                                 r−1
+up in adjacent buckets is given by Pr [H(x) = H(y) ± 1 (mod 2r )] = 2θ(x,y)π     ·   1 − θ(x,y)
+                                                                                           π         .
+
+
+Using this LSH function, as demonstrated by Zandieh et al. (2023), we can sort keys and queries
+within an attention layer in such a way that large entries get shifted towards the diagonal of the
+attention matrix. Subsequently, these significant entries in the attention matrix can be captured by
+computing equal-sized blocks along the diagonal. This approach aligns with the block-memory ac-
+cess patterns of modern hardware and can be efficiently parallelized through batching across blocks.
+
+
+                                                   3
+Published as a conference paper at ICLR 2024
+
+      k1 k2       ...     k9              k2 k8 k4 k7 k3 k6 k9 k1 k5
+q1                                   q2
+q2                                   q8
+                                     q5
+                               PK                                       −1
+                                                                       PK
+ ..                                  q4
+  .                            ⇒     q3                                ⇒
+                               PQ    q6                                 −1
+                                                                       PQ
+                                     q7
+                                     q9
+q9                                   q1
+              A                                  APQ ,PK                        MH ⊙ A
+Figure 1: How sortLSH finds large entries of A: (Left) Keys and queries undergo hashing using
+the Hamming ordered LSH H(·). (Middle) Keys and queries are rearranged based on their hash
+buckets. Attention matrix after applying these row and column permutations is denoted as APQ ,PK .
+Large entries of APQ ,PK are concentrated around the diagonal blocks. (Right) rows and columns
+permutations are reversed on the attention matrix and M H ⊙ A is highlighted.
+
+Algorithm 1: sortLSH for locating large entries of A
+ 1: input: matrices Q, K ∈ Rn×d , and block size b
+ 2: Let H(·) be a Hamming sorted LSH as per Definition 1 and hash rows of Q, K
+ 3: Let PK , PQ ∈ Sym(n) be permutations satisfying PK (i) < PK (j) if H(Ki,: ) ≤ H(Kj,: )
+      and PQ (i) < PQ (j) if H(Qi,: ) ≤ H(Qj,: )
+ 4: return Mask matrix M H ∈ {0, 1}n×n defined as Mi,j
+                                                   H
+                                                       = 1{⌊PQ (i)/b⌋=⌊PK (j)/b⌋}
+
+
+
+3     A LGORITHM
+To obtain a spectral guarantee when approximating Att, our initial step involves producing a 1 ± ε
+approximation of the diagonal entries in the matrix D. Subsequently, we approximate the matrix
+product between D −1 A and V via sampling according to the squared row ℓ2 -norms of V .
+
+Estimating D. Our procedure for approximating D consists of two steps. Initially, we identify
+the dominant entries within the attention matrix using an algorithm rooted in the Hamming sorted
+LSH, as defined in Definition 1. The second step revolves around randomly selecting a small subset
+of keys K. We will demonstrate that under certain mild assumptions about matrices A and D, this
+simple approach allows us to establish spectral bounds on the estimated matrix. Our aim is to find a
+sufficiently precise approximate matrix D
+                                        e that satisfies:
+
+                                 e −1 − D −1 A            ε
+                                D                     ≤     D −1 A op                            (2)
+                                                   op     2
+Our assumption is that the column norms of the softmax matrix exhibit a relatively uniform distri-
+bution. To be more precise, we assume that for any i ∈ [n] there exists some α = no(1) such that
+                2
+  D −1 A · e(i) 2 ≤ α
+                    n . It’s worth noting that our assumption is more general in comparison to the
+bounded input entries assumption made in (Alman & Song, 2023). In fact, if their assumption holds,
+                              2      o(1)
+it implies that D −1 A · e(i) 2 ≤ n n for all i ∈ [n]. In Section 4.3, we empirically compute α
+to be the maximum of the squared ℓ2 -norms of the columns in D −1 A and verify that it is indeed
+sublinear in n.
+The first step of our empirical algorithm involves identifying large entries of the attention matrix
+A through hashing keys and queries into uniformly-sized buckets using the Hamming sorted LSH,
+which we refer to as sortLSH. This process is detailed in Algorithm 1 and is visually illustrated in
+Fig. 1. Note that we also mention other was of identifying large patterns, such as checking for a
+known heavy hitter pattern, or using CountSketch which we describe more below.
+Algorithm 1 returns a sparse mask designed to isolate the dominant entries of the attention matrix.
+Given this mask, we compute an approximation of the matrix D in Algorithm 2 that satisfies the
+spectral guarantee in Eq. (2). This algorithm accomplishes this by combining the attention values
+corresponding to the mask with a randomly chosen subset of columns from the attention matrix.
+
+
+                                                   4
+Published as a conference paper at ICLR 2024
+
+
+Algorithm 2: ApproxD for estimating diagonal matrix D
+ 1: input: matrices Q, K ∈ Rn×d , large entries mask M H ∈ {0, 1}n×n , parameters κ > 0,
+    ε > κ14 , α > ε2 κ, and integer m
+ 2: Randomly choose a subset T ⊆ [n] with cardinality |T| = m
+                            H
+ 3: τ ← maxj∈T 1 − Mj,:       , exp(KQ⊤     j,: )              {estimate of maximum un-masked row sum}
+ 4: Generate m i.i.d. sample ℓ1 , ℓ2 , . . . ℓm ∼ Unif([n])
+ 5: for i ∈ [n] do
+                  2
+                                 H
+
+ 6:   Ci ← Θ nεlogmn · ⟨Mi,:       , exp(KQ⊤      i,: )⟩ + τ /κ      {(capped) row-sum of masked entries}
+      {di belowPis the (capped) row-sum estimator for the un-masked            entries}
+             n                   H
+
+ 7:   di ← m     j∈[m] (1 − M   i,ℓj ) · min exp  ⟨Q i,: , K ℓ j ,: ⟩   , Ci
+ 8:   d˜i ← ⟨Mi,:
+                H
+                  , exp(KQ⊤ i,: )⟩ + max (di , τ /κ)                               {full row-sum estimate}
+ 9: return diagonal matrix De = diag({d˜i }n )
+                                               i=1
+
+
+
+Algorithm 3: HyperAttention: attention mechanism in near-linear time
+                                                                                       1
+ 1: input: matrices Q, K, V ∈ Rn×d , mask matrix M H ∈ {0, 1}n×n , and parameter ε > no(1)
+                            e ← A PPROX D Q, K, M H , no(1) , ε, no(1) , d · no(1)
+
+ 2: Run Algorithm 2 and let D
+ 3: Let S ∈ Rm×n be an i.i.d. sampling matrix based on squared row norms of V as in Lemma 2
+ 4: return D
+           e and S
+
+
+The assumptions of Lemma 1 are used to ensure that the variance of the estimator is small, and the
+same complexity of the algorithm increases as a function of the parameters α, κ. We remark that our
+algorithm is versatile and can function effectively with a predefined mask that specifies the positions
+of dominant entries within the attention matrix, mirroring the approach taken in (Chen et al., 2021a).
+The main guarantee provided by this algorithm is given in Lemma 1.
+Lemma 1 (Approximating D). For any Q, K ∈ Rn×d , let A = exp(QK ⊤ ). Also let
+D ∈ Rn×n be the diagonal matrix with Di,i = ∥Ai,: ∥1 . Additionally, suppose that α =
+                              2
+n · maxi∈[n] D −1 A · e(i) 2 . For any mask matrix M H ∈ {0, 1}n×n let us define the condition
+                             H
+               maxi∈[n] ⟨1−Mi,: ,Ai,: ⟩
+                                                    7 2
+number κ :=                  H
+               minj∈[n] ⟨1−Mj,: ,Aj,: ⟩
+                                        . If m = Ω κ ·α
+                                                     ε6 log n , the output De of Algorithm 2 satisfies
+                                         1
+Eq. (2) with probability at least 1 − poly(n) .
+
+Approximating the product of softmax matrix D −1 A and values matrix V . Given a D           e that
+meets the spectral approximation conditions as in Eq. (2), we can achieve the spectral constraint in
+Eq. (1), by finding a sampling matrix that satisfies the following condition,
+                      e −1 AS ⊤ · SV − D  e −1 AV           ε
+                     D                                   ≤ · D −1 A op ∥V ∥op                    (3)
+                                                      op    2
+We can efficiently find a sampling matrix S ∈ Rm×n with a small number m of rows that satisfies
+Eq. (3) by leveraging well-established techniques in Approximate Matrix Multiplication (AMM).
+Lemma 2. For any matrices D,   e A ∈ Rn×n , V ∈ Rn×d consider a sampling matrix S ∈ Rm×n
+constructed as follows: first generate m i.i.d. samples ℓ1 , . . . ℓm ∈ [n] according to squared
+                                   ∥V     ∥2                                     ∥V ∥
+row norms of matrix V , i.e., ∥Vi,:∥22 , then let the rth row of S be √m·∥VℓF ,: ∥ · e(ℓr ) . If m =
+                                    F                                       r     2
+
+Ω ε−2 d · srank(D
+                e −1 A) for some ε > 0, the following holds with probability at least 0.99:
+
+                     e −1 AS ⊤ · SV − D
+                     D                e −1 AV                     e −1 A
+                                                              ≤ε· D             ∥V ∥op .
+                                                         op                op
+
+The above result is standard and for proof refer to (Drineas & Kannan, 2001).
+
+Main Theorem. Now, we can integrate the subroutines for approximating the diagonal D    e and
+                                           −1
+approximating the matrix product between D A and values matrix V . With this, we introduce the
+                                         e
+
+
+                                                     5
+Published as a conference paper at ICLR 2024
+
+
+HyperAttention, an efficient algorithm that can approximate the attention mechanism with spectral
+guarantees as per Eq. (1) in near-linear time. Our Algorithm 3 takes as input a mask M H that
+defines the positions of dominant entries within the attention matrix. This mask can be generated
+using the sortLSH algorithm (Algorithm 1), or it can be a predefined mask similar to the approach
+taken in (Chen et al., 2021a). The large entries mask M H is assumed to be sparse by design and its
+number of nonzero entries is bounded nnz(M H ) = n1+o(1) . We now introduce our main theorem
+which will be proved in Appendix A.
+Theorem 1 (HyperAttention guarantee). For any matrices Q, K, V ∈ Rn×d , any mask matrix
+                                           1
+M H ∈ {0, 1}n×n , and parameter ε > no(1)     , let A = exp(QK ⊤ ) and let D ∈ Rn×n be the diag-
+                                                               2       o(1)       max         ⟨1−M H ,Ai,: ⟩
+onal matrix with Di,i = ∥Ai,: ∥1 . If maxi∈[n] D −1 A · e(i) 2 ≤ n n          and min i∈[n]⟨1−M i,:
+                                                                                                H ,A
+                                                                                                    j,: ⟩
+                                                                                                          ≤
+                                                                                      j∈[n]         j,:
+
+no(1) then with probability at least 0.98 the outputs S, De of Algorithm 3 satisfy the spectral condi-
+tion as in Eq. (1). Moreover, this algorithm’s runtime is O(d · n1+o(1) + d · nnz(M H )).
+
+Note that even if M H is not given to us, but M H can be found in d·n1+o(1) time, the theorem holds.
+We also give examples when this is possible by using Hamming sorted LSH, which our experiments
+are based on, or using the ExpanderSketch of (Larsen et al., 2016) which is based on CountSketch
+(Charikar et al., 2002) but also gives a fast recovery time. In the supplementary we show:
+Corollary 1 (HyperAttention with sortLSH). Suppose all preconditions of Theorem 1 hold. Further,
+suppose the mask matrix M H ∈ {0, 1}n×n is generated as in Algorithm 1 with block size b = no(1)
+and r = log2 n in Definition 1. We further assume there are at most n1+o(1) pairs (i, j) with
+θ(Qi,∗ , Kj,∗ ) ≤ π2 (1 − o(1)), where θ is as in Definition 1. Then with probability 1 − 1/no(1) , the
+M H we find in Algorithm 1 has at most n1+o(1) non-zero entries and with probability at least .98,
+the outputs S, De of Algorithm 3 satisfy Eq. (1) and the overall runtime is O(d · n1+o(1) ).
+
+We note the assumption on the angles of the rows of Q and K in Corollary 1 is satisfied if most rows
+are drawn uniformly at random from a d-dimensional sphere, since in this case they will be nearly
+orthogonal, i.e., have angle at most π2 (1 − o(1)) with high probability. However, the corollarly also
+allows n1+o(1) pairs of rows to have arbitrary angle, which may be more realistic.
+Corollary 2 (HyperAttention with ExpanderSketch). Suppose all preconditions of Theorem 1 hold.
+Further, suppose the mask matrix M H ∈ {0, 1}n×n is defined such that there is a threshold τ =
+                    H                                     ∥QK ⊤ e ∥2
+no(1) such that Mi,j   = 1 if and only if (QK ⊤ )2i,j ≥     τ
+                                                               j 2
+                                                                   . Then we can find M H exactly
+with probability 1 − O(1/n2 ), and with probability at least .98, the outputs S, D
+                                                                                 e of Algorithm 3
+                                        1+o(1)
+satisfy Eq. (1). The runtime is O(d · n        ).
+
+The key idea behind the proof of Corollary 2 is to first sketch Q by an ExpanderSketch T , which is
+efficient since T has a small number of rows. Then compute (T · Q) · K ⊤ which is again efficient
+since (T · Q) has a small number of rows. Thus, we never form the matrix Q · K ⊤ .
+
+3.1   C AUSAL M ASKING
+
+Language models commonly employ causal masking. The causal mask is a lower triangular binary
+square matrix denoted as M C where Mi,j
+                                    C
+                                        = 1{i≥j} . The causal attention mechanism is defined as:
+
+                                    AttC = DC−1 (M C ⊙ A)V ,
+                       ⊤
+
+where A := exp QK is defined as before and DC is an n × n diagonal matrix derived from the
+sum of rows of the masked attention M C ⊙ A, specifically [DC ]i,i = ⟨Mi,: C
+                                                                             , Ai,: ⟩ for i ∈ [n]. To
+approximate causal attention with a spectral guarantee, we require two components. First, we need
+a spectral approximation for the diagonal matrix DC . Second, we need to approximate the matrix
+product between DC−1 (M C ⊙ A) and V , which can be achieved using the same sampling technique
+as described in Algorithm 3 and Lemma 2. The first component is more intricate, and we employ a
+recursive method to address it. So we focus on how to efficiently approximate the diagonal DC .
+Our approach is based on a key observation, as depicted in Fig. 2. The masked attention M C ⊙A can
+be decomposed into three non-zero matrices, each of which has half the size of the original attention
+matrix. The block A21 , located entirely below the diagonal is unmasked attention. Consequently,
+
+
+                                                  6
+Published as a conference paper at ICLR 2024
+
+
+                                                                      →      CausalApproxD
+                                                                              (recursive call)
+
+                                ⇒      M1C ! A11       M2C ! A22
+
+                                                               →      ApproxD
+
+
+        MC ! A                                      A21
+
+Figure 2: Causal attention matrix can be divided into three equal-sized non-zero sections: M1C ⊙A11
+and M2C ⊙ A22 are both causal attention matrices, and A21 is an unmasked attention matrix.
+
+Algorithm 4: CausalApproxD, recursive approximation of DC for causal masking
+ 1: input: matrices Q, K ∈ Rn×d
+ 2: Split Q and K into equal sized sub-matrices: Q = [Q⊤    ⊤ ⊤             ⊤  ⊤ ⊤
+                                                       1 , Q2 ] and K = [K1 , K2 ]
+ 3: De C11 ← CausalApproxD(Q1 , K1 ) and D  e C22 ← CausalApproxD(Q2 , K2 )
+ 4: Run the unmasked algorithm ApproxD (Algorithm 2) on Q2 , K1 to get D
+                                                                       e 21
+
+                 De C11 ,      0
+ 5: return DC =
+           e
+                   0,     D
+                          e 21 + D
+                                 e C22
+
+
+
+we can approximate its row sums using Algorithm 2. The two diagonal blocks M1C ⊙ A11 and
+M2C ⊙ A22 shown in Fig. 2 are causal attentions with half the original size. To handle these, we
+apply a recursive approach and further partition them into smaller blocks, and repeat this procedure.
+We present a pseudocode for this procedure in Algorithm 4.
+
+4     E XPERIMENTS
+
+In this section, we benchmark our algorithms by scaling up existing large language models to handle
+long-range sequences. All experiments are performed on a single A100 GPU with 40 GB memory
+and we use FlashAttention 2 (Dao, 2023) for the exact attention computation.
+
+Implementation Detail. We implement HyperAttention based on sortLSH and uniform column
+sampling. Specifically, we first apply sortLSH to all rows in Q, V ∈ Rn×d . Then, each set of rows is
+partitioned into b groups where b is the block size as in Fig. 1. The i-th set of rows in Q is multiplied
+by the corresponding set in K, resulting in a block-diagonal approximation of APQ ,PK . Next, we
+optimize Algorithm 2 for approximating D by sharing random indices {ℓj }m         j=1 with all rows in Q.
+This corresponds to uniformly sampling m rows in V . To further simplify, we reuse indices {ℓj }m     j=1
+for the Approximate Matrix Multiplication (AMM) in Lemma 2. The required operations involve
+permuting n rows, reshaping tensors, and small matrix multiplications. Since every batch, head and
+block has the same configurations, the implementation can be parallelized using GPUs.
+
+4.1   M ONKEY PATCHING S ELF - ATTENTION
+
+We first evaluate HyperAttention on two pre-trained LLMs. We choose three models with different
+architectures that are widely used in practical applications: chatglm3-6b-32k (Du et al., 2022), and
+phi-1.5 (Li et al., 2023b). We patch their final ℓ attention layers by replacing with HyperAttentions
+where ℓ can vary from 0 to the number of all attention layers in each LLM. Note that attentions in
+both models requires causal masking and we make use of Algorithm 4 by recursively applying it
+until the input sequence lengths n are less than 4,096. We set both bucket size b and the number of
+sampled columns m to 256 for all sequence lengths. We evaluate the performance of such monkey
+patched models in terms of perplexity and speedup.
+We use LongBench (Bai et al., 2023), a collection of long context benchmark datasets, which con-
+tains 6 different tasks ranging from single and multiple-document question answering, summariza-
+
+
+                                                   7
+Published as a conference paper at ICLR 2024
+
+
+                   4.5                                                             41
+                                                                                   40                                  1.4
+                   4.4                                2.0
+
+
+                                                                      perplexity
+      perplexity
+
+
+                                                                                                                             speedup
+                                                            speedup
+                                                                                   39
+                   4.3
+                                                      1.5                          38                                  1.2
+                   4.2                                                             37
+                   4.1                                1.0                          36                                  1.0
+                         0 4 8 12 16 20 24 28                                            0 4 8 12 16 20 24
+                         number of replaced layers                                       number of replaced layers
+                            (a) chatglm3-6b-32k                                                 (b) phi-1.5
+Figure 3: Perplexity and speedup of chatglm3-6b-32k (left) and phi-1.5 (right) monkey patched
+with HyperAttention. We vary the number of replaced attention layers in the final order.
+
+                                                                                        Task
+         Number of
+       Replaced Layers             single-qa   multi-qa          summarization                 few-shot   synthetic     code
+                   0 (exact)         96.07        88.19                     60.29              203.39         103.00   107.16
+                       7             91.82        90.02                     60.84              202.77         104.00   107.42
+                      14             87.98        89.64                     58.84              200.46         101.00   103.19
+                      21             84.61        77.51                     61.55              201.13          97.00   101.12
+                      28             53.30        73.98                     60.45              200.01          71.00   104.99
+
+Table 1: Performance evaluation of chatglm3-6b-32k equipped with HyperAttentions on Long-
+Bench datasets (Bai et al., 2023). They contain 6 different tasks and we evaluate each of them with
+its own metric where higher value indicates better performance.
+
+
+tion, few-shot learning, synthetic tasks, and code completion. We select a subset of dataset whose
+encoded sequence lengths are larger than 32,768 and trim them if the length is over 32,768 so that
+all data have sequence lengths of 32,768. Then, we compute the perplexity (i.e., loss on next tokens
+prediction) of each model. To highlight the scalability on the long sequences, we calculate the total
+speedup on all attention layers whether performed by HyperAttention or FlashAttention.
+The results are summarized in Fig. 3. Observe that chatglm3-6b-32k shows a reasonable perplexity
+even after monkey patched by HyperAttention, e.g., after replacing 20 layers the perplexity increases
+approximately by 1 and it slowly goes up until 24 layers. But it improves runtimes in attention layers
+about 50%. If all the layers are replaced then the perplexity goes to up 12 but it runs about 2.3×
+faster. For phi-1.5, similar happens but the perplexities are linearly increasing as the number of
+HyperAttention grows.
+In addition, we evaluate the performances of monkey patched chatglm3-6b-32k on LongBench
+datasets and compute task-specific evaluation scores on each task including single-document ques-
+tion answering, multiple-document question answering, summarization, few-shot learning, synthetic
+tasks and code completion. Results are provided in Table 1. While replacing HyperAttention gen-
+erally leads to performance degradation, we observe that its role can vary depending on the task at
+hand. For example, summarization and code completion are more robust to other tasks. Notably,
+when half of all attention layers are patched (i.e., 14 layers), we verify that most of the tasks do
+not degrade more than 13%. In particular, the performance of the summarization task remained
+almost unchanged, suggesting that this task may be more robust to partial alterations in the attention
+mechanism. We recall that computations in attention layers can be 1.5× faster when n = 32k.
+
+4.2           S INGLE S ELF ATTENTION L AYER
+
+We further explore the speedup of HyperAttention with varying sequence lengths from 4,096 to
+131,072. We measure wall-clock times of both forward and forward+backward operations when
+they are computed with FlashAttention or are accelerated by HyperAttention. We measure the times
+with and without causal masking. All inputs Q, K, V have the same length and their dimensions
+are fixed to d = 64 and the number of attention heads is set by 12. We chose the same parameters in
+
+
+                                                                      8
+Published as a conference paper at ICLR 2024
+
+
+                               Forward                                                     5          Forward
+                50
+                               Forward+Backward                                                       Forward+Backward
+                                                                                           4
+
+
+                                                                                 speedup
+                40
+
+      speedup
+                30                                                                         3
+
+                20                                                                         2
+
+                10                                                                         1
+                 0                                                                         0
+                     4k       8k    16k                      32k    65k   131k                 4k     8k    16k    32k    65k   131k
+                               sequence length n                                                       sequence length n
+                          (a) Without causal masking                                                (b) With causal masking
+Figure 4: Speedup of the exact computation using FlashAttention (Dao, 2023) and HyperAttention
+(this work) in single self-attention layer during forward and backward operations. For n =131k,
+HyperAttention runs up to 54× faster without causal masking and 5.4× with causal masking.
+
+
+HyperAttention as described in the previous section. In Fig. 4, we observe that HyperAttention runs
+to up 54× faster without causal masking and 5.4× when the causal masking applies. Although time
+complexities of both causal masking and non-masking are the same, a practical algorithm for causal
+masking (Algorithm 1) requires additional operations such as partitioning Q, K, V , and merging
+attention outputs which result in an increase of practical runtime. However, those speedups will
+increase when the sequence length n grows. We believe this opens the door to scale self-attention not
+only for inference but also for training or fine-tuning the LLMs to fit in significantly long sequences.
+
+4.3       E MPIRICAL V ERIFICATION OF A SSUMPTION
+
+In addition, we empirically verify our assumption in Theorem 1, i.e., squared ℓ2 -norm of columns in
+                               o(1)
+D −1 A is upper bounded by n n . We investigate pretrained transformers with and without causal
+masking. For non-causal masking attention, we use the T2T-ViT model (Yuan et al., 2021) and take
+Q, K, V from its first attention layer on the ImageNet test data set as it is the main computational
+bottleneck. For each image, we compute α to be the largest of the squared ℓ2 -norms of the columns
+                 2
+in D −1 A · ei 2 and collect the value over 50k images. The sequence length of the model is given
+by n = 3,136 and the averaged values of α is observed to be 8.1801. This is much smaller than n
+and can be possibly sublinear in n.
+To further investigate the dependence on n, we utilize the chatglm3-6b-32k and LongBench
+narrative-qa dataset, changing the sequence length n from 1k to 9k. We trim or pad the input context
+so that its length is strictly n. Unlike the vision model, we notice that the first columns in D −1 A
+often contain heavy entries; hence we compute α as the largest squared norm excluding the first 32
+columns. We collect these values for all heads and layers and compute their average. Fig. 5 plots the
+value of α                                                                    α
+          n with various sequence length n. It is observed that the value of n decreases as n grows,
+supporting the claim that our assumption α = no(1) holds in practice.
+                                       (1/n) maxi kD−1A · eik22
+
+
+                                                          0.08
+
+
+                                                          0.06
+
+
+                                                          0.04
+
+                                                                   1k 2k 3k 4k 5k 6k 7k 8k 9k
+                                                                           sequence length n
+
+Figure 5: Empirical values of α (i.e., the largest squared ℓ2 -norms of the columns in D −1 A).
+Theorem 1 assumes α = no(1) and the plot supports the claim that our assumption holds in practice.
+
+
+                                                                                 9
+Published as a conference paper at ICLR 2024
+
+
+5   C ONCLUSION
+
+In this work, we propose a simple linear time attention approximation algorithm by simplifying
+the existing algorithm based on kernel density estimation (KDE). We introduce a more general
+parameterization for a spectral approximation guarantee based on the condition number, which does
+not require assumptions used in prior work. Our algorithm makes use of sortLSH to find large
+entries and we adopt fast matrix multiplication via row norm sampling. We additionally study how
+our algorithm is used for causal masking by recursive partitioning. Empirically, we illustrate that
+pre-trained LLMs using our algorithm can enhance both inference and training speeds with only
+minimal performance degradation.
+
+ACKNOWLEDGEMENT
+
+D. Woodruff worked on this while at Google Research and also while visiting the Simons Institute
+for the Theory of Computing.
+
+R EFERENCES
+Thomas D Ahle, Michael Kapralov, Jakob BT Knudsen, Rasmus Pagh, Ameya Velingker, David P
+  Woodruff, and Amir Zandieh. Oblivious sketching of high-degree polynomial kernels. In Sympo-
+  sium on Discrete Algorithms (SODA), 2020.
+Josh Alman and Zhao Song.           Fast attention requires bounded entries.       arXiv preprint
+  arXiv:2302.13214, 2023.
+Yushi Bai, Xin Lv, Jiajie Zhang, Hongchang Lyu, Jiankai Tang, Zhidian Huang, Zhengxiao Du,
+  Xiao Liu, Aohan Zeng, Lei Hou, Yuxiao Dong, Jie Tang, and Juanzi Li. LongBench: A Bilingual,
+  Multitask Benchmark for Long Context Understanding, 2023.
+Tom Brown, Benjamin Mann, Nick Ryder, Melanie Subbiah, Jared D Kaplan, Prafulla Dhariwal,
+  Arvind Neelakantan, Pranav Shyam, Girish Sastry, Amanda Askell, et al. Language models are
+  few-shot learners. Neural Information Processing Systems (NeurIPS), 2020.
+Nicolas Carion, Francisco Massa, Gabriel Synnaeve, Nicolas Usunier, Alexander Kirillov, and
+  Sergey Zagoruyko. End-to-end object detection with transformers. In Proceedings of the Eu-
+  ropean Conference on Computer Vision(ECCV), 2020.
+Moses Charikar, Kevin Chen, and Martin Farach-Colton. Finding frequent items in data streams. In
+ International Colloquium on Automata, Languages, and Programming (ICAMP), 2002.
+Moses Charikar, Michael Kapralov, Navid Nouri, and Paris Siminelakis. Kernel density estimation
+ through density constrained near neighbor search. In Foundations of Computer Science (FOCS),
+ 2020.
+Beidi Chen, Tri Dao, Kaizhao Liang, Jiaming Yang, Zhao Song, Atri Rudra, and Christopher Re.
+  Pixelated Butterfly: Simple and Efficient Sparse training for Neural Network Models. In Interna-
+  tional Conference on Learning Representations (ICLR), 2021a.
+Beidi Chen, Tri Dao, Eric Winsor, Zhao Song, Atri Rudra, and Christopher Re. Scatterbrain: Uni-
+  fying sparse and low-rank attention. Neural Information Processing Systems (NeurIPS), 2021b.
+Krzysztof Marcin Choromanski, Valerii Likhosherstov, David Dohan, Xingyou Song, Andreea
+  Gane, Tamas Sarlos, Peter Hawkins, Jared Quincy Davis, Afroz Mohiuddin, Lukasz Kaiser, et al.
+  Rethinking Attention with Performers. In International Conference on Learning Representations
+  (ICLR), 2021.
+Tri Dao. FlashAttention-2: Faster Attention with Better Parallelism and Work Partitioning. 2023.
+Giannis Daras, Nikita Kitaev, Augustus Odena, and Alexandros G Dimakis. Smyrf-efficient atten-
+  tion using asymmetric clustering. Neural Information Processing Systems (NeurIPS), 2020.
+
+
+                                                10
+Published as a conference paper at ICLR 2024
+
+
+Jyotikrishna Dass, Shang Wu, Huihong Shi, Chaojian Li, Zhifan Ye, Zhongfeng Wang, and Yingyan
+  Lin. Vitality: Unifying low-rank and sparse approximation for vision transformer acceleration
+  with a linear taylor attention. arXiv preprint arXiv:2211.05109, 2022.
+Jacob Devlin, Ming-Wei Chang, Kenton Lee, and Kristina Toutanova. Bert: Pre-training of deep
+  bidirectional transformers for language understanding. In Conference of the North American
+  Association for Computational Linguistics (NAACL), 2018.
+Jiayu Ding, Shuming Ma, Li Dong, Xingxing Zhang, Shaohan Huang, Wenhui Wang, and Furu Wei.
+   Longnet: Scaling transformers to 1,000,000,000 tokens. arXiv preprint arXiv:2307.02486, 2023.
+Alexey Dosovitskiy, Lucas Beyer, Alexander Kolesnikov, Dirk Weissenborn, Xiaohua Zhai, Thomas
+  Unterthiner, Mostafa Dehghani, Matthias Minderer, Georg Heigold, Sylvain Gelly, Jakob Uszko-
+  reit, and Neil Houlsby. An Image is Worth 16x16 Words: Transformers for Image Recognition at
+  Scale. In International Conference on Learning Representations (ICLR), 2021.
+Petros Drineas and Ravi Kannan. Fast monte-carlo algorithms for approximate matrix multiplica-
+  tion. In Proceedings 42nd IEEE Symposium on Foundations of Computer Science, pp. 452–459.
+  IEEE, 2001.
+Zhengxiao Du, Yujie Qian, Xiao Liu, Ming Ding, Jiezhong Qiu, Zhilin Yang, and Jie Tang. Glm:
+  General language model pretraining with autoregressive blank infilling. 2022.
+Chi Han, Qifan Wang, Wenhan Xiong, Yu Chen, Heng Ji, and Sinong Wang. Lm-infinite: Simple
+  on-the-fly length generalization for large language models. arXiv preprint arXiv:2308.16137,
+  2023.
+Praneeth Kacham, Vahab Mirrokni, and Peilin Zhong. Polysketchformer: Fast transformers via
+  sketches for polynomial kernels. arXiv preprint arXiv:2310.01655, 2023.
+Angelos Katharopoulos, Apoorv Vyas, Nikolaos Pappas, and Francois Fleuret. Transformers are
+  rnns: Fast autoregressive transformers with linear attention. In International Conference on Ma-
+  chine Learning (ICML), 2020.
+Nikita Kitaev, Lukasz Kaiser, and Anselm Levskaya. Reformer: The Efficient Transformer. In
+  International Conference on Learning Representations (ICLR), 2020.
+Kasper Green Larsen, Jelani Nelson, Huy L. Nguyen, and Mikkel Thorup. Heavy hitters via cluster-
+  preserving clustering. CoRR, abs/1604.01357, 2016.
+François Le Gall. Faster algorithms for rectangular matrix multiplication. In 2012 IEEE 53rd annual
+  symposium on foundations of computer science, pp. 514–523. IEEE, 2012.
+Yi Li, Honghao Lin, Simin Liu, Ali Vakilian, and David P. Woodruff. Learning the positions in
+  countsketch. In The Eleventh International Conference on Learning Representations, ICLR 2023,
+  Kigali, Rwanda, May 1-5, 2023. OpenReview.net, 2023a.
+Yuanzhi Li, Sébastien Bubeck, Ronen Eldan, Allie Del Giorno, Suriya Gunasekar, and Yin Tat
+  Lee. Textbooks Are All You Need II: phi-1.5 technical report. arXiv preprint arXiv:2309.05463,
+  2023b.
+Colin McDiarmid. Concentration. In Probabilistic methods for algorithmic discrete mathematics,
+  pp. 195–248. Springer, 1998.
+Colin Raffel, Noam Shazeer, Adam Roberts, Katherine Lee, Sharan Narang, Michael Matena, Yanqi
+  Zhou, Wei Li, and Peter J Liu. Exploring the Limits of Transfer Learning with a Unified Text-to-
+  Text Transformer. Journal of Machine Learning Research (JMLR), 2020.
+Aurko Roy, Mohammad Saffar, Ashish Vaswani, and David Grangier. Efficient content-based sparse
+  attention with routing transformers. Transactions of the Association for Computational Linguis-
+  tics (ACL), 2021.
+Zhiqing Sun, Yiming Yang, and Shinjae Yoo. Sparse Attention with Learning to Hash. In Interna-
+  tional Conference on Learning Representations (ICLR), 2021.
+
+
+                                                11
+Published as a conference paper at ICLR 2024
+
+
+Ashish Vaswani, Noam Shazeer, Niki Parmar, Jakob Uszkoreit, Llion Jones, Aidan N Gomez,
+  Lukasz Kaiser, and Illia Polosukhin. Attention is all you need. Neural Information Processing
+  Systems (NeurIPS), 2017.
+
+David Woodruff and Amir Zandieh. Leverage score sampling for tensor product matrices in input
+  sparsity time. In International Conference on Machine Learning, pp. 23933–23964. PMLR, 2022.
+
+David P Woodruff and Amir Zandieh. Near Input Sparsity Time Kernel Embeddings via Adaptive
+  Sampling. In International Conference on Machine Learning (ICML), 2020.
+
+Zhilin Yang, Zihang Dai, Yiming Yang, Jaime Carbonell, Russ R Salakhutdinov, and Quoc V Le.
+  Xlnet: Generalized autoregressive pretraining for language understanding. Neural Information
+  Processing Systems (NeurIPS), 2019.
+
+Li Yuan, Yunpeng Chen, Tao Wang, Weihao Yu, Yujun Shi, Zi-Hang Jiang, Francis EH Tay, Jiashi
+  Feng, and Shuicheng Yan. Tokens-to-token vit: Training vision transformers from scratch on
+  imagenet. In International Conference on Computer Vision (ICCV), 2021.
+
+Manzil Zaheer, Guru Guruganesh, Kumar Avinava Dubey, Joshua Ainslie, Chris Alberti, Santiago
+ Ontanon, Philip Pham, Anirudh Ravula, Qifan Wang, Li Yang, et al. Big bird: Transformers for
+ longer sequences. In Neural Information Processing Systems (NeurIPS), 2020.
+
+Amir Zandieh, Insu Han, Majid Daliri, and Amin Karbasi. Kdeformer: Accelerating transformers
+ via kernel density estimation. In International Conference on Machine Learning (ICML), 2023.
+
+Haoyi Zhou, Shanghang Zhang, Jieqi Peng, Shuai Zhang, Jianxin Li, Hui Xiong, and Wancai Zhang.
+  Informer: Beyond efficient transformer for long sequence time-series forecasting. In Conference
+  on Artificial Intelligence (AAAI), 2021.
+
+
+
+A    O MITTED PROOFS
+
+Here we include the proofs that were omitted in the main body of the paper. First, we present the
+proof of Lemma 1.
+Proof of Lemma 1: First, we show that τ calculated in line 3 of Algorithm 2 is close to the maximum
+row sum of the matrix (1n −M H )⊙A. It is easy to check that κτ ≤ 1 − Mi,:    H
+                                                                                , exp(KQ⊤   i,: ) ≤ τ κ
+for all i ∈ [n] because of the definition of κ in the lemma statement. Furthermore, if we define the
+set:
+                                                     H
+                                                       , exp(KQ⊤
+
+                          S0 := i ∈ [n] : ⟨1 − Mi,:              i,: )⟩ > τ ,                       (4)
+
+then we can show that |S0 | is small. Recall that τ is the maximum of the row sums of a random
+subset of rows, denoted by T where |T| = m. Hence, Pr[|S0 | ≥ t] ≤ (1 − t/n)m . Choosing
+                                                                                           1
+m = Ω(κ7 α2 ε−6 log n) and t = O(κ−7 α−2 ε6 n) gives that with probability at least 1 − poly(n)
+
+                                   |S0 | ≤ O κ−7 · α−2 · ε6 · n .
+
+                                                                                                   (5)
+
+Next, let us define the upper-capped version of matrix A where entries of i-th row on positions
+where the mask M H value is equal to zero are capped at value Ci (line 6 of the algorithm) as:
+
+                                                              H
+
+          e ∈ Rn×n : A                min (Ai,j , Ci )   if Mi,j =0
+          A          ei,j :=                                        ,   for every i, j ∈ [n].
+                                      Ai,j               otherwise
+
+                                                    12
+Published as a conference paper at ICLR 2024
+
+
+We proceed by bounding the total mass of large entries of matrix D −1 A lost through capping (i.e.,
+                                                                         b := 2ε2 m , we can write,
+entries of A that are larger than thresholds Ci ). If we define constant C   κ n log n
+                         X
+  D −1 (A − A) e     =                 H
+                               (1 − Mi,j ) · (Ai,j − min (Ai,j , Ci )) /Di,i
+                   1
+                           i,j∈[n]
+                           ∞
+                           X                           X                                          Ai,j − min (Ai,j , Ci )
+                       =                                                                H =0} ·
+                                                                                     1{Mi,j
+                           t=0
+                                                                                                          Di,i
+                                                i,j∈[n]
+                                 (2t −1)CD
+                                        b i,i <Ai,j −Ci ≤(2t+1 −1)CD
+                                                                  b i,i
+                                  2
+                           log2 κb
+                            XC                   n                                                  o
+                                                                H
+                       ≤              2t+1 C
+                                           b·     i, j ∈ [n] : Mi,j = 0 & Ai,j > Ci + (2t − 1)CD
+                                                                                              b i,i
+                            t=0
+                                  2
+                           log2 κb
+                            XC                                            ε4
+
+                                       t+1 b    α
+                       ≤              2   C·         =O                         ·n                                         (6)
+                            t=0
+                                               t b 2
+                                             (2 C)                       κ5 · α
+
+The
+n inequality in Eq. (6) follows because, for every
+                                                 o  i ∈ [n], the cardinality of the set
+               H
+ i, j ∈ [n] : Mi,j = 0 & Ai,j > Ci + (2 − 1)CDi,i must be bounded by (2tαC)
+                                       t    b
+                                                                         b 2 . The proof of
+this is by contradiction
+                  n      because otherwise, there must be an l ∈ [n]
+                                                                  o such that the cardinality of
+                              H
+                                       Ai,l > Ci + (2 − 1)CDi,i is at least |Hl | > n·(2αt C)
+                                                       t
+                                     V
+the set Hl := i ∈ [n] : Mi,l = 0                               b
+                                                                                                b 2.
+                                  2
+                                                                                              2
+This implies that D −1 A · e(l) 2 ≥                          2            Ci       t
+                                        P                        P
+                                           i∈Hl (Ai,l /Dii )   =   i∈Hl Di,i + (2 − 1)C           ≥
+                                                                                          b
+         2                     2
+|Hl | · κ2εn log
+              m        t    b > α , however, this contradicts with the precondition of the lemma
+                 n + (2 − 1)C       n
+                                                 2
+about α = n · maxi∈[n] D −1 A · e(i) 2 . Now, if we defined the sets S1 , S2 ⊆ [n] as
+
+                εDii                       Dii                                        Dii
+ S1 = i ∈ [n] :       < ∥Ai,: − Ai,: ∥1 ≤
+                                  e                , S2 = i ∈ [n] : ∥Ai,: − Ai,: ∥1 >
+                                                                                e           (7)
+                  3                         3                                          3
+then it follows from Eq. (6) that the cardinalities of S1 and S2 are bounded by
+                    |S1 | ≤ O κ−4 · α−1 · ε3 n , |S2 | ≤ O κ−4 · α−1 · ε4 n .
+
+                                                                                                                           (8)
+
+Next note that di computed in line 7 of the algorithm is an estimator for i-th row norm of the capped
+and masked matrix (1n − M H ) ⊙ A.   e Let us define an estimator for the unmasked capped matrix
+                     H
+ e as dbi := di + ⟨M , Ai,: ⟩. By invoking Chernoff-Hoeffding inequality (see e.g., (McDiarmid,
+A                    i,:                                                                 7 2
+1998)) along with union bound, because the lemma statement assumes that m = Ω κ ε·α         6  log n
+                                                                                1
+the following holds simultaneously for all i ∈ [n] \ S2 with probability 1 − poly(n) :
+
+                                                A
+                                                ei,:                      A
+                                                                          ei,:
+                                                       1                         1
+                                                           ≤ dbi ≤                   .                                     (9)
+                                               1 + ε/6                   1 − ε/6
+This inequality combined with definition of S1 , S2 in Eq. (7) implies that for any i ∈ [n] \ (S1 ∪ S2 ),
+             −1
+(1−ε/2)·Di,i     ≤ db−1
+                     i  ≤ (1+ε/2)·Di,i −1
+                                          . Now we bound the operator norm of the error as follows:
+
+     (De −1 − D −1 )A      ≤ D  e −1 − D −1            A     + D   e −1 − D −1                 A
+                            op                                 S1 ∪S2      op                         [n]\(S1 ∪S2 )   op
+           3                                          ε
+         ≤   DS−1 A op + D  e −1 − D −1      A    +        −1
+                                                         D[n]\(S 1 ∪S2 )
+                                                                         A
+           2    1
+                                          S2   op     2                      op
+
+           3                                                      ε
+         ≤   DS−1 A op + κ2 DS−12 ∩S0
+                                      A op + κ DS−12 \S0
+                                                         A    +           −1
+                                                                      D[n]\(S    1 ∪S2 )
+                                                                                         A
+           2    1
+                                                           op     2                         op
+           3                                                ε
+         ≤   DS−1 A op + κ2 DS−1   A op + κ DS−1  A op +           −1
+                                                               D[n]\(S    1 ∪S2 )
+                                                                                  A       ,                            (10)
+           2    1               0               2
+                                                            2                         op
+
+
+
+                                                                13
+Published as a conference paper at ICLR 2024
+
+
+where the second inequality above follows from the inequality in Eq. (9) and also because the defi-
+nition of S1 ensures that D e i,i ≥ (1 − 1/3) · Di,i for any i ∈ S1 . The third inequality above follows
+because the lower capping in line 8 of the algorithm ensures that D      e j,j ≥ ⟨M H , Aj,: ⟩ + τ /κ for
+                                                                                      j,:
+                                  H
+any j ∈ S2 while Dj,j ≤ ⟨Mj,:       , Aj,: ⟩ + τ for any j ∈
+                                                           / S0 by definition of set S0 and we know that
+             H
+Dj,j ≤ ⟨Mj,:   , Aj,: ⟩ + τ κ for j ∈ S0 .
+Finally we conclude the proof by bounding the terms DS−1
+                                                       r
+                                                         A op for r ∈ {0, 1, 2} in Eq. (10).
+Fix some r ∈ {0, 1, 2}. Let v be the unit-normed vector that realizes the operator norm of DS−1 r
+                                                                                                  A.
+Since DS−1
+         r
+           A is a non-negative matrix, w.l.o.g., we can assume that v is a non-negative vector. More
+precisely v := arg max x∈Rn+ DS−1   r
+                                       A · x 2 . One has that DS−1  r
+                                                                      A · v 2 = DS−1    r
+                                                                                          A op . We
+                             ∥x∥2 =1
+define the sequence of binary matrices B 0 , B 1 , B 2 . . . which have same shape as DS−1
+                                                                                         r
+                                                                                           A as follows:
+               t
+              Bi,j := 1n2−t−1 √α/n< D−1 A ≤2−t √α/no                      for every integers t ≥ 0.                 (11)
+                                   [ Sr ]i,j
+                                                                                                                2
+Note that because of the precondition of the lemma about α = n · maxi∈[n] D −1 A · e(i) 2 which
+implies [D −1 A]i,j ≤ α/n, we have the following inequality on each entry of the matrix DS−1
+                      p
+                                                                                           r
+                                                                                             A:
+                                                    ∞
+                                                    X
+                                   −1
+                                                      2−t · B t i,j .
+                                             p
+                                  DSr A i,j ≤ α/n ·
+                                                               t=0
+
+Since DS−1
+         r
+           A and v both have non-negative entries, the above inequality implies the following:
+                                        ∞
+                                        X                                             ∞
+                                                                                      X
+            DS−1                          2−t · B t · v                                     2−t · B t · v 2 .
+                                 p                                        p
+               r
+                 A·v 2 ≤          α/n ·                               ≤       α/n ·                                 (12)
+                                               t=0                2                   t=0
+
+Now to bound ∥B t · v∥2 we first find bounds on the number of 1’s in rows and columns of B t . Using
+the definition of B t in Eq. (11) and the fact that row sums in matrix D −1 A are equal to 1, we have:
+                                        t
+                                                          p
+                                     Bi,:  0
+                                             ≤ min(2t+1 n/α, n).                                  (13)
+                                                                                                            2
+Additionally, using the precondition of the lemma about α = n·maxi∈[n] D −1 A · e(i) 2 , we have:
+                                              t
+                                             B:,j 0
+                                                    ≤ min(22t+2 , |Sr |).                                           (14)
+
+Now we bound the norm ∥B t · v∥2 for an arbitrary integer t ≥ 0 as follows:
+                     |Sr |
+               2     X                               2
+       Bt · v 2 ≤             t
+                             Bi,: 0
+                                       t
+                                    · Bi,: ⊙v 2                                (Cauchy–Schwarz inequality)
+                     i=1
+                                    |Sr |                          |Sr |
+                             p      X              2       p      XX
+                   ≤ 2t+1     n/α ·        t
+                                          Bi,: ⊙ v 2 = 2t+1 n/α ·         t
+                                                                         Bi,j · vj2
+                                       i=1                                      j∈[n] i=1
+                         p      X
+                   = 2t+1 n/α ·    t
+                                  B:,j 0
+                                         · vj2
+                                       j∈[n]
+                             p                           X           p
+                   ≤2 t+1
+                              n/α · min(22t+2 , |Sr |) ·   vj2 = 2t+1 n/α · min(22t+2 , |Sr |),
+                                                              j∈[n]
+
+where the inequality in second line above follows from Eq. (13) and the inequality in the last line
+follows from Eq. (14). The last equality follows from the assumption that ∥v∥2 = 1. Therefore,
+                                 ( 3t+3                                 p
+                       t          2 2 · (n/α)1/4              if 2t+1 ≤ |Sr |
+                    B ·v 2 ≤        t+1              p                         .
+                                  2 2 · (n/α)1/4 · |Sr | otherwise
+
+                                                         14
+Published as a conference paper at ICLR 2024
+
+
+Now by plugging the above inequalities into Eq. (12) we find that:
+                                   √                                                       
+                               log2 |Sr |−1                         ∞
+                                    X                               X
+      DS−1                                  2−t · B t · v 2 +               2−t · B t · v 2 
+                    p
+            A op ≤ α/n · 
+                                                                                           
+          r
+                                     t=0
+                                                                     √
+                                                               t=log2 |Sr |
+                                                 3/2
+                                                ε
+
+                         α · |Sr |
+                                    1/4   6κ7/4 α1/4 if r = 0
+                                              3/4
+                  ≤ 12                  ≤   ε
+                                                         if r = 1 ,
+                            n              ε9κ
+                                          
+                                            6κ           if r = 2
+
+where the last line above follows from the upper bound on the size of sets Sr we obtained in Eq. (5)
+and Eq. (8). Finally, by plugging the above inequality into Eq. (10) and using the fact that D −1 A is
+a row-stochastic matrix and thus D −1 A op ≥ 1 the lemma follows.
+
+
+Next, we prove the main theorem.
+Proof of Theorem 1: The diagonal matrix D  e in line 2 is computed by invoking Algorithm 2.
+
+                                            1                      e −1 − D −1 A
+By Lemma 1 with probability at least 1 − poly(n) , it holds that D                 ≤ ε/2 ·
+                                                                                              op
+  D −1 A op . Furthermore, in line 3 of the algorithm S is defined as the sampling matrix according
+to the row norms of V . To invoke Lemma 2, we need to have a bound on the stable rank of D  e −1 A.
+                                 e −1 A
+First, from Lemma 1 we know that D                   ≥ (1 − ε/2) · D −1 A op ≥ 1/2, where the second
+                                                op
+inequality follows because D −1 A is a row-stochastic matrix. Therefore we have srank(De −1 A) ≤
+            2                                                                               2
+4 D e −1 A . Second, the lower capping in line 8 of Algorithm 2 ensures that D      e −1 A     ≤
+              F                                                                                      F
+            2                   2                   e −1 A) ≤ no(1) .
+κ2 D −1 A F ≤ no(1) · D −1 A F ≤ no(1) , thus srank(D
+
+With this bound on the stable rank and since m = d · no(1) = Ω ε−2 d · srank(D
+                                                                             e −1 A) ,
+                     e −1 AS ⊤ · SV − D
+Lemma 2 implies that D                e −1 AV                            e −1 A
+                                                                 ≤ ε/3 · D                ∥V ∥op ≤ ε/2 ·
+                                                            op                       op
+     −1
+ D        A op ∥V ∥op with probability 0.99.
+By combining these two inequalities, we obtain the spectral approximation guarantee in Eq. (1). The
+runtime of this algorithm is primarily determined by the time it takes to invoke Algorithm 2 in line 2,
+which is dominated by the time to multiply two matrices of sizes n × d and d × m and the time to
+calculate attention matrix entries at the positions defined by M H . Using the matrix multiplication
+result from (Le Gall, 2012), the first computation can be done in time O(dn1+o(1) ) and the latter
+can be done in nnz(M H ).
+Proof of Corollary 1: Because r = log2 n, we have Pr[H(Qi,∗ ) = H(Kj,∗ )] ≤ 1/n1−o(1) when-
+ever θ(Qi,∗ , Kj,∗ ) ≥ π2 (1 − o(1)). As there are at most n2 total pairs, the expected number of such
+pairs that collide under H is at most n1+o(1) and so by a Markov bound is at most n1+o(1) with
+failure probability 1/no(1) .
+Since we also assume there are at most n1+o(1) pairs (i, j) with θ(Qi,∗ , Kj,∗ ) < π2 (1 − o(1)), there
+can be at most n1+o(1) additional pairs that collide.
+Thus, in total we have n1+o(1) collisions, and consequently the number of non-zero entries in M H
+is at most n1+o(1) with failure probability 1/no(1) . The proof now follows by the assumptions of
+the corollary statement as well as Theorem 1.
+Proof of Corollary 2: Let T be an ExpanderSketch matrix with O(τ log n) rows. By the guarantees
+(Larsen et al., 2016) of T , we have that with probability at least 1 − n13 , for any fixed vector x ∈ Rn ,
+                                                                                       ∥x∥22
+that from T · x, one can recover a set S of indices i ∈ [n] such that if x2i ≥          τ , then i ∈ S,
+                    ∥x∥22
+whereas if x2i ≤                 / S. Further, S can be found from T x in no(1) time.
+                     2τ , then i ∈
+
+
+                                                     15
+Published as a conference paper at ICLR 2024
+
+
+We compute T ·Q, followed by (T ·Q)·K ⊤ . Note that the time for this computation is O(τ n log n).
+Next, for each column j of QK ⊤ this allows us to construct a set Sj with the property that if
+                ∥Q·K ⊤ e ∥2
+(Q · K ⊤ )i,j ≥      τ
+                        j 2
+                            , then i ∈ Sj . This holds simultaneously for all columns with probability
+              1
+at least 1 − n2 by a union bound. The time for constructing all the sets Sj is n1+o(1) d
+Note that |Sj | ≤ 2τ for all j, and we can explicitly compute the exact value of (Q · K ⊤ )i,j for all
+i ∈ Sj and all j, in O(nτ d) time. By the assumptions of the corollary, we have that Sj contains a
+superset of the support of the j-th column of M H , and since we can compute the values exactly, we
+can exactly construct the mask M H matrix that the corollary requires, and in n1+o(1) d time. The
+proof now follows by the assumptions of the statement as well as Theorem 1.
+
+
+                                                 16

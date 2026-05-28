@@ -1,0 +1,2530 @@
+Under review as a conference paper at ICLR 2025
+
+
+000
+001
+      C LUS C OMP : A S IMPLE PARADIGM FOR M ODEL C OM -
+002   PRESSION AND E FFICIENT F INETUNING
+003
+004
+005    Anonymous authors
+006    Paper under double-blind review
+007
+008
+009                                                                 A BSTRACT
+010
+011                      As large language models (LLMs) continue to scale, model compression becomes
+012                      increasingly important for enabling edge deployment and ensuring accessibility
+013                      to users with limited resources. Weight-only quantization is a key technique
+014                      for model compression, allowing for a substantial reduction in model size while
+015                      preserving performance. However, as bit-width decreases, the performance of
+016                      quantized LLMs tends to degrade significantly. Additionally, due to the non-
+017
+                         differentiable operation in quantization, standard finetuning on quantized LLMs
+                         is unsupported, and alternative finetuning approaches often fail to match the ef-
+018
+                         fectiveness of full finetuning. In this paper, we introduce ClusComp, a novel and
+019
+                         simple model compression paradigm. ClusComp first clusters the weight matrices
+020                      to generate codebooks, and then tunes these codebooks block-by-block to recon-
+021                      struct intermediate activations. Despite its simplicity, ClusComp (1) consistently
+022                      achieves better performance in 2-4 bit precision; (2) pushes the compression limit
+023                      to the 1-bit level, and outperforms existing ultra-low-bit methods with limited
+024                      finetuning steps; (3) facilitates seamless and efficient finetuning, surpasses exist-
+025                      ing quantization-based or memory-efficient finetuning methods, and even rivals
+026                      full finetuning of the FP16 model. Notably, these procedures can be executed on
+027                      a single NVIDIA A6000-48GB GPU for LLMs with as many as 70B parameters.
+028
+029
+                                   AQ/4                                          Llama-2-7B                                Tesla V100-32GB
+                                      GPTVQ                            ClusComp                                  30       cluster                    26
+                                                                                               GPU Memory (GB)
+
+
+030
+                         8                                             Competitive baseline                               reconstruction
+031
+                                        GPTVQ                          FP16                                      20
+032                      7                                                                                                      11
+033
+                                                            AQ (=AffineQuant)                                    10
+                         6                                     GPTVQ                  AQ AQ
+          Wiki2 (PPL )
+
+
+034                                                                                                                   2                        2
+                                                                                                                  0
+035                           2.0             2.5        3.0           3.5          4.0                                   7B                       70B
+036                                           PB-LLM/2                           Llama-2-70B                     40
+                    12.5                                                                                                                            3.5
+037                                                                                                              30
+                                                                                               GPU-hour
+
+
+                    10.0                                                                                                         25.6 ± 15.0
+038                         BiLLM                                                                                20
+                     7.5                         QuIP
+039
+                     5.0
+                         ClusComp +
+                                                 GPTVQ GPTVQ OQ (=OmniQuant)                                     10
+040                                                                          OQ GPTVQ                                     0.4
+                                                                                                                  0              2.6 ± 1.2
+041                          1.0       1.5       2.0     2.5      3.0      3.5       4.0                                  7B                       70B
+042
+                                                          #Bit
+043
+      Figure 1: Compression quality and efficiency of ClusComp, consisting of a sequential clustering
+044   and reconstruction. Methods in triangle use more number of calibration samples. Some results are
+045   divided by a factor for better visualization. E.g. “AQ/4” indicates that the perplexity is divided by 4.
+046
+047
+048   1    I NTRODUCTION
+049
+050   Large language models (LLMs) have garnered significant acclaim and success across various do-
+051   mains and applications (Touvron et al., 2023a; Brown et al., 2020; Raffel et al., 2020b). With
+052   ongoing advancements, the scope and complexity of released LLMs have witnessed exponential
+053   growth, with some LLMs encompassing >50B parameters (Dubey et al., 2024; Zhang et al., 2022;
+      Scao et al., 2022). This remarkable upscaling introduces considerable challenges, particularly when
+
+
+                                                                            1
+      Under review as a conference paper at ICLR 2025
+
+
+054
+      deploying these models or granting their accessibility to users with constrained resources. To ad-
+055   dress these challenges, weight-only post-training quantization (PTQ) has emerged as a promising
+056   approach, effectively compressing LLMs to a lower bit while preserving the FP16 performance.
+057
+058
+      PTQ methods can generally be classified into three categories: statistic-based, gradient-based, and
+      codebook-based approaches. Statistic-based methods (Dettmers et al., 2024; Lin et al., 2024; Frantar
+059
+      et al., 2022) determine the quantization grid based on the distribution of the weight values, whereas
+060
+      gradient-based methods (Shao et al., 2024; Ma et al., 2024) optimize the quantization grid with
+061   some calibration samples. Codebook-based methods (Egiazarian et al., 2024; van Baalen et al.,
+062   2024; Kim et al., 2024; Park et al., 2024) cluster similar weight elements to the shared quantized
+063   centroids, employing non-uniform quantization and pushing the limits to extremely low bit levels.
+064   However, these methods continue to struggle with low-bit quantization and the presence of outliers,
+065   leading to significant performance degradation, especially in models like Llama-3 (Dubey et al.,
+066   2024), which exhibit a large number of outliers in their weight matrices (Huang et al., 2024c).
+067   Another challenge PTQs encounter is their limited support for finetuning, which is crucial for adapt-
+068   ing LLMs to various downstream tasks. Finetuning LLMs is computationally expensive due to
+069   their large scale and the need to cache activations and store optimizer states. PTQ, which com-
+070   presses LLMs, appears to be a promising approach for finetuning as it reduces memory require-
+071   ments for loading these LLMs. However, most quantization techniques use a round-to-nearest op-
+072   eration, which does not support gradient back-propagation. Typically, parameter-efficient methods
+073   (Dettmers et al., 2023; Li et al., 2024c; Liao & Monz, 2024a) are employed to train the added pa-
+074   rameters while keeping the quantized LLMs frozen, bypassing this limitation. Nonetheless, this
+075
+      finetuning approach presents two major drawbacks: (1) Freezing the quantized LLMs prevents fur-
+      ther reduction of quantization errors during finetuning; (2) The low-rank nature of most parameter-
+076
+      efficient methods restricts their expressiveness (Biderman et al., 2024; Liao & Monz, 2024b).
+077
+078   In this paper, we propose a simple while effective paradigm that mainly applies Clustering to
+079   Compress LLMs, referred to as ClusComp. Additionally, ClusComp can function as a parame-
+080   ter and memory-efficient finetuning method. Our preliminary experiments reveal that open-source
+081
+      LLMs are increasingly difficult to quantize, primarily due to the growing frequency of outliers in
+      their weight matrices (§3.1). Based on this observation, we propose using clustering instead of quan-
+082
+      tization to compress LLMs, retaining all values in FP16 format to circumvent issues arising from
+083
+      outlier quantization (§3.2.1). To further reduce compression errors, we minimize block-wise output
+084   discrepancies between the compressed and uncompressed blocks, using a limited set of calibration
+085   samples (§3.2.3). Since all parameters remain in FP16 after compression, ClusComp fully supports
+086   standard neural network training. By incorporating an inexpensive, end-to-end recovery finetuning
+087   step, we can push compression rates to the 1-bit level. Additionally, ClusComp allows for finetuning
+088   compressed LLMs on various downstream tasks (§3.2.4).
+089
+      We begin by evaluating the effectiveness of ClusComp in the context of model compression across 2
+090   language modeling tasks and 6 zero-shot reasoning tasks. ClusComp consistently surpasses various
+091   baselines at 2-4 levels, even achieving a perplexity of <13 at the 2-bit level on WikiText2 (Merity
+092   et al., 2017) for all LLMs (§4.1). Following recovery finetuning, ClusComp’s performance at 2-bit
+093   and 1-bit levels approaches that of the FP16 model, with an accuracy of 57.8 vs 68.6 for the 2-bit
+094   Llama-3-8B and 51.4 vs 75.4 for the 1-bit Llama-3-70B (§4.2). Additionally, ClusComp demon-
+095   strates its utility as a parameter-efficient (< 1%) and memory-efficient (42GB for Llama-3-70B)
+096   finetuning method, outperforming quantization-based and memory-efficient finetuning approaches,
+097   while matching the performance of full finetuning (§4.3).
+098
+099
+100
+      2     R ELATED WORKS
+101
+102
+103   2.1   M ODEL COMPRESSION
+104
+105
+      Quantization and pruning are two typical and effective methods for model compression.
+106
+107   Quantization refers to the process of converting floating-point values into discrete levels, thereby
+      reducing the bit-width required and minimizing memory consumption during model loading. Taking
+
+
+                                                       2
+      Under review as a conference paper at ICLR 2025
+
+
+108
+      the symmetric uniform quantization as an example, a weight matrix W is quantized as follows:
+109
+                                  W                                       max(|Wmin |, |Wmax |)
+110               Wq = clamp(⌊       ⌉, −2b−1 , 2b−1 − 1) with s =                                       (1)
+111                                s                                             2b − 1
+112   where b denotes the bit-width, s is the scale factor, and ⌊⌉ represents the round-to-nearest (RTN)
+113   operation. Since the quantization grid is uniform, its effectiveness is contingent on the distribution
+114   of the weight values. In cases where the weight matrix contains a significant number of outliers or
+115   is quantized to lower bit-widths, the resulting quantization error may be substantial.
+116   Post-training quantization (PTQ) methods, such as GPTQ (Frantar et al., 2022), AWQ (Lin et al.,
+117   2024), and OmniQuant (Shao et al., 2024), apply quantization to a model after training with mini-
+118   mal computational resources. However, these approaches, which rely on uniform quantization, are
+119   significantly impacted by the presence of outliers in the weight matrices. Recent methods (Dettmers
+120   et al., 2024; Yuan et al., 2024; Huang et al., 2024a) address this challenge by retaining salient weights
+121   in FP16 format, thereby maintaining strong performance at lower bit widths. Nonetheless, these
+122
+      mixed-precision quantization techniques require specially optimized CUDA kernels to either en-
+      hance or preserve inference speed. Closely related to our proposed method, ClusComp, are works
+123
+      such as GPTVQ (van Baalen et al., 2024), QuIP# (Tseng et al., 2024) and SqueezeLLM (Kim et al.,
+124
+      2024) which implement quantized codebooks for non-uniform quantization, achieving state-of-the-
+125   art performance for ultra-low-bit quantization. ClusComp, however, differs in two significant ways:
+126   (1) The codebook in ClusComp is stored in FP16, offering additional advantages for subsequent re-
+127   covery training and finetuning; (2) While other methods face limitations similar to those in VAE-like
+128   approaches (Kingma & Welling, 2014), where large and high-dimensional codebooks are infeasible
+129   due to mode collapse, ClusComp circumvents this issue. Our fixed-code design allows us to utilize
+130   a codebook size of 216 in 4-16D without encountering such difficulty.
+131   Pruning is a widely used model compression technique that removes redundant weights or struc-
+132   tures from the model (Sun et al., 2024a; Xia et al., 2024; Frantar & Alistarh, 2023; Liao et al.,
+133   2023). It often leads to significant degradation as sparsity increases, and generally yields inferior
+134   results at equivalent compression rates compared to quantization. Nevertheless, pruning offers an
+135   advantage for training, as all parameters remain in high precision, allowing for seamless integration
+136   with continuous pretraining or finetuning. Similarly, ClusComp retains high-precision parameters,
+137   and naturally supports standard finetuning.
+138
+139   2.2   K NOWLEDGE DISTILLATION
+140
+      Knowledge distillation is a technique used to enhance the performance of smaller models by trans-
+141
+      ferring knowledge from larger, more complex models (Hinton et al., 2015). Most state-of-the-art
+142
+      quantization methods leverage either block-wise or model-wise distillation. Block-wise distillation
+143   (as employed in OmniQuant, GPTVQ, AQLM and QuiP#) focuses on minimizing errors between
+144   the FP16 and quantized models on a block-by-block basis. This approach is more memory-efficient
+145   than model-wise distillation, as it requires loading only two blocks into the GPU at the same time.
+146   In contrast, model-wise distillation (used in QuiP# and LLM-QAT (Liu et al., 2024)) minimizes the
+147   error across the entire model output, necessitating the loading of at least one full FP16 model into the
+148   GPU. ClusComp adopts block-wise distillation, significantly reducing GPU memory requirements
+149   compared to loading an FP16 model. As demonstrated in Figure 1, ClusComp consumes only 26GB
+150   memory for a 70B LLM, which would otherwise require 140GB in FP16 for loading, making our
+151
+      technique more accessible to users with limited computational resources.
+152
+153   2.3   F INETUNE QUANTIZED MODEL
+154
+      Finetuning is crucial for adapting LLMs to various domains and applications. Quantization, which
+155
+      reduces model size, is theoretically more conducive to finetuning. However, directly finetuning a
+156   quantized model is not a standard approach, as RTN does not support gradient back-propagation.
+157   Finetuning using a straight-through estimator (STE) (Bengio et al., 2013) is relatively under-
+158   explored and may lead to catastrophic forgetting (Malinovskii et al., 2024). Previous works (Xu
+159   et al., 2024a; Liao & Monz, 2024a; Dettmers et al., 2023) propose freezing the quantized model
+160   while updating newly added LoRAs (Hu et al., 2022). However, these approaches suffer from
+161   two key limitations: (1) Freezing the quantized model prevents the mitigation of quantization er-
+      rors during finetuning. Moreover, not all quantization methods are suitable for finetuning. Popular
+
+                                                         3
+      Under review as a conference paper at ICLR 2025
+
+
+162                                            Llama-2-7B                                               Llama-3-8B                                8
+163                              106                      RTN                             106                                                                      Llama-1-7B
+
+
+                                                                                                                               Average Kurtosis
+              Wiki2 (log PPL )
+
+
+                                                                       Wiki2 (log PPL )
+164                                                       GPTQ                                                                                    6                Llama-2-7B
+                                                          AWQ                                                                                                      Llama-3-8B
+165                              104                      ClusComp                        104                                                     4
+166
+                                 102                                                      102                                                     2
+167
+                                                                                                                                                  0
+168                                    2.0   2.5   3.0     3.5   4.0                            2.0   2.5   3.0    3.5   4.0                          0   5   10   15     20    25   30
+169
+                                                   #Bit                                                     #Bit                                               Layer Index
+170
+      Figure 2: The Llama series becomes increasingly difficult to quantize. Left & Middle: From Llama-
+171
+      2 to Llama-3, all methods show increasing difficulty in quantization at lower bit levels. Right: From
+172   Llama-1 to Llama-3, the average kurtosis on weights of most layers is increasing.
+173
+174
+175   techniques like GPTQ and QLoRA, while widely used, exhibit significant quantization errors below
+176   4-bit. (2) The expressiveness of LoRA is constrained by its bottleneck design (Biderman et al., 2024;
+177   Liao & Monz, 2024b). In contrast, ClusComp, where all parameters are maintained in high preci-
+178   sion, inherently supports seamless finetuning. Additionally, updating the codebook in ClusComp
+179   results in modifying all parameters in the weight matrices, even offering superior performance com-
+180   pared to full finetuning while maintaining a similar number of trainable parameters as LoRA.
+181
+182   3        M ETHOD
+183
+184   3.1             P ILOT STUDY
+185
+186   Before introducing ClusComp, we present a key observation from our experiments on different
+187   Llama series. As depicted in Figure 2 (Left & Middle), when reducing the bit-width, the perfor-
+188   mance of various quantization methods (RTN, GPTQ, and AWQ) follows a similar trend: Llama-3
+189   (Dubey et al., 2024) proves more challenging to quantize than Llama-2 (Touvron et al., 2023b).
+190   We hypothesize that the increased difficulty arises from a higher frequency of outliers in the linear
+191   layers of Llama-3. Since these quantization methods rely on uniform quantization, they are particu-
+192   larly sensitive to outliers in the weight matrices. To test this hypothesis, we analyzed the kurtosis of
+193   the weight matrices—a well-established metric for identifying the presence of outliers (Bondarenko
+194   et al., 2023). As shown in Figure 2 (Right), we have two key observations: (1) All models exhibit
+195   higher kurtosis at the beginning and end of the model; (2) From Llama-1 to Llama-3, the kurtosis
+196   increases in most layers, indicating a rise in the frequency of outliers in the linear layers. This trend
+197
+      provides a potential explanation for our quantization difficulties. It also implies that the future Llama
+      series might be even more difficult for quantization.1
+198
+199   Given that the quantization performance is impacted by outliers, could an alternative approach for
+200   model compression involve storing all weight values in FP16 instead of applying quantization?
+201
+202   3.2             C LUS C OMP
+203
+204   The first idea that comes to our mind is clustering, where similar weight values are represented
+205   by a single identified value. This method enables model compression while preserving all weight
+206   values in FP16 format. In this section, we introduce three variants of ClusComp that primarily
+207
+      utilize clustering for compressing LLMs: ClusComp− , which applies clustering alone; ClusComp,
+      which enhances ClusComp− with block-wise error minimization; and ClusComp+ , which further
+208
+      improves the compressed LLMs through next-token prediction training based on ClusComp.
+209
+210
+      3.2.1                      C LUSTERING
+211
+212   Consider a weight matrix W ∈ Rdin ×dout , direct clustering along either dimension of W is subopti-
+213   mal as it leads to a significant reconstruction error, particularly due to the large values of din and dout
+214   in LLMs. To mitigate this issue, we reshape W into a set of lower-dimensional vectors, denoted as
+215
+          1
+              We present the kurtosis for different types of layers and a promising quantization idea in Figure C.1.
+
+
+                                                                                                                   4
+      Under review as a conference paper at ICLR 2025
+
+
+216                                                                                            1e 5
+                                                                                         1.5
+217   Table 1: Bits for W with din , dout = 4096 (16.78M).
+
+
+                                                                               Density
+                                                                                         1.0
+218                                                                                      0.5
+         Setting      #Params. for codes   #Params. for codebook      b̄
+219                                                                                      0.0
+        g4n65500           4.19M               0.26M (1.55%)       4.25                        0      10000 20000 30000 40000 50000 60000
+220
+        g6n65500           2.80M               0.39M (2.32%)       3.04
+                                                                                                                Centroid Index
+221     g9n65500           1.86M               0.59M (3.52%)       2.34
+222                                                                                Figure 3: Histogram of the codes.
+223
+224
+      W ′ = {w1 , w2 , . . . , wk }, where each wi ∈ Rg and k = din ·d    out 2                       ′
+                                                                        g . The goal is to partition W into
+225
+226
+      n clusters {C1 , C2 , . . . , Cn } by solving the following optimization problem:
+227                                                                   n
+                                                                      X X
+228                                        arg min{C1 ,C2 ,...,Cn }                ||wi − cj ||2                                            (2)
+229                                                                   j=1 wi ∈Cj
+
+230   where cj ∈ Rg denotes the centroid of cluster Cj . This clustering problem is well-established in the
+231   machine learning literature and can be iteratively addressed using K-means (Lloyd, 1982) with the
+232   Expectation-Maximization (EM) algorithm:
+233
+234           • E-step: Each vector wi is assigned to the cluster whose centroid cj minimizes the Eu-
+                                         (t)                   (t)          (t)
+235             clidean distance, i.e., Cj = {wi : ||wi − cj ||2 ≤ ||wi − cl ||2 ∀l}.
+236           • M-step: The centroid of each cluster is updated as the mean of the vectors assigned to that
+237                             (t+1)    P                 (t)
+                cluster, i.e., cj     = ( wi ∈C (t) wi )/|Cj |.
+238                                                      j
+
+239
+      Upon completion, two key elements are obtained for each weight matrix: (1) a codebook C =
+240
+      {c1 , c2 , . . . , cn } ∈ Rg×n that contains all centroids, and (2) a set of codes q = {q1 , q2 , . . . , qk } ∈
+241   {1, 2, . . . , n}k that records the assignment of each vector wi to the closest centroid, where qi =
+242   q(wi ) = j if cj = arg mincl ∈C ||wi − cl ||2 . Using the codes q and the codebook C, the weight
+243
+      matrix W ′ can be reconstructed as Ŵ ′ = {cq1 , cq2 , . . . , cqk }. In PyTorch (Paszke et al., 2017), the
+244   linear layer is adapted in Listing C.1.
+245
+246   Remark: ClusComp, when applied solely with clustering, is referred to as ClusComp− . In this
+247
+      configuration, only the weight matrices are utilized, leading to substantial memory efficiency, with
+      a mere 2GB memory consumption on 1 GPU as shown in Figure 1. Moreover, this process can be
+248
+      considerably accelerated with more GPUs, as the clustering of different matrices is independent.
+249
+250
+      3.2.2        E STIMATE MODEL SIZE
+251
+252   After clustering, it is sufficient to store the codes q ∈ {1, 2, . . . , n}k and the codebook C ∈ Rg×n .
+253   Unlike prior works (van Baalen et al., 2024; Egiazarian et al., 2024; Tseng et al., 2024), we don’t
+254   quantize the codebook; instead, we store it in FP16 format. The bit-width required for the codes
+255   depends on the range of n. To maintain efficiency, we set n < 216 and use unsigned 16-bit integers
+256   to represent the codes. Thus, the average bits-per-parameter can be calculated as:
+257                                   size in bits       16 · k + 16 · g · n   16 16 · g · n
+258
+                           b̄ =                        =                     =   +                                                          (3)
+                                  number of parameters        din · dout       g   din · dout
+259
+      In the right-most of Equation (3), the first term corresponds to the bit-width allocated to the codes,
+260
+      and the second term corresponds to the bit-width of the codebook. As an example, for a linear layer
+261
+      W with din = dout = 4096, clustering with g = 4 and n = 216 − 1 results in b̄ ≈ 4 + 0.25 = 4.25.
+262   This demonstrates that the majority of the bit-width is allocated to the codes, which is a primary
+263   reason for constraining n < 216 , so we can use 16 instead of 32-bit integers to represent the code.
+264   Further reducing n to a smaller range leads to fewer centroids, which in turn increases reconstruction
+265   error. More settings can be found in Table 1 and C.1.
+266
+      Remark: While we express the model size in terms of bits-per-parameter, it is important to note that
+267
+      no quantization is applied in ClusComp. Instead, we reduce the number of parameters in W from
+268
+         2
+269        In cases where the dimensions are not divisible, zero-padding is applied to W . In PyTorch, the matrix is
+      reshaped as W ′ = W .transpose(1, 0).view(-1, g), where transposing W offers slightly better performance.
+
+
+                                                                      5
+      Under review as a conference paper at ICLR 2025
+
+
+270
+      din · dout to k + g · n. Utilizing bits-per-parameter allows for a direct comparison between ClusComp
+271   and quantization-based methods. Surprisingly, ClusComp− , which only incorporates the clustering
+272   step without employing any calibration data, already surpasses RTN, GPTQ and AWQ, as illustrated
+273   in Figure 2 (Left & Middle). These results highlight its effectiveness in model compression.
+274
+275   3.2.3    B LOCK - WISE ERROR MINIMIZATION
+276
+277
+      Block-wise error minimization (block-wise reconstruction or knowledge distillation) has emerged as
+      a standard, efficient and effective approach to reducing quantization error (Egiazarian et al., 2024;
+278
+      Tseng et al., 2024; van Baalen et al., 2024; Shao et al., 2024; Liao & Monz, 2024a). To further
+279
+      mitigate the compression error caused by clustering, we incorporate block-wise error minimization
+280   into ClusComp− using a limited set of calibration samples, expressed as:
+281
+                                   arg minCs ||F(W s, X) − F(Cs, qs, X ′ )||                            (4)
+282
+      Here, F denotes a Transformer block (Vaswani et al., 2017), W s represent the weight matrices in
+283
+      the uncompressed block, and Cs and qs denote the codebooks and codes in the compressed block.
+284
+      X refers to the input of the uncompressed block, which is also the output from the previous un-
+285   compressed block, while X ′ is the input to the compressed block, originating from the output of the
+286   preceding compressed block. For the first block, we have X = X ′ . Block-wise error minimization
+287   is memory-efficient as it only requires loading two blocks into the GPU simultaneously.
+288
+      Remark: In Equation (4), we only train the codebook Cs while keeping the codes qs fixed as indices.
+289
+      This design offers two key advantages: (1) It enhances data efficiency. As illustrated in Table 1, the
+290
+      majority of parameters are represented by the codes. Training both the codebooks and codes with a
+291   limited number of calibration samples (128) leads to overfitting; (2) More importantly, training the
+292   codes with a large number of centroids (216 ) can result in mode collapse (Sun et al., 2024b; Kingma
+293   & Welling, 2014). Since the codes already exhibit a uniform distribution after clustering (see Figure
+294   3), keeping the codes fixed indicates that all centroids in the codebook can be trained uniformly.
+295   Such a code-fixed design is also applied to the following recovery and finetuning step. Combining
+296   both clustering and block-wise error minimization steps, we term this method ClusComp.
+297
+298   3.2.4    R ECOVERY AND FINETUNING
+299
+      We present the adapted linear layer for ClusComp in Listing C.1, which can be seamlessly integrated
+300   as a replacement for the original linear layer in LLMs. As the codebook is represented in FP16, this
+301   new layer inherently supports training without requiring additional tricks, like STE.
+302
+303
+      Recovery training. The compressed LLMs can be further trained by predicting the next token to
+      recover information lost due to compression. This is achieved by finetuning the codebook parame-
+304
+      ters. This form of training is memory-efficient in two distinct ways: (1) Since the LLM is already
+305
+      compressed, loading it onto the GPU consumes less memory compared to the FP16 version; (2)
+306   As illustrated in Table 1, the parameters in the codebook account for < 5% of the total parameters
+307   in the FP16 version, making the training both parameter-efficient and memory-efficient (with the
+308   optimizer states being smaller). We refer to ClusComp with recovery training as ClusComp+ .
+309
+      Finetuning. Like recovery training, finetuning the compressed LLM on downstream tasks can also
+310
+      be performed efficiently. Unlike QLoRA (Dettmers et al., 2023), which freezes the quantized LLM
+311
+      and trains only the LoRA (Hu et al., 2022) modules, finetuning the codebook alone eliminates the
+312   need for this additional constraint. This approach offers two key advantages over QLoRA: (1) Freez-
+313   ing the quantized LLM prevents mitigation of quantization errors, whereas finetuning the codebook
+314   can further address compression errors for downstream tasks; (2) The low-rank bottleneck of LoRA
+315   limits its expressiveness (Biderman et al., 2024). In contrast, finetuning the codebook is analogous
+316   to adapting the entire high-rank weight matrix, providing greater flexibility and expressiveness.
+317
+318   4     E XPERIMENTS
+319
+320   4.1     C OMPRESSION RESULTS
+321
+322   LLMs and evaluation. We evaluate ClusComp on widely adopted LLM families: Llama-1-7B,
+323   Llama-2-7B/13B/70B and Llama-3-8B/70B (Touvron et al., 2023a;b; Dubey et al., 2024). We mea-
+      sure the performance of compressed LLMs on zero-shot and language modeling tasks. For zero-shot
+
+
+                                                        6
+      Under review as a conference paper at ICLR 2025
+
+
+324   Table 2: The perplexity of Llama series on WikiText2 and C4. Only the competitive baselines are
+325   shown here for a compact representation. Refer to Table C.1 and C.2 for all results and settings.
+326
+327
+                                                 Wiki2 (PPL↓)                                       C4 (PPL↓)
+        Method          #Bit
+328                            1-7B    2-7B    2-13B     2-70B   3-8B    3-70B   1-7B    2-7B    2-13B    2-70B   3-8B    3-70B
+
+329     -              16.00    5.68    5.47    4.88      3.31    6.12    2.90    7.08    6.97    6.46     5.52    9.20    5.87
+
+330     GPTQ            4.13    5.85    5.61    4.98      3.42    6.50    3.30    7.21    7.12    6.56     5.58   10.40    6.94
+        AffineQuant     4.13    5.77    5.58    4.95         -       -       -    7.20    7.12    6.56        -       -       -
+331     GPTVQ           4.13       -    5.68    4.97      3.39       -       -       -       -       -        -       -       -
+        OmniQuant       4.16    5.77    5.58    4.95      3.40       -       -    7.21    7.12    6.56     5.58       -       -
+332     ClusComp−     ≤ 4.14    5.88    5.67    5.04      3.44    6.59    3.28    7.27    7.16    6.63     5.61    9.39    7.02
+333     ClusComp      ≤ 4.14    5.73    5.54    4.94      3.40    6.39    3.12    7.17    7.09    6.55     5.61    9.27    6.99
+
+334     RTN             3.13    7.01    6.66    5.51      3.97   27.91   11.84    8.62    8.40    7.18     6.02    27.9   22.39
+        GPTQ            3.00    8.06    8.37    6.44      4.82    13.0       -    9.49    9.81    8.02     6.57   13.00       -
+335     OmniQuant       3.00    6.49    6.58    5.58      3.92       -       -    8.19    8.65    7.44     6.06       -       -
+        AffineQuant     3.00    6.30    6.55    5.62         -       -       -    8.03    8.57    7.56        -       -       -
+336     QuIP            3.00       -       -       -      3.85    7.50       -       -       -       -     6.14       -       -
+337     ClusComp−     ≤ 2.89    6.74    6.54    6.27      4.02    8.77    4.98    8.14    8.19    8.21     6.06   12.41    8.26
+        ClusComp      ≤ 2.89    6.01    5.86    5.18      3.72    7.34    4.63    7.64    7.61    6.91     5.86   11.31    8.26
+338
+        GPTQ            2.13   44.01   36.77   28.14     NAN     2.1e2   11.90   27.71   33.70   20.97    NAN     2.1e2       -
+339     SliM-LLM+       2.13    9.68   10.87    7.59      6.44       -       -   14.99   18.18   10.24     8.40       -       -
+        QuIP            2.13       -   39.73   13.48      6.64   84.97   13.03       -   31.94   16.16     8.17   1.3e2   22.24
+340     PB-LLM          2.13       -   25.37   49.81     NAN     44.12   11.68       -   29.84   19.82     8.95   79.21   33.91
+341     GPTVQ           2.13       -    8.23    6.50      4.64       -       -       -       -       -        -       -       -
+        AffineQuant     2.13   13.51   10.87    7.64         -       -       -       -   16.02   10.98        -       -       -
+342     OmniQuant       2.14    9.72   11.06    8.26      6.55       -       -   12.97   15.02   11.05     8.52       -       -
+        ClusComp−     ≤ 2.15   28.76   21.90   14.50      5.43   2.1e2   11.40   29.67   25.26   18.83     7.59   1.9e2   16.52
+343     ClusComp      ≤ 2.15    7.06    7.04    5.85      4.37   11.57    7.61    9.33    9.49    7.92     6.44   17.89   10.81
+344     GPTQ            2.00   2.1e3   7.7e3   2.1e3     77.95   5.7e4       -   6.9e2   NAN     3.2e2    48.82   5.7e4       -
+345     QuIP            2.00       -       -       -      6.33   85.10       -       -       -       -        -   1.3e2       -
+        AffineQuant     2.00    9.53   35.07   12.42         -       -       -       -       -       -        -       -       -
+346     OmniQuant       2.00   15.47   37.37   17.21      7.81       -       -   24.89   90.64   26.76    12.28   8.2e5       -
+        ClusComp−     ≤ 2.01   65.09   52.38   22.90      9.84   3.1e2       -   74.61   50.08   24.47    13.96   2.2e2       -
+347     ClusComp      ≤ 2.01    7.49    7.50    6.17      4.83   12.33       -   10.11   10.29    8.49     7.02   21.45       -
+348
+349
+350
+351   evaluation, we apply 6 tasks from lm-eval v0.4.4 (Gao et al., 2024), i.e. PIQA (Bisk et al., 2020),
+352
+      ARC-e/c (Clark et al., 2018), BoolQ (Clark et al., 2019), HellaSwag (Zellers et al., 2019) and Wino-
+      Grande (Sakaguchi et al., 2020). For language modeling, we report the perplexity on the whole test
+353
+      set of WikiText2 (Merity et al., 2017) and on 256 samples from the validation set of C4 (Raffel et al.,
+354
+      2020a) with a sequence length of 2048 as our baselines. We also apply ClusComp to LLaVA-Next-
+355   8B (Li et al., 2024b), and evaluate it on 5 multimodal tasks from lmms-eval v0.2.3 (Li et al., 2024a)
+356   to show its broad applicability, i.e. AI2D (Kembhavi et al., 2016), ChartQA (Masry et al., 2022),
+357   DocVQA (Mathew et al., 2021), MMBench (Liu et al., 2023) and MME (Yin et al., 2023).3
+358
+      Baselines. Here we primarily compare ClusComp with three categories of baselines: (1) statistic-
+359
+      based methods without neural training, including vanilla RTN, GPTQ (Frantar et al., 2022), AWQ
+360
+      (Lin et al., 2024), and PB-LLM (Yuan et al., 2024);4 (2) gradient-based methods with neural training
+361   (such as block-wise distillation), including OmniQuant (Shao et al., 2024), AffineQuant (Ma et al.,
+362   2024), and SliM-LLM+ (Huang et al., 2024b); and (3) quantized codebook-based methods, includ-
+363   ing QuIP (Chee et al., 2023) and GPTVQ (van Baalen et al., 2024). All baseline results are directly
+364   borrowed from the original works or their follow-up works.
+365
+      Settings. We begin by applying K-means clustering to the weight matrices of all linear layers,
+366
+      referring to this method as ClusComp− . Next, we use 128 calibration sentences from the Wiki-
+367   Text2 training set to minimize block-wise error through codebook training only, which we denote
+368   as ClusComp. It is important to highlight that the majority of the aforementioned baselines uti-
+369   lize comparable resources (GPU memory and the number of calibration sentences) to those used in
+370   ClusComp. All detailed experimental settings in this section are provided in §B.
+371
+      Results. The language modeling results are presented in Table 2. At the 4-bit level, ClusComp
+372
+      demonstrates superior performance by achieving the lowest perplexity in 9 out of 12 cases, while
+373   maintaining a negligible perplexity difference (≤ 0.05) compared to the best baselines in the remain-
+374
+375         3
+           We observed that different studies may report varying zero-shot accuracy for the FP16 model, which can
+376   be attributed to the lm-eval version or the choice of evaluation metric (accuracy or normalized accuracy). We
+377   recommend that future researchers first reproduce the FP16 accuracy before making comparisons.
+         4
+           ClusComp− is also a statistic-based method.
+
+
+                                                                   7
+      Under review as a conference paper at ICLR 2025
+
+
+378                                                Llama-2-7B                             Llama-2-13B                                     Llama-3-8B          68.4
+                                                                                                        72.2          70
+                                 70                              67.9 67.7                                                                64.9
+379                                                                          70 67.6 69.0                                                                     67.9
+                                      61.8   63.0 64.1                              68.4                       71.8                       63.7 64.5
+
+
+
+              Average Accuracy
+380                                                                          65                                       60
+                                 60                                                      66.2                                56.4
+381                                             61.5                                 64.5                                  53.6
+                                             57.2                            60
+382                                                   FP16                   55                                       50     51.7
+                                 50                   RTN
+383                                                   GPTQ                   50                                         40.8
+384                                                   GPTVQ                                                           40 36.8                           QuIP
+                                 40                   ClusComp               45                                                                         SliM-LLM
+385
+                                    2.00 2.25 2.50 2.75 3.00                    2.00 2.25 2.50 2.75 3.00                   2.0      2.5      3.0     3.5 4.0
+386                                                                                             #Bit
+387
+388   Figure 4: Average zero-shot accuracy over 5/6 commonsense reasoning tasks, only including com-
+389
+      petitive baselines. Please refer to Table C.3 and C.4 for detailed numbers and the full comparison.
+390
+391         Table 3: Zero-shot multimodal evaluation, with baseline results from Huang et al. (2024c).
+392
+393                         Method                       #Bit     AI2D ↑     ChartQA ↑     DocVQA ↑      MMBench ↑          Avg ↑          MME (cog / per) ↑
+
+394                         LLaVA-Next-8B                16.00       71.7      69.2             78.2           72.2          72.8         1965.1 (376.8 / 1588.3)
+
+395                         GPTQ                          4.13       70.7      67.4             77.4           71.0          71.6         1895.0 (331.6 / 1563.4)
+                            AWQ                           4.13       70.6      68.0             77.2           71.1          71.7         1888.4 (325.7 / 1562.7)
+396                         ClusComp                      4.13       70.0      68.7             77.6           71.1          71.8         1915.7 (322.1 / 1593.6)
+397                         GPTQ                          3.13       66.2      65.1             75.6           67.4          68.6         1831.8 (290.1 / 1541.7)
+                            AWQ                           3.13       67.7      65.4             74.4           68.0          68.9         1840.3 (298.6 / 1541.7)
+398                         ClusComp                      2.87       68.7      65.8             74.8           67.7          69.3         1872.6 (331.1 / 1541.5)
+399                         GPTQ                          2.13        0.0       0.0              0.0           0.0            0.0             0.0 (0.0 / 0.0)
+400                         AWQ                           2.13        0.0       0.0              0.0           0.0            0.0             0.0 (0.0 / 0.0)
+                            ClusComp                      2.14       53.9      53.1             56.7           50.1          53.5         1673.0 (294.6 / 1378.4)
+401
+402
+403
+404   ing 3 cases. At bit-widths < 4, ClusComp consistently outperforms all baselines. Notably, even at
+405   the 2-bit level, ClusComp’s perplexity remains within a functional range, < 13 on Wikitext2. Figure
+406
+      4 presents the zero-shot evaluation results, where ClusComp again consistently surpasses all base-
+      lines across different bit-widths. Furthermore, ClusComp exhibits significantly less sensitivity to
+407
+      bit-width variations, as indicated by the flatter slope of its accuracy curve.
+408
+409   We also compress the Llama-3-8B backbone in LLaVA-Next-8B, and report the zero-short perfor-
+410   mance in Table 3. On average, ClusComp continues to outperform both GPTQ and AWQ, while
+411   using a comparable or even lower number of bits. A particularly noteworthy observation occurs
+412
+      at the 2-bit level, where none of the baselines produce correct outputs, whereas ClusComp retains
+      strong performance. In comparison to the 2-bit results for Llama-3-8B in Figure 4 (Right), this
+413
+      suggests that quantizing multimodal models presents unique challenges, warranting further study.
+414
+415
+416
+      4.2    P USH THE LIMIT OF MODEL COMPRESSION
+417
+      We further enhance the performance of 2-bit LLMs and extend the compression boundary to the 1-
+418
+      bit level through efficient recovery training. This is achieved by optimizing the codebook parameters
+419   in an end-to-end manner during a next-token prediction task.
+420
+421   Baselines. We include BiLLM (Huang et al., 2024a), which performs effectively at the 1-bit com-
+422
+      pression level. Additionally, three more resource-intensive PTQ baselines are considered: AQLM
+      (Egiazarian et al., 2024), which utilizes a larger number of calibration samples (4-16M tokens);
+423
+      QuIP# (Tseng et al., 2024) and DB-LLM (Chen et al., 2024), both of which employ model-wise
+424
+      distillation and a larger number of calibration samples (24-48M tokens).
+425
+426   Settings. ClusComp employs only 0.3M tokens for its compression. In this experiment, we further
+427   finetune the compressed LLM generated by ClusComp through end-to-end training, optimizing the
+428
+      codebook parameters using 16M tokens from a subset of the RedPajama dataset (Computer, 2023).
+      This extended method is referred to as ClusComp+ .
+429
+430   Results. We report the zero-shot accuracy of ultra-low-bit LLMs in Table 4. On both Llama-2-7B
+431   and Llama-2-13B, ClusComp already performs comparably to, or surpasses AQLM and QuiP#.
+      With minimal recovery training, ClusComp+ consistently outperforms these baselines on aver-
+
+
+                                                                                                8
+      Under review as a conference paper at ICLR 2025
+
+
+432    Table 4: Zero-shot accuracy on ultra-low-bit LLMs.                                 Table 5: In-domain finetuning perfor-
+433
+                                                                                          mance on Llama-2-7B. Two bits are
+434    Method            #Bit   PIQA    ArcE     ArcC      Hella.     Wino.      Avg
+                                                                                          shown for baselines, since the LoRA
+435    Llama-2-7B    16.00      78.1    76.3     43.4      57.1       69.1       64.8
+                                                                                          modules aren’t merged to the quantized
+       QuIP#          2.02      75.1    64.6     34.6      48.3       64.9       57.5
+436    AQLM           2.02      73.6    61.9     33.3      49.5       64.2       56.5     LLMs. The first and second numbers
+437    ClusComp       2.00      72.6    67.0     32.9      47.2       63.4       56.6
+       ClusComp+      2.00      73.5    67.2     33.9      49.3       65.1       57.8
+                                                                                          denote the quantized LLM and the con-
+438
+       Llama-2-13B   16.00      79.1    79.4     48.4      60.0       72.2       67.8
+                                                                                          verted bits from LoRA modules.
+439    QuIP#          2.01      77.3    69.3     39.5      53.4       67.7       61.5
+       AQLM           1.97      76.2    69.8     37.8      53.7       65.4       60.6
+440                                                                                                                       WikiText2          GSM8K
+       ClusComp       1.99      75.6    74.7     39.9      53.0       67.1       62.0       Method        #Bit
+                                                                                                                           PPL ↓             ACC ↑
+441    ClusComp+      1.99      76.8    74.9     40.7      54.5       68.4       63.1
+                                                                                            LoRA          16.00             5.08              36.9
+442    Llama-3-8B    16.00      79.7    80.1     50.4      60.2       72.6       68.6
+       QuiP           2.00      52.9    29.0     21.3      29.2       51.7       36.8       QLoRA         4.25 + 0.40       5.70              35.1
+443    PB-LLM         2.00      57.0    37.8     17.2      29.8       52.5       38.8       LoftQ         4.25 + 0.40       5.24              35.0
+       DB-LLM         2.00      68.9    59.1     28.2      42.1       60.4       51.8       ClusComp      4.15              5.26              41.0
+444    ClusComp       2.01      70.1    63.3     31.9      44.4       58.4       53.6
+                                                                                            QLoRA         3.25 + 0.40       5.73              32.1
+445    ClusComp+      2.01      74.8    66.7     34.8      49.6       63.4       57.8
+                                                                                            LoftQ         3.25 + 0.40       5.63              32.9
+446    Llama-3-70B   16.00      82.5    86.7     60.4      66.3       80.9       75.4       ClusComp      3.38              5.37              39.9
+       QuIP           2.00      65.3    48.9     26.5      40.9       61.7       48.7
+                                                                                            QLoRA         2.25 + 0.40       NAN               NAN
+447    PB-LLM         1.70      56.5    49.9     25.8      34.9       53.1       44.1
+                                                                                            LoftQ         2.25 + 0.40       7.85              20.9
+       BiLLM          1.10      58.2    46.4     25.1      37.5       53.6       44.2
+448    ClusComp       1.14      56.9    32.5     20.6      32.3       51.6       39.7
+                                                                                            ClusComp      2.54              5.78              37.2
+                                                                                            ClusComp      2.29              6.10              36.0
+449    ClusComp+      1.14      69.5    57.2     30.1      44.2       56.0       51.4
+
+450
+451     Table 6: General-domain finetuning performance, with baseline results from Xu et al. (2024b).
+452
+453                                               MMLU (0-shot, ACC ↑)                               MMLU (5-shot, ACC ↑)
+454             Method           #Bit
+                                        Hums.     STEM       Social     Other       Avg    Hums.     STEM        Social   Other       Avg
+455             Llama-1-7B      16.00     32.4      26.6       31.4       37.2     32.1     33.3       29.8       37.8     38.0       34.6
+456             GPTQ-LoRA        4.50     35.7      30.9       38.0       44.0     37.1     33.8       31.3       37.4     42.2       36.0
+457             QA-LoRA          4.50     36.9      31.4       40.3       44.9     38.3     36.6       32.4       44.8     44.9       39.4
+                PEQA             4.00        -         -          -          -        -     34.9       28.9       37.5     40.1       34.8
+458             ClusComp         4.15     36.9      31.4       40.0       44.2     38.0     36.8       34.1       42.7     43.9       39.1
+459             GPTQ-LoRA        3.50     31.5      28.9       31.8       36.8     32.2     31.6       30.1       35.6     39.8       34.0
+                QA-LoRA          3.50     36.0      34.1       42.0       42.3     38.3     35.6       30.5       41.5     42.7       37.4
+460             ClusComp         3.38     38.2      32.7       41.2       45.4     39.2     36.3       31.4       41.3     43.0       37.8
+461             GPTQ-LoRA        2.50     24.1      22.1       22.5       23.7     23.2     23.4       26.2       26.4     28.4       25.8
+462             QA-LoRA          2.50     26.4      25.5       25.6       28.7     26.5     27.3       26.1       26.1     30.3       27.5
+                ClusComp         2.29     32.6      29.7       34.4       37.0     33.3     31.1       30.1       37.8     37.2       33.7
+463
+                Llama-2-7B      16.00     38.9      32.9       46.6       44.9     40.7     43.0       36.4       51.4     52.2       45.5
+464             QA-LoRA          4.50     41.1      35.4       50.2       50.1     43.9     42.1       34.4       49.1     50.3       43.9
+465             ClusComp         4.15     41.6      36.3       52.3       51.1     44.9     42.8       38.1       52.2     53.1       46.1
+
+466             Llama-2-13B     16.00     48.1      42.7       60.5       59.5     52.3     53.3       44.1       63.3     61.0       55.3
+
+467             QA-LoRA          4.50     48.2      41.7       60.4       58.7     51.9     48.0       43.0       59.7     57.4       51.7
+                ClusComp         4.09     49.2      42.9       61.6       60.2     52.9     52.4       43.2       62.9     61.6       54.7
+468
+469
+470
+471   age, with the performance gap increasing for larger LLMs, indicating the robust scalability of
+472   ClusComp+ . On Llama-3-8B, ClusComp already exceeds all baselines, and ClusComp+ further
+473   widens this margin. On Llama-3-70B, ClusComp+ achieves remarkable accuracy at the 1-bit level.
+474   Furthermore, when comparing the improvements from ClusComp to ClusComp+ across different
+475   Llama series, a notably larger performance gain is observed on the Llama-3 models, underscoring
+476
+      the effectiveness of ClusComp+ on LLMs with a higher frequency of outliers.
+477
+478   4.3   F INETUNING QUALITY AND EFFICIENCY
+479
+480   We can finetune the compressed LLMs on downstream tasks by only training the codebooks.
+481   In-domain finetuning. We finetune Llama-2-7B on the training sets of WikiText2 and GSM8K
+482   (Cobbe et al., 2021), and report the perplexity and accuracy on their respective validation/test set.
+483   ClusComp is compared with two LoRA-based techniques: QLoRA (Dettmers et al., 2023) and
+484   LoftQ (Li et al., 2024c). As shown in Table 5, ClusComp consistently achieves superior results with
+485   fewer bits (except at the 4-bit level on WikiText2, where it performs comparably to LoftQ), even
+      outperforming LoRA-finetuning of the FP16 model on GSM8K with a 2.54-bit compressed LLM.
+
+
+                                                                             9
+      Under review as a conference paper at ICLR 2025
+
+
+486                                                                                                           >140
+      Table 7: ClusComp performance against efficient full                                      LoRA
+487                                                                                    125      LISA
+
+
+                                                                     GPU Memory (GB)
+      finetuning, with baseline results from (Pan et al., 2024).
+488                                                                                    100      ClusComp
+489
+          Method             Bit   #Trained
+                                              MMLU       AGIEval                        75
+490                                           5-shot ↑   3-shot ↑
+                                                                                        50       A6000-48GB           42
+491       Llama-2-7B
+          Full FT
+                           16.00
+                           16.00      100%
+                                          -    45.9
+                                               45.7
+                                                           25.7
+                                                           27.0                         25   23 23 22
+492
+                                                                                         0
+493       LoRA (r = 128)
+          GaLore
+                           16.00
+                           16.00
+                                      4.9%
+                                    100.0%
+                                               45.5
+                                               45.5
+                                                           24.7
+                                                           24.4
+                                                                                               7B               70B
+494       LISA             16.00    100.0%     46.2        26.1
+495       ClusComp          4.15      0.9%     47.0        26.5     Figure 5: Memory consumption for re-
+          ClusComp          2.88      1.4%     45.1        25.6
+496       ClusComp          2.00      1.4%     30.7        21.8
+                                                                    covery training or finetuning. 4-bit
+497                                                                 LLMs are used for ClusComp here.
+498
+499
+500   General-domain finetuning. We finetune the compressed LLMs on Alpaca-GPT3.5 (Taori et al.,
+501   2023) and evaluate them using the MMLU benchmark (Hendrycks et al., 2021). ClusComp is com-
+502   pared against baseline methods that merge trained LoRA modules into the quantized linear layers
+503   after finetuning, i.e. GPTQ-LoRA, QA-LoRA (Xu et al., 2024b) and PEQA (Kim et al., 2023).
+504   As shown in Table 6, ClusComp consistently outperforms the baseline methods across different
+505   LLMs and bit-widths, while using fewer bits. The only exception occurs at the 4-bit level for
+506   Llama-1-7B, where ClusComp underperforms QA-LoRA by a small margin of 0.3 accuracy. The
+507   performance gap between ClusComp and baselines is enlarged for lower bits or recent LLM series.
+508
+      Compared to full finetuning. Similar to the general-domain finetuning, we finetune the compressed
+509   LLMs on a new version of Alpaca, i.e. Alpaca-GPT4 (Peng et al., 2023), and evaluate them on both
+510   MMLU and AGIEval (Zhong et al., 2024). Here we mainly compare ClusComp to some memory-
+511   efficient finetuning methods that fully finetune the FP16 version, i.e. GaLore (Zhao et al., 2024) and
+512   LISA (Pan et al., 2024). As shown in Table 7, finetuning the compressed LLMs at the 4-bit level
+513   from ClusComp outperforms all memory-efficient finetuning methods, and rivals full finetuning. In
+514   addition, the finetuned LLMs can be used in a low bit, friendly for inference.
+515   The superior finetuning performance can be attributed to three key advantages of ClusComp: (1)
+516   ClusComp introduces smaller compression errors; (2) Unlike QLoRA, where compressed LLMs
+517   are frozen during finetuning, ClusComp allows for the model to remain unfrozen by training the
+518   codebook parameters, enabling further mitigation of compression errors; (3) The low-rank design
+519   of LoRA limits its expressiveness. In contrast, updating the codebook in ClusComp is analogous to
+520   updating a high-rank weight matrix. In addition, the fixed-code design allows uniform training of
+521   all centroids, providing greater expressiveness and can even rival full finetuning.
+522   Efficiency discussion. Figure 5 illustrates the memory efficiency of ClusComp during training, with
+523   a batch size of 1 and a sequence length of 1024. For the 70B LLM, we apply gradient checkpointing
+524   (this is not used for the 7B LLM), while omitting any additional memory-saving techniques.
+525
+      Finetuning the LLM compressed by ClusComp demonstrates memory efficiency in two key ways:
+526
+      (1) The compressed LLM requires less memory for loading onto the GPU compared to the FP16
+527   model; and (2) Only the codebook parameters, which contain a limited number of trainable param-
+528   eters (< 1%), are updated, as detailed in Table 7. Consequently, the optimizer state size remains
+529   small. ClusComp can serve not only as a model compression technique but also as an effective
+530   method for both memory- and parameter-efficient finetuning.
+531
+532
+533   5   C ONCLUSION
+534
+535   The newly introduced model compression technique, ClusComp, operates by (1) independently ap-
+536   plying clustering to the weight matrices to produce both the codebook and corresponding codes,
+537   (2) reducing compression error through block-wise knowledge distillation, and (3) enhancing model
+538   performance via efficient recovery finetuning. Comprehensive experiments demonstrate its effec-
+539   tiveness as a compression method at 1-4 bit levels, while also showcasing its parameter and memory
+      efficiency for finetuning, with a competitive performance with full finetuning.
+
+
+                                                             10
+      Under review as a conference paper at ICLR 2025
+
+
+540
+      R EPRODUCIBILITY STATEMENT
+541
+542
+      We explain all experimental details in Section §B, and guarantee the open source of our code upon
+543   decision notification.
+544
+545
+546   R EFERENCES
+547   Yoshua Bengio, Nicholas Léonard, and Aaron C. Courville. Estimating or propagating gradients
+548     through stochastic neurons for conditional computation. CoRR, abs/1308.3432, 2013. URL
+549     http://arxiv.org/abs/1308.3432.
+550
+      Dan Biderman, Jose Javier Gonzalez Ortiz, Jacob Portes, Mansheej Paul, Philip Greengard, Connor
+551
+        Jennings, Daniel King, Sam Havens, Vitaliy Chiley, Jonathan Frankle, Cody Blakeney, and John P.
+552
+        Cunningham. Lora learns less and forgets less. CoRR, abs/2405.09673, 2024. doi: 10.48550/
+553     ARXIV.2405.09673. URL https://doi.org/10.48550/arXiv.2405.09673.
+554
+555   Yonatan Bisk, Rowan Zellers, Ronan Le Bras, Jianfeng Gao, and Yejin Choi. PIQA: reasoning
+556     about physical commonsense in natural language. In The Thirty-Fourth AAAI Conference on
+557
+        Artificial Intelligence, AAAI 2020, The Thirty-Second Innovative Applications of Artificial Intel-
+        ligence Conference, IAAI 2020, The Tenth AAAI Symposium on Educational Advances in Artifi-
+558
+        cial Intelligence, EAAI 2020, New York, NY, USA, February 7-12, 2020, pp. 7432–7439. AAAI
+559
+        Press, 2020. doi: 10.1609/AAAI.V34I05.6239. URL https://doi.org/10.1609/aaai.
+560     v34i05.6239.
+561
+562   Yelysei Bondarenko, Markus Nagel, and Tijmen Blankevoort.      Quantizable transformers:
+563     Removing outliers by helping attention heads do nothing. In Alice Oh, Tristan Nau-
+564     mann, Amir Globerson, Kate Saenko, Moritz Hardt, and Sergey Levine (eds.), Advances
+565
+        in Neural Information Processing Systems 36: Annual Conference on Neural Informa-
+        tion Processing Systems 2023, NeurIPS 2023, New Orleans, LA, USA, December 10 - 16,
+566
+        2023, 2023. URL http://papers.nips.cc/paper_files/paper/2023/hash/
+567
+        edbcb7583fd8921dad78adecfe06a99b-Abstract-Conference.html.
+568
+569   Tom B. Brown, Benjamin Mann, Nick Ryder, Melanie Subbiah, Jared Kaplan, Prafulla Dhari-
+570     wal, Arvind Neelakantan, Pranav Shyam, Girish Sastry, Amanda Askell, Sandhini Agarwal,
+571     Ariel Herbert-Voss, Gretchen Krueger, Tom Henighan, Rewon Child, Aditya Ramesh, Daniel M.
+572     Ziegler, Jeffrey Wu, Clemens Winter, Christopher Hesse, Mark Chen, Eric Sigler, Mateusz
+573
+        Litwin, Scott Gray, Benjamin Chess, Jack Clark, Christopher Berner, Sam McCandlish, Alec
+        Radford, Ilya Sutskever, and Dario Amodei. Language models are few-shot learners. CoRR,
+574
+        abs/2005.14165, 2020. URL https://arxiv.org/abs/2005.14165.
+575
+576   Jerry Chee, Yaohui Cai, Volodymyr Kuleshov, and Christopher De Sa. Quip: 2-bit quan-
+577      tization of large language models with guarantees.  In Alice Oh, Tristan Naumann,
+578      Amir Globerson, Kate Saenko, Moritz Hardt, and Sergey Levine (eds.), Advances in
+579      Neural Information Processing Systems 36: Annual Conference on Neural Information
+580
+         Processing Systems 2023, NeurIPS 2023, New Orleans, LA, USA, December 10 - 16,
+         2023, 2023. URL http://papers.nips.cc/paper_files/paper/2023/hash/
+581
+         0df38cd13520747e1e64e5b123a78ef8-Abstract-Conference.html.
+582
+583   Hong Chen, Chengtao Lv, Liang Ding, Haotong Qin, Xiabin Zhou, Yifu Ding, Xuebo Liu, Min
+584     Zhang, Jinyang Guo, Xianglong Liu, and Dacheng Tao. DB-LLM: accurate dual-binarization
+585     for efficient llms. In Lun-Wei Ku, Andre Martins, and Vivek Srikumar (eds.), Findings of the
+586     Association for Computational Linguistics, ACL 2024, Bangkok, Thailand and virtual meet-
+587     ing, August 11-16, 2024, pp. 8719–8730. Association for Computational Linguistics, 2024.
+588
+        doi: 10.18653/V1/2024.FINDINGS-ACL.516. URL https://doi.org/10.18653/v1/
+        2024.findings-acl.516.
+589
+590   Christopher Clark, Kenton Lee, Ming-Wei Chang, Tom Kwiatkowski, Michael Collins, and Kristina
+591     Toutanova. Boolq: Exploring the surprising difficulty of natural yes/no questions. In Jill Burstein,
+592     Christy Doran, and Thamar Solorio (eds.), Proceedings of the 2019 Conference of the North Amer-
+593     ican Chapter of the Association for Computational Linguistics: Human Language Technologies,
+        NAACL-HLT 2019, Minneapolis, MN, USA, June 2-7, 2019, Volume 1 (Long and Short Papers),
+
+
+                                                       11
+      Under review as a conference paper at ICLR 2025
+
+
+594
+        pp. 2924–2936. Association for Computational Linguistics, 2019. doi: 10.18653/V1/N19-1300.
+595     URL https://doi.org/10.18653/v1/n19-1300.
+596
+597   Peter Clark, Isaac Cowhey, Oren Etzioni, Tushar Khot, Ashish Sabharwal, Carissa Schoenick, and
+598     Oyvind Tafjord. Think you have solved question answering? try arc, the AI2 reasoning challenge.
+599     CoRR, abs/1803.05457, 2018. URL http://arxiv.org/abs/1803.05457.
+600
+      Karl Cobbe, Vineet Kosaraju, Mohammad Bavarian, Mark Chen, Heewoo Jun, Lukasz Kaiser,
+601
+        Matthias Plappert, Jerry Tworek, Jacob Hilton, Reiichiro Nakano, Christopher Hesse, and John
+602
+        Schulman. Training verifiers to solve math word problems. CoRR, abs/2110.14168, 2021. URL
+603     https://arxiv.org/abs/2110.14168.
+604
+605   Together Computer. Redpajama: An open source recipe to reproduce llama training dataset, 2023.
+606     URL https://github.com/togethercomputer/RedPajama-Data.
+607
+      Tim Dettmers, Artidoro Pagnoni, Ari Holtzman, and Luke Zettlemoyer.    Qlora: Ef-
+608
+        ficient finetuning of quantized llms. In Alice Oh, Tristan Naumann, Amir Glober-
+609
+        son, Kate Saenko, Moritz Hardt, and Sergey Levine (eds.), Advances in Neural In-
+610     formation Processing Systems 36: Annual Conference on Neural Information Pro-
+611     cessing Systems 2023, NeurIPS 2023, New Orleans, LA, USA, December 10 - 16,
+612     2023, 2023. URL http://papers.nips.cc/paper_files/paper/2023/hash/
+613     1feb87871436031bdc0f2beaa62a049b-Abstract-Conference.html.
+614
+615   Tim Dettmers, Ruslan Svirschevski, Vage Egiazarian, Denis Kuznedelev, Elias Frantar, Saleh Ashk-
+616
+        boos, Alexander Borzunov, Torsten Hoefler, and Dan Alistarh. Spqr: A sparse-quantized repre-
+        sentation for near-lossless LLM weight compression. In The Twelfth International Conference on
+617
+        Learning Representations, ICLR 2024, Vienna, Austria, May 7-11, 2024. OpenReview.net, 2024.
+618
+        URL https://openreview.net/forum?id=Q1u25ahSuy.
+619
+620   Matthijs Douze, Alexandr Guzhva, Chengqi Deng, Jeff Johnson, Gergely Szilvasy, Pierre-
+621    Emmanuel Mazaré, Maria Lomeli, Lucas Hosseini, and Hervé Jégou. The faiss library. CoRR,
+622    abs/2401.08281, 2024. doi: 10.48550/ARXIV.2401.08281. URL https://doi.org/10.
+623    48550/arXiv.2401.08281.
+624
+      Abhimanyu Dubey, Abhinav Jauhri, Abhinav Pandey, Abhishek Kadian, Ahmad Al-Dahle, Aiesha
+625
+        Letman, Akhil Mathur, Alan Schelten, Amy Yang, Angela Fan, and et al. The llama 3 herd
+626
+        of models. CoRR, abs/2407.21783, 2024. doi: 10.48550/ARXIV.2407.21783. URL https:
+627     //doi.org/10.48550/arXiv.2407.21783.
+628
+629   Vage Egiazarian, Andrei Panferov, Denis Kuznedelev, Elias Frantar, Artem Babenko, and Dan Al-
+630     istarh. Extreme compression of large language models via additive quantization. In Forty-first
+631     International Conference on Machine Learning, ICML 2024, Vienna, Austria, July 21-27, 2024.
+632     OpenReview.net, 2024. URL https://openreview.net/forum?id=5mCaITRTmO.
+633
+      Elias Frantar and Dan Alistarh. Sparsegpt: Massive language models can be accurately pruned
+634     in one-shot. In Andreas Krause, Emma Brunskill, Kyunghyun Cho, Barbara Engelhardt, Sivan
+635     Sabato, and Jonathan Scarlett (eds.), International Conference on Machine Learning, ICML 2023,
+636     23-29 July 2023, Honolulu, Hawaii, USA, volume 202 of Proceedings of Machine Learning
+637     Research, pp. 10323–10337. PMLR, 2023. URL https://proceedings.mlr.press/
+638     v202/frantar23a.html.
+639
+640
+      Elias Frantar, Saleh Ashkboos, Torsten Hoefler, and Dan Alistarh. GPTQ: accurate post-training
+        quantization for generative pre-trained transformers. CoRR, abs/2210.17323, 2022. doi: 10.
+641
+        48550/ARXIV.2210.17323. URL https://doi.org/10.48550/arXiv.2210.17323.
+642
+643   Leo Gao, Jonathan Tow, Baber Abbasi, Stella Biderman, Sid Black, Anthony DiPofi, Charles Fos-
+644     ter, Laurence Golding, Jeffrey Hsu, Alain Le Noac’h, Haonan Li, Kyle McDonell, Niklas Muen-
+645     nighoff, Chris Ociepa, Jason Phang, Laria Reynolds, Hailey Schoelkopf, Aviya Skowron, Lin-
+646     tang Sutawika, Eric Tang, Anish Thite, Ben Wang, Kevin Wang, and Andy Zou. A framework
+647     for few-shot language model evaluation, 07 2024. URL https://zenodo.org/records/
+        12608602.
+
+
+                                                     12
+      Under review as a conference paper at ICLR 2025
+
+
+648
+      Dan Hendrycks, Collin Burns, Steven Basart, Andy Zou, Mantas Mazeika, Dawn Song, and Jacob
+649     Steinhardt. Measuring massive multitask language understanding. In 9th International Confer-
+650     ence on Learning Representations, ICLR 2021, Virtual Event, Austria, May 3-7, 2021. OpenRe-
+651     view.net, 2021. URL https://openreview.net/forum?id=d7KBjmI3GmQ.
+652
+653
+      Jung Hwan Heo, Jeonghoon Kim, Beomseok Kwon, Byeongwook Kim, Se Jung Kwon, and Dong-
+        soo Lee. Rethinking channel dimensions to isolate outliers for low-bit weight quantization
+654
+        of large language models. In The Twelfth International Conference on Learning Representa-
+655
+        tions, ICLR 2024, Vienna, Austria, May 7-11, 2024. OpenReview.net, 2024. URL https:
+656     //openreview.net/forum?id=JzG7kSpjJk.
+657
+658   Geoffrey E. Hinton, Oriol Vinyals, and Jeffrey Dean. Distilling the knowledge in a neural network.
+659     CoRR, abs/1503.02531, 2015. URL http://arxiv.org/abs/1503.02531.
+660   Edward J. Hu, Yelong Shen, Phillip Wallis, Zeyuan Allen-Zhu, Yuanzhi Li, Shean Wang, Lu Wang,
+661     and Weizhu Chen. Lora: Low-rank adaptation of large language models. In The Tenth Inter-
+662     national Conference on Learning Representations, ICLR 2022, Virtual Event, April 25-29, 2022.
+663     OpenReview.net, 2022. URL https://openreview.net/forum?id=nZeVKeeFYf9.
+664
+      Wei Huang, Yangdong Liu, Haotong Qin, Ying Li, Shiming Zhang, Xianglong Liu, Michele Magno,
+665
+       and Xiaojuan Qi. Billm: Pushing the limit of post-training quantization for llms. In Forty-first
+666
+       International Conference on Machine Learning, ICML 2024, Vienna, Austria, July 21-27, 2024.
+667    OpenReview.net, 2024a. URL https://openreview.net/forum?id=qOl2WWOqFg.
+668
+669   Wei Huang, Haotong Qin, Yangdong Liu, Yawei Li, Xianglong Liu, Luca Benini, Michele Magno,
+670    and Xiaojuan Qi. Slim-llm: Salience-driven mixed-precision quantization for large language
+671
+       models. CoRR, abs/2405.14917, 2024b. doi: 10.48550/ARXIV.2405.14917. URL https:
+       //doi.org/10.48550/arXiv.2405.14917.
+672
+673   Wei Huang, Xingyu Zheng, Xudong Ma, Haotong Qin, Chengtao Lv, Hong Chen, Jie Luo, Xiaojuan
+674    Qi, Xianglong Liu, and Michele Magno. An empirical study of llama3 quantization: From llms
+675    to mllms, 2024c. URL https://arxiv.org/abs/2404.14047.
+676
+      Aniruddha Kembhavi, Mike Salvato, Eric Kolve, Min Joon Seo, Hannaneh Hajishirzi, and Ali
+677
+        Farhadi. A diagram is worth a dozen images. In Bastian Leibe, Jiri Matas, Nicu Sebe, and
+678     Max Welling (eds.), Computer Vision - ECCV 2016 - 14th European Conference, Amsterdam,
+679     The Netherlands, October 11-14, 2016, Proceedings, Part IV, volume 9908 of Lecture Notes in
+680     Computer Science, pp. 235–251. Springer, 2016. doi: 10.1007/978-3-319-46493-0\ 15. URL
+681     https://doi.org/10.1007/978-3-319-46493-0_15.
+682
+      Jeonghoon Kim, Jung Hyun Lee, Sungdong Kim, Joonsuk Park, Kang Min Yoo, Se Jung
+683
+        Kwon, and Dongsoo Lee.       Memory-efficient fine-tuning of compressed large language
+684
+        models via sub-4-bit integer quantization.     In Alice Oh, Tristan Naumann, Amir
+685     Globerson, Kate Saenko, Moritz Hardt, and Sergey Levine (eds.), Advances in Neu-
+686     ral Information Processing Systems 36: Annual Conference on Neural Information Pro-
+687     cessing Systems 2023, NeurIPS 2023, New Orleans, LA, USA, December 10 - 16,
+688     2023, 2023. URL http://papers.nips.cc/paper_files/paper/2023/hash/
+689     7183f4fc87598f6c6e947b96714acbd6-Abstract-Conference.html.
+690
+      Sehoon Kim, Coleman Hooper, Amir Gholami, Zhen Dong, Xiuyu Li, Sheng Shen, Michael W.
+691
+        Mahoney, and Kurt Keutzer. Squeezellm: Dense-and-sparse quantization. In Forty-first Interna-
+692     tional Conference on Machine Learning, ICML 2024, Vienna, Austria, July 21-27, 2024. Open-
+693     Review.net, 2024. URL https://openreview.net/forum?id=0jpbpFia8m.
+694
+695   Diederik P. Kingma and Jimmy Ba. Adam: A method for stochastic optimization. In Yoshua
+696
+        Bengio and Yann LeCun (eds.), 3rd International Conference on Learning Representations, ICLR
+        2015, San Diego, CA, USA, May 7-9, 2015, Conference Track Proceedings, 2015. URL http:
+697
+        //arxiv.org/abs/1412.6980.
+698
+699   Diederik P. Kingma and Max Welling. Auto-encoding variational bayes. In Yoshua Bengio and Yann
+700     LeCun (eds.), 2nd International Conference on Learning Representations, ICLR 2014, Banff, AB,
+701     Canada, April 14-16, 2014, Conference Track Proceedings, 2014. URL http://arxiv.org/
+        abs/1312.6114.
+
+
+                                                     13
+      Under review as a conference paper at ICLR 2025
+
+
+702
+      Bo Li, Peiyuan Zhang, Kaichen Zhang, Fanyi Pu, Xinrun Du, Yuhao Dong, Haotian Liu,
+703     Yuanhan Zhang, Ge Zhang, Chunyuan Li, and Ziwei Liu. Lmms-eval: Accelerating the
+704     development of large multimoal models, March 2024a. URL https://github.com/
+705     EvolvingLMMs-Lab/lmms-eval.
+706
+707
+      Feng Li, Renrui Zhang, Hao Zhang, Yuanhan Zhang, Bo Li, Wei Li, Zejun Ma, and Chunyuan Li.
+        Llava-next-interleave: Tackling multi-image, video, and 3d in large multimodal models. CoRR,
+708
+        abs/2407.07895, 2024b. doi: 10.48550/ARXIV.2407.07895. URL https://doi.org/10.
+709
+        48550/arXiv.2407.07895.
+710
+711   Yixiao Li, Yifan Yu, Chen Liang, Nikos Karampatziakis, Pengcheng He, Weizhu Chen, and Tuo
+712     Zhao. Loftq: Lora-fine-tuning-aware quantization for large language models. In The Twelfth Inter-
+713     national Conference on Learning Representations, ICLR 2024, Vienna, Austria, May 7-11, 2024.
+714     OpenReview.net, 2024c. URL https://openreview.net/forum?id=LzPWWPAdY4.
+715   Baohao Liao and Christof Monz. Apiq: Finetuning of 2-bit quantized large language model. CoRR,
+716     abs/2402.05147, 2024a. doi: 10.48550/ARXIV.2402.05147. URL https://doi.org/10.
+717     48550/arXiv.2402.05147.
+718
+      Baohao Liao and Christof Monz. 3-in-1: 2d rotary adaptation for efficient finetuning, efficient
+719
+        batching and composability, 2024b. URL https://arxiv.org/abs/2409.00119.
+720
+721   Baohao Liao, Yan Meng, and Christof Monz. Parameter-efficient fine-tuning without introduc-
+722     ing new latency. In Anna Rogers, Jordan L. Boyd-Graber, and Naoaki Okazaki (eds.), Pro-
+723     ceedings of the 61st Annual Meeting of the Association for Computational Linguistics (Vol-
+724     ume 1: Long Papers), ACL 2023, Toronto, Canada, July 9-14, 2023, pp. 4242–4260. Asso-
+725
+        ciation for Computational Linguistics, 2023. doi: 10.18653/V1/2023.ACL-LONG.233. URL
+        https://doi.org/10.18653/v1/2023.acl-long.233.
+726
+727   Ji Lin, Jiaming Tang, Haotian Tang, Shang Yang, Wei-Ming Chen, Wei-Chen Wang, Guangxuan
+728      Xiao, Xingyu Dang, Chuang Gan, and Song Han. AWQ: activation-aware weight quantiza-
+729      tion for on-device LLM compression and acceleration. In Phillip B. Gibbons, Gennady Pekhi-
+730      menko, and Christopher De Sa (eds.), Proceedings of the Seventh Annual Conference on Ma-
+731      chine Learning and Systems, MLSys 2024, Santa Clara, CA, USA, May 13-16, 2024. mlsys.org,
+732
+         2024.      URL https://proceedings.mlsys.org/paper_files/paper/2024/
+         hash/42a452cbafa9dd64e9ba4aa95cc1ef21-Abstract-Conference.html.
+733
+734   Yuan Liu, Haodong Duan, Yuanhan Zhang, Bo Li, Songyang Zhang, Wangbo Zhao, Yike Yuan,
+735     Jiaqi Wang, Conghui He, Ziwei Liu, Kai Chen, and Dahua Lin. Mmbench: Is your multi-modal
+736     model an all-around player? CoRR, abs/2307.06281, 2023. doi: 10.48550/ARXIV.2307.06281.
+737     URL https://doi.org/10.48550/arXiv.2307.06281.
+738
+      Zechun Liu, Barlas Oguz, Changsheng Zhao, Ernie Chang, Pierre Stock, Yashar Mehdad, Yangyang
+739     Shi, Raghuraman Krishnamoorthi, and Vikas Chandra. LLM-QAT: data-free quantization aware
+740     training for large language models. In Lun-Wei Ku, Andre Martins, and Vivek Srikumar (eds.),
+741     Findings of the Association for Computational Linguistics, ACL 2024, Bangkok, Thailand and
+742     virtual meeting, August 11-16, 2024, pp. 467–484. Association for Computational Linguistics,
+743     2024. doi: 10.18653/V1/2024.FINDINGS-ACL.26. URL https://doi.org/10.18653/
+744     v1/2024.findings-acl.26.
+745
+      Stuart P. Lloyd. Least squares quantization in PCM. IEEE Trans. Inf. Theory, 28(2):129–136,
+746     1982. doi: 10.1109/TIT.1982.1056489. URL https://doi.org/10.1109/TIT.1982.
+747     1056489.
+748
+749   Ilya Loshchilov and Frank Hutter. Decoupled weight decay regularization. In 7th International
+750
+         Conference on Learning Representations, ICLR 2019, New Orleans, LA, USA, May 6-9, 2019.
+         OpenReview.net, 2019. URL https://openreview.net/forum?id=Bkg6RiCqY7.
+751
+752   Yuexiao Ma, Huixia Li, Xiawu Zheng, Feng Ling, Xuefeng Xiao, Rui Wang, Shilei Wen, Fei Chao,
+753     and Rongrong Ji. Affinequant: Affine transformation quantization for large language models. In
+754     The Twelfth International Conference on Learning Representations, ICLR 2024, Vienna, Austria,
+755     May 7-11, 2024. OpenReview.net, 2024. URL https://openreview.net/forum?id=
+        of2rhALq8l.
+
+
+                                                      14
+      Under review as a conference paper at ICLR 2025
+
+
+756
+      Vladimir Malinovskii, Denis Mazur, Ivan Ilin, Denis Kuznedelev, Konstantin Burlachenko, Kai Yi,
+757     Dan Alistarh, and Peter Richtárik. Pv-tuning: Beyond straight-through estimation for extreme
+758     LLM compression. CoRR, abs/2405.14852, 2024. doi: 10.48550/ARXIV.2405.14852. URL
+759     https://doi.org/10.48550/arXiv.2405.14852.
+760
+761   Ahmed Masry, Do Xuan Long, Jia Qing Tan, Shafiq R. Joty, and Enamul Hoque. Chartqa: A
+762     benchmark for question answering about charts with visual and logical reasoning. In Smaranda
+763
+        Muresan, Preslav Nakov, and Aline Villavicencio (eds.), Findings of the Association for Com-
+        putational Linguistics: ACL 2022, Dublin, Ireland, May 22-27, 2022, pp. 2263–2279. Associa-
+764
+        tion for Computational Linguistics, 2022. doi: 10.18653/V1/2022.FINDINGS-ACL.177. URL
+765
+        https://doi.org/10.18653/v1/2022.findings-acl.177.
+766
+767   Minesh Mathew, Dimosthenis Karatzas, and C. V. Jawahar. Docvqa: A dataset for VQA on doc-
+768    ument images. In IEEE Winter Conference on Applications of Computer Vision, WACV 2021,
+769    Waikoloa, HI, USA, January 3-8, 2021, pp. 2199–2208. IEEE, 2021. doi: 10.1109/WACV48630.
+770    2021.00225. URL https://doi.org/10.1109/WACV48630.2021.00225.
+771
+      Stephen Merity, Caiming Xiong, James Bradbury, and Richard Socher. Pointer sentinel mixture
+772
+        models. In 5th International Conference on Learning Representations, ICLR 2017, Toulon,
+773
+        France, April 24-26, 2017, Conference Track Proceedings. OpenReview.net, 2017. URL https:
+774     //openreview.net/forum?id=Byj72udxe.
+775
+776   Rui Pan, Xiang Liu, Shizhe Diao, Renjie Pi, Jipeng Zhang, Chi Han, and Tong Zhang. LISA:
+777     layerwise importance sampling for memory-efficient large language model fine-tuning. CoRR,
+778     abs/2403.17919, 2024. doi: 10.48550/ARXIV.2403.17919. URL https://doi.org/10.
+779     48550/arXiv.2403.17919.
+780
+      Yeonhong Park, Jake Hyun, SangLyul Cho, Bonggeun Sim, and Jae W. Lee. Any-precision LLM:
+781     low-cost deployment of multiple, different-sized llms. In Forty-first International Conference on
+782     Machine Learning, ICML 2024, Vienna, Austria, July 21-27, 2024. OpenReview.net, 2024. URL
+783     https://openreview.net/forum?id=u09gadH3BU.
+784
+785   Adam Paszke, Sam Gross, Soumith Chintala, Gregory Chanan, Edward Yang, Zachary DeVito,
+786     Zeming Lin, Alban Desmaison, Luca Antiga, and Adam Lerer. Automatic differentiation in
+787
+        pytorch. In NIPS-W, 2017.
+788
+      Baolin Peng, Chunyuan Li, Pengcheng He, Michel Galley, and Jianfeng Gao. Instruction tuning
+789     with gpt-4. arXiv preprint arXiv:2304.03277, 2023.
+790
+791   Colin Raffel, Noam Shazeer, Adam Roberts, Katherine Lee, Sharan Narang, Michael Matena, Yanqi
+792     Zhou, Wei Li, and Peter J. Liu. Exploring the limits of transfer learning with a unified text-to-
+793     text transformer. J. Mach. Learn. Res., 21:140:1–140:67, 2020a. URL http://jmlr.org/
+794     papers/v21/20-074.html.
+795
+      Colin Raffel, Noam Shazeer, Adam Roberts, Katherine Lee, Sharan Narang, Michael Matena, Yanqi
+796     Zhou, Wei Li, and Peter J. Liu. Exploring the limits of transfer learning with a unified text-to-
+797     text transformer. J. Mach. Learn. Res., 21:140:1–140:67, 2020b. URL http://jmlr.org/
+798     papers/v21/20-074.html.
+799
+800   Keisuke Sakaguchi, Ronan Le Bras, Chandra Bhagavatula, and Yejin Choi. Winogrande: An ad-
+801     versarial winograd schema challenge at scale. In The Thirty-Fourth AAAI Conference on Artifi-
+802
+        cial Intelligence, AAAI 2020, The Thirty-Second Innovative Applications of Artificial Intelligence
+        Conference, IAAI 2020, The Tenth AAAI Symposium on Educational Advances in Artificial Intelli-
+803
+        gence, EAAI 2020, New York, NY, USA, February 7-12, 2020, pp. 8732–8740. AAAI Press, 2020.
+804
+        doi: 10.1609/AAAI.V34I05.6399. URL https://doi.org/10.1609/aaai.v34i05.
+805     6399.
+806
+807   Teven Le Scao, Angela Fan, Christopher Akiki, Ellie Pavlick, Suzana Ilic, Daniel Hesslow, Roman
+808     Castagné, Alexandra Sasha Luccioni, François Yvon, Matthias Gallé, and et al. BLOOM: A
+809     176b-parameter open-access multilingual language model. CoRR, abs/2211.05100, 2022. doi: 10.
+        48550/ARXIV.2211.05100. URL https://doi.org/10.48550/arXiv.2211.05100.
+
+
+                                                      15
+      Under review as a conference paper at ICLR 2025
+
+
+810
+      Wenqi Shao, Mengzhao Chen, Zhaoyang Zhang, Peng Xu, Lirui Zhao, Zhiqian Li, Kaipeng Zhang,
+811    Peng Gao, Yu Qiao, and Ping Luo. Omniquant: Omnidirectionally calibrated quantization
+812    for large language models. In The Twelfth International Conference on Learning Represen-
+813    tations, ICLR 2024, Vienna, Austria, May 7-11, 2024. OpenReview.net, 2024. URL https:
+814    //openreview.net/forum?id=8Wuvhh0LYW.
+815
+816
+      Mingjie Sun, Zhuang Liu, Anna Bair, and J. Zico Kolter. A simple and effective pruning ap-
+       proach for large language models. In The Twelfth International Conference on Learning Rep-
+817
+       resentations, ICLR 2024, Vienna, Austria, May 7-11, 2024. OpenReview.net, 2024a. URL
+818
+       https://openreview.net/forum?id=PxoFut3dWW.
+819
+820   Peize Sun, Yi Jiang, Shoufa Chen, Shilong Zhang, Bingyue Peng, Ping Luo, and Zehuan Yuan. Au-
+821     toregressive model beats diffusion: Llama for scalable image generation. CoRR, abs/2406.06525,
+822     2024b. doi: 10.48550/ARXIV.2406.06525. URL https://doi.org/10.48550/arXiv.
+823     2406.06525.
+824
+      Rohan Taori, Ishaan Gulrajani, Tianyi Zhang, Yann Dubois, Xuechen Li, Carlos Guestrin, Percy
+825     Liang, and Tatsunori B. Hashimoto. Stanford alpaca: An instruction-following llama model.
+826     https://github.com/tatsu-lab/stanford_alpaca, 2023.
+827
+828   Hugo Touvron, Thibaut Lavril, Gautier Izacard, Xavier Martinet, Marie-Anne Lachaux, Timothée
+829     Lacroix, Baptiste Rozière, Naman Goyal, Eric Hambro, Faisal Azhar, Aurélien Rodriguez, Ar-
+830
+        mand Joulin, Edouard Grave, and Guillaume Lample. Llama: Open and efficient foundation
+        language models. CoRR, abs/2302.13971, 2023a. doi: 10.48550/ARXIV.2302.13971. URL
+831
+        https://doi.org/10.48550/arXiv.2302.13971.
+832
+833   Hugo Touvron, Louis Martin, Kevin Stone, Peter Albert, Amjad Almahairi, Yasmine Babaei, Niko-
+834     lay Bashlykov, Soumya Batra, Prajjwal Bhargava, Shruti Bhosale, and et al. Llama 2: Open
+835     foundation and fine-tuned chat models. CoRR, abs/2307.09288, 2023b. doi: 10.48550/ARXIV.
+836     2307.09288. URL https://doi.org/10.48550/arXiv.2307.09288.
+837
+      Albert Tseng, Jerry Chee, Qingyao Sun, Volodymyr Kuleshov, and Christopher De Sa. Quip#:
+838     Even better LLM quantization with hadamard incoherence and lattice codebooks. In Forty-first
+839     International Conference on Machine Learning, ICML 2024, Vienna, Austria, July 21-27, 2024.
+840     OpenReview.net, 2024. URL https://openreview.net/forum?id=9BrydUVcoe.
+841
+842   Mart van Baalen, Andrey Kuzmin, Markus Nagel, Peter Couperus, Cédric Bastoul, Eric Mahurin,
+843    Tijmen Blankevoort, and Paul N. Whatmough. GPTVQ: the blessing of dimensionality for LLM
+844
+       quantization. CoRR, abs/2402.15319, 2024. doi: 10.48550/ARXIV.2402.15319. URL https:
+       //doi.org/10.48550/arXiv.2402.15319.
+845
+846   Ashish Vaswani, Noam Shazeer, Niki Parmar, Jakob Uszkoreit, Llion Jones, Aidan N. Gomez,
+847     Lukasz Kaiser, and Illia Polosukhin. Attention is all you need. In Isabelle Guyon, Ulrike von
+848     Luxburg, Samy Bengio, Hanna M. Wallach, Rob Fergus, S. V. N. Vishwanathan, and Roman
+849     Garnett (eds.), Advances in Neural Information Processing Systems 30: Annual Conference on
+850     Neural Information Processing Systems 2017, December 4-9, 2017, Long Beach, CA, USA, pp.
+851     5998–6008, 2017. URL https://proceedings.neurips.cc/paper/2017/hash/
+852
+        3f5ee243547dee91fbd053c1c4a845aa-Abstract.html.
+853   Mengzhou Xia, Tianyu Gao, Zhiyuan Zeng, and Danqi Chen. Sheared llama: Accelerating language
+854    model pre-training via structured pruning. In The Twelfth International Conference on Learning
+855    Representations, ICLR 2024, Vienna, Austria, May 7-11, 2024. OpenReview.net, 2024. URL
+856    https://openreview.net/forum?id=09iOdaeOzp.
+857
+      Yuhui Xu, Lingxi Xie, Xiaotao Gu, Xin Chen, Heng Chang, Hengheng Zhang, Zhengsu Chen, Xi-
+858
+        aopeng Zhang, and Qi Tian. Qa-lora: Quantization-aware low-rank adaptation of large language
+859
+        models. In The Twelfth International Conference on Learning Representations, ICLR 2024, Vi-
+860     enna, Austria, May 7-11, 2024. OpenReview.net, 2024a. URL https://openreview.net/
+861     forum?id=WvFoJccpo8.
+862
+863   Yuhui Xu, Lingxi Xie, Xiaotao Gu, Xin Chen, Heng Chang, Hengheng Zhang, Zhengsu Chen, Xi-
+        aopeng Zhang, and Qi Tian. Qa-lora: Quantization-aware low-rank adaptation of large language
+
+
+                                                    16
+      Under review as a conference paper at ICLR 2025
+
+
+864
+        models. In The Twelfth International Conference on Learning Representations, ICLR 2024, Vi-
+865     enna, Austria, May 7-11, 2024. OpenReview.net, 2024b. URL https://openreview.net/
+866     forum?id=WvFoJccpo8.
+867
+868   Shukang Yin, Chaoyou Fu, Sirui Zhao, Ke Li, Xing Sun, Tong Xu, and Enhong Chen. A survey on
+869     multimodal large language models. CoRR, abs/2306.13549, 2023. doi: 10.48550/ARXIV.2306.
+870
+        13549. URL https://doi.org/10.48550/arXiv.2306.13549.
+871   Zhihang Yuan, Yuzhang Shang, and Zhen Dong. PB-LLM: partially binarized large language
+872     models. In The Twelfth International Conference on Learning Representations, ICLR 2024, Vi-
+873     enna, Austria, May 7-11, 2024. OpenReview.net, 2024. URL https://openreview.net/
+874     forum?id=BifeBRhikU.
+875
+      Rowan Zellers, Ari Holtzman, Yonatan Bisk, Ali Farhadi, and Yejin Choi. Hellaswag: Can a ma-
+876
+        chine really finish your sentence? In Anna Korhonen, David R. Traum, and Lluı́s Màrquez
+877
+        (eds.), Proceedings of the 57th Conference of the Association for Computational Linguistics,
+878     ACL 2019, Florence, Italy, July 28- August 2, 2019, Volume 1: Long Papers, pp. 4791–
+879     4800. Association for Computational Linguistics, 2019. doi: 10.18653/V1/P19-1472. URL
+880     https://doi.org/10.18653/v1/p19-1472.
+881
+882   Susan Zhang, Stephen Roller, Naman Goyal, Mikel Artetxe, Moya Chen, Shuohui Chen, Christo-
+883
+        pher Dewan, Mona T. Diab, Xian Li, Xi Victoria Lin, Todor Mihaylov, Myle Ott, Sam Shleifer,
+        Kurt Shuster, Daniel Simig, Punit Singh Koura, Anjali Sridhar, Tianlu Wang, and Luke Zettle-
+884
+        moyer. OPT: open pre-trained transformer language models. CoRR, abs/2205.01068, 2022.
+885
+        doi: 10.48550/ARXIV.2205.01068. URL https://doi.org/10.48550/arXiv.2205.
+886     01068.
+887
+888   Jiawei Zhao, Zhenyu Zhang, Beidi Chen, Zhangyang Wang, Anima Anandkumar, and Yuandong
+889      Tian. Galore: Memory-efficient LLM training by gradient low-rank projection. In Forty-first
+890      International Conference on Machine Learning, ICML 2024, Vienna, Austria, July 21-27, 2024.
+891
+         OpenReview.net, 2024. URL https://openreview.net/forum?id=hYHsrKDiX7.
+892   Wanjun Zhong, Ruixiang Cui, Yiduo Guo, Yaobo Liang, Shuai Lu, Yanlin Wang, Amin Saied,
+893    Weizhu Chen, and Nan Duan. Agieval: A human-centric benchmark for evaluating foun-
+894    dation models. In Kevin Duh, Helena Gómez-Adorno, and Steven Bethard (eds.), Find-
+895    ings of the Association for Computational Linguistics: NAACL 2024, Mexico City, Mexico,
+896    June 16-21, 2024, pp. 2299–2314. Association for Computational Linguistics, 2024. doi:
+897    10.18653/V1/2024.FINDINGS-NAACL.149. URL https://doi.org/10.18653/v1/
+898    2024.findings-naacl.149.
+899
+900
+901
+902
+903
+904
+905
+906
+907
+908
+909
+910
+911
+912
+913
+914
+915
+916
+917
+
+
+
+                                                   17
+      Under review as a conference paper at ICLR 2025
+
+
+918
+      A        L IMITATION AND FUTURE WORK
+919
+920
+      Limitation. Although ClusComp demonstrates strong performance in both model compression and
+921   finetuning tasks, its inference speed remains similar to that of FP16 models. As illustrated in Listing
+922   C.1, ClusComp introduces two additional operations—indexing and reshaping—beyond those found
+923   in a standard linear layer. These operations are computationally efficient, resulting in an inference
+924   speed that is similar to that of the original linear layer. Since no quantization techniques are applied,
+925   the transfer of weight tensors does not contribute to time savings, resulting in a smaller inference
+926   speed than the uniform quantization methods. Nevertheless, we consider this trade-off acceptable
+927   given the model’s notable performance in compression and finetuning.
+928   Future work. The following list of tasks is in our plan:
+929
+930             • Design a new CUDA kernel that is more efficient for ClusComp.
+931             • Apply ClusComp to reduce the memory requirement for caching the keys and values, which
+932               facilitates LLMs for long-context tasks.
+933
+                • Apply the fixed-code idea to a VAE-like method to scale up the size and dimension of the
+934
+                  codebook for the image generation task.
+935
+936             • Study the quantization of large multimodal models, since they show different behaviors
+937               from LLMs (see Table 3).
+938
+939   B        E XPERIMENTAL DETAILS
+940
+941   B.1       C LUSTERING
+942
+943   We use the K-means implementation from the Faiss library (Douze et al., 2024). The number of
+944   iterations is set to 20, with all default settings for other arguments.
+945
+946   B.2       B LOCK - WISE ERROR MINIMIZATION
+947
+948   For all LLMs, 128 calibration sentences with a length of 2048 tokens are randomly selected from
+949
+      the WikiText-2 training set (Merity et al., 2017). The detailed hyper-parameters are listed in Table
+      B.1. Only the codebooks are trained, while keeping all other parameters (from the embedding layer,
+950
+      output layer and normalization layers) frozen.
+951
+952
+      Table B.1: Hyper-parameters used for the block-wise error minimization and recovery training steps.
+953   The underlined settings generally perform well for different scales of LLMs.
+954
+955                            Hyper-parameter     Block-wise error minimization    Recovery training
+956                            Optimizer           AdamW (Loshchilov & Hutter, 2019; Kingma & Ba, 2015)
+957                            Weight decay               {0, 0.1, 0.01}                     0
+                               LR                     {1e-5, 5e-5, 1e-4, 5e-4}             1e-5
+958                            LR scheduler                   constant                    cosine
+959                            Warmup ratio                       0                          0
+                               Max grad norm                      -                         0.3
+960                            Sequence length                 2048                        4096
+961                            Number of samples                128                        8192
+                               Epochs                            20                          1
+962                            Batch size                         8                          8
+963
+964
+965
+966   B.3       R ECOVERY TRAINING
+967
+      For the recovery training, we randomly sample 1024 sentences with a length of 4096 tokens from a
+968
+      subset of RedPajama (Computer, 2023).5 Then we train the compressed LLMs to predict the next
+969   token by only tuning the codebook parameters. The hyperparameters used in this step are listed in
+970   Table B.1.
+971
+          5
+              https://huggingface.co/datasets/togethercomputer/RedPajama-Data-1T-Sample
+
+
+                                                                 18
+       Under review as a conference paper at ICLR 2025
+
+
+972
+       B.4   I N - DOMAIN FINETUNING
+973
+974    We follow the settings from (Li et al., 2024c), and finetune the compressed LLM on the training set
+975    of WikiText2 and on the training set of GSM8K. The hyperparameters for finetuning are listed in
+976    Table B.2. We evaluate the finetuned model on the validation set of WikiText2 and on the test set of
+977    GSM8K every epoch and report the best perplexity or accuracy.
+978
+979    Table B.2: Hyperparameters for the finetuning on Llama-2-7B. The underlined settings generally
+980
+       performs well for different bit levels.
+981
+                         Hyper-parameter       WikiText-2     GSM8K       Alpaca-GPT3.5    Alpaca-GPT4
+982
+                         Optimizer                    AdamW                           AdamW
+983                      Weight decay                     0.1                             0
+984                      LR                      {0.7, 1, 3}×10−4              {2, 4, 6, 8}×10−5
+                         LR scheduler                   cosine                         cosine
+985                      Warmup ratio                     3%                             6%
+986                      Epochs or max steps    3 epochs       6 epochs     10K steps         2 epochs
+                         Batch size                64              16                    16
+987                      Max sequence length      1024            512                   2048
+988
+989
+990    B.5   G ENERAL - DOMAIN FINETUNING
+991
+992    The finetuning hyper-parameters are listed in Table B.2, which is similar to the ones in QA-LoRA
+993    (Xu et al., 2024b) on Alpaca-GPT3.5, or to the ones in LISA (Pan et al., 2024) on Alpaca-GPT4.
+994
+995    C     M ORE RESULTS
+996
+997    In this section, we provide the detailed numbers for the figures in the main pages and more results:
+998
+999           • We present the kurtosis of various types of layers in Figure C.1, as a complement to Figure
+1000            2 (Right). We hypothesize that the higher kurtosis observed in Llama-3 may be attributed
+1001            to two factors: the larger pretraining steps (Bondarenko et al., 2023) and the inclusion of
+1002
+                multilingual data. However, as this is beyond the scope of the current study, we defer
+                further investigation to future work.
+1003
+1004          • The modified linear layer is illustrated in Listing C.1.
+1005          • We present the full perplexity results on WikiText2 and C4 in Table C.1 and C.2, as a
+1006            complement to Table 2.
+1007          • We present the full zero-shot evaluation accuracy and the reported metrics in Table C.3 and
+1008            C.4, as a complement to Figure 4.
+1009
+              • The quantization quality of the Llama-3-8B backbone in LLaVA-Next-8B on WikiText2
+1010            and C4 is shown in Table C.5.
+1011
+1012
+1013
+1014
+1015
+1016
+1017
+1018
+1019
+1020
+1021
+1022
+1023
+1024
+1025
+
+
+
+                                                                19
+       Under review as a conference paper at ICLR 2025
+
+
+1026
+1027
+1028
+1029
+1030
+1031
+1032
+1033
+1034
+1035
+1036
+1037
+1038
+1039
+1040
+                   6            q_proj                  6             k_proj             2.5            v_proj
+1041
+                                          Llama-1-7B
+1042                                      Llama-2-7B                                     2.0
+                   4                      Llama-3-8B    4                                1.5
+1043
+1044               2                                    2                                1.0
+1045                                                                                     0.5
+1046               0                                     0                               0.0
+                  10            o_proj                 1.5            up_proj              4        gate_proj
+1047
+1048               8                                                                      3
+                                                       1.0
+       Kurtosis
+
+
+1049               6
+                                                                                          2
+1050               4                                   0.5
+                   2                                                                      1
+1051
+                   0                                   0.0                                0
+1052
+                            down_proj                        0   10            20   30         0   10            20   30
+1053               8
+1054               6
+1055               4
+1056
+                   2
+1057
+                   0
+1058                   0   10            20       30
+1059                       Layer Index
+1060
+1061   Figure C.1: The kurtosis across various layers in different Llama series reveals three key observa-
+1062
+       tions: (1) Layers at either the beginning or the end of LLMs tend to exhibit higher kurtosis values;
+       (2) In the majority of layers, the kurtosis follows a consistent trend across Llama series, with Llama-
+1063
+       3 showing the highest values, followed by Llama-2, and then Llama-1; (3) Different types of layers
+1064
+       display varying scales of kurtosis, suggesting that a bit allocation strategy that accounts for quanti-
+1065   zation difficulty could yield better results. We leave the exploration of this idea to future work.
+1066
+1067
+1068
+1069
+1070
+1071
+1072
+1073
+1074
+1075
+1076
+1077
+1078
+1079
+
+
+
+                                                                  20
+       Under review as a conference paper at ICLR 2025
+
+
+1080
+1081   class ClusCompLinear(nn.Module):
+           def __init__(self, in_features, out_features, num_clusters, cluster_dim, bias):
+1082           super().__init__()
+               self.out_features = out_features
+1083           self.in_features = in_features
+               self.deficiency = out_features % cluster_dim # If the out_features is not dividable by cluster_dim
+1084           if self.deficiency > 0:
+1085               self.deficiency = cluster_dim - self.deficiency
+
+1086           num_codes = in_features * (out_features + self.deficiency) // cluster_dim
+               self.codebook = nn.Parameter(torch.empty((num_clusters, cluster_dim), dtype=torch.bfloat16) #
+1087                 trainable
+1088           code = torch.empty((num_codes,), dtype=torch.uint16)
+               self.register_buffer(’code’, code) # non-trainable
+1089           if bias:
+                   self.bias = nn.Parameter(torch.empty(out_features))
+1090           else:
+                   self.register_parameter(’bias’, None)
+1091
+1092      def forward(self, x):
+              vectors = self.codebook[self.code]
+1093          if self.deficiency > 0:
+                  weight = vectors.view(self.in_features, -1)[:, :-self.deficiency]
+1094          else:
+1095              weight = vectors.view(self.in_features, -1)
+
+1096           if self.bias is not None:
+                   out = torch.matmul(x, weight) + self.bias
+1097           else:
+                   out = torch.matmul(x, weight)
+1098           return out
+1099
+1100           Listing C.1: PyTorch code for the linear layer of ClusComp. All data type is 16-bit.
+1101
+1102
+1103
+1104
+1105
+1106
+1107
+1108
+1109
+1110
+1111
+1112
+1113
+1114
+1115
+1116
+1117
+1118
+1119
+1120
+1121
+1122
+1123
+1124
+1125
+1126
+1127
+1128
+1129
+1130
+1131
+1132
+1133
+
+
+
+                                                               21
+       Under review as a conference paper at ICLR 2025
+
+
+1134
+1135
+1136
+1137
+       Table C.1: The full perplexity results of Llama series on WikiText2. “g” and “n” denote the dimen-
+1138
+       sion and number of centroids in the codebook, respectively. The number in the brackets is the exact
+1139   bits of different settings for different LLMs.
+1140
+1141
+         Method        Setting     #Bit   1-7B            2-7B            2-13B           2-70B           3-8B            3-70B
+1142
+         -             -          16.00   5.68            5.47            4.88            3.31            6.12            2.90
+1143
+         RTN           w4g128      4.13   5.96            5.72            4.98            3.46            8.50            3.60
+1144     GPTQ          w4g128      4.13   5.85            5.61            4.98            3.42            6.50            3.30
+         AWQ           w4g128      4.13   5.81            5.62            4.97            -               6.60            3.30
+1145     GPTVQ         w4g128      4.13   -               5.68            4.97            3.39            -               -
+1146     AffineQuant   w4g128      4.13   5.77            5.58            4.95            -               -               -
+         OmniQuant     w4g128      4.16   5.77            5.58            4.95            3.40            -               -
+1147     ClusComp−     g4n65500   ≤4.14   5.88 (4.14)     5.67 (4.14)     5.04 (4.09)     3.44 (4.03)     6.59 (4.13)     3.28 (4.03)
+         ClusComp      g4n65500   ≤4.14   5.73 (4.14)     5.54 (4.14)     4.94 (4.09)     3.40 (4.03)     6.39 (4.13)     3.12 (4.03)
+1148
+         RTN           w4          4.00   6.43            6.11            5.20            3.67            8.70            -
+1149     GPTQ          w4          4.00   6.13            5.83            5.13            3.58            7.00            -
+1150     AWQ           w4          4.00   6.08            6.15            5.12            -               7.10            -
+         QuIP          w4          4.00   -               -               -               3.53            -               -
+1151     AffineQuant   w4          4.00   5.84            5.69            5.01            -               -               -
+         OmniQuant     w4          4.00   5.86            5.74            5.02            3.47            -               -
+1152     ClusComp−     g5n65500    3.38   6.27            5.90            -               -               -               -
+1153     ClusComp      g5n65500    3.38   5.84            5.67            -               -               -               -
+
+1154     RTN           w3g128      3.13   7.01            6.66            5.51            3.97            27.91           11.84
+         GPTQ          w3g128      3.13   6.55            6.29            5.42            3.85            8.22            5.22
+1155     AWQ           w3g128      3.13   6.46            6.24            5.32            -               8.19            4.81
+         SliM-LLM+     w3g128      3.13   6.07            5.94            5.11            3.35            -               -
+1156     AffineQuant   w3g128      3.13   6.14            6.08            5.28            -               -               -
+1157     GPTVQ         w3g128      3.13   -               5.82            5.10            3.55            -               -
+         OmniQuant     w3g128      3.15   6.15            6.03            5.28            3.78            -               -
+1158
+         RTN           w3          3.00   25.73           5.4e2           10.68           7.52            2.2e3           -
+1159     GPTQ          w3          3.00   8.06            8.37            6.44            4.82            13.0            -
+         AWQ           w3          3.00   11.88           24.00           10.45           -               12.8            -
+1160     QuIP          w3          3.00   -               -               -               3.85            7.5             -
+         AffineQuant   w3          3.00   6.30            6.55            5.62            -               -               -
+1161     OmniQuant     w3          3.00   6.49            6.58            5.58            3.92            -               -
+1162     ClusComp−     g6n65500   ≤2.89   6.74 (2.89)     6.54 (2.89)     6.27 (2.81)     4.02 (2.72)     8.77 (2.87)     4.98 (2.72)
+         ClusComp      g6n65500   ≤2.89   6.01 (2.89)     5.86 (2.89)     5.18 (2.81)     3.72 (2.72)     7.34 (2.87)     4.63 (2.72)
+1163
+         ClusComp−     g7n65500    2.54   7.79            7.64            -               -               -               -
+1164     ClusComp      g7n65500    2.54   6.28            6.15            -               -               -               -
+1165     RTN           w2g64       2.25   1.9e2           4.3e2           26.22           10.31           -               -
+1166     GPTQ          w2g64       2.25   22.10           20.85           22.44           NAN             1.8e2           -
+         AWQ           w2g64       2.25   2.5e5           2.1e5           1.2e5           -               -               -
+1167     GPTVQ         w2g64       2.25   -               7.22            6.08            4.39            -               -
+         AffineQuant   w2g64       2.25   8.35            9.05            7.11            -               -               -
+1168     OmniQuant     w2g64       2.28   8.90            9.62            7.56            6.11            -               -
+         ClusComp−     g8n65500   ≤2.29   10.25 (2.29)    11.10 (2.29)    14.39 (2.19)    -               29.20 (2.27)    -
+1169     ClusComp      g8n65500   ≤2.29   6.66 (2.29)     6.61 (2.29)     5.74 (2.19)     -               9.68 (2.27)     -
+1170     RTN           w2g128      2.13   1.9e3           4.2e3           1.2e2           27.27           1.9e3           4.6e5
+1171     GPTQ          w2g128      2.13   44.01           36.77           28.14           NAN             2.1e2           11.9
+         AWQ           w2g128      2.13   2.6e5           2.2e5           1.2e5           -               1.7e6           1.7e6
+1172     SliM-LLM+     w2g128      2.13   9.68            10.87           7.59            6.44            -               -
+         QuIP          w2g128      2.13   -               39.73           13.48           6.64            84.97           13.03
+1173     PB-LLM        w2g128      2.13   -               25.37           49.81           NAN             44.12           11.68
+1174     GPTVQ         w2g128      2.13   -               8.23            6.50            4.64            -               -
+         AffineQuant   w2g128      2.13   13.51           10.87           7.64            -               -
+1175     OmniQuant     w2g128      2.14   9.72            11.06           8.26            6.55            -               -
+         ClusComp−     g8         ≤2.15   28.76           21.9            14.50           5.43            2.1e2           11.40
+1176     ClusComp      g8         ≤2.15   7.06            7.04            5.85            4.37            11.57           7.61
+1177                                      (2.15,n35000)   (2.15,n35000)   (2.14,n50000)   (2.07,n65500)   (2.14,n35000)   (2.07,n65500)
+
+1178     ClusComp−     g9n65500    2.11   -               22.71           -               -               -               -
+         ClusComp      g9n65500    2.11   -               7.12            -               -               -               -
+1179
+         RTN           w2          2.00   1.1e5           3.8e4           5.6e4           2.0e4           2.7e6           -
+1180     GPTQ          w2          2.00   2.1e3           7.7e3           2.1e3           77.95           5.7e4           -
+         QuIP          w2          2.00   -               -               -               6.33            85.1            -
+1181     AffineQuant   w2          2.00   9.53            35.07           12.42           -               -               -
+1182     OmniQuant     w2          2.00   15.47           37.37           17.21           7.81            -               -
+         ClusComp−     g9         ≤2.01   65.09           52.38           22.90           9.84            3.1e2           -
+1183     ClusComp      g9         ≤2.01   7.49            7.50            6.17            4.83            12.33           -
+                                          (2.00,n45000)   (2.00,n45000)   (1.99,n65500)   (1.85,n65500)   (2.01,n50000)   -
+1184
+1185
+1186
+1187
+
+
+
+                                                                    22
+       Under review as a conference paper at ICLR 2025
+
+
+1188
+1189
+1190
+1191
+1192
+1193
+1194
+1195
+1196
+1197
+1198   Table C.2: The full perplexity results of Llama series on C4. “g” and “n” denote the dimension and
+1199   number of centroids in the codebook, respectively. The number in the brackets is the exact bits of
+1200
+       different settings for different LLMs.
+1201
+1202      Method        Setting     #Bit   1-7B            2-7B               2-13B           2-70B           3-8B            3-70B
+
+1203      -             -          16.00   7.08            6.97               6.46            5.52            9.20            5.87
+
+1204      RTN           w4g128      4.13   7.37            7.24               6.58            5.63            13.40           8.90
+          GPTQ          w4g128      4.13   7.21            7.12               6.56            5.58            10.40           6.94
+1205      AWQ           w4g128      4.13   7.21            7.13               6.56            -               9.40            7.00
+          AffineQuant   w4g128      4.13   7.20            7.12               6.56            -               -               -
+1206      OmniQuant     w4g128      4.16   7.21            7.12               6.56            5.58            -               -
+1207      ClusComp−     g4n65500   ≤4.14   7.27 (4.14)     7.16 (4.14)        6.63 (4.09)     5.61 (4.03)     9.39 (4.13)     7.02 (4.03)
+          ClusComp      g4n65500   ≤4.13   7.17 (4.14)     7.09 (4.14)        6.55 (4.09)     5.61 (4.03)     9.27 (4.13)     6.99 (4.03)
+1208
+          RTN           w3          3.00   28.26           4.0e2              12.51           10.02           2.2e3           -
+1209      GPTQ          w3          3.00   9.49            9.81               8.02            6.57            13.0            -
+          AWQ           w3          3.00   13.26           23.85              13.07           -               12.8            -
+1210      QuIP          w3          3.00   -               -                  -               6.14            -               -
+          AffineQuant   w3          3.00   8.03            8.57               7.56            -               -               -
+1211      OmniQuant     w3          3.00   8.19            8.65               7.44            6.06            -               -
+1212      ClusComp−     g6n65500   ≤2.89   8.14 (2.89)     8.19 (2.89)        8.21 (2.81)     6.06 (2.72)     12.41 (2.87)    8.26 (2.72)
+          ClusComp      g6n65500   ≤2.89   7.64 (2.89)     7.61 (2.89)        6.91 (2.81)     5.86 (2.72)     11.31 (2.87)    8.26 (2.72)
+1213
+          ClusComp−     g7n65500    2.54   9.46            9.51               -               -               -               -
+1214      ClusComp      g7n65500    2.54   8.10            8.13               -               -               -               -
+1215      RTN           w2g64       2.25   1.5e2           4.8e2              28.69           13.43           -               -
+1216      GPTQ          w2g64       2.25   17.71           19.40              12.48           NAN             -               -
+          AWQ           w2g64       2.25   2.8e5           1.6e5              9.5e4           -               -               -
+1217      OmniQuant     w2g64       2.28   11.78           12.72              10.05           7.88            -               -
+          ClusComp−     g8n65500   ≤2.29   13.06 (2.29)    14.07 (2.29)       19.75 (2.19)    -               38.68 (2.27)    -
+1218      ClusComp      g8n65500   ≤2.29   8.76 (2.29)     8.88 (2.29)        7.75 (2.19)     -               15.57 (2.27)    -
+1219      RTN           w2g128      2.13   1.0e3           4.9e3              1.4e2           42.13           1.9e3           -
+1220      GPTQ          w2g128      2.13   27.71           33.70              20.97           NAN             2.1e2           -
+          AWQ           w2g128      2.13   1.9e5           1.7e5              9.4e4           -               1.7e6           -
+1221      SliM-LLM+     w2g128      2.13   14.99           18.18              10.24           8.40            -               -
+          QuIP          w2g128      2.13   -               31.94              16.16           8.17            1.3e2           22.24
+1222      PB-LLM        w2g128      2.13   -               29.84              19.82           8.95            79.21           33.91
+          AffineQuant   w2g128      2.13   -               16.02              10.98           -               -               -
+1223      OmniQuant     w2g128      2.14   12.97           15.02              11.05           8.52            -               -
+1224      ClusComp−     g8         ≤2.15   29.67           25.26              18.83           7.59            1.9e2           16.52
+          ClusComp      g8         ≤2.15   9.33            9.49               7.92            6.44            17.89           10.81
+1225                                       (2.15,n35000)   (2.15,n35000)      (2.14,n50000)   (2.07,n65500)   (2.14,n35000)   (2.07,n65500)
+1226      ClusComp−     g9n65500    2.11   -               27.37              -               -               -               -
+1227      ClusComp      g9n65500    2.11   -               9.73               -               -               -               -
+
+1228      RTN           w2          2.00   1.3e5           4.8e4              7.2e4           2.4e4           2.7e6           -
+          GPTQ          w2          2.00   6.9e2           NAN                3.2e2           48.82           5.7e4           -
+1229      QuIP          w2          2.00   -               -                  -               -               1.3e2           -
+          OmniQuant     w2          2.00   24.89           90.64              26.76           12.28           8.2e5
+1230      ClusComp−     g9         ≤2.01   74.61           50.08              24.47           13.96           2.2e2           -
+1231      ClusComp      g9         ≤2.01   10.11           10.29              8.49            7.02            21.45           -
+                                           (2.00,n45000)   (2.00,n45000)      (1.99,n65500)   (1.85,n65500)   (2.01,n50000)   -
+1232
+1233
+1234
+1235
+1236
+1237
+1238
+1239
+1240
+1241
+
+
+
+                                                                         23
+       Under review as a conference paper at ICLR 2025
+
+
+1242
+1243
+1244
+1245
+1246
+1247
+1248
+1249
+1250
+1251
+1252
+1253   Table C.3: Zero-shot evaluation of the quantized Llama-2-7B and Llama-2-13B, with baseline re-
+1254   sults taken from van Baalen et al. (2024). “acc” and “acc n” mean accuracy and normalized accu-
+1255   racy, respectively. We offer the results of all metrics for a convenient comparison of the follow-up
+1256   works. But only the highlighted metrics are used to calculate the average accuracy.
+1257
+1258                                PIQA           ARC-e           ARC-c      BoolQ    HellaSwag     WinoGrande
+1259    Method         #Bit                                                                                       Avg
+                              acc     acc n   acc     acc n   acc     acc n    acc    acc    acc n      acc
+1260    Llama-2-7B    16.00    -       79.1    -      74.6     -      46.3    77.7     -     76.0       69.1      70.5
+1261
+        ClusComp       4.14   77.5     79.2   75.3    72.8    42.7    45.3    76.2    56.5   75.1       68.9      69.6
+1262
+        RTN            3.13    -       76.8    -      70.5     -      42.9    71.7     -     74.0       67.6      67.3
+1263    GPTQ           3.13    -       77.4    -      68.1     -      40.7    71.0     -     72.5       67.3      66.2
+1264    GPTVQ          3.13    -       77.6    -      72.7     -      43.7    71.7     -     72.7       67.6      67.7
+        ClusComp       2.89   76.8     77.6   74.4    71.3    42.3    42.9    74.6    54.4   72.4       68.8      67.9
+1265
+        RTN            2.25    -       58.8    -      36.7     -      24.8    41.9     -     40.4       51.9      42.4
+1266    GPTQ           2.25    -       60.8    -      39.0     -      25.2    59.3     -     45.8       55.5      47.6
+1267    GPTVQ          2.25    -       73.3    -      63.4     -      35.9    66.3     -     63.9       66.1      61.5
+        ClusComp       2.29   74.9     76.0   69.8    65.2    37.7    37.4    73.0    51.1   68.4       65.0      64.1
+1268
+        ClusComp       2.15   74.3     75.1   69.6    65.2    35.7    38.4    69.5    49.2   66.4       63.5      63.0
+1269
+        RTN            2.13    -       51.1    -      28.0     -      25.0    41.1     -     26.6       49.9      36.9
+1270    GPTQ           2.13    -       54.8    -      30.6     -      25.1    53.4     -     33.1       51.5      41.4
+1271    GPTVQ          2.13    -       70.7    -      58.1     -      31.5    63.7     -     58.5       60.9      57.2
+        ClusComp       2.00   72.6     73.7   67.0    62.8    32.9    36.6    70.9    47.2   63.5       63.4      61.8
+1272
+1273    Llama-2-13B   16.00    -       80.5    -      77.5     -      49.2    80.5     -     79.4       72.1      73.2
+
+1274    ClusComp       4.09   78.9     79.9   78.9    76.9    47.7    49.2    81.4    60.0   79.0       72.4      73.1
+
+1275    RTN            3.13    -       78.9    -      74.3     -      46.8    77.3     -     76.5       70.8      70.8
+        GPTQ           3.13    -       79.3    -      75.8     -      47.0    78.9     -     77.2       70.4      71.4
+1276    GPTVQ          3.13    -       79.4    -      75.3     -      48.1    79.0     -     77.0       71.7      71.8
+1277    ClusComp       2.81   78.7     79.7   78.5    76.7    45.9    47.8    80.7    58.3   76.8       71.4      72.2
+1278    RTN            2.25    -       61.6    -      41.6     -      25.4    49.8     -     48.2       51.9      46.4
+        GPTQ           2.25    -       70.1    -      56.7     -      31.6    51.1     -     56.6       58.9      54.2
+1279    GPTVQ          2.25    -       76.2    -      71.9     -      43.3    67.6     -     70.0       68.2      66.2
+1280    ClusComp       2.19   76.6     77.3   75.0    72.9    40.8    43.9    78.1    55.3   73.3       68.4      69.0
+1281    ClusComp       2.14   76.7     77.1   73.5    71.6    39.9    42.8    77.5    54.6   73.1       68.0      68.4
+1282    RTN            2.13    -       58.4    -      32.3     -      25.5    47.9     -     39.4       48.9      42.1
+1283    GPTQ           2.13    -       59.5    -      40.2     -      27.7    57.1     -     41.6       53.4      46.6
+        GPTVQ          2.13    -       75.2    -      68.3     -      39.5    70.7     -     65.7       67.5      64.5
+1284    ClusComp       1.99   75.6     77.7   74.7    73.6    39.9    42.1    74.0    53.0   71.0       67.1      67.6
+1285
+1286
+1287
+1288
+1289
+1290
+1291
+1292
+1293
+1294
+1295
+
+
+
+                                                              24
+       Under review as a conference paper at ICLR 2025
+
+
+1296
+1297
+1298
+1299   Table C.4: Zero-shot evaluation of the quantized Llama-3-8B, with baseline results taken from
+1300   (Huang et al., 2024c). “acc” and “acc n” mean accuracy and normalized accuracy, respectively. We
+1301
+       offer the results of all metrics for a convenient comparison of the follow-up works. But only the
+       highlighted metrics (excluding BoolQ) are used to calculate the average accuracy.
+1302
+1303
+1304                                PIQA            ARC-e                ARC-c             BoolQ          HellaSwag       WinoGrande
+         Method        #Bit                                                                                                            Avg
+1305                          acc      acc n   acc     acc n       acc      acc n           acc          acc     acc n       acc
+1306     Llama-3-8B   16.00   79.9         -   80.1         -      50.4          -           -        60.2            -      72.8      68.6
+1307     RTN           4.13   76.6      -      70.1        -       45.0      -              -         56.8         -         71.0      63.9
+         GPTQ          4.13   78.4      -      78.8        -       47.7      -              -         59.0         -         72.6      67.3
+1308
+         AWQ           4.13   79.1      -      79.7        -       49.3      -              -         59.1         -         74.0      68.2
+1309     SliM-LLM      4.13   78.9      -      79.9        -       49.4      -              -         58.7         -         72.6      67.9
+         ClusComp      4.13   79.1     80.5    80.9       79.6     49.7     54.1           81.1       59.3        78.3       72.9      68.4
+1310
+1311     RTN           3.13   62.3      -      32.1        -       22.5      -              -         29.1         -         54.7      40.2
+         GPTQ          3.13   74.9      -      70.5        -       37.7      -              -         54.3         -         71.1      61.7
+1312     AWQ           3.13   77.7      -      74.0        -       43.2      -              -         55.1         -         72.1      64.4
+1313     SliM-LLM      3.13   77.8      -      73.7        -       42.9      -              -         55.5         -         72.8      64.5
+         RTN           3.00   56.2      -      31.1        -       20.0      -              -         27.5         -         53.1      35.6
+1314     GPTQ          3.00   60.8      -      38.8        -       22.3      -              -         41.8         -         60.9      44.9
+1315     AWQ           3.00   71.9      -      66.7        -       35.1      -              -         50.7         -         64.7      57.8
+         QuIP          3.00   76.8      -      72.9        -       41.0      -              -         55.4         -         72.5      63.7
+1316     ClusComp      2.87   77.7     78.8    76.0       74.5     43.9     47.6           79.0       56.0        74.6       71.0      64.9
+1317     ClusComp      2.27   70.6     71.8    63.5       57.4     31.4     35.5           74.7       49.6        66.1       67.1      56.4
+1318     RTN           2.13   53.1      -      24.8        -       22.1      -              -         26.9         -         53.1      36.0
+1319     GPTQ          2.13   53.9      -      28.8        -       19.9      -              -         27.7         -         50.5      36.2
+         AWQ           2.13   52.4      -      24.2        -       21.5      -              -         25.6         -         50.7      34.9
+1320     SliM-LLM      2.13   57.1      -      35.4        -       26.1      -              -         28.9         -         56.6      40.8
+1321     PB-LLM        2.13   57.0      -      37.8        -       17.2      -              -         29.8         -         52.5      38.8
+         ClusComp      2.14   68.0     67.1    54.7       49.0     26.4     28.8           71.5       47.0        63.0       62.4      51.7
+1322
+         RTN           2.00   53.1      -      24.7        -       21.9      -              -         25.6         -         51.1      35.3
+1323     GPTQ          2.00   52.8      -      25.0        -       20.5      -              -         26.6         -         49.6      34.9
+1324     AWQ           2.00   55.2      -      25.2        -       21.3      -              -         25.4         -         50.4      35.5
+         QuIP          2.00   52.9      -      29.0        -       21.3      -              -         29.2         -         51.7      36.8
+1325     ClusComp      2.01   70.1     69.6    63.3       57.7     31.9     34.2           66.6       44.4        58.0       58.4      53.6
+1326
+1327
+1328
+1329
+1330
+1331
+1332
+1333
+       Table C.5: The perplexity of the Llama-3-8B backbone in LLaVA-Next-8B, with baseline results
+       from Huang et al. (2024c).
+1334
+1335
+1336                            Method          Setting            Bit     WikiText2 ↓            C4 ↓         PTB ↓
+
+1337                            -               -                16.00               9.5          14.8         16.3
+1338                            GPTQ            w4g128            4.13               9.5          14.8         17.1
+                                AWQ             w4g128            4.13               9.9          15.3         16.9
+1339
+                                ClusComp−       s4n65500          4.13               9.9          13.6         17.6
+1340                            ClusComp        s4n65500          4.13               9.7          13.6         17.7
+1341                            GPTQ            w3g128            3.13           13.0             19.5         28.4
+1342                            AWQ             w3g128            3.13           11.7             17.9         20.2
+                                ClusComp−       s6n65500          2.87           14.3             16.2         31.9
+1343                            ClusComp        s6n65500          2.87           10.7             15.3         22.0
+1344                            GPTQ            w2g128            2.13           83.7             3.1e3        2.0e2
+1345                            AWQ             w2g128            2.13           1.6e6            2.0e6        2.2e6
+                                ClusComp−       s8n35000          2.14           7.7e2            6.1e3        9.2e2
+1346
+                                ClusComp        s8n35000          2.14           14.6             21.8         27.5
+1347
+1348
+1349
+
+
+
+                                                                    25
+       Under review as a conference paper at ICLR 2025
+
+
+1350
+       D     N EW RESULTS
+1351
+1352
+       D.1   M ORE BASELINES
+1353
+1354   In this section, we compare ClusComp against SqueezeLLM (Kim et al., 2024) and AdaDim (Heo
+1355   et al., 2024). As presented in Table D.1, ClusComp consistently achieves lower perplexity than
+1356   SqueezeLLM, at comparable or even lower bit precision. Similarly, as shown in Table D.2, Clus-
+1357   Comp outperforms AdaDim on both MMLU and CSR benchmarks.
+1358
+1359   Table D.1: The perplexity of Llama-2 on WikiText2. The values in the brackets are the exact bits of
+1360   ClusComp for different LLMs. The SqueezeLLM results are taken from Kim et al. (2024).
+1361
+1362                           Method            #Bit    Llama-2-7B       Llama-2-13B    Llama-2-70B
+1363                           -                16.00    5.47             4.88           3.31
+1364
+                               SqueezeLLM       4.27     5.57             4.96           -
+1365                           ClusComp       ≤ 4.14     5.54 (4.14)      4.94 (4.09)    -
+1366                           SqueezeLLM       3.02     6.18             5.36           3.77
+1367                           ClusComp       ≤ 2.89     5.86 (2.89)      5.18 (2.81)    3.72 (2.72)
+
+1368                           SqueezeLLM       2.22     10.79            7.91           4.99
+                               SqueezeLLM       2.05     13.64            8.56           5.38
+1369                           SqueezeLLM       2.01     35.49            41.02          9.44
+1370                           ClusComp       ≤ 2.00     7.50 (2.00)      6.17 (1.99)    4.83 (1.85)
+
+1371
+1372
+1373   Table D.2: The accuracy of quantized LLMs on MMLU and four commonsense reasoning (CSR)
+1374   tasks (PIQA, HellaSwag, WinoGrande and ARC-easy). Following AdaDim, we use lm-eval v0.3.0
+1375   (Gao et al., 2024) for the evaluation. The GPTQ-AdaDim results are taken from Heo et al. (2024).
+1376
+1377                                                    Llama-2-7B                              Llama-2-13B
+1378             Method              #Bit
+                                            MMLU (5-shot ↑)      CSR (0-shot ↑)     MMLU (5-shot ↑)     CSR (0-shot ↑)
+1379
+                 -                  16.00        46.0                  67.9              55.6                 70.3
+1380
+                 GPTQ-AdaDim         4.13        45.3                  67.7              54.6                 70.1
+1381             ClusComp          ≤ 4.14        45.6                  68.2              55.1                 70.8
+1382             GPTQ-AdaDim         3.13        41.3                  66.4              52.3                 68.7
+1383             ClusComp          ≤ 2.89        43.2                  67.2              52.3                 69.5
+1384
+1385
+1386
+       D.2   V ISUALIZATION OF C LUS C OMP
+1387
+1388   To illustrate how ClusComp effectively simulates the original weight distribution, we compare it
+1389   (non-uniform compression) to OmniQuant (uniform quantization) in Figure D.1. The figures demon-
+1390   strate that ClusComp more closely approximates the 16-bit weight distribution, primarily due to its
+1391   non-uniform compression approach. Specifically, ClusComp clusters similar vectors over groups of
+1392   length g across different rows and columns of the weight matrix.
+1393
+1394   D.3   Q UANTIZATION DIFFICULTY TREND OF L LAMA SERIES
+1395
+1396   Previous works (Lin et al., 2024; Sun et al., 2024a; Heo et al., 2024) suggest that weight patterns can
+1397   be identified based on activations rather than relying solely on weight magnitudes. Following a rec-
+1398   ommendation from Reviewer wLyR at ICLR 2025, we incorporate an additional analysis based on
+1399   the Wanda score (Sun et al., 2024a) distribution to illustrate the increasing challenges of quantization
+1400
+       across the Llama series.
+1401   Given the weight matrix W ∈ Rdout ×din of a linear layer and the input activations X ∈ RN L×din ,
+1402   where N and L represent the batch and sequence dimensions, the Wanda score S ∈ Rdout ×din is
+1403   computed as Sij = |Wij | · ||Xj ||2 . A smaller Wanda score within a row of W (on a per-output
+       basis) indicates a less significant weight element.
+
+
+                                                                 26
+       Under review as a conference paper at ICLR 2025
+
+
+1404
+1405
+1406
+1407
+1408
+1409
+1410
+1411
+1412
+1413
+1414
+1415
+1416
+1417
+1418
+1419
+            (a) The query projection layer in the first block. Surprisingly, even the 4-bit OmniQuant (uniform
+1420        quantization) could not simulate the original weight distribution, demonstrating that the first query
+1421        layer is difficult for quantization. We also observe this for the first key projection layer in Figure
+1422        D.4(b). However, ClusComp with 4-2 bits perfectly simulates the original weight distribution.
+1423
+1424
+1425
+1426
+1427
+1428
+1429
+1430
+1431
+1432
+1433
+1434
+1435
+1436
+1437
+1438        (b) The output projection layer in the last block. Compared to OmniQuant (uniform quantization),
+1439        ClusComp can better simulate the weight distribution, more evident for the 3 and 2-bit levels.
+1440
+1441
+       Figure D.1: Weight patterns of two cherry-picked layers of Llama-2-7B. Darker red and blue indicate
+       larger and smaller weight values, respectively. To make the weight pattern more obvious, we apply
+1442
+       these sequential processing steps: (1) take the absolute weight values; (2) downsample the grids with
+1443
+       8 × 8 maxpool kernels; (3) calculate the logarithm of these values; (4) normalize the log-values. We
+1444   also offer the visualization of all layers in the first and last blocks of Llama-2-7B in Figure D.4 and
+1445   D.5. Overall, ClusComp’s weight distribution of different bit-levels can better simulate the original
+1446   weight distribution.
+1447
+1448
+1449
+1450
+1451
+1452
+1453   In Figure D.2 (Right), we present the standard deviation of the Wanda scores across different lay-
+1454   ers. The results show that Llama-2 exhibits a larger standard deviation compared to Llama-1, while
+1455   Llama-3 exceeds Llama-2 in this metric. A higher standard deviation reflects a more dispersed
+1456   Wanda score distribution, indicating that a greater proportion of weight elements are effective and di-
+1457   verse. Consequently, quantization becomes more challenging, as the expanded distribution stretches
+       the quantization grid.
+
+
+                                                             27
+       Under review as a conference paper at ICLR 2025
+
+
+1458
+                       8
+1459                                                 Llama-1-7B
+
+
+                                                                                      Avg. std of Wanda
+1460                   6                             Llama-2-7B
+1461   Avg. kurtosis                                 Llama-3-8B                                           0.4
+1462                   4
+1463
+1464                   2                                                                                  0.2
+1465
+                       0
+1466
+                            0         5         10   15      20     25         30                               0       5      10     15      20      25     30
+1467                                             Layer index                                                                    Layer index
+1468
+1469   Figure D.2: From Llama-1 to Llama-3, LLMs exhibit increasing challenges for quantization. Left:
+1470   The average kurtosis of weights across various layers in the Llama series, previously shown in Figure
+1471   2 (Right). Right: The average standard deviation of the Wanda score across various layers. Please
+1472   refer to Figure D.6 for the Wanda scores of different layer types. Both metrics indicate that Llama-3
+1473   has higher variance in most layers, reflecting the presence of more outliers and thus greater difficulty
+1474   for quantization.
+1475
+1476
+1477
+       D.4                 Q UANTIZATION OF THE CODEBOOK
+1478
+1479
+1480   Thanks to the suggestion of Reviewer h5Zw at ICLR 2025, we conduct further quantization on the
+1481
+       codebook C. Originally, the data type in the codebook was 16-bit, which facilitates our following
+       recovery training or finetuning step. However, if we can further quantize the codebook, we have
+1482
+       two additional advantages: (1) The model size can be further slightly reduced (Only slightly, since
+1483
+       the majority of bits is allocated to the code q.); (2) The inference can speed up, since the codebook
+1484   becomes smaller. In sum, we can keep the codebook in 16-bit if we want to do the recovery training
+1485   or finetuning. If we are only interested in inference, we can further quantize the codebook to a lower
+1486   bit.
+1487
+       As shown in Table D.3, the performance doesn’t change if we quantize the codebook from 16-
+1488
+       bit to 8-bit. When quantizing the codebook to 4-bit, the perplexity slightly increases, but is still
+1489
+       comparable to the best baseline at the 4-bit level and outperforms the best baseline at the 2-bit level.
+1490   However, if we further quantize the codebook to the 2-bit level, the perplexity increases significantly.
+1491   Therefore, we can safely quantize the codebook to 8-bit or 4-bit.
+1492
+1493
+1494   Table D.3: The perplexity of ClusComp with quantized codebook on WikiText2. The results of the
+1495   best baseline are taken from Table C.1. The values in the brackets are the exact bits for different
+1496   LLMs. We can observe: (1) 8-bit codebook offers the same perplexity as 16-bit’s; (2) 4-bit code-
+1497   book slightly hurts the performance, but is still comparable to the best baseline at the 4-bit level
+1498   and outperforms the best baseline at the 2-bit level. (3) The results of the 2-bit codebook are not
+1499
+       acceptable.
+1500
+1501                            Method           Bit for codebook   Avg. Bit        2-7B                        2-70B          3-8B           3-70B
+1502                            -                               -     16.00         5.47                        3.31           6.12           2.90
+1503                            Best baseline                  -       4.13         5.58                        3.39           6.50           3.30
+1504                            ClusComp                      16     ≤ 4.14         5.54 (4.14)                 3.40 (4.03)    6.39 (4.13)    3.12 (4.03)
+                                ClusComp                       8     ≤ 4.11         5.54 (4.11)                 3.40 (4.03)    6.39 (4.10)    3.13 (4.03)
+1505                            ClusComp                       4     ≤ 4.07         5.59 (4.07)                 3.43 (4.02)    6.52 (4.07)    3.26 (4.02)
+1506                            ClusComp                       2     ≤ 4.05         25.44 (4.05)                5.64 (4.01)    1.2e5 (4.05)   96.52 (4.01)
+
+1507                            Best baseline                  -     ≤ 2.13         35.07 (2.00)                4.64 (2.13)    85.10 (2.00)   11.68 (2.13)
+                                ClusComp                      16     ≤ 2.07         7.50 (2.00)                 4.37 (2.07)    12.33 (2.01)   7.61 (2.07)
+1508                            ClusComp                       8     ≤ 2.04         7.50 (1.92)                 4.37 (2.04)    12.33 (1.92)   7.63 (2.04)
+1509                            ClusComp                       4     ≤ 2.03         7.63 (1.86)                 4.42 (2.03)    12.77 (1.86)   7.64 (2.03)
+                                ClusComp                       2     ≤ 2.02         6.5e3 (1.83)                21.07 (2.02)   1.7e5 (1.83)   2.3e4 (2.02)
+1510
+1511
+
+
+
+                                                                                       28
+       Under review as a conference paper at ICLR 2025
+
+
+1512
+       D.5                 A BLATION STUDY ON THE GROUP SIZE AND NUMBER OF CLUSTERS
+1513
+1514   Thanks to the suggestion of Reviewer h5Zw at ICLR 2025, we conducted experiments to determine
+1515   whether the number of clusters n or the cluster dimension g has a greater impact on the performance
+1516   of quantized LLMs. As shown in Table D.4, increasing n positively affects performance more than
+1517   reducing g. This finding underpins our choice of n ≈ 216 . However, while n plays a crucial
+1518   role in enhancing performance, selecting n > 216 would necessitate using 32-bit storage for the
+1519   code q, substantially increasing the bits-per-parameter and adversely affecting memory efficiency.
+1520
+       Therefore, we always choose n < 216 .
+1521
+       Table D.4: Ablation study of ClusComp− on the number of clusters n and the cluster dimension
+1522
+       g in the codebook reveals that n plays a more significant role in the performance of the quantized
+1523   LLM. (a) The perplexity remains relatively stable with variations in g, although changes in g lead to
+1524   substantial differences in the bit requirement, as most bits are used to store the codes q. Specifically,
+1525   smaller g values result in larger q. Refer to Table 1 for detailed examples. (b) In contrast, perplexity
+1526   is highly sensitive to changes in n. Adjusting n causes only a minor change in the bit requirement,
+1527   as storing the codebook is memory-efficient. (c) For comparable bit budgets, n has a greater impact
+1528   on performance than g.
+1529
+       (a) n = 65500.                    Perplexity        (b) Same g. Perplexity changes    (c) Similar bit level. Perplexity is
+1530
+       changes smoothly.                                   dramatically.                     more sensitive to n.
+1531
+1532             Setting         #Bit    Wiki2               Setting      #Bit     Wiki2        Setting       #Bit     Wiki2
+1533                   g4        4.14     5.67               g7n16384       2.35   23.14        g7n16384      2.35         23.14
+1534                   g5        3.38     5.90               g7n4096        2.30   9.4e2        g7n4096       2.30         9.4e2
+1535                   g6        2.89     6.54                                                  g8n65500      2.29         11.10
+                                                             g8n65500       2.29   11.10
+1536                   g7        2.54     7.64
+                                                             g8n50000       2.15   21.90
+                       g8        2.29    11.10
+1537                                                         g8n4096        2.02   5.4e3
+1538
+1539
+1540                  14                       PB-LLM/2                                               ClusComp
+1541                                                                                                  Competitive baseline
+1542                  12                                                                              QuIP
+                                                                                                      GPTQ
+       Wiki2 (PPL )
+
+
+1543
+                      10                                                                              SqueezeLLM
+1544
+                                 BiLLM                    OQ (=OmniQuant)
+1545                   8
+1546
+1547                   6 ClusComp+
+                                                                  GPTVQ               OQ
+1548
+                       4                                     GPTVQ                                                OQ GPTVQ
+1549
+1550                       1.0           1.5               2.0          2.5            3.0         3.5               4.0
+1551                                                                        #Bit
+1552
+       Figure D.3: Perplexity of various methods on Llama-2-70B. Compared to Figure 1, we add three
+1553
+       new baselines: GPTQ (Frantar et al., 2022), QuIP (Chee et al., 2023) and SqueezeLLM (Kim et al.,
+1554
+       2024). For GPTQ, we only show the results ≥ 3-bit, since its perplexity under 3-bit is large.
+1555
+1556
+1557
+1558
+1559
+1560
+1561
+1562
+1563
+1564
+1565
+
+
+
+                                                                        29
+       Under review as a conference paper at ICLR 2025
+
+
+1566
+1567
+1568
+1569
+1570
+1571
+1572
+1573
+1574
+1575
+1576
+1577
+1578
+1579
+1580
+1581              (a) Query projection layer.                                    (b) Key projection layer.
+1582
+1583
+1584
+1585
+1586
+1587
+1588
+1589
+1590
+                    (c) Value projection layer.                            (d) Output projection layer.
+1591
+1592
+1593
+1594
+1595
+1596
+1597
+1598
+1599
+1600                 (e) Up projection layer.                                  (f) Gate projection layer.
+1601
+1602
+1603
+1604
+1605
+1606
+1607
+1608
+1609                                              (g) Down projection layer.
+1610
+1611   Figure D.4: Weight patterns of all layers in the first block (0-th block) of Llama-2-7B. Darker red
+1612   and blue indicate larger and smaller weight values, respectively. ClusComp’s weight distribution of
+1613   different bit levels can better simulate the original weight distribution.
+1614
+1615
+1616
+1617
+1618
+1619
+
+
+
+                                                             30
+       Under review as a conference paper at ICLR 2025
+
+
+1620
+1621
+1622
+1623
+1624
+1625
+1626
+1627
+1628
+1629
+1630
+1631
+1632
+1633
+1634
+1635              (a) Query projection layer.                                    (b) Key projection layer.
+1636
+1637
+1638
+1639
+1640
+1641
+1642
+1643
+1644
+                    (c) Value projection layer.                            (d) Output projection layer.
+1645
+1646
+1647
+1648
+1649
+1650
+1651
+1652
+1653
+1654                 (e) Up projection layer.                                  (f) Gate projection layer.
+1655
+1656
+1657
+1658
+1659
+1660
+1661
+1662
+1663                                              (g) Down projection layer.
+1664
+1665   Figure D.5: Weight patterns of all layers in the last block (31-st block) of Llama-2-7B. Darker red
+1666   and blue indicate larger and smaller weight values, respectively. ClusComp’s weight distribution of
+1667   different bit levels can better simulate the original weight distribution.
+1668
+1669
+1670
+1671
+1672
+1673
+
+
+
+                                                             31
+       Under review as a conference paper at ICLR 2025
+
+
+1674
+1675
+1676
+1677
+1678
+1679
+1680
+1681
+1682
+1683
+1684
+1685
+1686
+1687
+1688
+1689                                       1.5            q_proj                 1.5            k_proj             1.5            v_proj
+1690
+1691                                       1.0                                   1.0                               1.0
+1692
+                                           0.5                                   0.5                               0.5
+1693
+       Standard deviation of Wanda score
+
+
+1694                                       0.0                                   0.0                               0.0
+1695                                       1.5            o_proj                 1.5            up_proj            1.5        gate_proj
+1696                                                                Llama-1-7B
+                                           1.0                      Llama-2-7B   1.0                               1.0
+1697                                                                Llama-3-8B
+1698
+                                           0.5                                   0.5                               0.5
+1699
+1700                                       0.0                                   0.0                               0.0
+1701                                                  down_proj                        0   10            20   30         0   10            20   30
+                                           1.5
+1702
+1703                                       1.0
+1704
+                                           0.5
+1705
+1706                                       0.0
+                                                 0   10            20       30
+1707                                                 Layer index
+1708
+1709   Figure D.6: The standard deviation of Wanda score across various layers in different Llama series
+1710   reveals three key observations: (1) Deeper layers tend to exhibit higher standard deviation; (2)
+1711   Three layers (query, key and gate) show a clear trend across Llama series, with Llama-3 showing
+1712   the highest standard deviation, followed by Llama-2, and then Llama-1; (3) The other four layers
+1713   show a similar standard deviation for all Llama series.
+1714
+1715
+1716
+1717
+1718
+1719
+1720
+1721
+1722
+1723
+1724
+1725
+1726
+1727
+
+
+
+                                                                                            32

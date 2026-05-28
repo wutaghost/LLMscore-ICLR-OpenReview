@@ -1,0 +1,1211 @@
+Under review as a conference paper at ICLR 2025
+
+
+000
+001
+      C OMPUTE OR L OAD KV C ACHE ? W HY NOT BOTH ?
+002
+003
+                                               Anonymous authors
+004
+                                         Paper under double-blind review
+005
+006
+007
+008                                                  A BSTRACT
+009
+010            Recent advancements in Large Language Models (LLMs) have significantly in-
+011            creased context window sizes, enabling sophisticated applications but also in-
+012            troducing substantial computational overheads, particularly computing key-value
+013            (KV) cache in the prefill stage. Prefix caching has emerged to save GPU power
+014            in this scenario, which saves KV cache at disks and reuse them across multiple
+015            queries. However, traditional prefix caching mechanisms often suffer from sub-
+016            stantial latency because the speed of loading KV cache from disks to GPU mem-
+017            ory is bottlenecked by the throughput of I/O devices. To optimize the latency of
+018
+               long-context prefill, we propose Cake, a novel KV cache loader, which employs
+               a bidirectional parallelized KV cache generation strategy. Upon receiving a pre-
+019
+               fill task, Cake simultaneously and dynamically loads saved KV cache from prefix
+020
+               cache locations and computes KV cache on local GPUs, maximizing the utiliza-
+021            tion of available computation and I/O bandwidth resources. Additionally, Cake
+022            automatically adapts to diverse system statuses without manual parameter. tuning.
+023            In experiments on various prompt datasets, GPUs, and I/O devices, Cake offers
+024            up to 68.1% Time To First Token (TTFT) reduction compare with compute-only
+025            method and 94.6% TTFT reduction compare with I/O-only method.
+026
+027
+028   1    I NTRODUCTION
+029
+030   Large Language Models (LLMs) have been widely adopted in large-scale online services, making
+031
+      efficient online serving of these models a critical research and engineering challenge (Kwon et al.,
+      2023; Agrawal et al., 2024; Zheng et al., 2023; Miao et al., 2024; Leviathan et al., 2023; Ning et al.,
+032
+      2023; Jin et al., 2024b). Recent advancements in LLM development have significantly expanded the
+033
+      models’ context windows, enabling sophisticated applications such as long document understand-
+034   ing (Wang et al., 2024), long-context Retrieval Augmented Generation (RAG) (Jiang et al., 2024),
+035   and complex LLM agents (Zhang et al., 2024). For instance, GPT-4 boasts a context window of 128k
+036   tokens (openAI, 2024), while Claude-3.5 Sounet extends this further to 200K tokens (Anthropic,
+037   2024). However, processing these long-context prompts introduces substantial computational over-
+038   head, particularly in the prefill stage, where the key-value (KV) cache is calculated. 1 For example,
+039   generating KV cache for a 200-page book like ”The Great Gatsby” (approximately 72K tokens) re-
+040   quires about 180GB of memory. For a 70B parameter model, generating such a KV cache on an
+041   A100 GPU takes approximately 30 seconds, significantly impacting user experience.
+042   To mitigate this overhead, prefix caching, i.e., the cache of KV cache, has emerged as a useful mech-
+043   anism. This approach is particularly effective in applications where long contexts are frequently and
+044   repeatedly used across multiple requests. For example, in long document processing tasks, the KV
+045   cache of a large document can be reused for multiple queries about its content. Similarly, in coding
+046   assistance scenarios, a cached summary of the codebase can be reused across multiple code comple-
+047   tion or Q&A requests. LLM service providers like Claude and Deepseek have begun implementing
+048
+      such prefix caching mechanism in their online services (Anthropic, 2023; Deepseek, 2024). Recent
+      studies have proposed various system solutions to implement prefix caching (Juravsky et al., 2024;
+049
+      Jin et al., 2024a; Gim et al., 2024). LLM inference engines such as vLLM (Kwon et al., 2023) and
+050
+      SGLang (Zheng et al., 2023) cache KV in local CPU memory, but this approach is limited by CPU
+051   memory size. Given that disks offer much larger capacity and are more cost-efficient than CPU
+052
+          1
+053         KV cache is an essential technique to reduce the computational overhead of LLM inference in the decoding
+      stage for each request and widely adopted in the state-of-the-art inference system.
+
+
+                                                            1
+      Under review as a conference paper at ICLR 2025
+
+
+054
+      memory, storing KV caches in local or remote disks has become a more viable option (Gao et al.,
+055   2024; AutoGen, 2024). CacheGen (Liu et al., 2023) proposes solutions to optimize KV streaming
+056   from local or remote disks to GPU memory, aiming for scalable prefix caching.
+057
+058
+      In practice, long-context LLM inference workflow with pre-
+      fix caching is depicted in Figure 1. Upon receiving an LLM
+059
+      request, the serving system first checks whether it has a prefix
+060
+      with available corresponding KV cache. If so, the system di-       Bandwidth: 2TB/s     In GPU    Yes
+061                                                                                                           Start Decode
+      rectly loads KV cache from the cache location to the GPU’s         Size Limit: ~80GB    Memory
+062   memory, saving the overhead of recomputation. Note that                                 No
+063   prefix caching may involve multiple levels, including CPU          Bandwidth: 25GB/s    In CPU    Yes   Load KV from
+                                                                         Size Limit: ~1.8TB   Memory          CPU Memory
+064   memory, local disks, and remote disks. After loading the
+065   cached prefix, the system continues the prefill of remaining                            No                 Cake
+066   tokens in the request and proceeds with subsequent steps.              Bandwidth:
+                                                                                                              Load KV from
+                                                                                              In Disk   Yes   Local/Remote
+067                                                                          0.5~4GB/s
+      However, while prefix caching saves GPU computation, it Size Limit: ~26TB                                   Disk
+                                                                                No
+068   is not optimized for latency, specifically Time-to-First-Token                      Compute KV
+069   (TTFT), one of the key metrics in LLM serving. When the
+070   prefix cache is not found in local CPU memory (a com-
+071   mon scenario due to CPU memory constraints), streaming Figure 1: Workflow of long-context
+072   KV cache data from disk or network is often not faster than LLM inference with prefix caching.
+073   recomputing KV cache if GPU power is available as we Cake operates in the KV loading
+074   demonstrated in § 3. Additionally, both the available compu- phase (highlighted in blue). The
+075
+      tation and I/O resources vary based on the system workload. configuration parameter is based
+      Consequently, the two approaches of obtaining KV cache- on the specification of LambdaLab
+076
+      GPU computation and prefix cache loading - are only ben- Server (Lambda, 2024).
+077
+      eficial in terms of latency when there is sufficient GPU power
+078   or I/O bandwidth, respectively. Currently, there is a lack of
+079   dynamic KV cache management systems that can optimize LLM inference latency across diverse
+080   system statuses.
+081
+      To address this gap, we propose Cake (Computation and Network Aware KV CachE loader), a
+082
+      system designed to achieve optimal latency for long-context LLM inference. Cake simultane-
+083
+      ously leverages local computation and data streaming from prefix cache locations to generate the
+084   KV cache. It employs a bidirectional parallelized KV cache generation strategy: upon receiving a
+085   prefill task, Cake immediately utilizes available GPU power to compute KV cache in normal order
+086   starting from the first token, while simultaneously loading the prefix cache in reverse order starting
+087   from the last token, until all tokens have corresponding KV cache data. This design is inspired by
+088   key observations about the characteristics of computing and streaming KV cache: the computational
+089   cost of generating KV cache increases with the token’s distance from the beginning of the sequence,
+090   while the data streaming cost remains constant regardless of token position. Importantly, Cake’s
+091   design is both simple and elegant, adapting to diverse situations in terms of system architecture and
+092
+      available resources, without requiring manual parameter tuning.
+093   The main contribution of this paper includes the design and evaluation of Cake, which enables the
+094   following features improving the quality of LLM serving.
+095
+      • Optimized latency: Cake optimizes the overall latency of KV cache loading by achieving maxi-
+096   mum utilization of computation and network streaming in parallel without any idle time.
+097
+098   • Automatic adaptation: Cake continuously adapts to the available network and computational
+099
+      resources, achieving low latency without downgrading system performance. Previous computation-
+      only and network-only KV cache prefill solutions are special cases of Cake.
+100
+101   • Negligible Overhead: Cake introduces minimal computational and memory overhead, ensuring
+102   it doesn’t negatively impact the performance of the underlying system.
+103   Our experiments demonstrate that Cake efficiently utilizes both computation and I/O fetching to
+104   significantly reduce the prefilling latency in long-context LLM inference. Evaluations on diverse
+105   datasets, including LongChat (Li et al., 2023a), TriviaQA, and NarrativeQA (Bai et al., 2023),
+106   show that Cake achieves substantial improvements in Time-to-First-Token (TTFT). Compared to
+107   compute-only methods, Cake achieves an average 36.7% reduction in TTFT. When compared to
+
+
+                                                         2
+      Under review as a conference paper at ICLR 2025
+
+
+108
+      I/O-only methods, the improvement is even more pronounced, with an average 60.55% reduction
+109   in TTFT. Notably, Cake accomplishes these performance gains while introducing minimal overhead
+110   to the system, making it a highly efficient and practical solution for optimizing long-context LLM
+111   inference across various scenarios and workloads.
+112
+113   2     BACKGROUND
+114
+115   2.1   KV CACHE IN LLM I NFERENCE
+116
+      Large language models (LLMs) have recently made significant impacts across numerous domains.
+117   The key to their success lies in the attention mechanism, which enables these models to scale up and
+118   effectively process long contexts (Vaswani et al., 2017; Brown et al., 2020). In the attention calcu-
+119   lation process, the computation of Key (K) and Value (V) vectors for previously processed tokens
+120   becomes redundant during the decoding phase. Recognizing this, the concept of KV cache (Zhang
+121   et al., 2023) is introduced. This approach involves storing these computed values and reusing them
+122   to reduce computational overhead in subsequent decoding steps.
+123   State-of-the-art LLM inference engines (Kwon et al., 2023; Miao et al., 2024; Zheng et al., 2023)
+124   typically divide the inference procedure into two distinct phases: prefill and decode. The prefill
+125   stage generates the initial KV cache for the input prompt. In the subsequent decode stage, the
+126   model utilizes this cache to generate new tokens sequentially. As each new token is produced,
+127   its corresponding K and V vectors are computed and appended to the KV cache. This caching
+128   mechanism significantly accelerates inference by converting the time complexity of token generation
+129   from quadratic to linear (Yang et al., 2024).
+130
+      2.2   KV CACHE S AVING AND R EUSING
+131
+132   The prefill stage is a highly resource-consuming procedure that often saturates GPU computation
+133   resources and causes high latency compared to the normal decoding procedure (Agrawal et al.,
+134   2024). This overhead becomes even more significant in long context scenarios (Fu, 2024).
+135
+      Meanwhile, it is common for parts of prompts to be reused across multiple requests. For instance,
+136   system messages in chatbot services guiding the LLM model’s behavior are usually long and shared
+137   across multiple messages. In Retrieval-Augmented Generation scenarios, fetching long text blocks
+138   as the context to generate answers can improve the generation performance (Jiang et al., 2024).
+139   Other use cases include coding assistants that need to maintain a summarized version of the codebase
+140   in the prompt (Cursor, 2024), and agentic search, tool use and multi-agent communication which
+141   require multiple rounds of API calls using the same set of historical data (Wu et al., 2023; Li et al.,
+142   2023b).
+143   To address these challenges and optimize inference efficiency, various systems have been developed
+144   to save and reuse KV cache via prefix caching mechanism (Zheng et al., 2023; Kwon et al., 2023;
+145   Juravsky et al., 2024; Jin et al., 2024a; Gim et al., 2024; Gao et al., 2024). A typical workflow of
+146   these systems are demonstrate in Figure 1. These systems leverage different layers of the storage
+147   hierarchy, each with its own trade-offs. GPU memory offers the lowest latency but has the highest
+148   cost and smallest capacity, making it impractical for long-term KV cache storage. CPU memory,
+149   used by some inference engines (Zheng et al., 2023; Kwon et al., 2023), is often insufficient for
+150
+      large-scale online serving systems handling millions of requests per second. Consequently, local
+      or remote disk storage has emerged as a more viable option for large-scale operations, offering
+151
+      a balance between cost and capacity. The trend towards disk-based KV cache storage is evident
+152
+      in industry practices. For example, Deepseek, a major LLM API service provider, implements
+153   prefix caching on disk, potentially reducing users’ inference costs by up to 90% (Deepseek, 2024).
+154   Similarly, the multi-agent framework AutoGen employs disk-based prefix caching (AutoGen, 2024).
+155
+156
+      Cake aligns with the prefix caching mechanism for long-context LLM inference, improving latency
+      by simultaneously scheduling KV computation and loading.
+157
+158
+      2.3   C HUNK P REFILL
+159
+160   Chunk prefill is a technique used to optimize the prefill stage of LLM inference, particularly for
+161   long input sequences. Unlike the decoding procedure, which is memory-bound, prefill stage is a
+      computation-intensive process that demands significant GPU resources for extended periods. For
+
+
+                                                        3
+      Under review as a conference paper at ICLR 2025
+
+
+162
+      instance, prefilling 10,000 tokens on a 7B model on an A100 GPU takes approximately 1 seconds.
+163   Directly processing a long text prompt in its entirety for prefilling would monopolize the GPU,
+164   severely impacting the latency of other tasks.
+165
+166
+      Originally proposed in Sarathi (Agrawal et al., 2023; 2024), this method divides the input sequence
+      into smaller, near-equal sized chunks and processes them sequentially. By breaking down large
+167
+      prefill requests into manageable chunks, chunk prefill allows for improved throughput and reduced
+168
+      prefill operations’ latency impact in LLM serving systems. It enables the interleaving of prefill op-
+169   erations with decode operations, minimizing the blocking effect of long prompts on other tasks.This
+170   approach has been widely adopted in current mainstream LLM inference engines (Zheng et al.,
+171   2023; Kwon et al., 2023).
+172
+      In vLLM’s detailed implementation of chunk prefill (Kwon et al., 2023), the inference engine forms
+173
+      a batch of requests for each inference step based on a predetermined token budget. The scheduler
+174
+      prioritizes decode requests, allocating one token from the budget to each. Any remaining tokens
+175   in the budget are then assigned to prefill requests. This dynamic allocation determines the chunk
+176   size for chunk prefill operations. By giving precedence to decode requests, this approach minimizes
+177   interference with ongoing decoding requests, ensuring lower inter-token latency (ITL) for decode
+178   while efficiently utilizing available resources for prefill tasks.
+179
+      Cake adopts chunk prefill by default as it aims for the long-context inference scenarios.
+180
+181
+      3   E XPLORATORY E XPERIMENTS AND M OTIVATION
+182
+183   Upon receiving a new prefill task, the KV cache can be obtained through various sources, including
+184   the computation on local GPU, fetching from local disk, or data streaming from a remote loca-
+185   tion, as mentioned in § 2. This section evaluates the performance of different KV cache loading or
+186   generation methods and identifies potential improvements, motivating the design of Cake.
+187
+      Finding 1: The latency of loading KV cache from local or remote disks is linearly correlated
+188
+      with the data size.
+189
+190   The size of the KV cache grows linearly with the number of tokens and can be calculated as:
+191                                KV cache size = 4 · Nl · H · Lmax · B · P,                          (1)
+192   Where Nl is the number of layers, H is the hidden size, Lmax is the maximum context length, B
+193   is the batch size, and P is the precision in bytes. Using this formula, we can estimate that for the
+194   Llama3-70B model with FP16 precision, the KV cache for a single token consumes approximately
+195   2.5 MB. Consequently, a 15-page research paper contains around 10,000 tokens, would require a
+196   great amount of memory as large as 25 GB.
+197
+      Because of the size, the process of loading long-context KV cache into GPU memory is not fast
+198   because of the constrained bottleneck throughput of the I/O devices. Local storage options vary in
+199   performance: SATA SSDs offer I/O bandwidths of around 600 MB/s, HDDs are limited to about
+200   200 MB/s, and high-end NVMe SSDs can achieve read speeds of up to 3 GB/s at a premium cost.
+201   Even in the optimal case with a 3 GB/s read bandwidth, loading the KV cache for a 10-page paper
+202   would take approximately 8 seconds. Such latency will be even longer when using remote storage,
+203   whose bottleneck becomes the network bandwidth. Typical network bandwidths rarely exceed 20
+204   Gbps (i.e., 3GB/s) (Liu et al., 2023; Jain et al., 2023), potentially leading to transfer times of up to
+205   10 seconds to fetch the 25 GB KV cache from a remote disk.
+206   Finding 2: The latency and memory usage of computing KV cache on GPUs increases quadrat-
+207   ically with the length of the sequence.
+208
+      During the prefill stage, the computation cost for generating KV cache of later tokens (i.e., those
+209
+      with higher indices in the sequence) is expected to be higher than for earlier tokens This is because
+210   of the inherent nature of attention mechanisms — computing KV cache involves attention operations
+211   across the current and all preceding tokens. To test this hypothesis, we conducted experiments on
+212   long-context prefill tasks with the chunk prefill mechanism described in § 2.3. Results presented in
+213   Figure 3 demonstrate a clear pattern: the latency for each chunk linearly increases with its index;
+214   i.e., the latency for the whole sequence is quadratically correlated with the sequence length. We can
+215   also observe the KV cache memory usage linearly increases with the chunk index. The observation
+      is critical for Cake to arrange computation tasks optimally.
+
+
+                                                         4
+      Under review as a conference paper at ICLR 2025
+
+
+216
+                                      5
+                                                                                                                           A100
+
+
+                                                                                                                                                                       KV Cache Memory Usage (GB)
+217                                                                                                                                                                20
+
+      Equivalent Throughput (GB/s)
+                                                                  ~4GB/s ~4GB/s                                  100       H100
+218                                   4                                                                                    Memory Usage
+                                                                                                                                                                   15
+
+
+                                                                                                Step Time (ms)
+219                                                    ~3.3GB/s                                                  80
+220                                   3
+                                                                                                                                                                   10
+                                                                                                                 60
+221
+                                      2                                                                                                                            5
+222                                                                                                              40
+223                                   1                                           ~1GB/s
+                                                                                                                                                                   0
+224                                         ~200MB/s                                                                   0    10     20     30     40     50    60
+                                     0.0                                                                                   Chunk Index (512 tokens per chunk)
+225                                           HDD       A100      H100   NVMe SSD Network
+226                                                       Figure 3: Prefill latency(i.e., step time)/Total
+227      Figure 2: Equivalent KV cache loading bandwidth. Memory Usage v.s. chunk index.
+228
+229
+230   Finding 3: Computing KV cache could be even faster than loading cached KV cache.
+231   We compare the performance of loading and computing KV cache at various system settings. We use
+232   various GPUs to perform chunk prefill of a random context with 32k tokens through LongAlpaca-7B
+233   and -13B (Chen et al., 2023) models, implemented on vLLM (Kwon et al., 2023). We use equavelant
+234   throughput as the evaluation metric, dividing the computed or loaded KV cache file size by the time
+235   spent. We evaluate the prefill using chunk sizes as 512, as suggested by vLLM.
+236
+      We present the results in Figure 2. Loading KV cache from remote disk is faster than loading from
+237   a local HDD but is slower than loading from a local SSD. Throughput of computing KV cache with
+238   100% A100 GPU power is comparable to that of loading KV cache from SSD disk or network.
+239
+240
+      Conclusion. The above experiments highlighted the limitation of existing prefix caching – load-
+      ing KV cache via disk or network I/O introduces substantial latency. Recomputation of KV cache,
+241
+      though consuming GPU power, is fast enough to potentially accelerate the prefill process. Our find-
+242
+      ings suggest that an optimal approach for prefix caching could simultaneously leverage available
+243   GPU power and I/O bandwidth. This strategy forms the core concept of Cake.
+244
+245
+       4                               D ESIGN OF Cake
+246
+247   We propose Cake, a system that adaptively utilizes both network and available computation re-
+248   sources to achieve low-latency KV cache loading. In this section, we first discuss the scope of Cake
+249   by specifying its use cases in Section 4.1. We then elaborate design details in Section 4.2 and analyze
+250   the benefit of Cake in Section 4.3.
+251
+252
+       4.1                                 U SE C ASES OF Cake
+253   Cake works upon a LLM serving system with prefix caching as depicted in Figure 1. Cake is
+254   especially beneficial when the system needs to load saved KV cache from disk storage to GPU
+255   Memory for inference. It’s worth noting that in cases where the required KV cache data already
+256   resides in GPU or CPU memory, it is beyond the scope of Cake. This is because the bandwidth
+257   between CPU and GPU is dramatically higher than disk I/O or computation speeds, then comparing
+258   with I/O, computation can provide limited help. However, given the memory size constraints on
+259   CPU and GPU and the large size of long-context caches, such scenarios are relatively infrequent,
+260
+      making Cake a crucial component for most long-context LLM inference with prefix caching tasks.
+261   Cake is complementary to other optimization techniques. For instance, methods focused on reducing
+262   KV cache size (Hooper et al., 2024; Jiang et al., 2023; Kang et al., 2024) or optimizing KV cache
+263   loading from local/remote disks (Liu et al., 2023) can be used in conjunction with Cake, potentially
+264   yielding even greater performance improvements. Furthermore, Cake is designed to integrate seam-
+265   lessly with state-of-the-art LLM serving systems (Kwon et al., 2023; Yao et al., 2024), enhancing
+266
+      their capabilities in handling long-context scenarios efficiently.
+267    4.2                                 D ESIGN D ETAILS
+268
+269   We build Cake upon the chunk prefill design discussed in §2.3, where a long sequence is split into
+      chunks, and the prefill is performed chunk by chunk. Chunk prefill is widely adopted for long-
+
+
+                                                                                            5
+      Under review as a conference paper at ICLR 2025
+
+
+270
+271               Compute           Unfinished Chunks        Loaded Chunks                    I/O Load
+272
+273        Stage0:     E    ating    cake    makes      me   happy    ,     I   enjoy   eating   cakes    .
+274
+           Stage1:     E    ating    cake    makes      me   happy    ,     I   enjoy   eating   cakes    .
+275
+276          ….
+277
+          StageN-1:    E    ating    cake    makes      me   happy    ,     I   enjoy   eating   cakes    .
+278
+279        StageN      E    ating    cake    makes      me   happy    ,     I   enjoy   eating   cakes    .
+280
+281
+                               Figure 4: Diagram illustrating the workflow of Cake
+282
+283
+284
+      context LLM inference systems to offer scalable management of concurrent multiple user requests.
+285   In Cake, chunks serve as the fundamental unit for scheduling prefill tasks.
+286
+287   The key idea of Cake is to simultaneously leverage both local computation and I/O for data streaming
+288
+      to optimize the latency of KV cache prefill. For each long-context request, Cake determines an
+      efficient schedule for using all available resources to accomplish KV cache prefill, i.e., determining
+289
+      for each chunk whether to utilize local GPU computation or data streaming from local/remote disks,
+290
+      as well as the sequence of these operations. As discussed in §3, the computation of KV cache on later
+291   chunks is more expensive than that on earlier chunks. Therefore, we should prioritize computation
+292   operations on chunks near the beginning of the sequence while let cache loading operations to fill
+293   later chunks. Inspired by this intuition, we design Cake as a bidirectional parrallelized KV cache
+294   loader as below.
+295
+      As illustrated in Figure 4, upon receiving a request, Cake splits the sequence into chunks and initiates
+296
+      two simultaneous processes: (1) The local GPU computes KV cache from the beginning chunk of
+297   the prompt, progressing towards the end. (2) The data streaming process fetches KV cache starting
+298   from the last chunk, moving in reverse direction. This bidirectional approach continues until the two
+299   processes converge in the middle, signaling the completion of KV cache generation for the entire
+300   prompt. We discuss the whole algorithms in Appendix§A and the system implementation details in
+301   Appendix§B.
+302
+303   4.3    B ENEFITS OF Cake
+304
+305   Our design offers several key benefits:
+306
+      • Optimized latency: Cake optimally reduces the overall latency of prefill with KV cache loading
+307
+      by parallelizing computation and network streaming without any idle time.
+308
+309   • Automatic adaptation: Cake dynamically adapts to varying conditions without relying on man-
+310   ually defined parameters. It consistently offers latency improvements across different sequence
+311   lengths and diverse system configurations, tolerating fluctuations in network conditions and compu-
+312
+      tational capabilities. This adaptability is evidenced by our comprehensive evaluation across various
+      scenarios, as detailed in Section 5.
+313
+314   • Negligible overhead: Cake automatically balances the demand for computation and network
+315   resources according to dynamic situations without substantial additional overhead. Previous
+316   computation-only and network-only KV cache loading solutions (e.g., Kwon et al. (2023); Liu et al.
+317   (2023)) become special cases of Cake when either computation or network is unavailable. Ad-
+318
+      ditionally, Cake operates without such computation-intensive profiling phase, further reducing its
+      operational overhead.
+319
+320
+321   5     E VALUATION
+322
+323   In this section, we first introduce the setup of our experiments and then we utilize thorough ex-
+      periemnts to address the following questions:
+
+
+                                                         6
+      Under review as a conference paper at ICLR 2025
+
+
+324
+      1. How does Cake perform under varying I/O bandwidth conditions when utilizing the full power of
+325   GPU? §5.2
+326
+327   2. What is the impact of context length on Cake performance?§5.2
+328   3. How does Cake adapt to different levels of available GPU resources?§5.3
+329
+      4. How effectively does Cake integrate with state-of-the-art KV cache compression techniques?§5.4
+330
+331   5. What overhead does Cake introduce when integrated into vLLM’s inference procedure?§5.5
+332
+333   5.1   E XPERIMENT S ETUP
+334
+335   Models. We evaluate Cake on fine-tuned long context models LongAlpaca-7B (Chen et al., 2023)
+336
+      based on LLama2. The per-token KV cache size is 0.5MB respectively, using 16-bit floating point
+      as the data type.
+337
+338   Evaluation Metrics. We use time-to-first-token (TTFT) as our primary evaluation metric. TTFT
+339   is widely used in LLM inference, measuring the time between the arrival of a user query and the
+340   generation of the first token. In other words, it reflects either the time of loading stored KV cache or
+341   computing new KV cache.
+342   Datasets. We evaluate Cake across a range of context lengths based on three datasets with dif-
+343   ferent tasks: LongChat (Li et al., 2023a) for multi-turn conversation, and TriviaQA and Narra-
+344   tiveQA (Bai et al., 2023) for long document question-answering tasks. Based on the statistics an-
+345   alyzed in CacheGen (Liu et al., 2023), we found that most dataset queries fall between 5k to 16k
+346   tokens in length. Since the specific token values don’t affect our evaluation of Cake performance
+347   (only the token length matters), we create synthetic prompts by uniformly sampling 20 data points
+348
+      between 5k to 16k tokens to evaluate the system’s performance. To further stress test Cake and
+      evaluate its performance at the upper limit of the models’ capabilities, we also generate synthetic
+349
+      prompts with 32K tokens, which corresponds to the maximum context window supported by the
+350
+      LongAlpaca models.
+351
+352   Baselines. We compare Cake to three types of KV cache prefill/loading mechanisms:
+353   • Compute-only methods, which employ chunk prefill to compute all the KV cache. As suggested
+354   by vLLM, the token budget size is set to 512 throughout the experiment.
+355
+      • I/O Fetch-only, which loads saved KV cache from local/remote disks through Disk/Network I/O.
+356
+357   • KV cache Compression methods, which are orthogonal to our work. They can compress the
+358   KV cache size to make them more efficiently transferable through I/O. In our evaluation, we com-
+359   bine the most common 8bit quantization and CacheGen compression technique (Liu et al., 2023)
+360   with Cake to further evaluate its performance.
+361   Hardware setting. We run our evaluation on two server configurations: 1) An NVIDIA A100 80GB
+362   GPU server equipped with a 64-core AMD EPYC 7763 CPU and 2.0TB memory. 2) An NVIDIA
+363   H100 GPU server equipped with a 26-core vCPU and 200GB memory.
+364
+      I/O Bandwidth Control. To precisely control I/O Bandwidth with different I/O Bandwidth traces,
+365   we calculate the delay time based on the size of the chunk and network bandwidth, and then instruct
+366   LLMCache to sleep for this calculated time before fitting the data into CPU memory.
+367
+368
+      GPU Resource Usage. In online serving scenarios, it’s common for a machine to serve multiple
+      users’ requests simultaneously. Thus, a user’s prefill operation may not always have access to the
+369
+      full GPU resources. To evaluate different available GPU resource conditions, we utilize vLLM’s
+370
+      token budget scheduling policy as discussed in §2.3. We schedule a partial token budget to Cake’
+371   prefill request and use other synthetically generated requests to consume the rest of the token budget,
+372   simulating different levels of GPU resource availability.
+373
+374   5.2   Cake P ERFORMANCE UNDER F ULL GPU R ESOURCES S ETTING
+375
+376   In this section, we evaluate Cake with full GPU resources and present the results in Figure 5a. We
+377   simulated three static I/O bandwidths (2000/5000/10000 Mbps) to represent different I/O conditions
+      (HDD, network, SSD) and recorded the TTFT for a 32k token context under various settings.
+
+
+                                                         7
+       Under review as a conference paper at ICLR 2025
+
+
+378                                                                                                                          85
+                                     Comp-A100         Cake-A100          I/O Fetch
+
+
+                                                                                          Relative TTFT (%) Comp Ratio (%)
+379                                  Comp-H100         Cake-H100                                                             80
+380                                                                                                                          75
+                    50000                                                                                                              I/O Fetch 10000mbps
+381                                                                                                                          70
+                    25000                                                                                                              Compute
+382                                                                                                                          65
+      TTFT Wall Time (ms)
+
+
+383                         4000                                                                                             85
+384
+                                                                                                                             80
+385
+                            2000                                                                                             75
+386
+387
+                                                                                                                             70        Cake 10000mbps
+                              0                                                                                              65
+388                                 2000 mbps      5000 mbps       10000 mbps                                                     2k 8k 10k12k14k16k18k20k22k24k26k28k30k32k
+389                                              I/O Bandwidth                                                                                 Context Length
+390
+                                   (a) Prefill 32k context of Alpaca-7b                     (b) Performance of Cake on different context lengths
+391
+392                                               Figure 5: Evaluation of Cake with full GPU resources
+393
+394
+395    Our observations show that compared to I/O fetch-only methods, utilizing full GPU power simul-
+396    taneously reduces TTFT by 76.9-93.5% on A100 and 80.2-94.6% on H100. Moreover, compared
+397    to compute-only methods, Cake saves up to 31.5% on A100 and 26.7% on H100. These results
+398    demonstrate that Cake significantly reduces TTFT for long contexts.
+399    We further analyzed the workload distribution between computation and fetching in Cake under
+400    different context lengths to understand context length effect on compute and I/O. In this setting, we
+401    fixed the compute power to use the full A100 GPU, the I/O bandwidth to 10000mbps. As shown
+402    in Figure 5b. The top figure reveals that with 10000 Mbps bandwidth, the percentage of KV cache
+403    chunks processed by computation decreases by 10% as context length increases from 2k to 32k
+404    tokens. This aligns with our observation in §2.3: as context length grows, computing KV cache
+405
+       for later tokens becomes more time-consuming, while I/O time remains constant. Consequently, at
+       the convergence point, a smaller percentage of tokens will be processed by computation as context
+406
+       length increases.
+407
+408    The bottom figure illustrates the ratio of Cake TTFT to compute-only TTFT. We observe that as
+409    context length increases from 2k to 32k tokens, the relative TTFT is reduced by 15%. This demon-
+410    strates that Cake becomes even more efficient compared to compute-only methods as context length
+411
+       increases.
+412    Referring to Figure 3, we note that computing later chunks also requires more GPU memory.
+413    KV cache memory consumption grows linearly with token size. With Cake under 10000 Mbps
+414    bandwidth, only 75% tokens need to do computation and store KV cache in GPU memory, while
+415    the saved 25% space can be allocated for other short requests. This further highlights Cake’s mem-
+416    ory efficiency.
+417
+418    5.3                     Cake P ERFORMANCE UNDER D IFFERENT GPU U SAGE
+419
+420    In this section, we evaluate Cake under different GPU resource usage scenarios to assess its perfor-
+421    mance in real-world settings where GPU resources need to be shared among multiple users. The
+422
+       results are demonstrated in Figure 8. We control GPU usage by scheduling limited token budgets as
+       described in §5.1. We present two representative results with a context length of 14k tokens, with
+423
+       additional results available in Appendix§C.
+424
+425    Compared to the compute-only method, Cake leverages I/O prefetching to reduce latency by 5.3-
+426    68.1%. Higher I/O bandwidth allows Cake to provide greater benefits. When compared to I/O-
+427    only methods, Cake utilizes computation to reduce latency by 27.4-93.7%, with higher computation
+428
+       power yielding more significant improvements.
+429    Specifically, using the compute-only method, reducing computation power from 90% to 10% results
+430    in an 8.22x increase in prefilling latency, leading to an additional 14.34s delay. However, Cake au-
+431    tomatically fetches more chunks of KV cache via I/O, reducing latency by up to 68.1% compared to
+       the compute-only method and 27.4-65.1% compared to the I/O-only method under the same condi-
+
+
+                                                                                      8
+      Under review as a conference paper at ICLR 2025
+
+
+432
+433
+434
+435
+436
+437
+438
+439
+440
+441
+442
+443              (a) Computation Power 90%                           (b) Computation Power 10%
+444
+              Figure 6: Comparing Cake with compute-only and different I/O fetching methods.
+445
+446
+447   tions. This observation generalizes across different context lengths and compute powers, as shown
+448   in our results in Appendix§C, demonstrating that Cake consistently achieves the fastest prefilling
+449   speed compared to both computation-only and I/O-only methods.
+450
+      In conclusion, Cake significantly reduces prefilling latency when available computation power is
+451
+      insufficient by leveraging KV cache fetching. This feature can be exploited to utilize fragmented
+452   computational resources for prefilling long context requests without adversely affecting other users’
+453   experience.
+454
+455
+      5.4   I NCORPORATING KV CACHE C OMPRESSION WITH Cake
+456
+457   In this section, we show that Cake can incorporate with state-of-the-art KV cache compression tech-
+458   nologies to further boost its performance. We use the same settings as in §5.3 and apply the widely
+459   used 8bit-quantization and the latest CacheGen (Liu et al., 2023) to reduce the size of KV cache.
+460   Theoretically, they will reduce the fetching time by 2 and 8.6 respectively, thus lowering the band-
+461   width requirement.
+462   Our results in Figure 8 demonstrate that 8bit-quantization
+463   and CacheGen significantly enhance I/O bandwidth, achieving             70   A100
+464   speedups of up to 1.95x and 7.97x respectively. Leveraging                   H100
+                                                                              60
+465   these improvements, Cake is able to fetch more KV cache chunks
+                                                                          Time (ms)
+
+
+                                                                              50
+466   during computation, resulting in a remarkable 11.83x speedup
+                                                                              40
+467   compared to computation with only 10% GPU power. Further-
+                                                                              30
+468   more, Cake combined with CacheGen reduces time-to-first-token
+                                                                                 0    5 10      15 20 25
+469   (TTFT) by 32.8-73.5% compared to Cake with raw KV cache,                             Step
+
+470
+      showcasing its ability to efficiently utilize all available resources
+      to minimize latency.                                                  Figure 7: Per-step inference
+471
+                                                                            time in vLLM before and af-
+472   Conversely, when Cake has access to 90% of GPU resources, ter integration with Cake. The
+473   it outperforms CacheGen-only fetching by reducing TTFT by solid line represents the step
+474   66.4%. This demonstrates Cake’s adaptability across different re- time without Cake, while the ’x’
+475   source availability scenarios. As detailed in Appendix§C, Cake markers indicate step times with
+476
+      consistently achieves superior performance compared to both Cake.
+      computation-only and fetching-only methods across a wide range
+477
+      of scenarios, highlighting its versatility and effectiveness in opti-
+478
+      mizing prefilling latency.
+479
+480
+      5.5   OVERHEADS OF Cake IN LLM S ERVING S YSTEM
+481
+482   To demonstrate Cake has negaligible overheads, we compare the duration of each engine step on
+483   original vLLM and vLLM with Cake. As is shown on Figure 7, we launch a chunk prefill job on
+484   A100 and H100 server, and the chunk prefill time of vLLM with Cake basically follows the trace
+485   of original vLLM. This results prove that Cake introduce negaligible overheads, as it only needs to
+      check whether the next chunk is already fetched and doesn’t have to schedule anything.
+
+                                                       9
+      Under review as a conference paper at ICLR 2025
+
+
+486
+      6   D ISCUSSION
+487
+488   In this section, we discuss the benefits and potential overheads introduced by Cake. Our system
+489   effectively utilizes both compute and I/O resources to reduce KV cache loading latency, thereby
+490   improving the Time To First Token (TTFT).
+491
+      Comparison with Compute-Only Methods. Unlike approaches that rely solely on computation,
+492
+      Cake leverages I/O bandwidth to reduce the computational load, resulting in lower latency. This is
+493
+      particularly advantageous as I/O resources are often less costly and more readily available compared
+494   to high-performance compute resources.
+495
+496   Comparison with I/O-Only Methods. While Cake primarily focuses on efficient I/O utilization, it
+497
+      also employs compute resources to further reduce TTFT. This dual approach may introduce some
+      additional computational overhead. However, as discussed in §5.3 and §2.3, we can strategically use
+498
+      only the unused token budget for chunk prefill computation. This approach minimizes the system’s
+499
+      computational overhead due to the batching effect and efficient GPU utilization. The added com-
+500   putation is efficiently processed alongside other tasks, leveraging GPU parallelism. Even if there
+501   are no unused token left, we can pause the compute procedure and let I/O contribute more to the
+502   procedure.
+503
+      Cost-Benefit Analysis. In many online services, users who pay more often receive higher priority
+504
+      and faster request processing. Cake is particularly well-suited for these scenarios, offering signifi-
+505
+      cantly reduced TTFT for a marginal increase in cost.
+506
+507
+508
+      7   C ONCLUSION
+509
+      In this paper, we introduced Cake, a novel approach that efficiently utilizes both I/O and compute
+510
+      resources to reduce Time To First Token (TTFT) for LLM serving systems with prefix caching. Cake
+511
+      dynamically adapts to varying resource conditions, seamlessly integrating with existing KV cache
+512   optimization techniques to achieve optimal latency with minimal overhead. Our evaluation shows
+513   Cake outperforms both compute-only and I/O-only methods, reducing TTFT by up to 95% com-
+514   pared to baselines. Cake balances I/O and compute resources to maximize performance gains with-
+515   out significantly increasing costs. As a simple plug-in solution, Cake is easily implementable in
+516   existing LLM serving systems with prefix caching, offering substantial performance improvements
+517   and straightforward integration to enhance the responsiveness and efficiency of LLM services.
+518
+519   8   E THICS S TATEMENT
+520
+521   Our research on Cake, a system for reducing Time To First Token (TTFT) in LLM serving sys-
+522   tems, primarily focuses on improving computational efficiency without directly involving human
+523   subjects or sensitive personal data. However, we acknowledge broader ethical implications: po-
+524   tential disparities in service quality based on user access levels, the positive environmental impact
+525
+      through optimized resource utilization, our commitment to transparency and reproducibility, the risk
+      of misuse in scaling harmful LLM applications, and the importance of adhering to ethical AI de-
+526
+      ployment guidelines. We declare no conflicts of interest and affirm our commitment to the ICLR
+527
+      Code of Ethics, having conducted this research with integrity and in compliance with established
+528   ethical standards in AI and computer science. While Cake aims to enhance LLM services, we en-
+529   courage implementers to consider fair allocation strategies, implement safeguards against misuse,
+530   and continue efforts to minimize the environmental footprint of AI systems.
+531
+532
+533   R EFERENCES
+534   Amey Agrawal, Ashish Panwar, Jayashree Mohan, Nipun Kwatra, Bhargav S Gulavani, and Ra-
+535    machandran Ramjee. Sarathi: Efficient llm inference by piggybacking decodes with chunked
+536    prefills. arXiv preprint arXiv:2308.16369, 2023.
+537
+538   Amey Agrawal, Nitin Kedia, Ashish Panwar, Jayashree Mohan, Nipun Kwatra, Bhargav S Gula-
+539    vani, Alexey Tumanov, and Ramachandran Ramjee. Taming throughput-latency tradeoff in llm
+       inference with sarathi-serve. arXiv preprint arXiv:2403.02310, 2024.
+
+
+                                                       10
+      Under review as a conference paper at ICLR 2025
+
+
+540
+      Anthropic. Prompt caching, 2023. URL https://www.anthropic.com/news/prompt-c
+541     aching.
+542
+543   Anthropic. Anthropic model comparison, 2024. URL https://docs.anthropic.com/en/
+544     docs/about-claude/models#model-comparison-table.
+545
+      AutoGen. Autogen disk cache, 2024. URL https://microsoft.github.io/autogen/
+546     docs/reference/cache/disk_cache/.
+547
+548   Yushi Bai, Xin Lv, Jiajie Zhang, Hongchang Lyu, Jiankai Tang, Zhidian Huang, Zhengxiao Du,
+549     Xiao Liu, Aohan Zeng, Lei Hou, et al. Longbench: A bilingual, multitask benchmark for long
+550     context understanding. arXiv preprint arXiv:2308.14508, 2023.
+551   Tom B. Brown, Ben Mann, Nick Ryder, Deepak Subbiah, Jack Kaplan, Prafulla Dhariwal, and Dario
+552     Amodei. Language models are few-shot learners. Advances in Neural Information Processing
+553     Systems, 33, 2020. URL https://arxiv.org/abs/2005.14165.
+554
+555   Yukang Chen, Shengju Qian, Haotian Tang, Xin Lai, Zhijian Liu, Song Han, and Jiaya Jia. Longlora:
+556
+        Efficient fine-tuning of long-context large language models. arXiv preprint arXiv:2309.12307,
+        2023.
+557
+558   Cursor. Codebase indexing, 2024. URL https://docs.cursor.com/context/codeba
+559     se-indexing.
+560
+      Deepseek. Prompt caching api, 2024. URL https://platform.deepseek.com/api-doc
+561
+        s/news/news0802/.
+562
+563   Yao Fu. Challenges in deploying long-context transformers: A theoretical peak performance analy-
+564     sis. arXiv preprint arXiv:2405.08944, 2024.
+565
+      Bin Gao, Zhuomin He, Puru Sharma, Qingxuan Kang, Djordje Jevdjic, Junbo Deng, Xingkun Yang,
+566
+        Zhou Yu, and Pengfei Zuo. Attentionstore: Cost-effective attention reuse across multi-turn con-
+567
+        versations in large language model serving. arXiv preprint arXiv:2403.19708, 2024.
+568
+569   In Gim, Guojun Chen, Seung-seob Lee, Nikhil Sarda, Anurag Khandelwal, and Lin Zhong. Prompt
+570      cache: Modular attention reuse for low-latency inference. Proceedings of Machine Learning and
+571      Systems, 6:325–338, 2024.
+572
+      Coleman Hooper, Sehoon Kim, Hiva Mohammadzadeh, Michael W Mahoney, Yakun Sophia Shao,
+573     Kurt Keutzer, and Amir Gholami. Kvquant: Towards 10 million context length llm inference with
+574     kv cache quantization. arXiv preprint arXiv:2401.18079, 2024.
+575
+576   Paras Jain, Sam Kumar, Sarah Wooders, Shishir G Patil, Joseph E Gonzalez, and Ion Stoica. Sky-
+577     plane: Optimizing transfer cost and throughput using {Cloud-Aware} overlays. In 20th USENIX
+578
+        Symposium on Networked Systems Design and Implementation (NSDI 23), pp. 1375–1389, 2023.
+579   Huiqiang Jiang, Qianhui Wu, Chin-Yew Lin, Yuqing Yang, and Lili Qiu. Llmlingua: Compressing
+580     prompts for accelerated inference of large language models. arXiv preprint arXiv:2310.05736,
+581     2023.
+582
+583
+      Ziyan Jiang, Xueguang Ma, and Wenhu Chen. Longrag: Enhancing retrieval-augmented generation
+        with long-context llms. arXiv preprint arXiv:2406.15319, 2024.
+584
+585   Chao Jin, Zili Zhang, Xuanlin Jiang, Fangyue Liu, Xin Liu, Xuanzhe Liu, and Xin Jin.
+586     Ragcache: Efficient knowledge caching for retrieval-augmented generation. arXiv preprint
+587     arXiv:2404.12457, 2024a.
+588
+      Shuowei Jin, Yongji Wu, Haizhong Zheng, Qingzhao Zhang, Matthew Lentz, Z Morley Mao, Atul
+589
+        Prakash, Feng Qian, and Danyang Zhuo. Adaptive skeleton graph decoding. arXiv preprint
+590
+        arXiv:2402.12280, 2024b.
+591
+592   Jordan Juravsky, Bradley Brown, Ryan Ehrlich, Daniel Y Fu, Christopher Ré, and Azalia
+593     Mirhoseini. Hydragen: High-throughput llm inference with shared prefixes. arXiv preprint
+        arXiv:2402.05099, 2024.
+
+
+                                                     11
+      Under review as a conference paper at ICLR 2025
+
+
+594
+      Hao Kang, Qingru Zhang, Souvik Kundu, Geonhwa Jeong, Zaoxing Liu, Tushar Krishna, and Tuo
+595     Zhao. Gear: An efficient kv cache compression recipefor near-lossless generative inference of
+596     llm. arXiv preprint arXiv:2403.05527, 2024.
+597
+598   Woosuk Kwon, Zhuohan Li, Siyuan Zhuang, Ying Sheng, Lianmin Zheng, Cody Hao Yu, Joseph
+599    Gonzalez, Hao Zhang, and Ion Stoica. Efficient memory management for large language model
+600    serving with pagedattention. In Proceedings of the 29th Symposium on Operating Systems Prin-
+601
+       ciples, pp. 611–626, 2023.
+602   Lambda. Lambda lab gpu cloud specifications, 2024. URL https://lambdalabs.com/ser
+603     vice/gpu-cloud.
+604
+605   Yaniv Leviathan, Matan Kalman, and Yossi Matias. Fast inference from transformers via speculative
+606     decoding. In International Conference on Machine Learning, pp. 19274–19286. PMLR, 2023.
+607
+      Dacheng Li, Rulin Shao, Anze Xie, Ying Sheng, Lianmin Zheng, Joseph Gonzalez, Ion Stoica,
+608
+        Xuezhe Ma, and Hao Zhang. How long can context length of open-source llms truly promise? In
+609     NeurIPS 2023 Workshop on Instruction Tuning and Instruction Following, 2023a.
+610
+611   Guohao Li, Hasan Hammoud, Hani Itani, Dmitrii Khizbullin, and Bernard Ghanem. Camel: Com-
+612     municative agents for” mind” exploration of large language model society. Advances in Neural
+613     Information Processing Systems, 36:51991–52008, 2023b.
+614
+      Yuhan Liu, Hanchen Li, Kuntai Du, Jiayi Yao, Yihua Cheng, Yuyang Huang, Shan Lu, Michael
+615
+        Maire, Henry Hoffmann, Ari Holtzman, et al. Cachegen: Fast context loading for language
+616     model applications. arXiv preprint arXiv:2310.07240, 2023.
+617
+618   LMCache. Lmcache, 2024. URL https://github.com/LMCache/LMCache.
+619
+620
+      Xupeng Miao, Gabriele Oliaro, Zhihao Zhang, Xinhao Cheng, Zeyu Wang, Zhengxin Zhang, Rae
+        Ying Yee Wong, Alan Zhu, Lijie Yang, Xiaoxiang Shi, et al. Specinfer: Accelerating large lan-
+621
+        guage model serving with tree-based speculative inference and verification. In Proceedings of the
+622
+        29th ACM International Conference on Architectural Support for Programming Languages and
+623     Operating Systems, Volume 3, pp. 932–949, 2024.
+624
+625   Xuefei Ning, Zinan Lin, Zixuan Zhou, Zifu Wang, Huazhong Yang, and Yu Wang. Skeleton-of-
+626     thought: Large language models can do parallel decoding. Proceedings ENLSP-III, 2023.
+627
+      openAI. Gpt-4o, 2024. URL https://platform.openai.com/docs/models/gpt-4o.
+628
+629   Ashish Vaswani, Noam Shazeer, Niki Parmar, Jakob Uszkoreit, Llion Jones, Aidan N Gomez,
+630     Ł ukasz Kaiser, and Illia Polosukhin. Attention is all you need. In I. Guyon, U. Von Luxburg,
+631     S. Bengio, H. Wallach, R. Fergus, S. Vishwanathan, and R. Garnett (eds.), Advances in Neu-
+632     ral Information Processing Systems, volume 30. Curran Associates, Inc., 2017. URL https:
+633     //proceedings.neurips.cc/paper_files/paper/2017/file/3f5ee243547
+634     dee91fbd053c1c4a845aa-Paper.pdf.
+635
+      Minzheng Wang, Longze Chen, Cheng Fu, Shengyi Liao, Xinghua Zhang, Bingli Wu, Haiyang Yu,
+636
+       Nan Xu, Lei Zhang, Run Luo, et al. Leave no document behind: Benchmarking long-context llms
+637    with extended multi-doc qa. arXiv preprint arXiv:2406.17419, 2024.
+638
+639   Qingyun Wu, Gagan Bansal, Jieyu Zhang, Yiran Wu, Shaokun Zhang, Erkang Zhu, Beibin Li,
+640     Li Jiang, Xiaoyun Zhang, and Chi Wang. Autogen: Enabling next-gen llm applications via multi-
+641     agent conversation framework. arXiv preprint arXiv:2308.08155, 2023.
+642
+      Jiawei Yang, Zhiqiang Huang, Chen Li, and Yifan Wang. Accelerating inference for transformers
+643
+         using mixed precision and efficient caching. arXiv preprint arXiv:2407.18003, 2024. URL http
+644      s://arxiv.org/abs/2407.18003.
+645
+646   Jiayi Yao, Hanchen Li, Yuhan Liu, Siddhant Ray, Yihua Cheng, Qizheng Zhang, Kuntai Du, Shan
+647      Lu, and Junchen Jiang. Cacheblend: Fast large language model serving with cached knowledge
+         fusion. arXiv preprint arXiv:2405.16444, 2024.
+
+
+                                                      12
+      Under review as a conference paper at ICLR 2025
+
+
+648
+      Yilong Zhang, Kun Sun, and Nicolas Papernot. Best of both worlds: Accelerator-aware caching for
+649     building efficient transformers. arXiv preprint arXiv:2303.06865, 2023. URL https://arxi
+650     v.org/abs/2303.06865.
+651
+652   Yusen Zhang, Ruoxi Sun, Yanfei Chen, Tomas Pfister, Rui Zhang, and Sercan Ö Arik. Chain
+653     of agents: Large language models collaborating on long-context tasks. arXiv preprint
+654
+        arXiv:2406.02818, 2024.
+655   Lianmin Zheng, Liangsheng Yin, Zhiqiang Xie, Jeff Huang, Chuyue Sun, Cody Hao Yu, Shiyi Cao,
+656     Christos Kozyrakis, Ion Stoica, Joseph E Gonzalez, et al. Efficiently programming large language
+657     models using sglang. arXiv preprint arXiv:2312.07104, 2023.
+658
+659
+660
+661
+662
+663
+664
+665
+666
+667
+668
+669
+670
+671
+672
+673
+674
+675
+676
+677
+678
+679
+680
+681
+682
+683
+684
+685
+686
+687
+688
+689
+690
+691
+692
+693
+694
+695
+696
+697
+698
+699
+700
+701
+
+
+
+                                                     13
+      Under review as a conference paper at ICLR 2025
+
+
+702
+      A     D ETAILS OF Cake A LGORITHM
+703
+704   The workflow of Cake can be described in detail as follows:
+705
+706
+      1. Upon receiving a request, Cake first splits the input sequence into chunks of a predetermined size
+      (e.g., 512 tokens as suggested by vLLM).
+707
+708   2. Two pointers are initialized: compute ptr starting at the beginning of the sequence (index 0),
+709   and io ptr at the end of the sequence (index total tokens − 1).
+710   3. Two parallel processes are initiated: a) A GPU computation thread that starts from compute ptr
+711   and moves forward. b) An I/O streaming thread that starts from io ptr and moves backward.
+712
+713
+      4. The GPU computation thread: - Computes KV cache for chunks starting from compute ptr. -
+      After each chunk computation, it updates compute ptr by adding the chunk size. - Continues until
+714
+      compute ptr reaches or surpasses io ptr, or until the required KV cache is found in CPU memory.
+715
+716   5. The I/O streaming thread: - Fetches pre-computed KV cache for chunks ending at io ptr from
+717   storage (local or remote) to CPU memory. - After each chunk fetch, it updates io ptr by subtracting
+718   the chunk size. - Continues until io ptr reaches or goes below compute ptr.
+719   6. The process concludes when the two pointers meet or cross each other, indicating that KV cache
+720   for the entire sequence has been either computed or loaded.
+721
+      7. Finally, Cake returns the complete KV cache for the entire sequence, ready for use in the subse-
+722
+      quent inference steps.
+723
+724   This bidirectional approach allows Cake to efficiently utilize both computational and I/O resources
+725   simultaneously, minimizing idle time and optimizing the overall latency of KV cache preparation
+726
+      for long-context LLM inference.
+727
+728
+      Algorithm 1 Cake Bidirectional KV cache Loading Algorithm
+729    1: procedure C OMPUTE KV
+730
+       2:     while compute ptr < io ptr do
+       3:          if I S I N CPUM EMORY(compute ptr, CHU N K SIZE) then
+731    4:                Signal I/O worker to stop
+732    5:                break
+733    6:          Compute KV cache for chunk starting at compute ptr using GPU
+734    7:          compute ptr ← compute ptr + CHU N K SIZE
+735    8: procedure F ETCH KV
+736
+       9:     while compute ptr < io ptr do
+      10:          Fetch KV cache for chunk ending at io ptr from storage to CPU Memory
+737   11:          io ptr ← io ptr − CHU N K SIZE
+738   12: Initialize CPU Memory, compute ptr = 0, io ptr = total tokens − 1
+739   13: Start C OMPUTE KV in a new thread
+740   14: Start F ETCH KV in a new thread
+741   15: Wait for both threads to complete
+742
+      16: return KV cache for the entire sequence
+743
+744
+      B     I MPLEMENTATION
+745
+746   We implement Cake by extending LMCache (LMCache, 2024) and integrating it with vLLM (Kwon
+747   et al., 2023), adding approximately 1,000 lines of code.
+748
+749   B.1   E NHANCEMENTS TO LMC ACHE
+750
+751   LMCache, originally developed as the KV cache management backend for CacheGen (Liu et al.,
+752   2023), hashes token chunks into keys for efficient KV cache retrieval. To enable Cake to continu-
+753   ously receive KV cache in the background, we introduce the following enhancements:
+754
+755   Asynchronous Retrieval We implement an asynchronous get operation to complement LM-
+      Cache’s existing asynchronous put functionality. This involves creating a dedicated worker thread
+
+
+                                                        14
+      Under review as a conference paper at ICLR 2025
+
+
+756
+      that continuously reads chunk keys from a task queue and retrieves the corresponding KV cache
+757   to memory. Upon successful retrieval, the chunk’s key is added to a resident dictionary for quick
+758   access.
+759
+760   Buffer Preallocation We modify LMCache to preallocate chunk buffers as soon as a chunk key is
+761   pushed to the queue. This optimization allows the worker to immediately write received KV cache
+762   into memory and proceed to the next chunk without delay.
+763
+764   B.2   I NTEGRATION WITH LLM S ERVING S YSTEMS
+765
+766   Cake operates concurrently with LLM serving systems like vLLM. The integration process works
+767   as follows:
+768   1. Upon receiving a request, Cake divides it into chunks based on the scheduled token budget.
+769
+770
+      2. Hashed keys for these chunks are pushed to the task queue in reverse order using the push seq
+      API.
+771
+772   3. While the asynchronous get worker fetches KV cache from the end of the sequence, vLLM begins
+773   chunk prefill from the start.
+774   4. After each vLLM engine step, Cake checks if the next chunk of tokens is already in the resident
+775   dictionary using the is resident API.
+776
+777
+      5. If the chunk is resident, Cake interrupts the chunk prefill process and directs vLLM to begin token
+      generation.
+778
+779   6. If the chunk is not resident, chunk prefill continues until it encounters a chunk present in the
+780   dictionary.
+781   This bidirectional approach allows Cake to efficiently utilize both I/O and computational resources,
+782   potentially reducing the Time To First Token (TTFT) for long-context LLM inference tasks.
+783
+784   C     P ERFORMANCE OF Cake UNDER DIFFERENT CONDITIONS
+785
+786   We compare the performance of Cake with compute-only and I/O-only methods. We also incor-
+787   porate 8bits-quantization and CacheGen into Cake, which further boost our performance. Selected
+788   diagrams includes 9k and 14k context lengths with 10-50-90% of GPU resources. Bandwidth we
+789   test ranges from 2000-10000 mbps. Across all the conditions, Cake with CacheGen produce the best
+790   performance with the lowest TTFT.
+791
+792
+793
+794
+795
+796
+797
+798
+799
+800
+801
+802
+803
+804
+805
+806
+807
+808
+809
+
+
+
+                                                       15
+      Under review as a conference paper at ICLR 2025
+
+
+810
+811
+812
+813
+814
+815
+816
+817
+818
+819
+820
+821
+822
+823
+824
+825
+826
+827
+828
+829
+830
+831
+832
+833
+834
+835
+836
+837
+838
+839
+840
+841
+842
+843
+844
+845
+846
+847
+848
+849
+850
+851
+852
+             Figure 8: Comparing Cake with recompute only and different I/O fetching methods.
+853
+854
+855
+856
+857
+858
+859
+860
+861
+862
+863
+
+
+
+                                                   16

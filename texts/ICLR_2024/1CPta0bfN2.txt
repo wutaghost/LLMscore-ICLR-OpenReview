@@ -1,0 +1,2004 @@
+Published as a conference paper at ICLR 2024
+
+
+A DAPTIVE R ETRIEVAL AND S CALABLE I NDEXING FOR
+k-NN S EARCH WITH C ROSS -E NCODERS
+                     ∗
+ Nishant Yadav1 , Nicholas Monath2 , Manzil Zaheer2 , Rob Fergus2 , Andrew McCallum1
+                  1
+                    University of Massachusetts Amherst, 2 Google DeepMind
+
+
+
+                                              A BSTRACT
+
+            Cross-encoder (CE) models which compute similarity by jointly encoding a
+            query-item pair perform better than using dot-product with embedding-based
+            models (dual-encoders) at estimating query-item relevance. Existing approaches
+            perform k-NN search with cross-encoders by approximating the CE similarity
+            with a vector embedding space fit either with dual-encoders (DE) or CUR matrix
+            factorization. DE-based retrieve-and-rerank approaches suffer from poor recall as
+            DE generalizes poorly to new domains and the test-time retrieval with DE is de-
+            coupled from the CE. While CUR-based approaches can be more accurate than the
+            DE-based retrieve-and-rerank approach, such approaches require a prohibitively
+            large number of CE calls to compute item embeddings, thus making it imprac-
+            tical for deployment at scale. In this paper, we address these shortcomings with
+            our proposed sparse-matrix factorization based method that efficiently computes
+            latent query and item representations to approximate CE scores and performs k-
+            NN search with the approximate CE similarity. In an offline indexing stage, we
+            compute item embeddings by factorizing a sparse matrix containing query-item
+            CE scores for a set of train queries. Our method produces a high-quality ap-
+            proximation while requiring only a fraction of CE similarity calls as compared to
+            CUR-based methods, and allows for leveraging DE models to initialize the em-
+            bedding space while avoiding compute- and resource-intensive finetuning of DE
+            via distillation. At test time, we keep item embeddings fixed and perform retrieval
+            over multiple rounds, alternating between a) estimating the test query embedding
+            by minimizing error in approximating CE scores of items retrieved thus far, and
+            b) using the updated test query embedding for retrieving more items in the next
+            round. Our proposed k-NN search method can achieve up to 5% and 54% im-
+            provement in k-NN recall for k = 1 and 100 respectively over the widely-used
+            DE-based retrieve-and-rerank approach. Furthermore, our proposed approach to
+            index the items by aligning item embeddings with the CE achieves up to 100×
+            and 5× speedup over CUR-based and dual-encoder distillation based approaches
+            respectively while matching or improving k-NN search recall over baselines.
+
+
+1       I NTRODUCTION
+Efficient and accurate nearest neighbor search is paramount for retrieval (Menon et al., 2022; Rosa
+et al., 2022; Qu et al., 2021), classification in large output spaces (e.g., entity linking (Ayoola et al.,
+2022; Logeswaran et al., 2019; Wu et al., 2020)), non-parametric models (Das et al., 2022; Wang
+et al., 2022), and many other such applications in machine learning (Goyal et al., 2022; Izacard
+et al., 2023; Bahri et al., 2020). The accuracy and efficiency of nearest neighbor search depends
+on a combination of factors (1) the computational cost of pairwise distance comparisons between
+datapoints, (2) preprocessing time for constructing a nearest neighbor index (e.g., dimensionality
+reduction (Indyk, 2000), quantization (Ge et al., 2013; Guo et al., 2020), data structure construc-
+tion (Beygelzimer et al., 2006; Malkov & Yashunin, 2018; Zaheer et al., 2019)), and (3) the time
+taken to query the index to retrieve the nearest neighbor(s).
+Similarity functions such as cross-encoders which take a pair of data points as inputs and directly
+output a scalar score, have achieved state-of-the-art results on numerous tasks (e.g., QA (Qu et al.,
+    ∗
+        Now at Google DeepMind
+
+
+                                                    1
+Published as a conference paper at ICLR 2024
+
+
+2021; Thakur et al., 2021b), entity linking (Logeswaran et al., 2019)). However, these models are
+exceptionally computationally expensive since these are typically parameterized by several layers of
+neural models such as transformers (Vaswani et al., 2017), and scoring each item for a given query
+requires a forward pass of the large parametric model, making them impractical similarity functions
+to use directly in nearest neighbor indices (Yadav et al., 2022). Initial work has approximated search
+with cross-encoders (CE) for a given test query using a heuristic retrieve-and-rerank approach that
+uses a separate model to retrieve a subset of items followed by re-ranking using the CE. Prior work
+performs the initial retrieval using dot-product of sparse query/item embedding from models such
+as BM25, or dense query/item embeddings from models such as dual-encoders (DE) which are typ-
+ically trained on the same task and data as the CE. To support search with CE, recent work (Yadav
+et al., 2022; 2023) improves upon heuristic retrieve-and-rerank approaches, by directly learning an
+embedding space that approximates the CE score function. These approaches use CUR decompo-
+sition (Mahoney & Drineas, 2009) to compute (relatively) low-dimensional embeddings for queries
+and items. The item embeddings are computed by scoring each item against a set of anchor/train
+queries. At test-time, the test query embedding is computed by using CE scores of the test query
+against a set of (adaptively-chosen) anchor items.
+Both DE-based retrieve-and-rerank and CUR-based methods are not well suited for a typical appli-
+cation setting in k-NN search – building an index on a new set of targets with a given (trained) sim-
+ilarity function. The DE-based approach has several disadvantages in this setting. DE models show
+poor generalization to new domains and thus require additional fine-tuning on the target domain to
+improve performance Yadav et al. (2022); Thakur et al. (2021a). This can be both resource-intensive
+as well time-consuming. Furthermore, it requires access to the parameters (not just embedding out-
+puts) of the DE, which might not be possible if the DE is provided by an API service. On the other
+hand, while CUR-based approaches outperform retrieve-and-rerank approaches without additional
+fine-tuning of DE, they require computing a dense score matrix by scoring each item against a set of
+anchor/train queries. This does not scale well with the number of items. For instance, for a domain
+with 500 anchor/train queries and 10K items, it takes around 10 hours1 to compute the dense query-
+item score matrix with a CE parameterized using bert-base (Yadav et al., 2022). By simple
+extrapolation, indexing 5 million items using 500 queries would take around 5000 GPU hours.
+In this paper, we propose a sparse-matrix factorization-based approach to improve the efficiency
+of fitting an embedding space to approximate the cross-encoder for k-NN search. Our proposed
+approach significantly reduces the offline indexing cost as compared to existing approaches by con-
+structing a sparse matrix containing cross-encoder scores between a set of training queries (Qtrain )
+and all the items (I), and using efficient matrix factorization methods to produce a set of item
+embeddings that are aligned with the cross-encoder. At test-time, our proposed approach, A XN,
+computes a test query embedding to approximate cross-encoder scores between the test query and
+items, and performs retrieval using approximate cross-encoder scores. A XN performs retrieval over
+multiple rounds while keeping the item embedding fixed and incrementally refining the test query
+embedding using cross-encoder scores of the items retrieved in previous rounds. In the first round,
+the cross-encoder is used to score the test query against a small number of items chosen uniformly
+at random or baseline retrieval methods such as dual-encoder or BM25. In each subsequent round,
+A XN alternates between (a) updating the test query embedding to improve the approximation of the
+cross-encoder score of items retrieved so far, and (b) retrieving additional items using the improved
+approximation of the cross-encoder, and computing the exact cross-encoder scores for the retrieved
+items. Finally, the retrieved items are ranked based on exact cross-encoder scores and the top-k
+items returned as the k-nearest neighbors for the given test query.
+We perform an empirical evaluation of our method using cross-encoder models trained for the task
+of entity linking and information retrieval on Z E S H EL (Logeswaran et al., 2019) and B E IR (Thakur
+et al., 2021b) benchmark respectively. Our proposed k-NN search method can be used together with
+dense item embeddings produced by any method such as baseline dual-encoder models and still
+yield up to 5% and 54% improvement in k-NN recall for k =1 and 100 respectively over retrieve-
+and-rerank style inference with the same dual-encoder. Furthermore, our proposed approach to
+align item embeddings with the cross-encoder achieves up to 100× and 5× speedup over CUR-
+based approaches and training dual-encoders via distillation-based respectively while matching or
+improving test-time k-NN search recall over baseline approaches.
+
+   1
+       On an Nvidia 2080ti GPU with 12 GB memory using batch size=50
+
+
+                                                   2
+Published as a conference paper at ICLR 2024
+
+
+2     P ROPOSED A PPROACH
+Task Description A cross-encoder model f : Q × I → R maps a query-item pair (q, i) ∈ Q × I
+to a scalar similarity. We consider the task of similarity search with the cross-encoder, in particular
+finding the k-nearest neighbors items for a given query q from a fixed set of items I:
+                                          N(q) , arg topk f (q, i)                                      (1)
+                                                             i∈I
+where arg topk returns the indices of the top k scoring items of the function. Exact k-NN search with
+a cross-encoder would require O(|I|) cross-encoder calls as an item needs to be jointly encoded with
+the test query in order to compute its score. Since cross-encoders are typically parameterized using
+deep neural models such as transformers (Vaswani et al., 2017), O(|I|) calls to the cross-encoder
+model can be prohibitively expensive at test time. Therefore, we tackle the task of approximate
+k-NN search with cross-encoder models. Let fˆ(·, ·) denote the approximation to the cross-encoder
+that is learned using exact cross-encoder scores for a sample of query-item pairs. We refer to the
+approximate k-nearest neighbors as N̂(q) , arg topk i∈I fˆ(q, i) and measure the quality of the
+approximation using nearest neighbor recall: |N̂(q)∩N(q)|
+                                                 |N(q)|
+
+In this work, we assume black-box access to the cross-encoder2 , access to the set of items and train
+queries from the target domain, and a base dual-encoder (DE SRC ) trained on the same task and source
+data as the cross-encoder. In §2.1, we first present our proposed sparse-matrix factorization based
+method to compute item embeddings in an offline step. In §2.2, we present an online approach to
+compute a test query embedding to approximate the cross-encoder scores and perform k-NN search
+using the approximate cross-encoder scores.
+
+2.1   P ROPOSED O FFLINE I NDEXING OF I TEMS
+
+In this section, we describe our proposed approach to efficiently align the item embeddings with
+the cross-encoder where efficiency is measured in terms of the number of training samples (query-
+item pairs) required to be gathered and scored using the cross-encoder and wall-clock time to fit an
+approximation of the cross-encoder model. We consider an approximation of the cross-encoder with
+an inner-product space where a query (q) and an item (i) are represented with d-dimensional vectors
+uq ∈ Rd and vi ∈ Rd respectively. k-NN search using this approximation corresponds to solving
+the following vector-based nearest neighbor search:
+
+                                          N̂(q) , arg topk uq vi| .                                     (2)
+                                                             i∈I
+
+This vector-based k-nearest neighbor search can potentially be made more efficient using data struc-
+tures such as cover trees (Beygelzimer et al., 2006), HNSW (Malkov & Yashunin, 2018), or any
+of the many other highly effective vector nearest neighbor search indexes (Guo et al., 2020; John-
+son et al., 2019). The focus of our work is not on a new way to make the vector nearest neighbor
+search more efficient, but rather to develop efficient and accurate methods of fitting the embedded
+representations of uq and vi| to approximate the cross-encoder scores.
+Let G ∈ R|Qtrain |×|I| denote the pairwise similarity matrix containing the exact cross-encoder over
+the pairs of training queries (Qtrain ) and items (I). We assume that G is partially observed or
+incomplete, that is only a very small subset of the query-item pairs (Ptrain ) are observed in G. Let
+U ∈ R|Qtrain |×d and V ∈ R|I|×d be matrices such that each row corresponds to the embedding of a
+query q ∈ Qtrain and an item i ∈ I respectively. We optimize the following widely-used objective
+for matrix completion to estimate U and V via stochastic gradient descent:
+                                          min                     k(G − U V | )Ptrain k2                (3)
+                                    |Qtrain |×d           |I|×d
+                               U ∈R               ,V ∈R
+
+where (·)Ptrain denotes projection on the set of observed entries in G. There are two important con-
+siderations: (1) how to select with values of G to observe (and incur the cost of running the cross-
+encoder model), and (2) how to compute/parameterize the matrices U and V .
+    2
+      Approximating a neural scoring function by compressing, approximating, quantizing the scoring function
+is widely studied but outside the scope of this paper.
+
+
+                                                             3
+Published as a conference paper at ICLR 2024
+
+
+Constructing Sparse Matrix G Given a set of items (I) and train queries (Qtrain ), we construct the
+sparse matrix G by selecting kd items Iq ⊂ I for each query q ∈ Qtrain either uniformly at random
+or using top-kd items from a baseline retrieval method such as the base dual-encoder (DE SRC ). This
+approach requires kd |Qtrain | calls to the cross-encoder. We also experiment with an approach that
+selects kd queries Qi ⊂ Qtrain for each item i ∈ I, and thus requires kd |I| calls to the cross-encoder.
+
+Parameterizing and Training U and V
+• Transductive (MF T RNS ): In this setting, U and V are trainable parameters and are learned by
+  optimizing the objective in Eq. 4. U and V can be optionally initialized using query and item
+  embeddings from the base dual-encoder (DE SRC ). Note that this parameterization requires scoring
+  each item against at least a small number of queries to update the embedding of an item from its
+  initialized value, thus requiring scoring of O(|I|) query-item pairs to construct the sparse matrix
+  G. Such an approach may not scale well with the number of items as the number of cross-encoder
+  calls to construct G and the number of trainable parameters are both linear in the number of items.
+  For instance, when |I| = 5 million, d = 1000, V would contain 5 billion trainable parameters.
+• Inductive (MF I ND ): In this setting, we train parametric models to produce query and item em-
+  beddings U and V from (raw) query and item features such as textual descriptions of queries and
+  items. Unlike transductive approaches, inductive matrix factorization approaches can produce em-
+  beddings for unseen queries and items, and thus can be used to produce embeddings for items not
+  scored against any train query in matrix G as well as embeddings for test queries qtest ∈/ Qtrain .
+  Prior work typically uses DE SRC (a DE trained on the same task and source domains as the CE)
+  and finetunes DE SRC on the target domain via distillation using the CE. However, training all
+  parameters of such parametric encoding models via distillation can be compute- and resource-
+  intensive as these models are built using several layers of neural models such as transformers.
+  Recall that our goal is to efficiently build an accurate approximation of the CE on a given target
+  domain. Thus, to improve the efficiency of fitting the approximation of the CE, we propose to
+  train a shallow MLP model (using data from the target domain) that takes query/item embeddings
+  from DE SRC as input and outputs updated embeddings while keeping DE SRC parameters frozen.
+
+2.2   P ROPOSED T EST-T IME k-NN S EARCH M ETHOD : A XN
+
+At test-time, we need to perform k-NN search for a test query qtest ∈     / Qtrain , and thus need to
+compute an embedding for the test query in order to approximate cross-encoder scores and perform
+retrieval with the approximate scores. Note that computing the test query embedding by factorizing
+the matrix G at test-time while including the test query qtest is computationally infeasible. Thus,
+an ideal solution would be to compute item representations in an offline indexing step, and compute
+the test query embedding on-the-fly while keeping item embeddings fixed. A potential solution is
+to use a parametric model such as DE SRC or MF I ND to compute test query embedding, perform
+retrieval using inner-product scores between test query and item embeddings, and finally, re-rank
+the retrieved items using the cross-encoder. While such a retrieve-and-rerank approach can work,
+the retrieval step on such an approach is decoupled from the re-ranking model, and thus may result
+in poor recall.
+In this work, we propose an adaptive approach A XN, which stands for ”Adaptive Cross-Encoder
+Nearest Neighbor Search”. As described in Algorithm 1, A XN performs retrieval over R rounds
+while incrementally refining the cross-encoder approximation for qtest by updating uqtest , the em-
+bedding for qtest . The test-time inference latency (and throughput) depends largely on the number
+of cross-encoder calls made at test time as each cross-encoder call requires a forward pass through
+a large neural model. Thus, we operate under a fixed computational budget which allows for up to
+BCE cross-encoder calls at test-time.
+Let Ar be the cumulative set of items chosen up to round r. In the first round (r = 1), we select
+BCE /R items either uniformly at random or using separate retrieval models such as dual-encoders
+or BM25 and compute the exact cross-encoder scores of these items for the given test query. We
+compute the test query embedding uqtest by solving the following system of linear equations
+                                           VAr uqtest = ar                                          (4)
+where VAr ∈ R   |Ar |×d
+                        contains embeddings for items in Ar , and ar contains cross-encoder scores
+for qtest paired with items in Ar . In round r > 1, we select additional BCE /R items from I \ Ar−1
+
+
+                                                   4
+Published as a conference paper at ICLR 2024
+
+
+Algorithm 1 A XN - Test-time k-NN Search Inference
+ 1: Input: q: Test query, V ∈ R|I|×d Item Embeddings, R: Number of iterative search rounds, ks : Number
+    of items to retrieve in each round, fθ : Cross-Encoder (CE) model
+ 2: Output: Ŝ: Approximate scores of q with all items, AR : Retrieved items with CE scores in aR .
+ 3: A1 ← I NIT(I, ks )                                                                 B Initial set of items
+ 4: a1 ← [fθ (q, i)]i∈A1                                                  B CE scores of q with items in A1
+ 5: uq ← Solve-Linear-Regression(V, A1 , a1 )                   B Compute query embedding by solving Eq.4
+ 6: for r ← 2 to R do
+ 7:    Ŝ (r) ← uq × V |                                                           B Update approx. scores
+                                                   (r)
+ 8:    Ar ← Ar−1 ∪ arg topki∈I\Ar−1 ,k=ks Ŝi                                      B Retrieve ks new items
+ 9:    ar ← ar−1 ⊕ [fθ (q, i)]i∈Ar \Ar−1                                 B Compute CE scores of new items
+10:    uq ← Solve-Linear-Regression(V, Ar , ar )                B Compute query embedding by solving Eq.4
+11: Ŝ ← uq × V |                                                                 B Compute approx. scores
+12: return Ŝ, AR , aR
+
+using inner-product of test query embedding uqtest and item embeddings vi (line 8 in Alg. 1).
+                               Ar = Ar−1 ∪          arg topk        uqtest vi|                           (5)
+                                               i∈I\Ar−1 ,k=BCE /R
+
+After computing Ar , we compute CE scores for new items chosen in round r, and we update the test
+query embedding uqtest by solving Eq. 4 with the latest set of items Ar which includes additional
+items selected in round r. Note that solving for uqtest in Eq 4 is akin to solving a linear regression
+problem with embeddings of items in Ar as features and cross-encoder scores of the items as re-
+gression targets. We solve Eq. 4 analytically to get uqtest = (VA|r VAr )† VA|r ar where M † denotes
+pseudo-inverse of a matrix M .
+At the end of R rounds, we obtain AR containing BCE items, all of which have been scored using
+the cross-encoder model. We return top-k items from this set sorted based on exact cross-encoder
+scores as the set of approximate k-NN for given test query qtest
+
+                                    N̂(qtest ) = arg topk f (qtest , i)                                  (6)
+                                                    i∈AR
+
+
+Regularizing Test Query Embedding The system of equation in Eq 4 in round r contains |Ar |
+equations with d variables and is an under-determined system when |Ar | < d. In such a case,
+there exist infinitely many solutions to Eq 4 and the test query embedding uqtest can achieve zero
+approximation error on items in Ar , and may show poor generalization when estimating cross-
+encoder scores for items in I \ Ar . Since the approximate scores are used to select the additional set
+of items in round r + 1 (line 8 in Alg. 1), such poor approximation affects the additional set of items
+chosen, and subsequently, it may affect the overall retrieval quality in certain settings. To avoid such
+overfitting, we compute the final test query embedding as:
+                                  uqtest = (1 − λ)u(LinReg)
+                                                   qtest    + λu(param)
+                                                                qtest                                    (7)
+
+where u(LinReg)
+         qtest  is the analytical solution to the linear system in Eq. 4 and u(param)
+                                                                              qtest is the test query
+embedding obtained from a parametric model such as a dual-encoder or an inductive matrix factor-
+ization model. We tune the weight parameter λ ∈ [0, 1] on the dev set.
+
+3    E XPERIMENTS
+In our experiments, we evaluate proposed approaches and baselines on the task of finding k-nearest
+neighbors for cross-encoder (CE) models as well as on downstream tasks. We use cross-encoders
+trained for the downstream task of zero-shot entity linking and zero-shot information retrieval and
+present extensive analysis of the effect of various design choices on the offline indexing latency and
+the test-time retrieval recall.
+
+Experimental Setup We run experiments on two datasets/benchmarks – Z E S H EL (Logeswaran
+et al., 2019), a zero-shot entity linking benchmark, and B E IR benchmark (Thakur et al., 2021b), a
+collection of information retrieval datasets for evaluating zero-shot performance of IR models. We
+
+
+                                                     5
+Published as a conference paper at ICLR 2024
+
+
+use separate CE models for Z E S H EL and B E IR datasets, trained using ground-truth labeled data
+from the corresponding dataset. For evaluation, we use two test domains from Z E S H EL dataset
+–YuGiOh and Star Trek with 10K and 34K items (entities) respectively, and we use SciDocs and
+Hotpot-QA datasets from B E IR with 25K and 5M items (documents) respectively. These domains
+were not part of the data used to train the corresponding cross-encoder models. Following the
+precedent set by previous work (Yadav et al., 2022; 2023), we create a train/test split uniformly at
+random for each Z E S H EL domain. For datasets from B E IR, we use pseudo-queries released as part
+of the benchmark as train queries and test on queries in the official test split in B E IR benchmark.
+We use queries in the train split to train proposed matrix factorization models or baseline DE models
+via distillation, and we evaluate on the corresponding domain’s test split. We refer interested readers
+to Appendix A for more details about datasets, cross-encoder training, and model architecture.
+
+Baselines We compare with the following retrieve-and-rerank baselines, denoted by R N RX , where
+top-scoring items wrt baseline scoring method X are retrieved and then re-ranked using the CE.
+• TF - IDF: It computes the similarity score for a query-item pair using the dot-product of sparse
+  query/item vectors containing TF-IDF weights.
+• Dual-Encoders (DE): It computes query-item scores using the dot-product of dense embeddings
+  produced by encoding queries and items separately. We experiment with two DE models.
+  – DE SRC : DE trained on the same source data and downstream task as the cross-encoder model.
+    This model is not trained or finetuned on the target domains used for evaluation in this work.
+  – DE DSTL : This corresponds to DE SRC further finetuned via distillation using the cross-encoder
+    model on the target domain i.e. the domain used for evaluation.
+We also compare with ADACUR (Yadav et al., 2023), a CUR-based approach that computes a
+dense matrix with CE scores between training queries and all items to index the items, and performs
+adaptive retrieval at test time. We use ADACURX to denote inference with ADACUR method
+when items in the first round are chosen using method X ∈ {DE SRC , TF - IDF}. We refer readers to
+Appendix A for implementation details for all baselines and proposed approaches.
+
+Proposed Approach We construct the sparse matrix G on the target domain by selecting top-
+scoring items wrt DE SRC for each query in Qtrain followed by computing the CE scores for observed
+query-item pairs in G. We use DE SRC to initialize embeddings for train queries and all items, fol-
+lowed by inductive (MF I ND ) or transductive (MF T RNS ) matrix factorization while minimizing the
+objective function in 3. We use the same sparse matrix G when training DE via distillation (DE DSTL )
+on the target domain. We use A XNX,Y to denote the proposed k-NN search method (§2.2) when
+using method X to compute item embeddings and method Y to retrieve items in the first round.
+
+Evaluation Metrics Following the precedent set by previous work (Yadav et al., 2022; 2023),
+we use Top-k-Recall@m for test queries as the evaluation metric which measures the fraction of
+k-nearest neighbors as per the CE which are present in the set of m retrieved items. For each
+method, we retrieve m items and re-rank them using exact CE scores. We also evaluate the quality
+of the retrieved k-NN items wrt the CE on the downstream task. We use entity linking accuracy for
+Z E S H EL, and we use downstream task specific nDCG@10 and recall for B E IR domains.
+For each approach, we calculate the time taken for indexing a given set of items from the target
+domain which involves some or all of the following steps: a) computing query/item embeddings
+using DE SRC , b) computing (dense or sparse) query-item score matrix G for Qtrain , c) gradient-based
+training using G to estimate item embeddings for MF T RNS or parameters of models such as DE DSTL
+and MF I ND , and d) for DE DSTL and MF I ND , computing updated item embeddings after training.
+
+
+3.1   R ESULTS
+
+Figure 1 shows Top-1-Recall@Inference-Cost=100 and Top-100-Recall@Inference-Cost=500 ver-
+sus the total wall-clock time taken to index the items for various approaches on YuGiOh and Hotpot-
+QA. ADACUR can control the indexing time by varying |Qtrain |, the number of train queries, while
+MF and distillation-based methods can control the indexing time by varying |Qtrain | and the number
+of items scored per train query (kd ). For YuGiOh, we use |Qtrain | ≤ 500 for all methods, and for
+Hotpot-QA, we use |Qtrain | ≤ 1K for ADACUR and |Qtrain | ≤ 50K with other methods.
+
+
+                                                  6
+Published as a conference paper at ICLR 2024
+
+
+                                                              Baselines                                                                                                                      Proposed
+                        RnRDESRC                             RnRtf-idf                     adaCURtf-idf                          AxnDESRC , DESRC                                      AxnDEDSTL , DEDSTL                      AxnMF, DESRC            RnRMF
+                        RnRDEDSTL                            adaCURDESRC                                                         AxnDESRC , tf-idf                                     AxnDEDSTL , tf-idf                      AxnMF, tf-idf
+
+                                     k=1@m=100                                        k=100@m=500                                                                                 k=1@m=100                                             k=100@m=500
+                        1.0                                                 80                                                                                                                                            50
+                   90
+
+
+                                                                                                                                               Top-k-Recall@m
+  Top-k-Recall@m
+
+
+                                                                                                                                                                90
+                   80
+                        0.8                                                                                                                                                                                               45
+                                                                            60
+                                                                                                                                                                80                                                        40
+                   70 0.6
+                                                                                                                                                                                                                          35
+                   60 0.4                                                   40
+                                                                                                                                                                70                                                        30
+                   50 0.2
+                                         −1                  0          1                   −1          0                    1                                                     1                 2               3
+                                    10                  10         10                  10          10                   10                                                    10                10              10                      101      102      103
+                        0.0
+                              0.0                 0.2    Total Indexing
+                                                                  0.4   Time (in
+                                                                              0.6 hours)               0.8                       1.0                                                                 Total Indexing Time (in hours)
+
+                                    (a) Domain = YuGiOh, 10K items                                                                                                   (b) Domain = Hotpot-QA, 5 million items
+Figure 1: Top-1-Recall and Top-100-Recall at inference cost budget (m) of 100 and 500 CE calls
+respectively versus indexing time for various approaches. Matrix factorization approaches (MF)
+can be significantly faster than ADACUR and training DE via distillation (DE DSTL ). The proposed
+adaptive k-NN search method (A XN) provides consistent improvement over corresponding retrieve-
+and-rerank style inference (R N R).
+Proposed Inference (A XN) vs Retrieve-and-Rerank (R N R) A XN consistently provides im-
+provement over the corresponding retrieve-and-rerank (R N R) baseline. For instance, A XN DESRC ,DESRC
+provides an improvement of 5.2% for k=1 and 54% for k=100 over R N R DESRC for domain=YuGiOh.
+Note that this performance improvement comes at no additional offline indexing cost and with neg-
+ligible test-time overhead3 . R N R TF - IDF performs poorly on YuGiOh while it serves as a strong base-
+line for Hotpot-QA, potentially due to differences in task, data, and CE model. On Hotpot-QA,
+Top-k-Recall for A XN can be further improved by8 sampling items in the first round using TF - IDF
+(A XNZ,TF - IDF ) instead of DE SRC (A XNZ,DESRC ) for all indexing methods Z ∈ {DE SRC , DE DSTL , MF}.
+                                                                                                                                           6
+                                                                   SciDocs                                                                                                    Hotpot-QA                                                       Method
+               50K, 100                                                                      24                      50K, 1K                                                                                                       24
+                                                        0.67                                                                                                                                              9.0                                  DEDSTL
+                                                                                                        24           50K, 100              4                                                    24                                             MF
+Qtrain, kd
+
+
+                                                                                                        Qtrain, kd
+
+
+                   10K, 1K                                         1.1
+                                                                                                                                                  1.2
+                                                                                                                     10K, 1K                                                                         24
+                                                             9.0                                                                                                 3.0
+               10K, 100                   0.12                                                                                                                                                                                                Cost Breakdown
+                                                                                                                     10K, 100                                          9.0
+                                                                                                                                           0.33
+                    1K, 1K                                                       24                                                        2                                                                                                    CE Calls for G
+                                          0.12                                                                        1K, 1K                                                               24
+                                                                                                                                           0.33                                                                                                 Item Embedding
+                   1K, 100                  3.0                                                                       1K, 100                          3.0
+                                        0.03                                                                                               0.08                                                                                                 Training
+                                    0               10              20                30          40                               0       0             10                  20           30              40             50
+                                              Total Indexing Time (in hours)                                                                         Total
+                                                                                                                                                      0    Indexing
+                                                                                                                                                              2     Time
+                                                                                                                                                                      4  (in hours)
+                                                                                                                                                                              6                                                8
+Figure 2: Breakdown of indexing latency of MF and DE DSTL into various steps with training time
+shown on the right of each bar for different values of |Qtrain | and no. of items scored per query (kd ).
+Matrix Factorization vs DE DSTL Unsurprisingly, performance on the target domain can be further
+improved by using data from the target domain to fit an embedding space to approximate the CE. As
+shown in Figure 1, our proposed matrix factorization based approaches (MF) can be significantly
+more efficient than the distillation-based (DE DSTL ) approaches while matching or outperforming
+DE DSTL in terms of k-NN search recall in the majority of the cases. Figure 2 shows the breakdown
+of total indexing time of DE DSTL and MF for different numbers of training queries (|Qtrain |) and
+number of items scored per query (kd ) using the CE in the sparse matrix G. As expected, both the
+time taken to compute G and the training time increases with the number of queries and the number
+of items scored per query. The training time does not increase proportionally after 10K queries as
+we allocated a maximum training time of 24 hours for all methods. For MF, the majority of the
+time is spent either in computing sparse matrix G or the initial item embeddings. While we report
+total GPU hours taken for CE calls to compute G and initial item embeddings, these steps can be
+easily parallelized across multiple GPUs without any communication overhead. Since DE DSTL trains
+all parameters of a large parametric neural model, it requires large amounts of GPU memory and
+takes up to several hours 4 . In contrast, MF-approaches require significantly less memory5 and
+training time as these approaches train the item embeddings as free parameters (MF T RNS ) or train a
+                   3
+                     We refer readers to §B.1 for analysis of overhead incurred by A XN
+                   4
+                     We trained dual-encoders on an Nvidia RTX8000 GPU with 48 GB memory for a maximum of 24 hours.
+                   5
+                     We used an Nvidia 2080ti with 12 GB memory for MF-based methods.
+
+
+                                                                                                                                       7
+Published as a conference paper at ICLR 2024
+
+
+shallow neural network on top of fixed embeddings (MF I ND ) from an existing DE. We report results
+for MF T RNS on small-scale domains (e.g. YuGiOh with 10K items) and for MF I ND on large-scale
+domain Hotpot-QA (5 million items). We refer interested readers to Appendix B.3 for comparison
+of MF T RNS and MF I ND on small- and large-scale datasets.
+Proposed Approaches vs ADACUR Our proposed inference method (A XN) in combination with
+MF or DE can outperform or closely match the performance of ADACUR while requiring orders
+of magnitude less compute for the offline indexing stage, on both small- and large-scale datasets.
+For instance, ADACUR DE SRC requires 1000+ GPU hours for embedding 5 million items in Hotpot-
+QA, and achieves Top-1-Recall@100 = 75.9 and Top-100-Recall@500 = 44.8. In contrast, MF I ND
+with |Qtrain |=10K and 100 items per query takes less than three hours to fit item embeddings, and
+A XN MF IND ,DESRC achieves Top-1-Recall@100 = 80.5 and Top-100-Recall@500 = 42.6.
+
+                                                         Baselines                                                                                                                     Proposed Approaches
+                               RnRDESRC                 RnRtf-idf                                          adaCURtf-idf            AxnDESRC , DESRC                                   AxnDEDSTL , DEDSTL                              AxnMF, DESRC          RnRMF
+                               RnRDEDSTL                adaCURDESRC                                        Exact                   AxnDESRC , tf-idf                                  AxnDEDSTL , tf-idf                              AxnMF, tf-idf
+
+
+                                                                                                                                                                                                           Downstream Task nDCG@10
+                                                                                                                                             Downstream Task nDCG@10
+                                                                       Downstream Task Accuracy
+Downstream Task Accuracy
+
+
+                           50.50
+                               1.0                                                                63.0                                                                                                                               70
+                                                                                                                                                                       16.5
+                           50.25
+                               0.8
+                                                                                                  62.5                                                                                                                               65
+                                                                                                                                                                       16.0
+                           50.00
+                               0.6
+                                                                                                                                                                                                                                     60
+                           49.75                                                                  62.0                                                                 15.5
+                               0.4
+                                                                                                                                                                                                                                     55
+                           49.50                                                                                                                                       15.0
+                                                                                                  61.5
+                               0.2
+                           49.25                                                                                                                                                                                                     50
+                                           10−1   100      101                                            10−1   100         101                                                     100          102                                        101      102     103
+                              Total
+                               0.0  Indexing Time (in hours)                                        Total Indexing Time (in hours)                                       Total Indexing Time (in hours)                               Total Indexing Time (in hours)
+                                     0.0          0.2            0.4                                     0.6           0.8         1.0
+
+                                      (a) YuGiOh                                                         (b) Star Trek                                                        (c) SciDocs                                                 (d) Hotpot-QA
+Figure 3: Downstream task performance versus indexing time for proposed and baseline approaches
+on different domains. All methods use a fixed inference cost budget of 100 cross-encoder calls.
+Downstream Task Performance Figure 3 shows downstream task performance on proposed and
+baseline approaches including E XACT which performs exact brute-force search using CE at test-
+time. For Hotpot-QA, we observe that improvement in k-NN search accuracy results in improve-
+ment in downstream task performance with E XACT brute-force performing the best. We observe
+a different trend on SciDocs, YuGiOh, and Star Trek where E XACT search results in suboptimal
+performance as compared to R N R DESRC . For instance, R N R DE SRC achieves accuracy of 50.6 while
+the accuracy of E XACT is 49.8 on the downstream task of entity linking on YuGiOh. We believe
+that this difference in trends in k-NN search performance and downstream task performance could
+be due to differences in the training setup of the corresponding CE (i.e. the loss function and nega-
+tives used during training, see Appendix A.1 for details) as well as the nature of the task and data.
+While beyond the scope of this paper, it would be interesting to explore different loss functions and
+training strategies such as using negative items mined using k-NN search strategies proposed in this
+work to improve the robustness and generalization capabilities of cross-encoders and minimize such
+discrepancies in k-NN search and downstream task performance.
+We refer readers to Appendix B for an analysis of the overhead incurred by A XN (§B.1), a compari-
+son of A XN with pseudo-relevance feedback based approaches (§B.2), an analysis of design choices
+for our proposed approach (§B.3,B.4), and results on other downstream evaluation metrics for B E IR.
+
+4                              R ELATED W ORK
+
+Approximating Similarity Function Matrix factorization methods have been widely used for
+computing low-rank approximation of dense distance and kernel matrices (Musco & Woodruff,
+2017; Bakshi & Woodruff, 2018; Indyk et al., 2019), non-PSD matrices (Ray et al., 2022) as well as
+for estimating missing entries in sparse matrices (Koren et al., 2009; Luo et al., 2014; Yu et al., 2014;
+Mehta & Rana, 2017; Xue et al., 2017). In this work, we focus on methods for factorizing sparse
+matrices instead of dense matrices as computing each entry in the matrix (i.e. CE score for a query-
+item pair) requires a forward-pass through an expensive neural model. An essential assumption for
+matrix completion methods is that the underlying matrix M is low-rank, thus enabling recovery of
+the missing entries while only observing a small fraction of entries in M (Candes & Recht, 2012;
+
+
+                                                                                                                                         8
+Published as a conference paper at ICLR 2024
+
+
+Nguyen et al., 2019). Theoretically, such matrix completion methods require Ω(nr) samples to re-
+cover an m × n matrix of rank r with m ≤ n (Krishnamurthy & Singh, 2013; Xu et al., 2015).
+The sample complexity can be improved in the presence of features describing rows and columns
+of the matrix, often referred to as side information (Jain & Dhillon, 2013; Xu et al., 2013; Zhong
+et al., 2019). Inductive matrix completion (MF I ND ) approaches leverage such query and item fea-
+tures to improve the sample complexity and also enable generalization to unseen queries (rows) and
+items (columns). Training dual-encoder (DE) models via distillation using a cross-encoder (CE),
+where the DE consumes raw query and item features (such as query/item description) and produces
+query/item embeddings, can be seen as solving an inductive matrix factorization problem. A typ-
+ical training objective for training DE involves minimizing the discrepancy between CE (teacher
+model) and DE (student model) scores on observed entries in the sparse matrix (Hofstätter et al.,
+2020; Reddi et al., 2021; Thakur et al., 2021a). Recent work has explored different strategies for
+distillation-based training of DE such as curriculum learning based methods (Zeng et al., 2022),
+joint training of CE and DE to mutually improve the performance of both models (Liu et al., 2022;
+Ren et al., 2021). Inductive MF methods (MF I ND ) used in this work also share similar motivations to
+adapters (Houlsby et al., 2019) which introduce a small number of trainable parameters between lay-
+ers of the model, and may reduce training time and memory requirements in certain settings (Rücklé
+et al., 2021). MF I ND used in this work only trains a shallow MLP on top of query/item embeddings
+from DE while keeping DE parameters frozen, and does not introduce any parameters in the DE.
+Nearest Neighbor Search k-NN search has been widely studied in applications where the inputs
+are described as vectors in Rd (Clarkson et al., 2006; Li et al., 2019), and the similarity is com-
+puted using simple (dis-)similarity functions such as inner-product (Johnson et al., 2019; Guo et al.,
+2020) and `2 -distance (Kleinberg, 1997; Chávez et al., 2001; Hjaltason & Samet, 2003). These ap-
+proaches typically work by speeding up each distance/similarity computation (Jegou et al., 2010;
+Hwang et al., 2012; Zhang et al., 2014; Yu et al., 2017; Bagaria et al., 2021) as well as constructing
+tree-based (Beygelzimer et al., 2006; Dong et al., 2020) or graph-based data structures (Malkov &
+Yashunin, 2018; Wang et al., 2021a; Groh et al., 2022) over the given item set to efficiently navigate
+and prune the search space to find (approximate) k-NN items for a given query. Recent work also
+explores such graph-based (Boytsov & Nyberg, 2019a; Tan et al., 2020; 2021; MacAvaney et al.,
+2022), or tree-based (Boytsov & Nyberg, 2019b) data structures for non-metric and parametric sim-
+ilarity functions. Another line of work explores model quantization (Nayak et al., 2019; Liu et al.,
+2021) and early-exit strategies (Xin et al., 2020a;b) to approximate the neural model while speeding
+up each forward pass through the model and reducing its memory footprint. It would be interesting
+to study if such data structures and approaches to speed up cross-encoder score computation can
+be combined with matrix factorization based approaches proposed in this work to further improve
+recall-vs-cost trade-offs for k-NN search with cross-encoders.
+Pseudo-Relevance Feedback (PRF) Similar to PRF-based methods in information retrieval (Roc-
+chio Jr, 1971; Lavrenko & Croft, 2001), our proposed k-NN search method A XN refines the test
+query representation using model-based feedback. In our case, we use the cross-encoder scores of
+items retrieved in the previous round as feedback to update the test query representation. PRF-based
+approaches have been widely used in information retrieval for retrieval with sparse(Li et al., 2018;
+Mao et al., 2020; 2021) and dense embeddings (Yu et al., 2021; Wang et al., 2021b). We refer readers
+to Appendix §B.2 for comparison with a recent PRF-based method (Sung et al., 2023).
+
+5   C ONCLUSION
+
+In this paper, we present an approach to perform k-NN search with cross-encoders by efficiently ap-
+proximating the cross-encoder scores using dot-product of learned test query and item embeddings.
+In the offline indexing step, we compute item embeddings to index a given set of items from a target
+domain by factorizing a sparse query-item score matrix, leveraging existing dual-encoder models
+to initialize the item embeddings while avoiding computationally-expensive distillation-based train-
+ing of dual-encoder models. At test time, we compute the test query embedding to approximate
+cross-encoder scores of the given test query for a small set of adaptively-chosen items, and perform
+retrieval with the approximate cross-encoder scores. We perform extensive empirical analysis on
+two zero-shot retrieval benchmarks and show that our proposed approach provides significant im-
+provement in test-time k-NN search recall-vs-cost tradeoffs while still requiring significantly less
+compute resources for indexing items from a target domain as compared to previous approaches.
+
+
+                                                  9
+Published as a conference paper at ICLR 2024
+
+
+ACKNOWLEDGMENTS
+
+We thank members of UMass IESL for helpful discussions and feedback. This work was supported
+in part by the Center for Data Science and the Center for Intelligent Information Retrieval, in part
+by the National Science Foundation under Grant No. NSF1763618, in part by the Chan Zuckerberg
+Initiative under the project “Scientific Knowledge Base Construction”, in part by International Busi-
+ness Machines Corporation Cognitive Horizons Network agreement number W1668553, in part by
+Amazon Digital Services, and in part using highperformance computing equipment obtained under a
+grant from the Collaborative R&D Fund managed by the Massachusetts Technology Collaborative.
+Any opinions, findings, conclusions, and recommendations expressed in this material are those of
+the authors and do not necessarily reflect those of the sponsor(s).
+
+
+R EFERENCES
+Tom Ayoola, Shubhi Tyagi, Joseph Fisher, Christos Christodoulopoulos, and Andrea Pierleoni. Re-
+  FinED: An efficient zero-shot-capable approach to end-to-end entity linking. In Proceedings
+  of the 2022 Conference of the North American Chapter of the Association for Computational
+  Linguistics: Human Language Technologies: Industry Track, pp. 209–220. Association for Com-
+  putational Linguistics, 2022.
+
+Vivek Bagaria, Tavor Z Baharav, Govinda M Kamath, and N Tse David. Bandit-based monte carlo
+  optimization for nearest neighbors. IEEE Journal on Selected Areas in Information Theory, 2(2):
+  599–610, 2021.
+
+Dara Bahri, Heinrich Jiang, and Maya Gupta. Deep k-nn for noisy labels. In International Confer-
+  ence on Machine Learning, pp. 540–550. PMLR, 2020.
+
+Ainesh Bakshi and David Woodruff. Sublinear time low-rank approximation of distance matrices.
+  Advances in Neural Information Processing Systems, 2018.
+
+Alina Beygelzimer, Sham Kakade, and John Langford. Cover trees for nearest neighbor. In Pro-
+  ceedings of the 23rd international conference on Machine learning, pp. 97–104, 2006.
+
+Leonid Boytsov and Eric Nyberg. Accurate and fast retrieval for complex non-metric data via
+  neighborhood graphs. In International Conference on Similarity Search and Applications, pp.
+  128–142. Springer, 2019a.
+
+Leonid Boytsov and Eric Nyberg. Pruning algorithms for low-dimensional non-metric k-nn search:
+  a case study. In International Conference on Similarity Search and Applications, pp. 72–85.
+  Springer, 2019b.
+
+Emmanuel Candes and Benjamin Recht. Exact matrix completion via convex optimization. Com-
+  munications of the ACM, 55(6):111–119, 2012.
+
+Edgar Chávez, Gonzalo Navarro, Ricardo Baeza-Yates, and José Luis Marroquı́n. Searching in
+  metric spaces. ACM computing surveys (CSUR), 33(3):273–321, 2001.
+
+Kenneth L Clarkson et al. Nearest-neighbor searching and metric space dimensions. Nearest-
+  neighbor methods for learning and vision: theory and practice, pp. 15–59, 2006.
+
+Rajarshi Das, Ameya Godbole, Ankita Naik, Elliot Tower, Manzil Zaheer, Hannaneh Hajishirzi,
+  Robin Jia, and Andrew McCallum. Knowledge base question answering by case-based reasoning
+  over subgraphs. In International Conference on Machine Learning. PMLR, 2022.
+
+Yihe Dong, Piotr Indyk, Ilya Razenshteyn, and Tal Wagner. Learning space partitions for nearest
+  neighbor search. 2020.
+
+Tiezheng Ge, Kaiming He, Qifa Ke, and Jian Sun. Optimized product quantization. IEEE transac-
+  tions on pattern analysis and machine intelligence, 36(4):744–755, 2013.
+
+
+                                                 10
+Published as a conference paper at ICLR 2024
+
+
+Anirudh Goyal, Abram Friesen, Andrea Banino, Theophane Weber, Nan Rosemary Ke, Adrià Puig-
+  domènech Badia, Arthur Guez, Mehdi Mirza, Peter C Humphreys, Ksenia Konyushova, Michal
+  Valko, Simon Osindero, Timothy Lillicrap, Nicolas Heess, and Charles Blundell. Retrieval-
+  augmented reinforcement learning. In Proceedings of the 39th International Conference on Ma-
+  chine Learning, 2022.
+
+Fabian Groh, Lukas Ruppert, Patrick Wieschollek, and Hendrik PA Lensch. Ggnn: Graph-based
+  gpu nearest neighbor search. IEEE Transactions on Big Data, 9(1):267–279, 2022.
+
+Ruiqi Guo, Philip Sun, Erik Lindgren, Quan Geng, David Simcha, Felix Chern, and Sanjiv Ku-
+  mar. Accelerating large-scale inference with anisotropic vector quantization. In International
+  Conference on Machine Learning, pp. 3887–3896, 2020.
+
+Gisli R Hjaltason and Hanan Samet. Index-driven similarity search in metric spaces (survey article).
+  ACM Transactions on Database Systems (TODS), 28(4):517–580, 2003.
+
+Sebastian Hofstätter, Sophia Althammer, Michael Schröder, Mete Sertkan, and Allan Hanbury. Im-
+  proving efficient neural ranking models with cross-architecture knowledge distillation. ArXiv,
+  abs/2010.02666, 2020.
+
+Neil Houlsby, Andrei Giurgiu, Stanislaw Jastrzebski, Bruna Morrone, Quentin De Laroussilhe, An-
+  drea Gesmundo, Mona Attariyan, and Sylvain Gelly. Parameter-efficient transfer learning for nlp.
+  In International Conference on Machine Learning, pp. 2790–2799. PMLR, 2019.
+
+Yoonho Hwang, Bohyung Han, and Hee-Kap Ahn. A fast nearest neighbor search algorithm by
+  nonlinear embedding. In 2012 IEEE Conference on Computer Vision and Pattern Recognition,
+  pp. 3053–3060. IEEE, 2012.
+
+Piotr Indyk. Dimensionality reduction techniques for proximity problems. In Proceedings of the
+  eleventh annual ACM-SIAM symposium on Discrete algorithms, pp. 371–378, 2000.
+
+Pitor Indyk, Ali Vakilian, Tal Wagner, and David P Woodruff. Sample-optimal low-rank approxi-
+   mation of distance matrices. In Conference on Learning Theory, pp. 1723–1751. PMLR, 2019.
+
+Gautier Izacard, Patrick Lewis, Maria Lomeli, Lucas Hosseini, Fabio Petroni, Timo Schick, Jane
+  Dwivedi-Yu, Armand Joulin, Sebastian Riedel, and Edouard Grave. Atlas: Few-shot learning
+  with retrieval augmented language models. Journal of Machine Learning Research, 24, 2023.
+  URL http://jmlr.org/papers/v24/23-0037.html.
+
+Prateek Jain and Inderjit S Dhillon.     Provable inductive matrix completion.      arXiv preprint
+  arXiv:1306.0626, 2013.
+
+Herve Jegou, Matthijs Douze, and Cordelia Schmid. Product quantization for nearest neighbor
+  search. IEEE Transactions on Pattern Analysis and Machine Intelligence, 33(1):117–128, 2010.
+
+Jeff Johnson, Matthijs Douze, and Hervé Jégou. Billion-scale similarity search with gpus. IEEE
+   Transactions on Big Data, 7(3):535–547, 2019.
+
+Jon M Kleinberg. Two algorithms for nearest-neighbor search in high dimensions. In Proceedings
+  of the twenty-ninth annual ACM symposium on Theory of computing, pp. 599–608, 1997.
+
+Yehuda Koren, Robert Bell, and Chris Volinsky. Matrix factorization techniques for recommender
+  systems. Computer, 42(8):30–37, 2009.
+
+Akshay Krishnamurthy and Aarti Singh. Low-rank matrix and tensor completion via adaptive sam-
+  pling. Advances in Neural Information Processing Systems, 26, 2013.
+
+Victor Lavrenko and W. Bruce Croft. Relevance based language models. SIGIR ’01, pp. 120–127.
+  Association for Computing Machinery, 2001. ISBN 1581133316. doi: 10.1145/383952.383972.
+  URL https://doi.org/10.1145/383952.383972.
+
+
+                                                11
+Published as a conference paper at ICLR 2024
+
+
+Canjia Li, Yingfei Sun, Ben He, Le Wang, Kai Hui, Andrew Yates, Le Sun, and Jungang Xu. NPRF:
+  A neural pseudo relevance feedback framework for ad-hoc information retrieval. In Proceedings
+  of the 2018 Conference on Empirical Methods in Natural Language Processing, pp. 4482–4491.
+  Association for Computational Linguistics, 2018. doi: 10.18653/v1/D18-1478. URL https:
+  //aclanthology.org/D18-1478.
+
+Wen Li, Ying Zhang, Yifang Sun, Wei Wang, Mingjie Li, Wenjie Zhang, and Xuemin Lin. Approx-
+ imate nearest neighbor search on high dimensional data—experiments, analyses, and improve-
+ ment. IEEE Transactions on Knowledge and Data Engineering, 32(8):1475–1488, 2019.
+
+Fangxin Liu, Wenbo Zhao, Zhezhi He, Yanzhi Wang, Zongwu Wang, Changzhi Dai, Xiaoyao Liang,
+  and Li Jiang. Improving neural network efficiency via post-training quantization with adaptive
+  floating-point. In Proceedings of the IEEE/CVF International Conference on Computer Vision,
+  pp. 5281–5290, 2021.
+
+Fangyu Liu, Yunlong Jiao, Jordan Massiah, Emine Yilmaz, and Serhii Havrylov. Trans-encoder: Un-
+  supervised sentence-pair modelling through self-and mutual-distillations. In International Con-
+  ference on Learning Representations, ICLR, 2022.
+
+Lajanugen Logeswaran, Ming-Wei Chang, Kenton Lee, Kristina Toutanova, Jacob Devlin, and
+  Honglak Lee. Zero-shot entity linking by reading entity descriptions. In Proceedings of the 57th
+  Annual Meeting of the Association for Computational Linguistics, pp. 3449–3460. Association
+  for Computational Linguistics, 2019.
+
+Ilya Loshchilov and Frank Hutter. Decoupled weight decay regularization. In International Con-
+   ference on Learning Representations (ICLR), 2019. URL https://openreview.net/
+   forum?id=Bkg6RiCqY7.
+
+Xin Luo, Mengchu Zhou, Yunni Xia, and Qingsheng Zhu. An efficient non-negative matrix-
+  factorization-based approach to collaborative filtering for recommender systems. IEEE Trans-
+  actions on Industrial Informatics, 10(2):1273–1284, 2014.
+
+Sean MacAvaney, Nicola Tonellotto, and Craig Macdonald. Adaptive re-ranking with a corpus
+  graph. In Proceedings of the 31st ACM International Conference on Information & Knowledge
+  Management, pp. 1491–1500, 2022.
+
+Michael W Mahoney and Petros Drineas. Cur matrix decompositions for improved data analysis.
+ Proceedings of the National Academy of Sciences, 106(3):697–702, 2009.
+
+Yu A Malkov and Dmitry A Yashunin. Efficient and robust approximate nearest neighbor search
+  using hierarchical navigable small world graphs. IEEE Transactions on Pattern Analysis and
+  Machine Intelligence, 42(4):824–836, 2018.
+
+Yuning Mao, Pengcheng He, Xiaodong Liu, Yelong Shen, Jianfeng Gao, Jiawei Han, and Weizhu
+  Chen. Generation-augmented retrieval for open-domain question answering. arXiv preprint
+  arXiv:2009.08553, 2020.
+
+Yuning Mao, Pengcheng He, Xiaodong Liu, Yelong Shen, Jianfeng Gao, Jiawei Han, and Weizhu
+  Chen. Generation-augmented retrieval for open-domain question answering. In Proceedings of
+  the 59th Annual Meeting of the Association for Computational Linguistics and the 11th Interna-
+  tional Joint Conference on Natural Language Processing (Volume 1: Long Papers), pp. 4089–
+  4100. Association for Computational Linguistics, 2021. doi: 10.18653/v1/2021.acl-long.316.
+  URL https://aclanthology.org/2021.acl-long.316.
+
+Rachana Mehta and Keyur Rana. A review on matrix factorization techniques in recommender
+  systems. In 2017 2nd International Conference on Communication Systems, Computing and IT
+  Applications (CSCITA), pp. 269–274. IEEE, 2017.
+
+Aditya Menon, Sadeep Jayasumana, Ankit Singh Rawat, Seungyeon Kim, Sashank Reddi, and San-
+  jiv Kumar. In defense of dual-encoders for neural ranking. In International Conference on Ma-
+  chine Learning. PMLR, 2022.
+
+
+                                               12
+Published as a conference paper at ICLR 2024
+
+
+Cameron Musco and David P Woodruff. Sublinear time low-rank approximation of positive semidef-
+  inite matrices. In IEEE 58th Annual Symposium on Foundations of Computer Science (FOCS),
+  pp. 672–683. IEEE, 2017.
+Prateeth Nayak, David Zhang, and Sek Chai. Bit efficient quantization for deep neural networks. In
+  2019 Fifth Workshop on Energy Efficient Machine Learning and Cognitive Computing-NeurIPS
+  Edition (EMC2-NIPS), pp. 52–56. IEEE, 2019.
+Luong Trung Nguyen, Junhan Kim, and Byonghyo Shim. Low-rank matrix completion: A contem-
+  porary survey. IEEE Access, 7:94215–94237, 2019.
+F. Pedregosa, G. Varoquaux, A. Gramfort, V. Michel, B. Thirion, O. Grisel, M. Blondel, P. Pretten-
+   hofer, R. Weiss, V. Dubourg, J. Vanderplas, A. Passos, D. Cournapeau, M. Brucher, M. Perrot, and
+   E. Duchesnay. Scikit-learn: Machine learning in Python. Journal of Machine Learning Research,
+   12:2825–2830, 2011.
+Yingqi Qu, Yuchen Ding, Jing Liu, Kai Liu, Ruiyang Ren, Wayne Xin Zhao, Daxiang Dong, Hua
+  Wu, and Haifeng Wang. RocketQA: An optimized training approach to dense passage retrieval for
+  open-domain question answering. In Proceedings of the 2021 Conference of the North American
+  Chapter of the Association for Computational Linguistics: Human Language Technologies, pp.
+  5835–5847. Association for Computational Linguistics, 2021.
+Archan Ray, Nicholas Monath, Andrew McCallum, and Cameron Musco. Sublinear time approxi-
+  mation of text similarity matrices. Proceedings of the AAAI Conference on Artificial Intelligence,
+  36(7):8072–8080, 2022.
+Sashank Reddi, Rama Kumar Pasumarthi, Aditya Menon, Ankit Singh Rawat, Felix Yu, Seungyeon
+  Kim, Andreas Veit, and Sanjiv Kumar. Rankdistil: Knowledge distillation for ranking. In Inter-
+  national Conference on Artificial Intelligence and Statistics, pp. 2368–2376. PMLR, 2021.
+Ruiyang Ren, Yingqi Qu, Jing Liu, Wayne Xin Zhao, QiaoQiao She, Hua Wu, Haifeng Wang,
+  and Ji-Rong Wen. RocketQAv2: A joint training method for dense passage retrieval and
+  passage re-ranking. In Proceedings of the 2021 Conference on Empirical Methods in Nat-
+  ural Language Processing. Association for Computational Linguistics, 2021. URL https:
+  //aclanthology.org/2021.emnlp-main.224.
+Joseph John Rocchio Jr. Relevance feedback in information retrieval. The SMART retrieval system:
+  experiments in automatic document processing, 1971.
+Guilherme Rosa, Luiz Bonifacio, Vitor Jeronymo, Hugo Abonizio, Marzieh Fadaee, Roberto Lotufo,
+  and Rodrigo Nogueira. In defense of cross-encoders for zero-shot retrieval. arXiv preprint
+  arXiv:2212.06121, 2022.
+Andreas Rücklé, Gregor Geigle, Max Glockner, Tilman Beck, Jonas Pfeiffer, Nils Reimers, and
+  Iryna Gurevych. AdapterDrop: On the efficiency of adapters in transformers. In Proceedings
+  of the 2021 Conference on Empirical Methods in Natural Language Processing, pp. 7930–7946.
+  Association for Computational Linguistics, 2021. doi: 10.18653/v1/2021.emnlp-main.626. URL
+  https://aclanthology.org/2021.emnlp-main.626.
+Victor Sanh, Lysandre Debut, Julien Chaumond, and Thomas Wolf. Distilbert, a distilled version of
+  bert: smaller, faster, cheaper and lighter. arXiv preprint arXiv:1910.01108, 2019.
+Mujeen Sung, Jungsoo Park, Jaewoo Kang, Danqi Chen, and Jinhyuk Lee. Optimizing test-time
+ query representations for dense retrieval. In Findings of the Association for Computational Lin-
+ guistics: ACL 2023, pp. 5731–5746. Association for Computational Linguistics, 2023. URL
+ https://aclanthology.org/2023.findings-acl.354.
+Shulong Tan, Zhixin Zhou, Zhaozhuo Xu, and Ping Li. Fast item ranking under neural network
+  based measures. In International Conference on Web Search and Data Mining, pp. 591–599,
+  2020.
+Shulong Tan, Weijie Zhao, and Ping Li. Fast neural ranking on bipartite graph indices. Proceedings
+  of the VLDB Endowment, 15(4):794–803, 2021.
+
+
+                                                13
+Published as a conference paper at ICLR 2024
+
+
+Nandan Thakur, Nils Reimers, Johannes Daxenberger, and Iryna Gurevych. Augmented SBERT:
+  Data augmentation method for improving bi-encoders for pairwise sentence scoring tasks. In Pro-
+  ceedings of the 2021 Conference of the North American Chapter of the Association for Computa-
+  tional Linguistics: Human Language Technologies, pp. 296–310. Association for Computational
+  Linguistics, 2021a.
+Nandan Thakur, Nils Reimers, Andreas Rücklé, Abhishek Srivastava, and Iryna Gurevych. BEIR: A
+  heterogeneous benchmark for zero-shot evaluation of information retrieval models. In Thirty-fifth
+  Conference on Neural Information Processing Systems Datasets and Benchmarks Track (Round
+  2), 2021b. URL https://openreview.net/forum?id=wCu6T5xFjeJ.
+Ashish Vaswani, Noam Shazeer, Niki Parmar, Jakob Uszkoreit, Llion Jones, Aidan N Gomez,
+  Łukasz Kaiser, and Illia Polosukhin. Attention is all you need. Advances in Neural Informa-
+  tion Processing Systems, 2017.
+Mengzhao Wang, Xiaoliang Xu, Qiang Yue, and Yuxiang Wang. A comprehensive survey and
+ experimental comparison of graph-based approximate nearest neighbor search. arXiv preprint
+ arXiv:2101.12631, 2021a.
+Shuohang Wang, Yichong Xu, Yuwei Fang, Yang Liu, Siqi Sun, Ruochen Xu, Chenguang Zhu, and
+  Michael Zeng. Training data is more valuable than you think: A simple and effective method by
+  retrieving from training data. In Proceedings of the 60th Annual Meeting of the Association for
+  Computational Linguistics (Volume 1: Long Papers), 2022.
+Wenhui Wang, Furu Wei, Li Dong, Hangbo Bao, Nan Yang, and Ming Zhou. Minilm: Deep self-
+ attention distillation for task-agnostic compression of pre-trained transformers. Advances in Neu-
+ ral Information Processing Systems, 33:5776–5788, 2020.
+Xiao Wang, Craig Macdonald, Nicola Tonellotto, and Iadh Ounis. Pseudo-relevance feedback for
+  multiple representation dense retrieval. In Proceedings of the 2021 ACM SIGIR International
+  Conference on Theory of Information Retrieval, pp. 297–306, 2021b.
+Ledell Wu, Fabio Petroni, Martin Josifoski, Sebastian Riedel, and Luke Zettlemoyer. Scalable
+  zero-shot entity linking with dense entity retrieval. In Proceedings of the 2020 Conference on
+  Empirical Methods in Natural Language Processing (EMNLP), pp. 6397–6407. Association for
+  Computational Linguistics, 2020.
+Ji Xin, Rodrigo Nogueira, Yaoliang Yu, and Jimmy Lin. Early exiting BERT for efficient document
+   ranking. In Proceedings of SustaiNLP: Workshop on Simple and Efficient Natural Language
+   Processing, pp. 83–88. Association for Computational Linguistics, 2020a. doi: 10.18653/v1/
+   2020.sustainlp-1.11. URL https://aclanthology.org/2020.sustainlp-1.11.
+Ji Xin, Raphael Tang, Jaejun Lee, Yaoliang Yu, and Jimmy Lin. DeeBERT: Dynamic early exiting
+   for accelerating BERT inference. In Proceedings of the 58th Annual Meeting of the Associa-
+   tion for Computational Linguistics, pp. 2246–2251. Association for Computational Linguistics,
+   2020b. doi: 10.18653/v1/2020.acl-main.204. URL https://aclanthology.org/2020.
+   acl-main.204.
+Miao Xu, Rong Jin, and Zhi-Hua Zhou. Speedup matrix completion with side information: Appli-
+ cation to multi-label learning. Advances in neural information processing systems, 26, 2013.
+Miao Xu, Rong Jin, and Zhi-Hua Zhou. Cur algorithm for partially observed matrices. In Interna-
+ tional Conference on Machine Learning, pp. 1412–1421. PMLR, 2015.
+Hong-Jian Xue, Xinyu Dai, Jianbing Zhang, Shujian Huang, and Jiajun Chen. Deep matrix fac-
+  torization models for recommender systems. In IJCAI, volume 17, pp. 3203–3209. Melbourne,
+  Australia, 2017.
+Nishant Yadav, Nicholas Monath, Rico Angell, Manzil Zaheer, and Andrew McCallum. Efficient
+  Nearest Neighbor Search for Cross-encoder Models using Matrix Factorization. In Proceedings
+  of the 2022 Conference on Empirical Methods in Natural Language Processing, pp. 2171–2194,
+  2022. URL https://aclanthology.org/2022.emnlp-main.140.
+
+
+                                                14
+Published as a conference paper at ICLR 2024
+
+
+Nishant Yadav, Nicholas Monath, Manzil Zaheer, and Andrew McCallum. Efficient k-NN Search
+  with Cross-encoders using Adaptive Multi-Round CUR Decomposition. In Findings of the Asso-
+  ciation for Computational Linguistics: EMNLP, 2023.
+
+HongChien Yu, Chenyan Xiong, and Jamie Callan. Improving query representations for dense re-
+  trieval with pseudo relevance feedback. In Proceedings of the 30th ACM International Conference
+  on Information & Knowledge Management, pp. 3592–3596, 2021.
+
+Hsiang-Fu Yu, Cho-Jui Hsieh, Si Si, and Inderjit S Dhillon. Parallel matrix factorization for recom-
+  mender systems. Knowledge and Information Systems, 41:793–819, 2014.
+
+Hsiang-Fu Yu, Cho-Jui Hsieh, Qi Lei, and Inderjit S Dhillon. A greedy approach for budgeted
+  maximum inner product search. Advances in Neural Information Processing Systems, 30, 2017.
+
+Manzil Zaheer, Guru Guruganesh, Golan Levin, and Alex Smola. Terrapattern: A nearest neighbor
+ search service. Pre-print, 2019.
+
+Hansi Zeng, Hamed Zamani, and Vishwa Vinay. Curriculum learning for dense retrieval distillation.
+  In Proceedings of the 45th International ACM SIGIR Conference on Research and Development
+  in Information Retrieval, pp. 1979–1983, 2022.
+
+Ting Zhang, Chao Du, and Jingdong Wang. Composite quantization for approximate nearest neigh-
+  bor search. In International Conference on Machine Learning, pp. 838–846. PMLR, 2014.
+
+Kai Zhong, Zhao Song, Prateek Jain, and Inderjit S Dhillon. Provable non-linear inductive matrix
+  completion. Advances in Neural Information Processing Systems, 32, 2019.
+
+
+A       T RAINING AND I MPLEMENTATION D ETAILS
+
+ Dataset        Domain            |I|              (|Qtrain |/|Qtest |) Splits   Train Query (Qtrain ) Type
+ Z E S H EL     YuGiOh          10,031     (100/3274), (500/2874), (2000/1374)         Real Queries
+ Z E S H EL     Star Trek       34,430     (100/4127), (500/3727), (2000/2227)         Real Queries
+ B E IR         SciDocs         25,657            {1K, 10K, 50K}/1000                Pseudo-Queries
+ B E IR         Hotpot-QA      5,233,329          {1K, 10K, 50K}/1000                Pseudo-Queries
+Table 1: Statistics on number of items (I), number of queries in train (Qtrain ) and test (Qtest ) splits
+for each domain. Following the precedent set by Yadav et al. (2022), we create train/test split
+by splitting the queries in each Z E S H EL domain uniformly at random, and experiment with three
+values of |Qtrain | ∈ {100, 500, 2000}. For B E IR domains, we use pseudo-queries released as part
+of the benchmark as train queries (Qtrain ) and run k-NN evaluation on test-queries from the official
+test-split (as per B E IR benchmark) of these domains. For HotpotQA, we use the first 1K queries out
+of a total of 7K test queries and we use all 1K test queries for SciDocs.
+
+
+
+A.1       T RAINING C ROSS -E NCODER M ODELS
+
+In our experiments, we use [ EMB ]-CE, a cross-encoder model variant proposed by Yadav et al.
+(2022) that jointly encodes a query-item pair and computes the final score using dot-product of
+contextualized query and item embeddings extracted after joint encoding.
+
+Z E S H EL Dataset For Z E S H EL, we use the cross-encoder model checkpoint6 released by Yadav
+et al. (2022). We refer readers to Yadav et al. (2022) for further details on parameterization and
+training of the cross-encoder.
+    6
+        https://huggingface.co/nishantyadav/emb crossenc zeshel
+
+
+                                                       15
+Published as a conference paper at ICLR 2024
+
+
+B E IR Benchmark For B E IR, we use the cross-encoder model checkpoint7 trained on MS-
+MARCO dataset and released by Yadav et al. (2023). The cross-encoder model is parameterized
+using a 6-layer M INI -LM8 model (Wang et al., 2020) and uses the dot-product based scoring mech-
+anism for cross-encoders proposed by Yadav et al. (2022).
+
+A.2     T RAINING D UAL -E NCODER AND M ATRIX FACTORIZATION M ODELS
+
+For B E IR datasets, we train matrix factorization models and DE DSTL using sparse matrix G con-
+taining number of train queries |Qtrain | ∈ {1K, 10K, 50K} with number of items per query
+kd ∈ {100, 1000}. For Z E S H EL datasets, we use |Qtrain | ∈ {100, 500, 2000} with the number
+of items per query kd ∈ {100, 1000} for matrix factorization models and kd ∈ {25, 100} for train-
+ing DE DSTL model. Table 1 shows train/test splits used for each domain.
+
+A.2.1    T RAINING D UAL -E NCODER M ODELS
+We train dual-encoder models on Nvidia RTX8000 GPUs with 48 GB GPU memory.
+
+Z E S H EL dataset We report results for DE baselines as reported in Yadav et al. (2022). The
+DE models were initialized using bert-base-uncased and contain separate query and item
+encoders, thus resulting in a total of 2 × 110M parameters. The DE models are trained using cross-
+entropy loss to match the DE score distribution with the CE score distribution. We refer readers
+to Yadav et al. (2022) for details related to training of DE models on Z E S H EL dataset.
+
+B E IR benchmark For B E IR domains, we use a dual-encoder model checkpoint9 released as
+part of sentence-transformer repository as DE SRC , unless specified otherwise. This DE
+model was initialized using distillbert-base (Sanh et al., 2019) model and trained on MS-
+MARCO dataset which contains 40 million (query, positive document (item), negative document
+(item)) triplets using triplet ranking loss. This DE SRC is not trained on target domains SciDocs
+and Hotpot-QA used for running k-NN experiments in this paper. We finetune DE SRC via distil-
+lation on the target domain to get the DE DSTL model. Given a set of training queries Qtrain from
+the target domain, we retrieve top-100 or top-1000 items for each query, score the items with the
+cross-encoder model and train the dual-encoder by minimizing cross-entropy loss between predicted
+query-item scores (using DE) and target query-item scores (obtained using CE). We train DE DSTL
+using AdamW (Loshchilov & Hutter, 2019) optimizer with learning rate 1e-5 and accumulating gra-
+dient over 4 steps. We trained for 10 epochs when using top-100 items per query and for 4 epochs
+when using top-1000 items per query. We allocate a maximum time of 24 hours for training.
+
+A.2.2    M ATRIX -FACTORIZATION M ODELS
+We train both transductive (MF T RNS ) and inductive (MF I ND ) matrix factorization models on Nvidia
+2080ti GPUs with 12 GB GPU memory for all datasets with the exception that we trained
+MF T RNS for Hotpot-QA on Nvidia A100 GPUs with 80 GB GPU memory. We use AdamW op-
+timizer (Loshchilov & Hutter, 2019) with learning rate and number of epochs as shown in Ta-
+ble 2. Training MF T RNS on Hotpot-QA required 80 GB GPU memory as it involved training 768-
+dimensional embeddings for 5 million items which roughly translates to around 4 billion trainable
+parameters, and we used AdamW optimizer with stores additional memory for each trainable pa-
+rameter. For smaller datasets with the number of items of the order of 50K, smaller GPUs with 12
+GB memory sufficed.
+For inductive matrix factorization (MF I ND ), we train a 2-layer MLP with skip-connection on top of
+query and item embeddings from DE SRC . For a given input embedding xin ∈ Rd , we compute the
+output embedding xout ∈ Rd as
+                               x0out = b2 + W2| gelu(b1 + W1| xin )
+                               xout = σ(wskip )x0out + (1 − σ(wskip ))x
+   7
+      https://huggingface.co/nishantyadav/emb crossenc msmarco miniLM
+   8
+     https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2
+   9
+     msmarco-distilroberta-base-v2: www.sbert.net/docs/pretrained-models/msmarco-v2.html
+
+
+                                                 16
+Published as a conference paper at ICLR 2024
+
+
+where W1 ∈ Rd×2d , b1 ∈ R2d , W2 ∈ R2d×d , b2 ∈ Rd , wskip ∈ R are learnable parameters and σ(.)
+is the sigmoid function. We initialize wskip with -5 and use default PyTorch initialization for other
+parameters. We trained separate MLP models for queries and items. We would like to highlight
+that a simple 2-layer MLP without the skip connection i.e. using x0out as the final output embedding
+performed poorly in our experiments and it did not generalize well to unseen queries and items.
+
+        Domain       MF Type     Learning Rate                      Number of Epochs
+       SciDocs        MF T RNS       0.005          4 if (|Qtrain |, kd ) ∈ {(10K,1K), (50K, 1K} else 10
+       SciDocs        MF I ND        0.005         10 if (|Qtrain |, kd ) ∈ {(10K,1K), (50K, 1K} else 20
+      Hotpot-QA       MF T RNS       0.001          4 if (|Qtrain |, kd ) ∈ {(10K,1K), (50K, 1K} else 10
+      Hotpot-QA       MF I ND        0.001         10 if (|Qtrain |, kd ) ∈ {(10K,1K), (50K, 1K} else 20
+        YuGiOh        MF T RNS       0.001                                  20
+       Star Trek      MF T RNS       0.001                                  20
+Table 2: Hyperparameters for transductive (MF T RNS ) and inductive (MF I ND ) matrix factorization
+models for different number of training queries (|Qtrain |) and number of items per train query (kd ) in
+sparse matrix G.
+
+
+A.3    TF - IDF
+
+For B E IR datasets, we use BM 25 with parameters as reported in Thakur et al. (2021b) and for
+Z E S H EL, we use TF - IDF with default parameters from Scikit-learn (Pedregosa et al., 2011), as
+reported in Yadav et al. (2022).
+
+A.4    T EST-T IME I NFERENCE WITH A XN , ADACUR , AND R N R
+
+For R N RX , we retrieve top-scoring items using dot-product of query and item embeddings computed
+using baseline retrieval method X and re-rank the retrieved items using the cross-encoder model.
+For R N R MF TRNS , we use dense query embedding from base dual-encoder model DE SRC for test-
+queries qtest ∈ / Qtrain along with item embeddings learnt using transductive matrix factorization to
+retrieve-and-rerank items for the given test query.
+For both ADACUR and A XN, we use R = 10 for domains in B E IR and R = 5 for domains in
+Z E S H EL unless stated otherwise. For B E IR datasets, we tune A XN weight parameter λ (in eq 7)
+on the dev set. We refer interested readers to §B.2 for the effect of λ on final performance. For
+Z E S H EL, we report results for λ = 0. For Hotpot-QA, we restrict our k-NN search with A XNX,Y
+and ADACURY to top-10K items wrt method Y , Y ∈ {DE SRC , TF - IDF}. For other domains, we
+do not use any such heuristic and search over all items.
+
+Cross-Encoder Score Normalization for A XN Figure 4a shows query-item score distribution for
+the cross-encoder model and DE SRC on SciDocs datasets from B E IR benchmark. For cross-encoder
+models trained on B E IR dataset, we observe that the cross-encoder and DE SRC model produce query-
+item scores in significantly different ranges. Since DE SRC is used to initialize the embedding space
+for matrix factorization approaches, this resulted in a mismatch in the range of the target score
+distribution from the cross-encoder in sparse matrix G and the initial predicted score distribution
+from DE SRC . Consequently, using raw cross-encoder scores while training MF models and while
+computing test query embedding by solving the linear regression problem in Eq 4 leads to a poor
+approximation of the cross-encoder. To alleviate this issue, we normalize the cross-encoder scores
+to match the score distribution from DE SRC model using two parameters α, β ∈ R.
+                                     sfinal (q, i) = β(sinit (q, i) − α)
+where sinit (q, i) and sfinal (q, i) are initial and normalized cross-encoder scores, and α and β are esti-
+mated by re-normalizing cross-encoder distribution to match dual-encoder score distribution using
+100 training queries. Note that such score normalization does not affect the final ranking of items.
+We do not perform any such normalization for Z E S H EL datasets the cross-encoder and DE SRC
+model output scores in similar ranges as shown in Figure 4b.
+
+
+                                                     17
+Published as a conference paper at ICLR 2024
+
+
+                                                                          0.20                                           Dual-Encoder                                                                                                                                                               Dual-Encoder
+                                                                                                                         Cross-Encoder                                                                                                                     0.15                                     Cross-Encoder
+
+
+                                                          Score Density
+
+
+                                                                                                                                                                                                                                           Score Density
+                                                                          0.15
+                                                                                                                                                                                                                                                           0.10
+                                                                          0.10
+
+                                                                                                                                                                                                                                                           0.05
+                                                                          0.05
+
+                                                                          0.00                                                                                                                                                                             0.00
+                                                                                               0                       50               100                                                                                                                    25               50                75                100
+                                                                                           Query-Item Score                                                                                                                                                                 Query-Item Score
+                                                                                          (a) SciDocs                                                                                                                                                                   (b) YuGiOh
+Figure 4: Score distribution for cross-encoder (CE) and dual-encoder (DE) models on SciDocs
+for B E IR and YuGiOh from Z E S H EL. For each domain, we use cross-encoder and dual-encoder
+models trained on the corresponding task. See §A.1 for details on cross-encoder training and §A.2.1
+for dual-encoder training.
+B                                         A DDITIONAL R ESULTS AND A NALYSIS
+
+B.1                                            OVERHEAD OF A DAPTIVE R ETRIEVAL WITH A XN
+
+                                      Total              Cross-Enc Calls                           Matrix Inverse                      Matrix Multiply                                                                           Total                        Cross-Enc Calls             Linear Regression                   Matrix Multiply
+
+                                               # CE Calls=50                         # CE Calls=100                             # CE Calls=500                                                                                            # CE Calls=50                         # CE Calls=100                      # CE Calls=500
+                                                                                                                                                           Latency Breakdown (in %)
+
+
+                                                                                                                                                                                                                                                                                                                                               Latency Breakdown (in %)
+                                                                                                                                                    1.00                                                                                                                                                                                1.00
+Inference Latency (in s)
+
+
+                                                                                                                                                                                           Inference Latency (in s)
+
+                                                                                                                                                                                                                       100
+                            100
+                                                                                                                                                    0.75                                                                                                                                                                                0.75
+
+                                                                                                                                                    0.50                                                              10   −1                                                                                                           0.50
+                           10−1
+                                                                                                                                                    0.25                                                                                                                                                                                0.25
+
+                           10−2                                                                                                                     0.00                                                              10−2                                                                                                              0.00
+                                           1     2     5 10 50                   1   2 5 10 50 100                          1    2    5 10 50 100                                                                                     1          2          5 10 50         1   2 5 10 50 100                   1    2    5 10 50 100
+                                                                                     Number of Rounds                                                                                                                                                                           Number of Rounds
+
+                                                                           (a) ADACUR DE SRC                                                                                                                                                                            (b) A XN DE SRC ,DE SRC
+Figure 5: Breakdown of inference latency for ADACUR DESRC and A XN DESRC ,DESRC under different
+test-time CE call budgets for domain=Hotpot-QA. See §B.1 for detailed discussion.
+
+
+             # Rounds                                        1                       2                5                 10               50          100                                                # Rounds                                                  1             2            5                 10            50          100
+                                                                  k=1                                                                k=100                                                                                                                            k=1                                                k=100
+                                                                                                                  70                                                                                                                                                                                     40
+                                                                                                                                                                                                                                     85
+                                          90
+                                                                                                                  60
+                           Top-k-Recall
+
+
+                                                                                                   Top-k-Recall
+
+
+                                                                                                                                                                                                                      Top-k-Recall
+
+
+                                                                                                                                                                                                                                                                                          Top-k-Recall
+
+
+                                                                                                                                                                                                                                     80
+                                                                                                                                                                                                                                                                                                         30
+                                          80                                                                      50
+                                                                                                                                                                                                                                     75
+                                                                                                                  40
+                                                                                                                                                                                                                                     70                                                                  20
+                                          70
+                                                                                                                  30
+                                                                                                                                                                                                                                     65
+                                                  50     100                200          500                           100       200     500 1000                                                                                                   50            100   200         500                       100    200     500 1000
+                                                        Inference Cost (Total Number of CE calls)                                                                                                                                                            Inference Cost (Total Number of CE calls)
+
+                                                                                     (a) SciDocs                                                                                                                                                                            (b) Hotpot-QA
+Figure 6: Top-k-Recall versus number of rounds for A XN DE SRC ,DESRC under different test-time cross-
+encoder call budgets for domains Hotpot-QA and SciDocs. Number of rounds (R) = 1 corresponds
+to retrieve-and-rerank style inference with DE SRC i.e. R N R DE SRC . Top-k-Recall generally improves
+with the number of rounds and saturates around 5 to 10 rounds.
+
+
+Figures 5a and 5b show total inference latency for ADACUR and A XN for varying number of
+rounds (R) at different cross-encoder (CE) calls budgets. The secondary y-axis in Figure 5 shows the
+breakdown of the inference latency into three main steps in Algorithm 1 - (a) CE Calls: computing
+CE scores for retrieved items (line 9), (b) solving linear regression problem to update test query
+embedding for A XN (line 10) (c) Matrix Multiply: updating approximate scores for all items (line 7)
+followed by retrieving items using approximate scores. In case of ADACUR , computing query
+embedding in step (b) involves computing the pseudo-inverse of a matrix instead of solving a linear
+regression problem.
+
+
+                                                                                                                                                                                      18
+Published as a conference paper at ICLR 2024
+
+
+As shown in Figure 5, the overhead of adaptive retrieval is negligible for R = 5 to 10, and the
+overhead increases linearly with the number of rounds. A XN DESRC ,DESRC for R = 1 corresponds
+to R N R DESRC , retrieve-and-rerank style inference using DE SRC . We observe that A XN incurs less
+overhead than ADACUR under the same test-time CE call budget. Each CE call takes an amortized
+time of ∼2 ms10 when computing CE scores with a batch-size of up to 50 for domain=Hotpot-QA.
+While the time complexity of updating the approximate scores is linear in the number of items, we
+observe that this step can be significantly sped up using GPUs/TPUs, and use of efficient vector-
+based k-NN search methods. In this work, to get an efficient implementation for large domains such
+as Hotpot-QA, we first shortlist 10K items for the test query using the baseline retrieval method (e.g.
+DE SRC ), and only update the approximate scores for those 10K during inference using brute-force
+computation of scores for all 10K items. Further, note that the approximate scores are only used
+for retrieving items (line 8 in Alg. 1), and this operation can also be implemented on CPUs using
+efficient vector-based k-NN search methods (Malkov & Yashunin, 2018; Guo et al., 2020) without
+the need for brute-force computation of approximate scores for all items.
+
+B.2                      C OMPARING DIFFERENT QUERY EMBEDDING METHODS
+
+
+                                             DE                              Axnλ=0               Axnλ=0.8                                   TouR-ce                           TouR-mse
+                                 k=1                                                k=100
+                                                                       70                                                   16.50
+               90
+                                                                                                                                                                                    35
+
+
+                                                                                                                                                                  Downstream Task
+                                                                                                          Downstream Task
+
+
+
+                                                                       60                                                   16.25
+Top-k-Recall
+
+
+                                                        Top-k-Recall
+
+
+                                                                                                             nDCG@10
+
+
+                                                                                                                                                                      Recall
+               80                                                      50                                                   16.00
+                                                                                                                                                                                    30
+                                                                                                                            15.75
+                                                        8 40
+               70                                                                                                           15.50                                                   25
+                                                                       30
+                    50     100         200        500                       100   200       500    1000
+                                                                                                                                      50    100 200 500 1000                             50   100   200   500 1000
+                                   Inference Cost (Total
+                                                  6      Number of CE calls)                                                                Inference Cost                                    Inference Cost
+                                                                                                   (a) SciDocs
+                                 k=1                                                k=100
+               85
+                                                        4                                                                   65                                                      70
+                                                                       40
+                                                                                                          Downstream Task
+
+
+                                                                                                                                                                  Downstream Task
+
+
+               80
+Top-k-Recall
+
+
+                                                        Top-k-Recall
+
+
+                                                                                                                                                                                    65
+                                                                                                             nDCG@10
+
+
+                                                                                                                            60
+                                                                                                                                                                      Recall
+
+
+               75                                                      30                                                                                                           60
+               70
+                                                        2                                                                   55                                                      55
+                                                                       20
+               65                                                                                                                                                                   50
+                                                                                                                            50
+                    50     100         200        500                       100   200       500    1000
+                                                                                                                                 50        100   200   500 1000                          50   100   200   500 1000
+                                                  0
+                                   Inference Cost (Total Number of CE calls)                                                               Inference Cost                                     Inference Cost
+
+                                                                            0           2         (b) Hotpot-QA
+                                                                                                       4        6                                       8
+Figure 7: Top-k-Recall versus inference cost for different test query embedding methods on domains
+SciDocs and Hotpot-QA. See §B.2 for detailed discussion.
+
+Our proposed k-NN search method shares a similar motivation to pseudo-relevance feedback (PRF)
+methods that aim to improve the quality of retrieval by updating the initial query representation
+using heuristic or model-based feedback on retrieved items. We show results for T OU R (Sung
+et al., 2023), a recent PRF-based method that, similar to our method, also optimizes the test query
+representations using retrieval results while utilizing the CE call budget of BCE CE calls over R
+rounds. However, unlike A XN, T OU R uses a single gradient-based update to query embedding to
+minimize KL-Divergence (T OU R- CE) or mean-squared error (T OU R- MSE) between approximate
+and exact scores for top-BCE /R items in each round. In contrast, A XN computes the analytical
+solution to the least-square problem in Eq. 4 in each round, and optionally computes a weighted
+sum with the test query embedding from a dense parametric model such as a dual-encoder using
+weight λ ∈ [0, 1] in Eq. 7. For T OU R- CE, we use learning rate =0.1 (chosen from {0.1, 0.5, 1.0})
+and for T OU R- MSE, we use learning rate = 1e-3 (chosen from {1e-2, 1e-3, 1e-4}).
+               10
+                    On an Nvidia 2080ti GPU with 12 GB memory for a 6-layer Mini-LM (Wang et al., 2020) based model.
+
+
+                                                                                                          19
+Published as a conference paper at ICLR 2024
+
+
+                                                                                                                 k=1                                                                       k=100
+                                           Axnλ=0.0 (76.2)                                      90                                                                    50
+                                           Axnλ=0.1 (77.1)
+                                           Axnλ=0.2 (77.6)                                      85
+
+
+                                                                                 Top-k-Recall
+
+
+                                                                                                                                                       Top-k-Recall
+                                           Axnλ=0.3 (79.1)                                                                                                            40
+                                                                                                80
+                                           Axnλ=0.4 (79.1)
+                                           Axnλ=0.5 (80.4)                                      75                                                                    30
+                                           Axnλ=0.6 (81.0)
+                                           Axnλ=0.7 (80.6)                                      70
+                                                                                                                                                                      20
+                                           Axnλ=0.8 (81.0)
+                                                                                                65
+                                           Axnλ=0.9 (80.5)
+                                           DE = Axnλ=1 (79.2)                                        50    100        200                        500                       100           200         500     1000
+                                                                                                                     Inference Cost (Total Number of CE calls)
+Figure 8: Top-k-Recall for A XN DESRC ,DESRC for different values of λ parameter in eq 7. We use 200
+queries from the validation set in Hotpot-QA and the value in parentheses in the legend denotes
+average Top-1-Recall, averaged over different test-time inference cost budgets. For k = 1, using
+λ = 0.8 yields the best performance and for k = 100, we use λ = 0 unless specified otherwise.
+Figure 7 shows Top-k-Recall and downstream task metrics versus test-time inference CE cost bud-
+get (BCE ) for A XN DESRC ,DESRC under two settings of the weight parameter, λ = 0 and 0.8, and for
+DE SRC and T OU R baselines. For both SciDocs and Hotpot-QA, A XNλ=0.8 performs better than
+A XNλ=0 for k-NN search when k = 1 while λ = 0 works better for searching for k=100 near-
+est neighbors. T OU R and A XN achieve similar Top-1-Recall at smaller inference costs with A XN
+performing marginally better than T OU R at larger cost budgets. However, for k = 100, A XNλ=0
+achieves significantly better recall than T OU R. We observe mixed trends for downstream task met-
+rics. For instance, A XNλ=0.8 and T OU R baselines yield similar performance for nDCG@10 on both
+SciDocs and Hotpot-QA and for downstream task recall on Hotpot-QA while A XNλ=0 performs
+better than all baselines on downstream task recall for SciDocs.
+
+B.3                     T RANSDUCTIVE VERSUS I NDUCTIVE M ATRIX FACTORIZATION
+
+                                                              Axn DESRC , DESRC       MFInd , DESRC
+                                                                                                          Axn                                          Axn      MFTrns , DESRC
+                                                                                                                                                AxnDESRC , DESRC
+                   AxnDESRC , DESRC                  AxnMFInd , DESRC
+                                                         RnRDESRC AxnMFTrns, DESRC RnRMFInd                                                            RnRMFTrnsAxnMFInd, DESRC                            AxnMFTrns , DESRC
+                   RnRDESRC                          RnRMFInd              RnRMFTrns                                                            RnRDESRC               RnRMFInd                            RnRMFTrns
+
+
+                             k=1@m=100                                         k=1@m=100
+                                                                                k=100@m=500
+                                                                                                                                           84
+                                                                                                                                                       k=100@m=500
+                                                                                                                                                       k=1@m=100                                           k=100@m=500
+                 90.0                                                     80
+                                                                                                                          Top-k-Recall@m
+Top-k-Recall@m
+
+
+                                                            90.0                                                             8082                                                               40
+                                           Top-k-Recall@m
+
+
+                 87.5                                                                                                                      80
+                                                                          70
+                 85.0                                       87.5                                                                           78                                                   35
+                 82.5
+                                                                          60
+                                                                                                                             7076
+                                                            85.0                                                                                                                                30
+                 80.0                                                                                                                      74
+
+                                  10   0
+                                                            82.5 10   2
+                                                                                            10   0
+                                                                                                            10   2
+                                                                                                                                                                           10   1
+                                                                                                                                                                                                                     101
+                                              Total Indexing Time (in hours)                                                 60                                                     Total Indexing Time (in hours)
+                                                      80.0
+                                                     (a) SciDocs    (b) Hotpot-QA
+                                    0              2                0
+                                 10             10               10              102 (MF I ND ) ma-
+Figure 9: Top-k-Recall versus indexing time for transductive (MF T RNS ) and inductive
+trix factorization for SciDocs and Hotpot-QA.   We report
+                                       Total Indexing TimeTop-1-Recall
+                                                           (in hours) and Top-100-Recall at fixed
+inference cost budget (m) of 100 and 500 CE calls respectively. See §B.3 for detailed discussion.
+
+Figure 9 shows Top-k-Recall versus indexing time for DE SRC , and transductive (MF T RNS ) and in-
+ductive (MF I ND ) matrix factorization in combination with two test-time inference methods: pro-
+posed inference method (A XN) and retrieve-and-rerank style (R N R) inference. We construct the
+sparse matrix G by selecting top-kd items for each train query using DE SRC , and report results for
+|Qtrain | ∈ {1K, 10K, 50K} and kd ∈ {100, 1000}. We use DE SRC to initialize the query and item
+embeddings for MF methods.
+Recall that MF T RNS trains item embeddings as free-parameters, and thus requires scoring an item
+against a small number of train queries in order to update the item embedding. For this reason,
+MF T RNS performs marginally better than or at par with MF I ND on small-scale data SciDocs with
+25K items, as selecting even for |Qtrain | = 1000, kd = 100, results in each item being scored with
+
+
+                                                                                                                     20
+Published as a conference paper at ICLR 2024
+
+
+four queries on average. However, MF T RNS performs poorly for large-scale data Hotpot-QA (with
+5 million items) due to the increased sparsity of matrix G, providing marginal to no improvement
+over DE SRC . In contrast, MF I ND provides consistent improvement over DE SRC on Hotpot-QA.
+
+B.4    E FFECT OF S PARSE M ATRIX C ONSTRUCTION S TRATEGY
+
+                                                      Hotpot-QA                                      SciDocs
+    Sparse Matrix        |Qtrain |, kd     Time to           Train-Time                 Time to           Train-Time
+ Construction Strategy                   compute G        MF I ND       MF T RNS      compute G        MF I ND       MF T RNS
+                         1K, 100            3 mins     5 mins (20)                -     10 mins     5 mins (10)    1.5 mins (10)
+                         1K, 1000          31 mins    20 mins (20)                -      1.6 hrs   20 mins (20)      7 mins (10)
+                         10K, 100          30 mins    20 mins (20)    1.2 hrs (10)       1.6 hrs   20 mins (20)    7.5 mins (10)
+  kd items per query
+                         10K, 1000          5.2 hrs      3 hrs (20)   3.2 hrs ( 4 )     16.7 hrs    3.2 hrs (20)     1.1 hrs ( 4)
+                         50K, 100           2.6 hrs    1.2 hrs (20)   4.1 hrs (10)       8.3 hrs    1.3 hrs (20)     0.6 hrs (10)
+                         50K, 1000         26.3 hrs      9 hrs (10)    16 hrs ( 4)       82 hrs     14 hrs (10)      3.7 hrs ( 4)
+                         50K, 2             5.8 hrs      3hrs (20)    7.5 hrs (10)       5 mins     3 mins (20)    6.5 mins (20)
+  kd queries per item    50K, 5            12.7 hrs      8hrs (20)    8.5 hrs ( 4)      14 mins     5 mins (20)      9 mins (20)
+                         50K, 10            23 hrs       9hrs (10)    16 hrs ( 4)       26 mins     6 mins (20)    10 mins (20)
+
+Table 3: Breakdown of indexing latency for transductive MF T RNS and inductive MF I ND matrix fac-
+torization methods on SciDocs and Hotpot-QA. For each setting, we show the number of epochs
+for training the model in parentheses. Total indexing time also includes the time taken to compute
+initial query and item embeddings using DE SRC . Computing item embeddings takes 90 seconds for
+SciDocs (with 25K items) and ∼2 hours for Hotpot-QA (with 5 million items) on an Nvidia 2080ti
+GPU with 12 GB GPU memory.
+
+Figure 10 shows Top-k-Recall versus indexing time for and MF with two different strategies to
+construct sparse matrix G and Table 3 shows the time taken to construct the sparse matrix G and the
+time taken to train the matrix factorization model. Q − ∗ indicates that G is constructed by selecting
+a fixed number of kd items per query in Qtrain , and I − ∗ indicates that G is constructed by selecting
+fixed number of kd queries per item in I. When selecting a fixed number of items per query, we
+experiment with |Qtrain | ∈ {1K, 10K, 50K } and kd ∈ {100, 1000}. When selecting a fixed number
+of queries per item, we first create a pool of 50K queries and then select kd queries per item for
+kd ∈ {2, 5, 10}.
+Transductive Matrix Factorization For MF T RNS , both Q−∗ and I −∗ strategies yield similar Top-
+k-Recall at a given indexing cost on SciDocs as both strategies result in each item being scored with
+at least a few queries. However, on Hotpot-QA, selecting a fixed number of items per query may
+not result in each item being scored against some queries, and thus Q − ∗ variants yield marginal
+(if any) improvement over DE SRC . I − ∗ variants perform better than DE SRC and corresponding
+Q − ∗ variants as each item is scored against a fixed number of queries. Note that this performance
+improvement comes at the cost of an increase in time required to compute sparse matrix G, as shown
+in Table 3.
+Inductive Matrix Factorization For MF I ND , we observe that Q − ∗ variants consistently provide
+better recall-vs-indexing time trade-offs as compared to corresponding I − ∗ variants on both Sci-
+Docs and Hotpot-QA.
+
+
+                                                               21
+Published as a conference paper at ICLR 2024
+
+
+                                                                    AxnDE                         , DESRC
+                                                                                                                                         Q ° AxnMF, DESRC                                                       I ° AxnMF, DESRC
+                       AxnDESRC , DESRC                            Q ° AxnMF,SRC
+                                                                              DESRC
+                                                                                                                     I ° AxnMF, DESRC                                               AxnDESRC , DESRC                         Q ° AxnMF, DESRC              I ° AxnMF, DESRC
+                       RnRDESRC                                     RnRDESRC
+                                                                   Q ° RnRMF                                         I ° RnRMF           Q ° RnRMF                                  RnRDESRC                    I ° RnR
+                                                                                                                                                                                                                    Q ° RnRMF
+                                                                                                                                                                                                                         MF                                I ° RnRMF
+
+
+                                       k=1@m=100                                                          k=100@m=500                                                                          k=1@m=100                                                 k=100@m=500
+                                                                                             80 k=1@m=100                                                                                          k=100@m=500
+                                                   (10K, 1000)
+                  90.0                                                                                                                                                                                     40
+ Top-k-Recall@m
+
+
+                                                                                                                                                              Top-k-Recall@m
+                                                                             (50K, 1000)                                                                                       78
+                                                                                                                                                                                                           (10K, 1000)
+                  87.5                      (10K, 100)
+                                                                                                                           (10K, 1000)
+                                                              90.0                           70                                                                  80                         (10K, 100)
+                                             Top-k-Recall@m
+
+
+                  85.0                                                                                                                                                         76                                                                35                          (5)   (10)
+                              (1K, 100)                                                                                                       (50K, 1000)
+                                                                                                                                                                                                                                                                       (2)
+                                                                                                                                                                                                                                  (50K, 1000)
+                  82.5
+                                                              87.5
+                                                                       (50K, 100)
+                                                                                                         (10K, 100)(10)
+                                                                                             60          (2)         (5)                                                                                (50K, 100)
+                                                                 (1K, 1000)                                                                                                    74                                                                30
+                  80.0
+                                                                                                                                                                 70
+                                                  10    0     85.0                       2
+                                                                                    10 100)
+                                                                                    (1K,                                     10   0
+                                                                                                                                             10   2
+                                                                                                                                                                                                                 10   1
+                                                                                                                                                                                                                                                                101
+                                                               Total Indexing Time (in hours)                                                                                                                              Total Indexing Time (in hours)
+                                                              82.5
+                                                               (a-1) SciDocs
+                                                                                                                                           (50K, 100)
+                                                                                                                                                                                                                             Hotpot-QA I ° Axn
+                                                                                                                                                                                                                          (10)
+                                                                                                                                                                                                                      (a-2)
+                       AxnDESRC , DESRC                            Q ° AxnMF, DESRC                                  I ° AxnMF, DESRC                            60 Axn                       (2)
+                                                                                                                                                                                         DESRC , DESRC
+                                                                                                                                                                                                           (5)           Q ° Axn             MF, DESRC             MF, DESRC
+                       RnRDESRC                                    Q ° RnRMF                                         I ° RnRMF(1K, 1000)                                            RnRDESRC                                 Q ° RnRMF                     I ° RnRMF
+                                                              80.0                                (a) Transductive Matrix Factorization (MF T RNS )
+                                     k=1@m=100                                    (50K, 1000)            k=100@m=500                                                                           k=1@m=100                                                 k=100@m=500
+                  90                       (10K, 100)
+                                                              (50K, 100)
+                                                                                             75                       100                               102                    84                  (10K, 1000)
+                                                                                                                                                                                                                           100
+                                                                                                                                                                                                                            (50K, 1000)          45
+                                                                                                                                                                                                                                                          102
+ Top-k-Recall@m
+
+
+                                                                                                                                                              Top-k-Recall@m
+
+
+                                                                                                                                                                                                   (50K, 100)
+
+                                                                                                                                                     82
+                                     (1K, 1000)                                              70                                       Total Indexing Time (in hours)                  (10K, 100)
+                                                                                                                                                                                                                                          (10)   40
+                  85                                                       (10K, 1000)
+                                                                                                                                                                                                                                 (5)
+                         (1K, 100)                                                           65                                                                                80                                    (2)
+
+                                                                                                                                                                                                   (1K, 1000)                                    35
+                                                                                             60                (5)
+                  80                                                                               (2)
+                                                                                                                               (10)                                            78
+                                                                                             55                                                                                              (1K, 100)
+                                                                                                                                                                                                                                                 30
+                  75                                                                                                                                                           76
+                                                                                             50
+                                               100                                102                                       100              102                                                                 101                                             101
+                                                               Total Indexing Time (in hours)                                                                                                                              Total Indexing Time (in hours)
+
+                                                                (b-1) SciDocs                                                                                                                                         (b-2) Hotpot-QA
+
+                                                                                                         (b) Inductive Matrix Factorization (MF I ND )
+Figure 10: Top-1-Recall and Top-100-Recall at fixed inference cost budget (m) of 100 and 500 cross-
+encoder calls respectively versus indexing time (in hours) for different strategies of constructing
+sparse matrix G. Q − ∗ indicates that G is constructed by selecting a fixed number of items per
+query in Qtrain , and I − ∗ indicates that G is constructed by selecting fixed number of queries per
+item in I. For Q − ∗ approaches, the text annotations indicate (|Qtrain |, kd ) pairs where |Qtrain | is the
+number of anchor/train queries and kd is the number of items per query in the sparse matrix G. For
+I − ∗ approaches, the text annotations indicate the number of queries per item in the sparse matrix
+G. See §B.4 for detailed discussion.
+
+
+                                                                                                                                                      22
+Published as a conference paper at ICLR 2024
+
+
+ Baselines                                RnRDESRC                        RnRDEDSTL                      adaCURDESRC                                          Exact
+
+ Proposed                                 AxnDESRC , DESRC                      AxnDEDSTL , DEDSTL                                    AxnMF, DESRC                          RnRMF
+
+                                  k=1@m=100                                     k=100@m=500
+
+
+                                                                                                                        Downstream Task Accuracy
+                   90
+                    1.0                                                                                                                            50.50
+                                                                         70
+  Top-k-Recall@m
+
+
+                   85                                                                                                                              50.25
+                   0.8                                                   60
+                                                                                                                                                   50.00
+                   80                                                    50
+                   0.6                                                                                                                             49.75
+                   75                                                    40
+                                                                                                                                                   49.50
+                   0.4
+                                                                         30
+                   70                                                                                                                              49.25
+                                       10−1                100                        10−1                 100
+                   0.2                                                                                                                                         10−1         100
+                                                     Total Indexing Time (in hours)                                                                  Total Indexing Time (in hours)
+
+                   0.0                                                 (a) |Qtrain | = 100, |Qtest | = 3274
+                          0.0                 0.2                  0.4                0.6                   0.8                                       1.0
+                                  k=1@m=100                                     k=100@m=500
+                   95
+
+
+
+                                                                                                                        Downstream Task Accuracy
+                                                                         80
+                                                                                                                                                   50.50
+  Top-k-Recall@m
+
+
+                   90
+                                                                                                                                                   50.25
+                   85                                                    60
+                                                                                                                                                   50.00
+                   80
+                                                                                                                                                   49.75
+                   75                                                    40
+                                                                                                                                                   49.50
+                   70
+
+                                 10−1               100          101            10−1               100            101                              49.25
+                                                                                                                                                            10−1      100         101
+                                                     Total Indexing Time (in hours)                                                                  Total Indexing Time (in hours)
+
+                                                                       (b) |Qtrain | = 500, |Qtest | = 2874
+                                  k=1@m=100                                     k=100@m=500
+                   95
+                                                                                                                        Downstream Task Accuracy
+
+
+                                                                         90                                                                        49.25
+  Top-k-Recall@m
+
+
+                   90                                                    80                                                                        49.00
+
+                                                                         70                                                                        48.75
+                   85
+                                                                         60                                                                        48.50
+
+                   80                                                    50                                                                        48.25
+
+                                10−1          100         101                  10−1          100          101                                      48.00
+                                                                                                                                                            10−1   100      101
+                                                     Total Indexing Time (in hours)                                                                  Total Indexing Time (in hours)
+
+                                                                    (c) |Qtrain | = 2000, |Qtest | = 1374
+Figure 11: Top-k-Recall and downstream task accuracy versus indexing time for various approaches
+on domain=YuGiOh. We report Top-1-Recall and Top-100-Recall at fixed inference cost budget (m)
+of 100 and 500 CE calls respectively, and downstream task accuracy for fixed inference cost of 100
+CE calls. Each subfigure shows results for different train/test splits.
+
+
+                                                                                            23
+Published as a conference paper at ICLR 2024
+
+
+ Baselines                               RnRDESRC                             RnRDEDSTL                          adaCURDESRC                                                Exact
+
+ Proposed                                AxnDESRC , DESRC                               AxnDEDSTL , DEDSTL                                     AxnMF, DESRC                               RnRMF
+
+                                      k=1@m=100                                         k=100@m=500
+
+
+                                                                                                                                 Downstream Task Accuracy
+                   94
+                   1.0
+  Top-k-Recall@m
+
+
+                                                                             60                                                                             63.4
+                   92
+                   0.8
+                                                                             50                                                                             63.2
+                   90
+                   0.6
+                                                                             40                                                                             63.0
+                   88
+                   0.4
+                                                                             30                                                                             62.8
+                   86
+                               10−1               100                             10−1                     100
+                   0.2                                                                                                                                               10−1           100
+                                                    Total Indexing Time (in hours)                                                                            Total Indexing Time (in hours)
+
+                   0.0                                                   (a) |Qtrain | = 100, |Qtest | = 4127
+                         0.0                  0.2                      0.4                  0.6                        0.8                                     1.0
+                                      k=1@m=100                                         k=100@m=500
+
+
+
+                                                                                                                                 Downstream Task Accuracy
+                                                                             70                                                                             63.0
+                   94
+  Top-k-Recall@m
+
+
+                   92                                                        60
+                                                                                                                                                            62.5
+
+                   90                                                        50
+                                                                                                                                                            62.0
+                   88                                                        40
+                                                                                                                                                            61.5
+                   86           −1            0              1                         −1              0               1
+                           10            10             10                        10              10              10
+                                                                                                                                                                     10−1     100         101
+                                                    Total Indexing Time (in hours)                                                                            Total Indexing Time (in hours)
+
+                                                                        (b) |Qtrain | = 500, |Qtest | = 3727
+                                      k=1@m=100                                         k=100@m=500
+                                                                                                                                 Downstream Task Accuracy
+
+
+                   96                                                        90
+                                                                                                                                                            63.5
+  Top-k-Recall@m
+
+
+                                                                             80
+                   94
+                                                                             70                                                                             63.0
+                   92
+                                                                             60
+                                                                                                                                                            62.5
+                   90
+                                                                             50
+                                                                                                                                                            62.0
+                   88                                                        40
+                                                                                                                                                            61.5
+                                       100                       102                        100                            102
+                                                                                                                                                                             100                102
+                                                    Total Indexing Time (in hours)                                                                            Total Indexing Time (in hours)
+
+                                                                        (c) |Qtrain | = 2000, |Qtest | = 2227
+Figure 12: Top-k-Recall and downstream task accuracy versus indexing time for various approaches
+on domain=Star Trek. We report Top-1-Recall and Top-100-Recall at fixed inference cost budget
+(m) of 100 and 500 CE calls respectively, and downstream task accuracy for fixed inference cost of
+100 CE calls. Each subfigure shows results for different train/test splits.
+
+
+                                                                                                  24
+Published as a conference paper at ICLR 2024
+
+
+ Baselines                         RnRDESRC         RnRDEDSTL       RnRtf-idf                               adaCURDESRC            adaCURtf-idf         Exact
+
+
+  Proposed                           AxnDESRC , DESRC              AxnDEDSTL , DEDSTL                                    AxnMF, DESRC              RnRMF
+                                     AxnDESRC , tf-idf             AxnDEDSTL , tf-idf                                    AxnMF, tf-idf
+
+                                         k=1@m=100                                                                     k=100@m=500
+        1.0
+       Top-k-Recall@m
+
+
+        0.8                                                                               80
+                              90
+        0.6
+
+                                                                                          70
+        0.4                   80
+
+        0.2
+                                                                                          60
+                              70
+        0.0
+                   0.0                 0.2              0.4              0.6                                     0.8         1.0
+                                               100                       102                                               100                     102
+                                                              Total Indexing Time (in hours)
+                                                                                Downstream Task nDCG@10
+     Downstream Task Recall
+
+
+                              35                                                                          16.5
+
+                                                                                                          16.0
+                              30
+                                                                                                          15.5
+                              25
+                                                                                                          15.0
+
+
+                                              100                  102                                                      100                   102
+                               Total Indexing Time (in hours)                                               Total Indexing Time (in hours)
+Figure 13: Top-k-Recall and downstream task performance metrics versus indexing time for var-
+ious approaches on domain=SciDocs. We report Top-1-Recall and Top-100-Recall at fixed in-
+ference cost budget (m) of 100 and 500 cross-encoder (CE) calls respectively, and downstream
+task metrics for fixed inference cost of 100 cross-encoder calls. We report results for transduc-
+tive matrix factorization (MF T RNS ) in these plots. The base dual-encoder (DE SRC ) in these plots
+is a 6-layer distilbert model finetuned on MS-MARCO dataset. The DE SRC model is available at
+https://huggingface.co/sentence-transformers/msmarco-distilbert-base-v2.
+
+
+                                                                               25
+Published as a conference paper at ICLR 2024
+
+
+ Baselines                         RnRDESRC     RnRDEDSTL        RnRtf-idf                             adaCURDESRC               adaCURtf-idf         Exact
+
+
+  Proposed                           AxnDESRC , DESRC           AxnDEDSTL , DEDSTL                                     AxnMF, DESRC               RnRMF
+                                     AxnDESRC , tf-idf          AxnDEDSTL , tf-idf                                     AxnMF, tf-idf
+
+                                         k=1@m=100                                                               k=100@m=500
+        1.0
+                                                                                      50
+       Top-k-Recall@m
+
+
+        0.8                   90
+                                                                                      45
+        0.6
+
+                              80                                                      40
+        0.4
+                                                                                      35
+        0.2
+                              70                                                      30
+        0.0
+                   0.0                 0.2           0.4             0.6                                   0.8             1.0
+                                        101          102             103                                         101              102           103
+                                                           Total Indexing Time (in hours)
+                                                                            Downstream Task nDCG@10
+     Downstream Task Recall
+
+
+                                                                                                      70
+                              80
+                                                                                                      65
+                              70
+                                                                                                      60
+                              60
+                                                                                                      55
+                              50
+                                                                                                      50
+                                       101        102          103                                                101              102          103
+                               Total Indexing Time (in hours)                                          Total Indexing Time (in hours)
+Figure 14: Top-k-Recall and downstream task performance metrics versus indexing time for var-
+ious approaches on domain=Hotpot-QA. We report Top-1-Recall and Top-100-Recall at fixed in-
+ference cost budget (m) of 100 and 500 cross-encoder (CE) calls respectively, and downstream
+task metrics for fixed inference cost of 100 cross-encoder calls. We report results for induc-
+tive matrix factorization (MF I ND ) in these plots. The base dual-encoder (DE SRC ) in these plots
+is a 6-layer distilbert model finetuned on MS-MARCO dataset. The DE SRC model is available at
+https://huggingface.co/sentence-transformers/msmarco-distilbert-base-v2.
+
+
+                                                                           26
+Published as a conference paper at ICLR 2024
+
+
+ Baselines                          RnRDESRC          RnRDEDSTL          RnRtf-idf                             adaCURDESRC                 adaCURtf-idf    Exact
+
+
+  Proposed                            AxnDESRC , DESRC                AxnDEDSTL , DEDSTL                                         AxnMF, DESRC             RnRMF
+                                      AxnDESRC , tf-idf               AxnDEDSTL , tf-idf                                         AxnMF, tf-idf
+
+                                            k=1@m=100                                                                     k=100@m=500
+        1.0
+                                                                                             85
+       Top-k-Recall@m
+
+
+        0.8                   95                                                             80
+        0.6
+                              90                                                             75
+        0.4
+                                                                                             70
+                              85
+        0.2
+                                                                                             65
+                              80
+        0.0
+                   0.0                    0.2             0.4               0.6              60                     0.8              1.0
+                                   10−1          100               101                                          10−1               100              101
+                                                                Total Indexing Time (in hours)
+                                                                                   Downstream Task nDCG@10
+     Downstream Task Recall
+
+
+                                                                                                             16.6
+                              35
+                                                                                                             16.4
+
+                                                                                                             16.2
+                              30
+
+                                                                                                             16.0
+                              25
+                                                                                                             15.8
+
+                                   10−1         100             101                                                       10−1      100            101
+                               Total Indexing Time (in hours)                                                  Total Indexing Time (in hours)
+Figure 15: Top-k-Recall and downstream task performance metrics versus indexing time for various
+approaches on domain=SciDocs. We report Top-1-Recall and Top-100-Recall at fixed inference
+cost budget (m) of 100 and 500 cross-encoder (CE) calls respectively, and downstream task metrics
+for fixed inference cost of 100 cross-encoder calls. We report results for transductive matrix factor-
+ization (MF T RNS ) in these plots. The base dual-encoder (DE SRC ) in these plots is a 12-layer bert-base
+model finetuned on MS-MARCO dataset. The model is available at https://huggingface.co/sentence-
+transformers/msmarco-bert-base-dot-v5.
+
+
+                                                                                  27
+Published as a conference paper at ICLR 2024
+
+
+ Baselines                           RnRDESRC     RnRDEDSTL         RnRtf-idf                             adaCURDESRC               adaCURtf-idf         Exact
+
+
+  Proposed                             AxnDESRC , DESRC            AxnDEDSTL , DEDSTL                                     AxnMF, DESRC               RnRMF
+                                       AxnDESRC , tf-idf           AxnDEDSTL , tf-idf                                     AxnMF, tf-idf
+
+                                               k=1@m=100                                                             k=100@m=500
+        1.0
+                              95.0                                                             55
+       Top-k-Recall@m
+
+
+        0.8
+                              92.5                                                             50
+        0.6
+                              90.0
+                                                                                               45
+        0.4
+
+                              87.5
+        0.2                                                                                    40
+                              85.0
+        0.0
+                   0.0                   0.2            0.4             0.6                    35             0.8             1.0
+                                         101            102             103                                         101             102             103
+                                                              Total Indexing Time (in hours)
+                                                                               Downstream Task nDCG@10
+     Downstream Task Recall
+
+
+                                                                                                         72
+                              85
+                                                                                                         70
+                              80
+                                                                                                         68
+                              75
+                                                                                                         66
+                              70
+                                                                                                         64
+                              65
+
+                                      101         102             103                                               101             102            103
+                               Total Indexing Time (in hours)                                             Total Indexing Time (in hours)
+Figure 16: Top-k-Recall and downstream task performance metrics versus indexing time for var-
+ious approaches on domain=Hotpot-QA. We report Top-1-Recall and Top-100-Recall at fixed in-
+ference cost budget (m) of 100 and 500 cross-encoder (CE) calls respectively, and downstream
+task metrics for fixed inference cost of 100 cross-encoder calls. We report results for inductive
+matrix factorization (MF I ND ) in these plots. The base dual-encoder (DE SRC ) in these plots is a
+12-layer bert-base model finetuned on MS-MARCO dataset. This DE SRC model is available at
+https://huggingface.co/sentence-transformers/msmarco-bert-base-dot-v5.
+
+
+                                                                              28

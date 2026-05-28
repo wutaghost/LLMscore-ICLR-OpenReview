@@ -1,0 +1,1826 @@
+Under review as a conference paper at ICLR 2025
+
+
+000
+001
+      RetrievalAttention: ACCELERATING L ONG -C ONTEXT
+002   LLM I NFERENCE VIA V ECTOR R ETRIEVAL
+003
+004
+005    Anonymous authors
+006    Paper under double-blind review
+007
+008
+009                                               A BSTRACT
+010
+011            Transformer-based Large Language Models (LLMs) have become increasingly
+012            important. However, due to the quadratic time complexity of attention computa-
+013            tion, scaling LLMs to longer contexts incurs extremely slow inference speed and
+014            high GPU memory consumption for caching key-value (KV) vectors. This paper
+015            proposes RetrievalAttention, a training-free approach to both accelerate attention
+016            computation and reduce GPU memory consumption. By leveraging the dynamic
+017            sparsity of attention mechanism, RetrievalAttention proposes to build approximate
+018
+               nearest neighbor search (ANNS) indexes for KV vectors in CPU memory and
+               retrieve the most relevant ones through vector search during generation. Unfortu-
+019
+               nately, we observe that the off-the-shelf ANNS indexes are often ineffective for
+020
+               such retrieval tasks due to the out-of-distribution (OOD) between query vectors
+021            and key vectors in the attention mechanism. RetrievalAttention addresses the OOD
+022            challenge by designing an attention-aware vector search algorithm that can adapt to
+023            the distribution of query vectors. Our evaluation demonstrates that RetrievalAtten-
+024            tion achieves near full attention accuracy while only requiring access to 1–3% of
+025            the data. This leads to a significant reduction in the inference cost of long-context
+026            LLMs, with a much lower GPU memory footprint. In particular, RetrievalAttention
+027            only needs a single NVIDIA RTX4090 (24GB) to serve 128K tokens for LLMs
+028            with 8B parameters, which is capable of generating one token in 0.188 seconds.
+029
+030
+031
+      1    I NTRODUCTION
+032
+033
+      Recent transformer-based Large Language Models (Vaswani et al., 2017) have shown remarkable
+      capabilities in processing long contexts. For instance, Gemini 1.5 Pro (Team, 2024) has supported
+034
+      the context window of up to 10 million tokens. While this is promising for analyzing extensive data,
+035
+      supporting longer context windows also introduces challenges for inference efficiency due to the
+036   quadratic complexity of attention computation. To enhance efficiency, KV caching, a technique that
+037   retains past key and value vectors, has been widely adopted to prevent redundant computations. How-
+038   ever, KV caching-based systems face two primary issues: (a) substantial GPU memory requirements,
+039   particularly for long contexts, e.g., the Llama-3-8B model requires approximately 125GB per million
+040   tokens; and (b) inference latency increases linearly to the context size, primarily due to the time
+041   needed to access cached tokens — a common issue across various computing devices, including
+042   GPUs. Therefore, reducing storage costs and token access is vital for enhancing inference efficiency.
+043   The solution lies in leveraging the dynamic sparsity inherent in the attention mechanism (Deng
+044   et al., 2024). This refers to the phenomenon where each query vector significantly interacts with
+045   only a limited subset of key and value vectors, with the selection of these critical vectors varying
+046   dynamically based on individual queries. Prior work (Tang et al., 2024; Xiao et al., 2024a; Ribar
+047   et al., 2024; Lee et al., 2024; Singhania et al., 2024) has proposed various techniques to capitalize on
+048   this observation to improve the efficiency of attention computation. However, most of these methods
+049   identify important tokens either statically (Xiao et al., 2024b; Li et al., 2024) or heuristically (Xiao
+050
+      et al., 2024a; Ribar et al., 2024; Tang et al., 2024), leading to imprecise approximations that often
+      result in a significant performance drop.
+051
+052   We observe that the Approximate Nearest Neighbor Search (ANNS) index, such as proximity
+053   graph (Malkov & Yashunin, 2018), is particularly effective in this context. ANNS index is used
+      to efficiently find the most similar vectors to the query and is widely adopted in various domains
+
+
+                                                         1
+      Under review as a conference paper at ICLR 2025
+
+
+054               RetrievalAttention               Recompute
+055                                        KNN                           Prompt Length       128K   256K   512K   1M
+                                                 FlexGen
+056    Model             Traditional ANN                                 Total Latency (s)   32.8   111    465    1,765
+                                                 Full attention by                FFN (s)    7.6    15      31      70
+057   accuracy
+                          InfLLM                 KV recompute or
+        (the   SnapKV                                                        Attention (s)   25.2   96     434    1,695
+058                                                     offloading
+       higher
+059     the                   Heuristic method                            GPU Memory
+                                                                                             15.6   31.2   62.5   125
+060    better)                                                           KV Cache (GB)
+               StreamingLLM
+061                     Static KV compression
+062                Decoding latency (the lower the better)
+063
+064   Figure 1: RetrievalAttention achieves similar                  Table 1: Decoding latency and memory required
+065   task accuracy as full attention but exhibits                   for KV cache of Llama-3-8B across different con-
+066
+      extremely low decoding latency.                                text lengths on one A100 GPU.
+067
+068
+      like information retrieval (Xiong et al., 2021) and recommendation systems (Cost & Salzberg, 1993;
+069
+      Covington et al., 2016; Pal et al., 2020). When using the inner product as the similarity measurement
+070   to build the index for key vectors, searching over the index with the query vector exactly aligns with
+071   the attention mechanism.1 It can directly identify the most critical key vectors with the maximum inner
+072   product to the query vector in sub-linear time complexity, yielding a higher accuracy compared to
+073   previous static or heuristic methods (as illustrated in Figure 1). Furthermore, most ANNS algorithms
+074   are compatible with CPU implementation, which enables strategic allocation of GPU and CPU
+075   memory resources and thus facilitates the handling of longer context inference on devices with
+076   limited GPU memory.
+077   Leveraging ANNS for attention mechanism presents a unique challenge: the out-of-distribution
+078   (OOD) problem between query and key vectors. Most ANNS engines operate under the assumption
+079   that both query and key vectors are drawn from the same data distribution. However, this assumption
+080   does not hold in this context due to the different projection weights for query and key vectors in
+081   attention mechanism. The Mahalanobis distance (Mahalanobis, 2018) shows that query vectors
+082   deviate more than 10× farther from key vectors compared to that between in-distribution query and
+083   key vectors. Unfortunately, the effectiveness of ANNS degrades significantly under OOD problem. In
+084
+      particular, our empirical analysis indicates that maintaining an acceptable level of inference accuracy
+      requires conventional ANNS scanning 30–50% of all key vectors to identify the critical ones, which
+085
+      fails to fully leverage the inherent sparsity of the attention mechanism and impairs the inference
+086
+      latency. To the best of our knowledge, we are the first to identify the challenge of OOD in using
+087   ANNS index for attention computation, a factor that is crucial for inference efficiency and accuracy.
+088
+089   In this work, we present RetrievalAttention, an efficient method for accelerating long-context LLM
+090
+      generation. RetrievalAttention employs dynamic sparse attention during token generation, allowing
+      the most critical tokens to emerge from the extensive context data. To address the challenge of
+091
+      OOD, RetrievalAttention proposes a vector index tailored for the attention mechanism, focusing
+092
+      on the distribution of queries rather than keys. This approach allows for the traversal of only a
+093   small subset of key vectors (1–3%) to identify the most relevant tokens, yielding accurate attention
+094   scores and inference accuracy. In addition, RetrievalAttention reduces GPU memory consumption by
+095   retaining a small number of KV vectors in GPU memory following static patterns (e.g., similar to
+096   StreamingLLM (Xiao et al., 2024b)) and offloading the majority of KV vectors to CPU memory for
+097   index construction. During token generation, RetrievalAttention efficiently retrieves critical tokens
+098   using ANNS index on the CPU and merges the partial attention results from both the CPU and GPU.
+099   This strategy enables RetrievalAttention to perform attention computation with reduced latency and
+100   minimal GPU memory footprint.
+101   We evaluate the accuracy and efficiency of RetrievalAttention on both commodity GPUs (RTX4090)
+102   and high-end GPUs (A100) on three long-context LLMs across various long-context benchmarks
+103   like ∞-Bench (Zhang et al., 2024b) and RULER (Hsieh et al., 2024). For the 128K context on the
+104   RTX4090 GPU, RetrievalAttention achieves 4.9× and 1.98× decoding-latency reduction compared to
+105   the retrieval method based on exact KNN and traditional ANNS index, respectively, while maintaining
+106
+          1
+107         Maximum inner product search can be viewed as similarity search and efficiently solved by ANNS
+      indexes (Morozov & Babenko, 2018).
+
+
+                                                                     2
+      Under review as a conference paper at ICLR 2025
+
+
+108
+109
+110
+111
+112
+113
+114
+115
+116   Figure 2: The dynamic sparsity of each layer and head in Llama-3-8B model in the KV retrieval test
+117   of 100,000 tokens. The blue curve shows that using dynamically selected top-1000 critical tokens
+118   achieves an average recovery ratio of 89%, indicating high attention sparsity. In contrast, the orange
+119   curve reveals that statically using the initially determined top-1000 critical tokens from the generation
+120   of the first token to generate subsequent tokens drops the average recovery ratio to 71%.
+121
+122
+      the same accuracy as full attention. To the best of our knowledge, RetrievalAttention is the first
+123
+      solution that supports running 8B-level models on a single RTX4090 GPU (24GB) with acceptable
+124
+      latency and almost no accuracy degradation.
+125
+126
+127   2     BACKGROUND AND M OTIVATION
+128
+129   2.1   LLM AND ATTENTION O PERATION
+130
+      In the generation process of the t-th token, the attention operation computes the dot product between
+131
+      the query vector qt ∈ R1×d (where d is the hidden dimension) and the key vectors of all preceding
+132                                                                      1
+      tokens ki ∈ R1×d (for i ≤ t). This product is scaled by d− 2 and normalized via a Softmax
+133
+      function to yield the attention score at,i . These scores then weight the values vi , resulting in the
+134   output ot .
+135
+136
+                                  qt · kTi               ezi                     X
+137                        zi =     √ ,      at,i = P                 ,   ot =            at,i · vi         (1)
+138                                    d               j=1..t   ezj              i=1..t
+139
+      LLM inference contains two stages: the prefill phase and decoding phase. The prefill phase, which
+140
+      only happens once, takes all tokens of the prompt as input and performs attention with a time-
+141
+      complexity O(n2 ). In the decoding (token generation) phase, the newly generated token is added to
+142   the input and computes attention scores with same complexity. One common optimization to avoid
+143   repetitive calculation is caching past KV states, thereby reducing the complexity to O(n).
+144
+145   2.2   E XPENSIVE L ONG -C ONTEXT S ERVING
+146
+147   Due to the quadratic time complexity of attention operation, serving long-sequence input incurs
+148   extremely high costs. Table 1 shows the inference latency of Llama-3-8B without KV cache. When
+149   the prompt length reaches 1 million tokens, generating every token requires 1,765 seconds with
+150   over 96% of latency spent on attention operations. Although KV cache can reduce the decoding
+151
+      latency, it demands a huge amount of GPU memory for long contexts. As shown in Table 1, 125 GB
+      memory is necessary for storing the KV cache when the context length reaches 1 million tokens,
+152
+      which is far beyond the GPU memory capacity of commodity GPUs such as the RTX4090 (24GB)
+153
+      or even high-end GPUs like A100 (40GB or 80GB). This necessitates either scaling to more GPUs
+154   to accommodate the large KV cache (Liu et al., 2024a) or repetitively offloading and reloading
+155   the entire KV cache between CPU and GPU memory over PCIe (Sheng et al., 2023), resulting in
+156   excessive communication overhead. Neither approach provides an efficient and cost-effective solution
+157   for long-context inference on commodity GPUs.
+158
+159   2.3   DYNAMIC AND S PARSE ATTENTION
+160
+161   Corroborating recent work (Xiao et al., 2024b; Li et al., 2024), we observe that attention computation
+      in LLMs exhibits significant sparsity. Despite the large context length, only a small fraction of tokens
+
+
+                                                         3
+      Under review as a conference paper at ICLR 2025
+
+
+162                               Yi-9B-200K                           Llama-3-8B-Instruct-262k                                     Yi-9B-200K                    Llama-3-8B-Instruct-262k
+                   1.0                                          1.0
+163                                                                                                                     1500       K to K    Q to K    2500            K to K     Q to K
+                   0.8                                          0.8                                                                                    2000
+      Recall@100
+164
+
+
+                                                                                                            Frequency
+                   0.6                                          0.6                                                     1000                           1500
+165
+                                               IVF, K to K      0.4                        IVF, K to K                                                 1000
+166                0.4                         IVF, Q to K                                 IVF, Q to K                   500
+                                               HNSW, K to K     0.2                        HNSW, K to K                                                 500
+167                0.2                         HNSW, Q to K                                HNSW, Q to K
+                                                                                                                           0                              0
+168                      0.00   0.25    0.50     0.75    1.00         0.00   0.25   0.50    0.75     1.00                      0   50    100     150          0          100       200
+                                          Scanned Vectors (Percentage)                                                                         Mahalanobis Distance
+169
+170
+                                       (a) ANNS index performance.                                                                      (b) Different distribution.
+171
+      Figure 3: (a) Query vectors (Q) and key vectors (K) are dumped from Yi-9B and Llama-3-8B with a
+172   prompt length of 128,000 tokens. Off-the-shelf ANNS indexes perform poorly on Q to K searches
+173   while work well for K to K searches. (b) Query vectors are distant from key vectors, while key
+174   vectors themselves are close.
+175
+176
+177   with the highest attention scores (i.e., at,i in Equation 1), also known as critical tokens, contribute
+178   significantly to the attention output.
+179   We quantify the attention sparsity by calculating the cumulative sum of attention scores of top-k
+180   critical tokens. This cumulative sum, called recovery ratio, represents how much of the full attention
+181   can be recovered using a small number of critical tokens, with a higher recovery ratio indicating
+182   greater sparsity. When generating 20 tokens consecutively based on a prompt of 100,000 tokens, we
+183   profile the average recovery ratio of decoding tokens using top-1000 critical tokens in different layers
+184   and heads of the model. As shown in the blue curve of Figure 2, by accurately selecting top-1000
+185   critical tokens based on full attention, most attention heads can recover over 90% of the attention
+186
+      scores from the full attention, with an average of 89% across all heads and layers.
+187   Furthermore, we observe that as the LLM continues generating new tokens, the critical key vectors
+188   change dynamically, highly depending on the current query vector. To verify this, we first collect the
+189   top-1000 critical key vectors to generate the first token in each attention head and statically apply
+190   them for the subsequent token generation. The results shown in the orange curve of Figure 2 indicate
+191   a significant drop in the average recovery rate, from 89% to 71%. This demonstrates that tokens
+192
+      considered important in previous queries may not be critical in subsequent queries, and vice versa.
+      Therefore, it is necessary to dynamically select important tokens for each query vector.
+193
+194   The dynamic sparsity shows a promising path to approximately compute attention with greatly
+195   reduced cost and without sacrificing the model accuracy. For each query, if we can accurately identify
+196   the relevant key-value vectors with higher importance, minimum GPU memory and a much lower
+197   time complexity can be achieved for attention computation.
+198
+199   2.4                C HALLENGES OF O FF - THE - SHELF V ECTOR S EARCH
+200
+      To reduce the latency of long contexts inference while maintaining performance, we require a
+201
+      method to accurately identify the critical tokens to the current query in sub-linear time complexity.
+202
+      Additionally, given the constrained GPU memory, it would be beneficial if such a method could
+203   efficiently utilize CPU memory to manage the KV vectors. Based on Equation 1, one key vector is
+204   critical for a query vector if they have a large inner product. With the inner product as a similarity
+205   function, performing searches on ANNS indexes aligns well with the goal of the attention mechanism
+206   to efficiently find critical key vectors for a query vector.
+207
+      Traditional ANNS indexes generally cluster similar (close) vectors and select the representative vector
+208
+      for each cluster (Sivic & Zisserman, 2003) or directly build connections between similar vectors to
+209   form a proximity graph (Wang et al.).2 For cluster-based indexes, the query first compares with all
+210   representative vectors and then only accesses the most similar clusters, whereas, in the proximity
+211   graph, the query performs a greedy search, moving closer to the most similar vectors at each hop.
+212   Both methods typically require scanning a limited subset of all vectors (e.g., 1%) to identify the most
+213   similar vectors to the query, achieving high search efficiency and accuracy. However, we find that
+214
+215
+                   2
+                       In this context, we use “similar” and “close” to indicate vectors with larger inner product interchangeably.
+
+
+                                                                                                          4
+      Under review as a conference paper at ICLR 2025
+
+
+216
+                                                      GPU-side
+217                  KV          KV                                    Combine
+          GPU                                         Attention                                             Query vectors
+218   Predictable
+                      Offload Most KV Vectors                                      Attention
+      KV Vectors
+219                   to CPU Vector DB                  Query Vector                Output
+220                                                                                                                          KNN
+221                                             Retrieval
+                                                                       CPU-side
+222       CPU                                    Search
+                                                                       Attention
+      ANNS Index
+223   (indexed by
+      key vectors)                                        Nearest KV Vectors                                   Key vectors
+224
+                                                        (dynamically retrieved)
+225                                                                                            (b) Key building procedure of
+226                       (a) Overall design of RetrievalAttention.                            OOD-aware index.
+227
+      Figure 4: (a) RetrievalAttention offloads most KV tokens to vector databases in CPU, which are
+228
+      retrieved during the decoding phase to find the most relevant KV tokens with queries. (b) During the
+229
+      index construction, we link each query to its exact top-k nearest key vectors (KNN).
+230
+231
+232   naively applying off-the-shelf vector indexes fails to provide good performance because of the OOD
+233   issue between query (Q) and key vectors (K).
+234
+235
+      In conventional vector databases, the distribution of vectors between content and query is often
+      well-aligned because they are derived from the same embedding model. However, naively using
+236
+      traditional vector indexes for attention computation suffers from an inherent distribution gap between
+237
+      queries and keys, which are projected by different weights as 2.1. Figure 3a (focus on Q to K for
+238   now) demonstrates the performance of widely-used vector indexes supported by Faiss (Douze et al.,
+239   2024) using a query vector to retrieve the most similar key vectors. It compares the percentage of
+240   keys scanned and the corresponding recall achieved (i.e., the overlapping ratio between the retrieved
+241   top-100 results and the ground truth). Cluster-based IVF (Sivic & Zisserman, 2003) requires scanning
+242   ∼30–50% data for a recall rate higher than 0.95, and graph-based HNSW (Malkov & Yashunin,
+243   2018) falls into a local optimum. The results show that traditional vector indexes require scanning a
+244   large number of vectors to achieve a high recall, highlighting the challenge of performing efficient
+245   vector searches for attention.
+246   Fundamentally, the difficulty is due to the OOD between query and key vectors. We quantify this
+247   using Mahanobis distance (Mahalanobis, 2018), which measures the distance from a vector to a
+248   distribution. We sample 5,000 vectors from Q and K respectively as the query set and compute the
+249   the Mahanobis distance from the query set to the remaining vectors in K. Figure 3b shows that the
+250   queries from Q are significantly distant from the K vectors (OOD) while K themselves are very
+251   close. Therefore, traditional index building based solely on the closeness between key vectors does
+252
+      not align with the attention mechanism, which requires to retrieve critical tokens as nearest neighbors
+      from the query vectors’ viewpoint. In contrast, Figure 3a shows that using sampled K as the queries
+253
+      (K to K) can easily achieve a high recall by only scanning 1–5% vectors because they are in the
+254
+      same distribution. Similarly, query vectors in each attention head also follow the same distribution as
+255   they are projected by the same model weight. For efficient vector search, the index must consider the
+256   OOD characteristic of the attention computation by design.
+257
+258
+259   3    R ETRIEVAL ATTENTION D ESIGN
+260
+261   In this work, we focus on the acceleration of token generation and assume the prefill of the long-
+262   context prompt is done in advance, which is widely supported by existing LLM service providers
+263   (e.g., context caching (Google Cloud, 2024) or separation of prefill and decoding (Patel et al., 2024;
+264   Qin et al., 2024)).
+265   We propose RetrievalAttention that leverages attention-aware vector search to approximate atten-
+266   tion computation by CPU-GPU co-execution accurately. Figure 4a shows the overall design of
+267   RetrievalAttention. Based on our observation in §2.3, We derive an approximated attention by
+268   selectively retrieving relevant key-value vectors while discarding those that are negligible(§3.1).
+269   To efficiently support long context, we offload most KV vectors to the CPU memory, build vector
+      indexes, and use attention-aware vector search to find critical tokens. (§3.2). To better exploit the
+
+
+                                                                  5
+      Under review as a conference paper at ICLR 2025
+
+
+270
+      GPU devices, we leverage the attention scores obtained in the prefill phase to select a proportion of
+271   KV cache that is consistently important during the decoding phase and persist them on GPU devices.
+272   RetrievalAttention computes partial attention with dynamically retrieved from CPU memory and
+273   persistent key-value vectors in GPU memory in parallel and finally combines them together(§3.3).
+274
+275   3.1   A PPROXIMATED ATTENTION
+276
+277   Based on the Equation 1, RetrievalAttention approximates the full attention output ot by selectively
+278   utilizing the KV vectors associated with high attention scores (i.e., at,i ). Specifically, we define It,ϵ
+279   as a subset of token indices for which the attention score surpasses ϵ. Consequently, a sparse attention
+280   mechanism, which only considers tokens located in It,ϵ , can be defined as follows:
+281                   X                H X                X                                    ezi
+282            ot =         at,i · vi + HH   at,i · vi ≈
+                                                                 ãt,i · vi where ãt,i = P                  (2)
+                                                                                                     ezj
+                                             H
+                     i∈It,ϵ            i̸∈I              i∈I                                 j∈I t,ϵ
+283
+                                         t,ϵ      HH         t,ϵ
+
+284
+285   Based on the above approximation, we build RetrievalAttention to only consider important key-value
+286   vectors (i.e., It,ϵ ) that are persistent in GPU cache and dynamically retrieved by vector indexes.
+287
+288   3.2   ATTENTION - AWARE V ECTOR S EARCH
+289
+      For each pair of key and value vectors, we first decide whether to hold them in CPU or GPU memory
+290
+      (the decision method is elaborated in §3.3). The KV vectors offloaded to CPU memory will be
+291
+      indexed by ki ∈ Rd and queried by qt to find the most relevant ones.
+292
+293   To accelerate the vector search during token generation, RetrievalAttention diverges from traditional
+294   indexes that only consider the closeness between key vectors for index building. Instead, it leverages
+295
+      the existing query vectors in the prefill phase to guide the index building for key vectors, efficiently
+      mitigating the distribution gap. As shown in Figure 4b, during the index construction, RetrievalAt-
+296
+      tention explicitly establishes connections from the query vector to its nearest key vectors (i.e., exact
+297
+      k-nearest neighbors, or KNN). The KNN results can be efficiently computed via GPU, forming a
+298   mapping from query vector distribution to key vector distribution. Using this structure, the decoding
+299   query vector can first search its nearest query vectors and then obtain the most relevant key vectors
+300   through the distribution mapping.
+301
+      Therefore, the KNN connections from query vectors to key vectors serve as a bridge to reconcile their
+302
+      distribution differences. However, this structure still has imperfections in both memory overhead and
+303
+      search efficiency because we need to store and access query vectors besides key vectors. To address
+304   this problem, we leverage the projection technique from the state-of-the-art cross-modal ANNS index
+305   RoarGraph (Chen et al., 2024a) to eliminate all query vectors. Specifically, we project the KNN
+306   connections into key vectors by linking key vectors that are connected to the same query vectors,
+307   which efficiently streamlines the search. This process connects key vectors that are perceived as close
+308   from the query vectors’ perspective, allowing efficient index traversal for future query vectors.
+309
+      Our evaluation shows that, by effectively modeling the proximity relationship between the query
+310   and key vectors, the vector database only requires scanning 1–3% key vectors to reach a high
+311   recall, significantly reducing the index search latency by 74% compared with IVF indexes (Sivic &
+312   Zisserman, 2003).
+313
+314   3.3   CPU-GPU C O -E XECUTION
+315
+316   To exploit GPU parallelism and accelerate attention computation, RetrievalAttention decomposes the
+317   attention computation into two disjoint sets of KV cache vectors, the predictable ones on GPU and
+318   the dynamic ones on CPU, and then combines the partial attention outputs together.
+319   We leverage the patterns observed in the prefill phase to predict KV vectors that are consistently
+320   activated during token generation. Similar to StreamingLLM (Xiao et al., 2024b), our current
+321   implementation uses fixed initial tokens and the last sliding window of the context as the static pattern
+322   and persists them in the GPU cache. RetrievalAttention can be adapted to utilize more complex static
+323   patterns (Li et al., 2024; Jiang et al., 2024), achieving the best trade-off between low inference cost
+      and high accuracy. During the prefill phase, we physically separate the static tokens in the GPU
+
+
+                                                          6
+      Under review as a conference paper at ICLR 2025
+
+
+324
+      memory with the remaining tokens, which are offloaded to the CPU memory indexed by the ANNS.
+325   To minimize data transfer over the slow PCIe interface, RetrievalAttention independently computes
+326   the attention results for the CPU and GPU components and then combines them, inspired by the
+327   FastAttention (Dao et al., 2022).
+328
+329
+330
+      4     E VALUATION
+331
+      In this section, we compare the performance of RetrievalAttention in long-context LLM inference
+332
+      against full attention and other state-of-the-art methods. Through experiments, we mainly explore
+333
+      the following questions: (1) How does RetrievalAttention affect the model’s inference accu-
+334   racy? Specifically, we assess the generation accuracy of RetrievalAttention and other methods
+335   across various downstream tasks (§4.2) (2) Can RetrievalAttention efficiently reduce the token
+336   generation latency of long-context LLM inference? We compare the end-to-end decoding latency
+337   of RetrievalAttention with that of other baselines (§4.3).
+338
+339   4.1   E XPERIMENTAL S ETUP
+340
+341   Testbed, Models, and Configurations. We conduct experiments on a server equipped with one
+342   NVIDIA RTX4090 GPU (24GB memory) and an Intel i9-10900X CPU with 10 physical cores (20
+343
+      logical cores) and 128GB DRAM. The experiment results using NVIDIA A100 GPU can be found
+      in §A.4. We implement RetrievalAttention on three state-of-the-art long-context LLMs, including
+344
+      Llama-3-8B-Instruct-262k (Gradient AI, 2024), Yi-6B-200K (01-ai, 2024a), and Yi-9B-200K (01-ai,
+345
+      2024b). To show a practical speedup of RetrievalAttention and ensure the CPU memory consumption
+346   in long contexts does not exceed the DRAM capacity, we follow previous work (Tang et al., 2024) to
+347   run the benchmark in real-world single-batch scenarios.
+348
+349
+      Baselines. We compare RetrievalAttention with the following training-free baselines. (1) Full
+      attention without KV cache as well as the version with KV cache using vLLM (Kwon et al., 2023).
+350
+      (2) StreamingLLM (Xiao et al., 2024b): it retains initial tokens along with fixed-length recent tokens
+351
+      in the GPU memory and discards remaining tokens. (3) SnapKV (Li et al., 2024): it only caches
+352   the critical tokens observed from the last window of the prompt. (4) InfLLM (Xiao et al., 2024a):
+353   it separates the KV cache of continuous token sequences into blocks and selects representative
+354   vectors for each block. In the decoding phase, the current query scans all representative vectors and
+355   retrieves top-k blocks with the highest similarity. (5) Quest (Tang et al., 2024): it keeps track of the
+356   minimal and maximal key values in KV cache pages and estimates the criticality of a page using the
+357   query vector. (6) InfiniGen (Lee et al., 2024): it prefetches only the essential KV cache entries by
+358   speculating important tokens required for subsequent attention layers.
+359   To better assess the effectiveness of our method, we introduce two additional baselines using tradi-
+360   tional vector search methods from Faiss (Douze et al., 2024). Specifically, Flat is an exact KNN
+361   method that performs a linear scan of all key-value vectors, whereas IVF indexes key vectors through
+362   clustering. By default, all indexing-based methods retrieve the top-100 nearest key vectors.
+363
+      Benchmarks. We adopt three representative long-context benchmarks for evaluation.
+364
+365   • ∞-Bench (Zhang et al., 2024b): this benchmark consists of 7 tasks, including three retrieval tasks
+366     (passKey retrieval, number retrieval, KV retrieval) and four realistic tasks (code debugging, math
+367     find, dialogue and multiple-choices questions). The average context length of ∞-Bench is over
+368     100K tokens.
+369   • RULER (Hsieh et al., 2024): a comprehensive long-context benchmark consisting of 4 categories
+370     and 13 tasks, including retrieval, multi-hop tracing, aggregation, and QA tasks. The prompt length
+371     ranges from 4K to 128K, allowing us to determine the actual context window size of models.
+372   • Needle-in-a-haystack (Greg Kamradt, 2023): it challenges the models to accurately retrieve
+373     information (the “needle”) hidden within a lengthy document (the “haystack”).
+374
+375   4.2   ACCURACY ON L ONG C ONTEXT TASKS
+376
+377   ∞-Bench. As shown in Table 2, RetrievalAttention achieves comparable accuracy to the full
+      attention, benefiting from its efficient dynamic retrieval of important tokens. Static methods, such
+
+
+                                                         7
+      Under review as a conference paper at ICLR 2025
+
+
+378   Table 2: Performance (%) of different methods and models on ∞-Bench. The size of the static
+379   pattern is consistently 640 (128 initial tokens + 512 tokens in the local window). All indexing-based
+380   methods, including Flat, IVF, and RetrievalAttention retrieve top-100 key vectors by default. In the
+381   relatively complicated task KV Retrieval, we include the results of retrieving top-2000 key vectors.
+382
+383                 Methods           Act. Tokens Retr.N Retr.P Retr.KV Code.D Math.F En.QA En.MC                    Avg.
+384                 FullAttention         128K      100.0   100.0     17.5     19.0   39.5    9.1   68.0             50.4
+       Llama-3-8B
+
+
+                    StreamingLLM           2K        5.0     5.0       1.0     18.5   40.0    6.0   66.0         20.2 (-30.2)
+385                 SnapKV                 2K       100.0   100.0      0.5     18.0   40.0   11.8   67.0          48.2 (-2.2)
+386                 InfLLM               640+2K     100.0   100.0      0.5     20.5   48.0    7.0   37.0          44.7 (-5.7)
+                    InfiniGen              2K        99.5   100.0      0.0     17.5   39.0    7.3   57.5          45.8 (-4.6)
+387                 Quest                  2K       100.0   100.0      0.0     18.0   40.0    8.2   67.0          47.6 (-2.8)
+388                 Flat               640+100/2K   100.0   100.0   8.5/14.5   19.0   40.0    7.5   67.0   48.9 (-1.5) / 49.7 (-0.7)
+389                 IVF                640+100/2K    94.0   100.0   9.5/14.0   19.0   40.0    7.8   67.0   48.2 (-2.2) / 48.8 (-1.6)
+                    RetrievalAttention 640+100/2K   100.0   100.0   9.0/14.0   19.0   40.0    7.5   67.0   48.9 (-1.5) / 49.6 (-0.8)
+390
+                    FullAttention         128K    100.0     100.0   30.5       25.5   36.5    9.8   67.0             52.8
+391                 StreamingLLM           2K      5.0       5.0     0.5       24.0   33.5    6.4   72.0         20.9 (-31.9)
+       Yi-9B
+
+
+392                 SnapKV                 2K      63.0     100.0    0.5       23.0   33.0   10.3   68.5         42.6 (-10.2)
+                    InfLLM               640+2K   100.0     100.0    0.5       20.5   43.0    9.4   44.0          45.3 (-7.5)
+393                 Quest                  2K      99.0     100.0    0.0       22.5   34.5   10.4   68.5          47.8 (-5.0)
+394                 Flat               640+100/2K 100.0     100.0 21.0/30.0    23.0   35.0   10.8   68.5   51.2 (-1.6) / 52.5 (-0.3)
+                    IVF                640+100/2K 99.0      100.0 19.5/29.5    23.0   35.0   10.7   69.0   50.9 (-1.9) / 52.3 (-0.5)
+395
+                    RetrievalAttention 640+100/2K 99.5      100.0 20.0/30.0    23.0   35.0    9.5   68.5   50.8 (-2.0) / 52.2(-0.6)
+396
+                    FullAttention         128K      98.0    100.0     3.5      31.0   11.0   19.2   55.5             45.5
+397                 StreamingLLM           2K        5.0     5.0      0.5      27.5   11.0   12.2   54.0         16.5 (-29.0)
+       Yi-6B
+
+
+398                 SnapKV                 2K       39.0    100.0     0.0      30.5    8.5   17.1   55.0          35.7 (-9.8)
+                    InfLLM               640+2K     99.0    100.0     0.5      27.5   18.0   12.7   40.5          42.6 (-2.9)
+399                 Quest                  2K       98.5    100.0     0.0      30.5    8.5   17.3   54.5          44.2 (-1.3)
+400                 Flat               640+100/2K   98.5    100.0   2.5/3.0    30.5   16.0   17.7   54.5   45.7 (+0.2) / 45.7 (+0.2)
+                    IVF                640+100/2K   98.0    100.0   2.5/3.5    29.5   16.0   17.5   54.5   45.4 (-0.1) / 45.6 (+0.1)
+401                 RetrievalAttention 640+100/2K   95.0    99.0    3.0/3.0    30.0   16.0   17.6   54.5   45.0 (-0.5) / 45.0 (-0.5)
+402
+403
+404
+405   as StreamingLLM and SnapKV, lack this capability and, therefore, achieve sub-optimal accuracy.
+406
+      During token generation, the critical tokens change dynamically according to the current query,
+      invalidating the previously captured static patterns. InfiniGen exhibits a noticeable drop in model
+407
+      accuracy compared to full attention due to inaccurate speculation of important tokens from previous
+408
+      layers. Although InfLLM and Quest supports dynamic retrieval of relevant blocks, it achieves nearly
+409   zero accuracy in complex tasks (i.e., KV retrieval) due to the low accuracy of representative vectors.
+410   Since RetrievalAttention can accurately identify the most relevant key vectors, it achieves the best
+411   accuracy in KV retrieval. Moreover, by retrieving more tokens (i.e., top-2000 shown in the column
+412   of Retr.KV) in KV retrieval, RetrievalAttention achieves nearly the same accuracy as full attention,
+413   which demonstrates the effectiveness of our method in complex and dynamic tasks.
+414
+      It is worth noting that Flat and IVF need to scan 100% and 30% of the past key vectors to achieve the
+415   same task accuracy as RetrievalAttention. In contrast, RetrievalAttention only requires scan 1–3%
+416   vectors, resulting in much lower decoding latency.
+417
+418
+      RULER. Table 3 demonstrates that models utilizing RetrievalAttention achieve nearly the same
+      task accuracy as full attention in different context lengths. In contrast, other training-free methods
+419
+      experience a noticeable reduction in accuracy, particularly for longer context sizes like 128K, as they
+420
+      fail to capture dynamically changed important tokens.
+421
+422   Needle-in-a-haystack. As shown in Figure 5, RetrievalAttention can effectively focus on information
+423   at various positions across different context windows, ranging from 4K to 128K. In contrast, other
+424
+      methods like StreamingLLM encounter difficulties when critical information lies beyond the range of
+      the static patterns, whose results are shown in §A.2.
+425
+426
+427   4.3             D ECODING L ATENCY
+428
+429   As the context length increases, the decoding latency of full attention significantly increases due to its
+430   quadratic time complexity. Enabling the KV cache (vLLM) incurs out-of-memory (OOM) issues due
+431   to limited GPU memory. The latency of StreamingLLM, SnapKV, and InfLLM remains relatively
+      stable because of constant tokens involved in the attention computation, but they suffer significant
+
+
+                                                                          8
+      Under review as a conference paper at ICLR 2025
+
+
+432                            Table 3: Performance (%) of different methods and models on RULER.
+433
+434                 Methods              Act. Tokens   Claimed   Effective        4K      8K      16K     32K     64K    128K           Avg.
+435                 FullAttention          128K         262K       32K           93.13   90.49   89.27   85.11   82.51   78.74        86.54
+       Llama-3-8B
+                    StreamingLLM            2K            -        <4K           60.10   28.77   20.99   16.36   12.52   11.34    25.01 (-61.53)
+436
+                    SnapKV                  2K            -         4K           91.51   80.70   75.53   70.84   65.44   58.68    73.78 (-12.76)
+437                 InfLLM                640+2K          -         4K           85.20   52.86   38.29   32.44   27.94   25.71    43.74 (-42.81)
+438                 Flat                  640+100         -        16K           92.71   87.93   87.01   84.97   80.99   74.34     84.66 (-1.89)
+                    IVF                   640+100         -        16K           92.73   87.86   87.22   84.74   78.46   68.21     83.20 (-3.34)
+439                 RetrievalAttention    640+100         -        16K           92.64   88.46   86.80   84.78   80.50   74.70     84.70(-1.85)
+440                 FullAttention          128K         200K        8K           91.02   86.62   82.85   73.17   67.08   60.51        76.87
+441                 StreamingLLM            2K            -        <4K           57.53   28.30   19.08   13.48   12.53   12.81    23.95 (-52.92)
+       Yi-9B
+
+
+                    SnapKV                  2K            -         4K           90.39   75.59   64.48   48.70   39.28   32.97    58.57 (-18.30)
+442                 InfLLM                640+2K          -        <4K           82.66   50.36   36.17   28.20   22.65   20.94    40.16 (-36.71)
+443                 Flat                  640+100         -         8K           91.09   87.71   84.42   74.58   66.16   59.50    77.24 (+0.37)
+                    IVF                   640+100         -         8K           91.03   91.04   83.85   72.19   65.13   58.04     76.29 (-0.58)
+444                 RetrievalAttention    640+100         -         8K           90.78   86.32   82.95   73.73   65.67   59.15     76.43(-0.44)
+445                 FullAttention          128K         200K       <4K           84.52   77.77   69.12   61.64   58.36   55.77        67.86
+446                 StreamingLLM            2K            -        <4K           51.66   24.57   15.82    9.70    9.77   11.54    20.51 (-47.35)
+       Yi-6B
+
+
+                    SnapKV                  2K            -        <4K           80.94   59.55   45.36   36.11   33.43   29.53    47.49 (-20.37)
+447                 InfLLM                640+2K          -        <4K           76.42   44.38   34.11   27.11   25.28   25.33    38.77 (-29.09)
+448                 Flat                  640+100         -        <4K           83.69   77.26   67.28   60.58   57.27   50.63     66.12 (-1.75)
+                    IVF                   640+100         -        <4K           83.25   76.90   67.00   58.94   55.99   50.31     63.33 (-2.53)
+449                 RetrievalAttention    640+100         -        <4K           83.01   76.56   67.49   59.46   57.20   51.44     65.86(-2.00)
+450
+451
+452                                                                   Methods                     4K      8K     16K     32K      64K      128K
+453                                                                   Full (without cache)       0.527   1.167   2.672   6.214   15.263   43.927
+454                                                                   vLLM                       OOM     OOM     OOM     OOM     OOM      OOM
+                                                                      StreamingLLM               0.029   0.030   0.029   0.030    0.030    0.029
+455                                                                   SnapKV                     0.029   0.028   0.028   0.029    0.029    0.028
+456                                                                   InfLLM                     0.058   0.063   0.063   0.065    0.067    0.069
+                                                                      Flat                       0.140   0.178   0.226   0.328    0.522    0.922
+457                                                                   IVF                        0.128   0.140   0.162   0.201    0.253    0.373
+                                                                      RetrievalAttention         0.137   0.144   0.156   0.162    0.169    0.188
+458
+459
+460   Figure 5: Performance of RetrievalAt-                         Table 4: Per-token generation latency (s) as context
+461   tention in Needle-in-a-haystack.                              length varies from 4K to 128K on Llama-3-8B.
+462
+463
+464
+      model accuracy degradation. Due to efficient attention-aware vector search, RetrievalAttention
+465   achieves 4.9× and 1.98× latency reduction compared to Flat and IVF for the 128K context.
+466
+467   Table 5 presents the breakdown of end-to-end latency for different retrieval attention-based algorithms
+468
+      under the 128K context length. RetrievalAttention only requires 34.0% of the time for vector search,
+      while Flat and IVF spend 86.6% and 67.0% of time, respectively. This is because RetrievalAttention
+469
+      scans less data for a high recall, avoiding memory bandwidth contention when multiple heads are per-
+470
+      forming parallel retrieval on the CPU side. Overall, compared with Flat and IVF, RetrievalAttention
+471   effectively reduces the index search latency by 91% and 74%, respectively. This advantage becomes
+472   more pronounced with longer context lengths.
+473
+474
+475
+      4.4            I NDEX R ECALL VS . S CANNING V ECTORS
+476
+477
+      Now, we conduct a micro-analysis of the efficiency of attention-aware vector search by examining
+478
+      the relationship between recall and the number of scanned key vectors. The number of key vectors
+479
+      scanned to achieve a target recall serves as an indicator of search efficiency. Figure 6 demonstrates
+480   that for the Q to K search, RetrievalAttention requires scanning only a very limited number of
+481   key vectors (1–3%) to reach a recall rate higher than 0.95, whereas traditional indexes necessitate
+482   retrieving a significantly higher number of keys. We also included a well-known OOD-optimized
+483   solution RobustVamana (Jaiswal et al., 2022) for comparison. However, it performs poorly on
+484   attention vectors. The efficiency of RetrievalAttention arises because it effectively mitigates the OOD
+485   issue between query and key vectors. In contrast, for the in-distribution K to K search, all indexes
+      exhibit good performance.
+
+
+                                                                             9
+      Under review as a conference paper at ICLR 2025
+
+
+486                                      Table 5: Decoding latency breakdown on Llama-3-8B.
+487
+488                                    Methods                      Retrieval      Attention        Others        Total
+489
+                                       Flat                           0.798              0.083      0.041         0.922
+490                                    IVF                            0.250              0.084      0.039         0.373
+491                                    RetrievalAttention             0.064              0.081      0.043         0.188
+492
+493
+                                      IVF, Q to K      HNSW, Q to K       RobustVamana, Q to K             RetrievalAttention, Q to K
+494                                   IVF, K to K      HNSW, K to K       RobustVamana, K to K             RetrievalAttention, K to K
+495                                     Yi-6B-200K                         Yi-9B-200K                     Llama-3-8B-Instruct-262k
+496                        1.0                                1.0                                   1.0
+497                        0.8                                0.8                                   0.8
+              Recall@100
+
+
+498                        0.6                                0.6                                   0.6
+499                        0.4                1.0             0.4
+                                                                                   1.0
+                                                                                                    0.4
+                                                                                                                         1.0
+500                        0.2
+                                              0.9             0.2                  0.9              0.2                  0.9
+501                        0.0                  0.00   0.05                          0.00    0.05                          0.00    0.05
+502                              0.00 0.25 0.50 0.75 1.00           0.00 0.25 0.50 0.75 1.00              0.00 0.25 0.50 0.75 1.00
+503
+                                                               Scanned Vectors (Percentage)
+504   Figure 6: Recall vs. scanning key vectors when using the query vector (Q to K) and key vector (K
+505   to K) as the query, individually. Q and K are dumped from three long-context LLM models.
+506
+507
+508   5   R ELATED W ORKS
+509
+510
+      To accelerate the long-context LLM inference, some works (Zhang et al., 2023; Liu et al., 2024b;
+511
+      Xiao et al., 2024b; Han et al., 2024; Ge et al., 2024; Li et al., 2024) attempt to compress the size
+512   of the KV cache by leveraging the sparsity of attention. However, these methods often suffer from
+513   significant model accuracy drops due to the dynamic nature of attention sparsity.
+514
+515
+      FlexGen (Sheng et al., 2023) and Lamina (Chen et al., 2024b) offload the KV cache to CPU memory,
+      but they struggle with slow and costly full-attention computation. By identifying the dynamic nature
+516
+      of important KV vectors for different queries, recent work chooses to retain all of the KV cache and
+517
+      dynamically attend to different parts of KV vectors based on the current query. Quest (Tang et al.,
+518   2024) partitions the KV cache into blocks and selects a representative key vector for each block.
+519   For a given query, it scans all representative key vectors and attends top-k blocks with the highest
+520   attention scores. InfLLM (Xiao et al., 2024a) adopts a similar strategy as Quest but offloads most
+521   KV cache blocks to the CPU memory to support longer contexts. Due to block-based organization
+522   and retrieval, the accuracy of representative vectors significantly impacts the effectiveness of those
+523   methods for obtaining important tokens. SparQ (Ribar et al., 2024), InfiniGen (Lee et al., 2024),
+524   and LoKi (Singhania et al., 2024) approximate the most relevant top-k keys corresponding to a
+525   given query by reducing the channel dimension. RetrievalAttention instead organizes the KV cache
+526
+      using ANNS indexes, allowing the retrieval of important tokens with high recalls and low cost. The
+      concurrent work MagicPiG (Chen, 2024) and PQCache (Zhang et al., 2024a) employ LSH and PQ
+527
+      centroids to retrieve critical tokens, respectively. However, they fail to address the OOD issue in
+528
+      attention, necessitating retrieving a large portion of KV cache (e.g., 20%) for high model accuracy.
+529
+530
+531   6   C ONCLUSION
+532
+533
+      We propose RetrievalAttention, a method that offloads most KV vectors to CPU memory and lever-
+534   ages vector search for dynamic sparse attention to minimize inference cost. RetrievalAttention
+535   identifies the different distributions of the query and key vectors and employs an attention-aware
+536   approach to efficiently find critical tokens for model generation. Experimental results demonstrate
+537   that RetrievalAttention effectively achieves 4.9× and 1.98× decoding speedup than exact KNN and
+538   traditional ANNS methods, on a single RTX4090 GPU for a context of 128K tokens. RetrievalAtten-
+539   tion is the first system that supports running 8B-level LLMs with 128K tokens on a single RTX4090
+      (24GB) GPU with an acceptable latency cost and without compromising model accuracy.
+
+
+                                                                              10
+      Under review as a conference paper at ICLR 2025
+
+
+540
+      R EFERENCES
+541
+542   01-ai. Yi-6b-200k. https://huggingface.co/01-ai/Yi-6B-200K, 2024a. Accessed:
+543     2024-07-01.
+544
+      01-ai. Yi-9b-200k. https://huggingface.co/01-ai/Yi-9B-200K, 2024b. Accessed:
+545     2024-07-01.
+546
+547   Joshua Ainslie, Santiago Ontanon, Chris Alberti, Vaclav Cvicek, Zachary Fisher, Philip Pham,
+548     Anirudh Ravula, Sumit Sanghai, Qifan Wang, and Li Yang. ETC: Encoding long and structured
+549     inputs in transformers. In Proceedings of the 2020 Conference on Empirical Methods in Natural
+550     Language Processing (EMNLP), pp. 268–284, Online, 2020. Association for Computational
+551
+        Linguistics. doi: 10.18653/v1/2020.emnlp-main.19. URL https://aclanthology.org/
+        2020.emnlp-main.19.
+552
+553   Joshua Ainslie, James Lee-Thorp, Michiel de Jong, Yury Zemlyanskiy, Federico Lebron, and Sumit
+554     Sanghai. Gqa: Training generalized multi-query transformer models from multi-head checkpoints.
+555     In The 2023 Conference on Empirical Methods in Natural Language Processing, 2023.
+556
+      Yushi Bai, Xin Lv, Jiajie Zhang, Hongchang Lyu, Jiankai Tang, Zhidian Huang, Zhengxiao Du, Xiao
+557
+        Liu, Aohan Zeng, Lei Hou, et al. Longbench: A bilingual, multitask benchmark for long context
+558
+        understanding. arXiv preprint arXiv:2308.14508, 2023.
+559
+560   Yushi Bai, Jiajie Zhang, Xin Lv, Linzhi Zheng, Siqi Zhu, Lei Hou, Yuxiao Dong, Jie Tang, and
+561     Juanzi Li. Longwriter: Unleashing 10,000+ word generation from long context llms. CoRR,
+562     abs/2408.07055, 2024. doi: 10.48550/ARXIV.2408.07055. URL https://doi.org/10.
+563     48550/arXiv.2408.07055.
+564
+      Iz Beltagy, Matthew E Peters, and Arman Cohan. Longformer: The long-document transformer.
+565      ArXiv preprint, abs/2004.05150, 2020. URL https://arxiv.org/abs/2004.05150.
+566
+567   Amanda Bertsch, Uri Alon, Graham Neubig, and Matthew Gormley. Unlimiformer: Long-range
+568    transformers with unlimited length input. Advances in Neural Information Processing Systems,
+569    36, 2024.
+570
+      Zefan Cai, Yichi Zhang, Bofei Gao, Yuliang Liu, Tianyu Liu, Keming Lu, Wayne Xiong, Yue Dong,
+571     Baobao Chang, Junjie Hu, and Wen Xiao. Pyramidkv: Dynamic KV cache compression based on
+572     pyramidal information funneling. CoRR, abs/2406.02069, 2024.
+573
+574   Meng Chen, Kai Zhang, Zhenying He, Yinan Jing, and X. Sean Wang. Roargraph: A projected
+575    bipartite graph for efficient cross-modal approximate nearest neighbor search. Proc. VLDB
+576
+       Endow., 17(11):2735–2749, 2024a. ISSN 2150-8097. doi: 10.14778/3681954.3681959. URL
+       https://doi.org/10.14778/3681954.3681959.
+577
+578   Shaoyuan Chen, Yutong Lin, Mingxing Zhang, and Yongwei Wu. Efficient and economic large
+579     language model inference with attention offloading. ArXiv preprint, abs/2405.01814, 2024b. URL
+580     https://arxiv.org/abs/2405.01814.
+581
+582
+      Zhuoming Chen. Magicpig: sparse inference engine for llm.           https://github.com/
+        Infini-AI-Lab/MagicPiG/, 2024. Accessed: 2024-08-01.
+583
+584   Rewon Child, Scott Gray, Alec Radford, and Ilya Sutskever. Generating long sequences with
+585     sparse transformers. ArXiv preprint, abs/1904.10509, 2019. URL https://arxiv.org/
+586     abs/1904.10509.
+587
+      Scott Cost and Steven Salzberg. A weighted nearest neighbor algorithm for learning with symbolic
+588
+        features. Machine learning, 10:57–78, 1993.
+589
+590   Paul Covington, Jay Adams, and Emre Sargin. Deep neural networks for youtube recommendations.
+591     In Shilad Sen, Werner Geyer, Jill Freyne, and Pablo Castells (eds.), Proceedings of the 10th
+592     ACM Conference on Recommender Systems, Boston, MA, USA, September 15-19, 2016, pp.
+593     191–198. ACM, 2016. doi: 10.1145/2959100.2959190. URL https://doi.org/10.1145/
+        2959100.2959190.
+
+
+                                                    11
+      Under review as a conference paper at ICLR 2025
+
+
+594
+      Tri Dao, Daniel Y. Fu, Stefano Ermon, Atri Rudra, and Christopher Ré. FlashAttention: Fast
+595     and memory-efficient exact attention with IO-awareness. In Advances in Neural Information
+596     Processing Systems, 2022.
+597
+598   Yichuan Deng, Zhao Song, and Chiwun Yang. Attention is naturally sparse with gaussian distributed
+599     input, 2024.
+600
+      Matthijs Douze, Alexandr Guzhva, Chengqi Deng, Jeff Johnson, Gergely Szilvasy, Pierre-Emmanuel
+601
+       Mazaré, Maria Lomeli, Lucas Hosseini, and Hervé Jégou. The faiss library. 2024.
+602
+603   Suyu Ge, Yunan Zhang, Liyuan Liu, Minjia Zhang, Jiawei Han, and Jianfeng Gao. Model tells
+604     you what to discard: Adaptive KV cache compression for LLMs. In The Twelfth International
+605     Conference on Learning Representations, 2024. URL https://openreview.net/forum?
+606     id=uNrFpDPMyo.
+607
+      Google Cloud. Context caching overview. https://cloud.google.com/vertex-ai/
+608     generative-ai/docs/context-cache/context-cache-overview, 2024. Ac-
+609     cessed: 2024-07-01.
+610
+611   Gradient AI. Llama-3-8b-instruct-262k. https://huggingface.co/gradientai/
+612     Llama-3-8B-Instruct-262k, 2024. Accessed: 2024-07-01.
+613
+      Greg Kamradt. Needle in a haystack - pressure testing llms. https://github.com/
+614
+        gkamradt/LLMTest_NeedleInAHaystack, 2023. Accessed: 2024-08-12.
+615
+616   Chi Han, Qifan Wang, Hao Peng, Wenhan Xiong, Yu Chen, Heng Ji, and Sinong Wang. LM-infinite:
+617     Zero-shot extreme length generalization for large language models. In Kevin Duh, Helena Gomez,
+618     and Steven Bethard (eds.), Proceedings of the 2024 Conference of the North American Chapter of
+619     the Association for Computational Linguistics: Human Language Technologies (Volume 1: Long
+620     Papers), pp. 3991–4008, Mexico City, Mexico, 2024. Association for Computational Linguistics.
+621
+        URL https://aclanthology.org/2024.naacl-long.222.
+622   Cheng-Ping Hsieh, Simeng Sun, Samuel Kriman, Shantanu Acharya, Dima Rekesh, Fei Jia, and
+623     Boris Ginsburg. Ruler: What’s the real context size of your long-context language models? ArXiv
+624     preprint, abs/2404.06654, 2024. URL https://arxiv.org/abs/2404.06654.
+625
+626   Sam Ade Jacobs, Masahiro Tanaka, Chengming Zhang, Minjia Zhang, Leon Song, Samyam Ra-
+627
+        jbhandari, and Yuxiong He. Deepspeed ulysses: System optimizations for enabling training
+        of extreme long sequence transformer models. ArXiv preprint, abs/2309.14509, 2023. URL
+628
+        https://arxiv.org/abs/2309.14509.
+629
+630   Shikhar Jaiswal, Ravishankar Krishnaswamy, Ankit Garg, Harsha Vardhan Simhadri, and Sheshansh
+631     Agrawal. Ood-diskann: Efficient and scalable graph anns for out-of-distribution queries. arXiv
+632     preprint arXiv:2211.12850, 2022.
+633
+634
+      Huiqiang Jiang, Yucheng Li, Chengruidong Zhang, Qianhui Wu, Xufang Luo, Surin Ahn, Zhenhua
+        Han, Amir H Abdi, Dongsheng Li, Chin-Yew Lin, et al. Minference 1.0: Accelerating pre-filling
+635
+        for long-context llms via dynamic sparse attention. ArXiv preprint, abs/2407.02490, 2024. URL
+636
+        https://arxiv.org/abs/2407.02490.
+637
+638   Jeff Johnson, Matthijs Douze, and Hervé Jégou. Billion-scale similarity search with gpus. IEEE
+639     Transactions on Big Data, 7(3):535–547, 2019.
+640
+641
+      Nikita Kitaev, Lukasz Kaiser, and Anselm Levskaya. Reformer: The efficient transformer. In
+        8th International Conference on Learning Representations, ICLR 2020, Addis Ababa, Ethiopia,
+642
+        April 26-30, 2020. OpenReview.net, 2020. URL https://openreview.net/forum?id=
+643
+        rkgNKkHtvB.
+644
+645   Woosuk Kwon, Zhuohan Li, Siyuan Zhuang, Ying Sheng, Lianmin Zheng, Cody Hao Yu, Joseph E.
+646    Gonzalez, Hao Zhang, and Ion Stoica. Efficient memory management for large language model
+647    serving with pagedattention. In Proceedings of the ACM SIGOPS 29th Symposium on Operating
+       Systems Principles, 2023.
+
+
+                                                     12
+      Under review as a conference paper at ICLR 2025
+
+
+648
+      Wonbeom Lee, Jungi Lee, Junghwan Seo, and Jaewoong Sim. InfiniGen: Efficient generative
+649    inference of large language models with dynamic KV cache management. In 18th USENIX
+650    Symposium on Operating Systems Design and Implementation (OSDI 24), pp. 155–172, Santa
+651    Clara, CA, 2024. USENIX Association. ISBN 978-1-939133-40-3. URL https://www.
+652    usenix.org/conference/osdi24/presentation/lee.
+653
+      Yuhong Li, Yingbing Huang, Bowen Yang, Bharat Venkitesh, Acyr Locatelli, Hanchen Ye, Tianle Cai,
+654
+        Patrick Lewis, and Deming Chen. Snapkv: Llm knows what you are looking for before generation.
+655
+        ArXiv preprint, abs/2404.14469, 2024. URL https://arxiv.org/abs/2404.14469.
+656
+657   Hao Liu, Matei Zaharia, and Pieter Abbeel. Ringattention with blockwise transformers for near-
+658     infinite context. In The Twelfth International Conference on Learning Representations, 2024a.
+659     URL https://openreview.net/forum?id=WsRHpHH4s0.
+660   Zichang Liu, Aditya Desai, Fangshuo Liao, Weitao Wang, Victor Xie, Zhaozhuo Xu, Anastasios
+661     Kyrillidis, and Anshumali Shrivastava. Scissorhands: Exploiting the persistence of importance
+662     hypothesis for llm kv cache compression at test time. Advances in Neural Information Processing
+663     Systems, 36, 2024b.
+664
+      Prasanta Chandra Mahalanobis. On the generalized distance in statistics. Sankhyā: The Indian
+665
+        Journal of Statistics, Series A (2008-), 80:S1–S7, 2018.
+666
+667   Yu A Malkov and Dmitry A Yashunin. Efficient and robust approximate nearest neighbor search using
+668     hierarchical navigable small world graphs. IEEE transactions on pattern analysis and machine
+669     intelligence, 42(4):824–836, 2018.
+670   Yuzhen Mao, Martin Ester, and Ke Li. Iceformer: Accelerated inference with long-sequence
+671     transformers on CPUs. In The Twelfth International Conference on Learning Representations,
+672     2024. URL https://openreview.net/forum?id=6RR3wU4mSZ.
+673
+      Stanislav Morozov and Artem Babenko. Non-metric similarity graphs for maximum in-
+674
+        ner product search.     In Samy Bengio, Hanna M. Wallach, Hugo Larochelle, Kris-
+675
+        ten Grauman, Nicolò Cesa-Bianchi, and Roman Garnett (eds.), Advances in Neural
+676     Information Processing Systems 31: Annual Conference on Neural Information Processing
+677     Systems 2018, NeurIPS 2018, December 3-8, 2018, Montréal, Canada, pp. 4726–
+678     4735, 2018.       URL https://proceedings.neurips.cc/paper/2018/hash/
+679     229754d7799160502a143a72f6789927-Abstract.html.
+680
+      Nassimi and Sahni. Bitonic sort on a mesh-connected parallel computer. IEEE Transactions on
+681
+        Computers, 100(1):2–7, 1979.
+682
+683   Aditya Pal, Chantat Eksombatchai, Yitong Zhou, Bo Zhao, Charles Rosenberg, and Jure Leskovec.
+684     Pinnersage: Multi-modal user embedding framework for recommendations at pinterest. In Ra-
+685     jesh Gupta, Yan Liu, Jiliang Tang, and B. Aditya Prakash (eds.), KDD ’20: The 26th ACM
+686     SIGKDD Conference on Knowledge Discovery and Data Mining, Virtual Event, CA, USA,
+687
+        August 23-27, 2020, pp. 2311–2320. ACM, 2020. URL https://dl.acm.org/doi/10.
+       1145/3394486.3403280.
+688
+689   Pratyush Patel, Esha Choukse, Chaojie Zhang, Aashaka Shah, Íñigo Goiri, Saeed Maleki, and Ricardo
+690     Bianchini. Splitwise: Efficient generative llm inference using phase splitting. In 2024 ACM/IEEE
+691     51st Annual International Symposium on Computer Architecture (ISCA), pp. 118–132. IEEE,
+692     2024.
+693   Ruoyu Qin, Zheming Li, Weiran He, Mingxing Zhang, Yongwei Wu, Weimin Zheng, and Xinran Xu.
+694     Mooncake: Kimi’s kvcache-centric architecture for llm serving. ArXiv preprint, abs/2407.00079,
+695     2024. URL https://arxiv.org/abs/2407.00079.
+696
+697
+      Luka Ribar, Ivan Chelombiev, Luke Hudlass-Galley, Charlie Blake, Carlo Luschi, and Douglas Orr.
+        Sparq attention: Bandwidth-efficient llm inference. In Forty-first International Conference on
+698
+        Machine Learning, 2024. URL https://openreview.net/forum?id=OS5dqxmmtl.
+699
+700   Jay Shah, Ganesh Bikshandi, Ying Zhang, Vijay Thakkar, Pradeep Ramani, and Tri Dao.
+701     Flashattention-3: Fast and accurate attention with asynchrony and low-precision. arXiv preprint
+        arXiv:2407.08608, 2024.
+
+
+                                                      13
+      Under review as a conference paper at ICLR 2025
+
+
+702
+      Ying Sheng, Lianmin Zheng, Binhang Yuan, Zhuohan Li, Max Ryabinin, Beidi Chen, Percy Liang,
+703     Christopher Ré, Ion Stoica, and Ce Zhang. Flexgen: high-throughput generative inference of
+704     large language models with a single gpu. In Proceedings of the 40th International Conference on
+705     Machine Learning, ICML’23. JMLR.org, 2023.
+706
+707   Prajwal Singhania, Siddharth Singh, Shwai He, Soheil Feizi, and Abhinav Bhatele. Loki: Low-
+708
+        rank keys for efficient sparse attention. ArXiv preprint, abs/2406.02542, 2024. URL https:
+        //arxiv.org/abs/2406.02542.
+709
+710   Sivic and Zisserman. Video google: A text retrieval approach to object matching in videos. In
+711     Proceedings ninth IEEE international conference on computer vision, pp. 1470–1477. IEEE, 2003.
+712
+      Jiaming Tang, Yilong Zhao, Kan Zhu, Guangxuan Xiao, Baris Kasikci, and Song Han. QUEST: Query-
+713
+         aware sparsity for efficient long-context LLM inference. In Forty-first International Conference on
+714
+         Machine Learning, 2024. URL https://openreview.net/forum?id=KzACYw0MTV.
+715
+716   Gemini Team. Gemini 1.5: Unlocking multimodal understanding across millions of tokens of context,
+717     2024.
+718
+      Ashish Vaswani, Noam Shazeer, Niki Parmar, Jakob Uszkoreit, Llion Jones, Aidan N. Gomez,
+719     Lukasz Kaiser, and Illia Polosukhin. Attention is all you need. In Isabelle Guyon, Ulrike von
+720     Luxburg, Samy Bengio, Hanna M. Wallach, Rob Fergus, S. V. N. Vishwanathan, and Roman
+721     Garnett (eds.), Advances in Neural Information Processing Systems 30: Annual Conference on
+722     Neural Information Processing Systems 2017, December 4-9, 2017, Long Beach, CA, USA, pp.
+723     5998–6008, 2017. URL https://proceedings.neurips.cc/paper/2017/hash/
+724     3f5ee243547dee91fbd053c1c4a845aa-Abstract.html.
+725
+      Mengzhao Wang, Xiaoliang Xu, Qiang Yue, and Yuxiang Wang. A comprehensive survey and
+726    experimental comparison of graph-based approximate nearest neighbor search. seed, 4(2):1.
+727
+728   Chaojun Xiao, Pengle Zhang, Xu Han, Guangxuan Xiao, Yankai Lin, Zhengyan Zhang, Zhiyuan Liu,
+729     Song Han, and Maosong Sun. Infllm: Unveiling the intrinsic capacity of llms for understanding
+730     extremely long sequences with training-free memory. ArXiv preprint, abs/2402.04617, 2024a.
+731
+        URL https://arxiv.org/abs/2402.04617.
+732   Guangxuan Xiao, Yuandong Tian, Beidi Chen, Song Han, and Mike Lewis. Efficient streaming
+733     language models with attention sinks. In The Twelfth International Conference on Learning
+734     Representations, 2024b.
+735
+      Lee Xiong, Chenyan Xiong, Ye Li, Kwok-Fung Tang, Jialin Liu, Paul N. Bennett, Junaid Ahmed,
+736
+        and Arnold Overwijk. Approximate nearest neighbor negative contrastive learning for dense text
+737
+        retrieval. In 9th International Conference on Learning Representations, ICLR 2021, Virtual Event,
+738     Austria, May 3-7, 2021. OpenReview.net, 2021. URL https://openreview.net/forum?
+739     id=zeFrfgyZln.
+740
+741   Manzil Zaheer, Guru Guruganesh, Kumar Avinava Dubey, Joshua Ainslie, Chris Alberti, Santi-
+742    ago Ontañón, Philip Pham, Anirudh Ravula, Qifan Wang, Li Yang, and Amr Ahmed. Big bird:
+743
+       Transformers for longer sequences. In Hugo Larochelle, Marc’Aurelio Ranzato, Raia Hadsell,
+       Maria-Florina Balcan, and Hsuan-Tien Lin (eds.), Advances in Neural Information Processing
+744
+       Systems 33: Annual Conference on Neural Information Processing Systems 2020, NeurIPS
+745
+       2020, December 6-12, 2020, virtual, 2020. URL https://proceedings.neurips.cc/
+746    paper/2020/hash/c8512d142a2d849725f31a9a7a361ab9-Abstract.html.
+747
+748   Hailin Zhang, Xiaodong Ji, Yilin Chen, Fangcheng Fu, Xupeng Miao, Xiaonan Nie, Weipeng Chen,
+749     and Bin Cui. Pqcache: Product quantization-based kvcache for long context llm inference. ArXiv
+750
+        preprint, abs/2407.12820, 2024a. URL https://arxiv.org/abs/2407.12820.
+751   Xinrong Zhang, Yingfa Chen, Shengding Hu, Zihang Xu, Junhao Chen, Moo Hao, Xu Han, Zhen
+752     Thai, Shuo Wang, Zhiyuan Liu, and Maosong Sun. ∞Bench: Extending long context evaluation
+753     beyond 100K tokens. In Lun-Wei Ku, Andre Martins, and Vivek Srikumar (eds.), Proceedings
+754     of the 62nd Annual Meeting of the Association for Computational Linguistics (Volume 1: Long
+755     Papers), pp. 15262–15277, Bangkok, Thailand, 2024b. Association for Computational Linguistics.
+        URL https://aclanthology.org/2024.acl-long.814.
+
+
+                                                       14
+      Under review as a conference paper at ICLR 2025
+
+
+756
+      Zhenyu Zhang, Ying Sheng, Tianyi Zhou, Tianlong Chen, Lianmin Zheng, Ruisi Cai, Zhao Song,
+757     Yuandong Tian, Christopher Ré, Clark W. Barrett, Zhangyang Wang, and Beidi Chen. H2O: heavy-
+758     hitter oracle for efficient generative inference of large language models. In Advances in Neural
+759     Information Processing Systems 36: Annual Conference on Neural Information Processing
+760     Systems 2023, NeurIPS 2023, New Orleans, LA, USA, December 10 - 16, 2023, 2023.
+761
+762
+      Wenting Zhao, Xiang Ren, Jack Hessel, Claire Cardie, Yejin Choi, and Yuntian Deng. Wildchat:
+       1m chatgpt interaction logs in the wild. In The Twelfth International Conference on Learning
+763
+       Representations, ICLR 2024, Vienna, Austria, May 7-11, 2024. OpenReview.net, 2024. URL
+764
+       https://openreview.net/forum?id=Bl8u7ZRlbM.
+765
+766   Yinmin Zhong, Shengyu Liu, Junda Chen, Jianbo Hu, Yibo Zhu, Xuanzhe Liu, Xin Jin, and
+767     Hao Zhang. DistServe: Disaggregating prefill and decoding for goodput-optimized large
+768     language model serving. In 18th USENIX Symposium on Operating Systems Design and
+769
+        Implementation (OSDI 24), pp. 193–210, Santa Clara, CA, 2024. USENIX Association.
+        ISBN 978-1-939133-40-3. URL https://www.usenix.org/conference/osdi24/
+770
+        presentation/zhong-yinmin.
+771
+772
+773   A     A DDITIONAL E XPERIMENTAL D ETAILS AND R ESULTS
+774
+775   A.1    M ODEL A RCHITECTURE
+776
+777   Table 6 compares the architecture differences of         Table 6: Architecture overview of LLMs.
+778   the three models used in our experimental
+779   evaluation. All models supports the grouped query         Model     Total Layer   Query Head   KV Head
+780   attention (GQA), in which multiple query heads
+                                                                Yi-6B         32           32           4
+781   share one KV head. Among them, the Yi-9B                  Yi-9B         48           32           4
+782   model has more transformer layers, while the           Llama-3-8B       32           32           8
+783
+      Llama-3-8B model has more KV heads.
+784
+785   A.2    A DDITIONAL R ESULTS ON N EEDLE - IN - A - HAYSTACK
+786
+787   Figure 7 shows the results of other methods on Needle-in-a-haystack benchmark. StreamingLLM can
+788
+      only find the correct answer when the needle’s position is within the static pattern. InfLLM maintains
+      high performance with shorter context lengths. However, as the length increases, its performance
+789
+      shows a significant decline. Although SnapKV, Flat, and IVF perform well on this benchmark, we
+790
+      have analyzed their disadvantages in accuracy and latency in the previous evaluation.
+791
+792
+793
+794   A.3    P ERFORMANCE IN THE EXTREMELY LONG - CONTEXT INFERENCE
+795
+796
+      Figure 8 shows the evaluation results of RetrievalAttention for extremely long contexts using the
+      model Llama-3-8B-1048K. RetrievalAttention still passes all test cases when ranging the context
+797
+      length from 250K to 1 million, which demonstrates the robustness of our attention-aware indexes.
+798
+799   A.4    D ECODING L ATENCY ON A100
+800
+801
+      We test the generality of RetrievalAttention by measuring its performance on a server with one
+      A100 (80GB) and one AMD EPYC 7V13 CPU with 24 cores and 220GB DRAM. We show the
+802
+      token-generation latency of different methods on three models in Table 7. Since the KV cache of
+803
+      full attention is disabled, all prompt tokens need to be recalculated during the decoding, incurring
+804   a very high decoding latency. By enabling the KV cache with the PageAttention optimization in
+805   vLLM, the decoding latency is significantly reduced. However, vLLM suffers from OOM issue with
+806   the increase of context length, which we elaborate further later. Other KV cache dropping or block
+807   retrieval methods including StreamingLLM, SnapKV, and InfLLM achieve faster decoding speed,
+808   but this is at the expense of a significant drop in model accuracy. In contrast, RetrievalAttention does
+809   not compromise generation accuracy while achieving much lower decoding latency than IVF and
+      Flat because of the efficient mitigation of out-of-distribution problem.
+
+
+                                                        15
+      Under review as a conference paper at ICLR 2025
+
+
+810
+811
+812
+813
+814
+815
+816
+817
+818
+819
+820
+821
+                          (a) Full Attention                      (b) StreamingLLM
+822
+823
+824
+825
+826
+827
+828
+829
+                             (c) SnapKV                              (d) InfLLM
+830
+831
+832
+833
+834
+835
+836
+837
+                              (e) FLAT                                 (f) IVF
+838
+839   Figure 7: Performance of different algorithms and models on Needle-in-a-haystack. The size of the
+840   static pattern is consistently 640 (128 initial tokens + 512 tokens in the local window).
+841
+842
+843
+844
+845
+846
+847
+848
+849
+850
+851
+852
+853
+854
+855
+856
+857
+858
+859          Figure 8: Performance of RetrievalAttention in 1 million Needle-in-a-haystack test.
+860
+861
+862
+863
+
+
+
+                                                     16
+      Under review as a conference paper at ICLR 2025
+
+
+864
+      We also evaluate how the decoding latency changes when the context length varies from 100K to
+865   1M tokens on Llama-3-8B model and the results can be found in Table 8. To make sure there is
+866   enough CPU memory to hold the KV cache and indexes, especially in the 1M context scenario, we
+867   use a powerful machine equipped with an AMD EPYC 7V12 CPU with 48 cores and 1.72 TB of
+868   memory. The machine is also equipped with the same 80GB A100 GPU. The decoding latency of full
+869   attention with KV state re-computation increases quadratically with the context size. With the KV
+870   cache enabled in the GPU memory, vLLM starts triggering the OOM issues when the context size is
+871   larger than 200K. Static KV dropping methods such as StreamingLLM have no latency increase due
+872   to the constant KV cache involved for attention computation. Different from Flat and IVF whose
+873
+      latency numbers are sensitive to context size, RetrievalAttention only has a minor latency increase
+      (8%) when the context size increases 10× from 100K to 1M.
+874
+875
+      Table 7: Per-token generation latency (s) of                    Table 8: Per-token generation latency (s) as
+876
+      128K context-length on A100.                                    context length varies from 100K to 1M.
+877
+878    Methods                Yi-6B   Yi-9B     Llama-3-8B             Methods                100K    200K    500K     1M
+879
+       Full (without cache)   31.61   47.51       33.38                Full (without cache)   25.47   83.03    457    1740
+880    vLLM                   0.030   0.044       0.033                vLLM                   0.029   0.046   OOM     OOM
+881    StreamingLLM           0.032   0.047       0.031                StreamingLLM           0.034   0.035   0.032   0.035
+       SnapKV                 0.033    0.05       0.033                SnapKV                 0.035   0.035   0.034   0.034
+882                                                                    InfLLM                 0.082   0.079   0.082   0.084
+       InfLLM                 0.069    0.11       0.068
+883    Flat                   0.541   0.802       0.564                Flat                   0.489   0.871    1.92    3.69
+884    IVF                    0.309   0.468       0.345                IVF                    0.308   0.476   1.032   1.889
+       RetrievalAttention     0.150   0.227       0.155                RetrievalAttention     0.159   0.167   0.170   0.172
+885
+886
+887
+888   B     R ETRIEVAL ATTENTION A LGORITHM
+889
+890   B.1   F ORMULA OF C OMBINING ATTENTION R ESULTS FROM THE CPU AND GPU S IDE
+891
+892
+      RetrievalAttention partitions the KV vectors for attention into two disjoint sets: predictable ones on
+      GPU (denoted as W) and dynamically retrieved ones on CPU (denoted as Ω).
+893
+894                                                       It,ϵ = W ∪ Ω                                                   (3)
+895
+896   Attention operation is applied to the two sets of KV vectors separately on CPU and GPU, generating
+897   two partial attention outputs (denoted as oW and oΩ , respectively). To guarantee the approximated
+898
+      attention output equals to the attention computation on It,ϵ , RetrievalAttention uses a similar idea of
+      FlashAttention (Dao et al., 2022) to combine oW and oΩ in the following equations:
+899
+900                                           oW = Attn(qt , K[W, :], V[W, :])
+901                                                P         zi −z̃1
+                                                      i∈W e          · vi
+902                                              = P            z  −z̃
+                                                        i∈W e
+                                                                 i    1
+903
+904                                           oΩ = Attn(qt , K[Ω, :], V[Ω, :])
+                                                            zi −z̃2
+                                                   P
+905                                                                  · vi
+                                                      i∈Ω e
+906                                              = P           z   −z̃
+                                                        i∈Ω e
+                                                                 i     2
+907
+908
+                                               ot = γ1 · oW + γ2 · oΩ                                                    (4)
+909   where z̃1 = maxi∈W zi and z̃2 = maxi∈Ω zi are the local maximum dot products in set W and Ω
+910   respectively. And γ1 and γ2 are re-scaling factors to guarantee the attention output is the same as that
+911   on It,ϵ , which are defined as follows:
+912
+913
+                                                     ez̃1 −z̃ ·           zi −z̃1
+                                                                  P
+                                                                   i∈W e
+914                                             γ1 =
+                                                                     ezi −z̃
+                                                          P
+915                                                           i∈It,ϵ
+916
+                                                                                                                         (5)
+                                                     ez̃2 −z̃ ·          zi −z̃2
+                                                                  P
+                                                                   i∈Ω e
+917                                             γ2 =
+                                                                     ezi −z̃
+                                                          P
+                                                              i∈It,ϵ
+
+
+
+                                                              17
+       Under review as a conference paper at ICLR 2025
+
+
+918
+919
+       Algorithm 1: RetrievalAttention
+920     Input: Query vector qt ∈ R1×d
+921     Data: KV Cache in GPU KW , VW ∈ R|W|×d
+922     Data: CPU-based Vector Database H
+923     Output: Attention output ot ∈ R1×d
+924
+        // Find the predictable KV vectors
+           ′
+      1 W ←  − PredictActiveTokens(...);
+925                        ′
+      2 for {i|i ∈ H ∪ W } do
+926
+      3      H.remove(i); W.insert(i); // move to GPU
+927
+928
+                 / W ′ ∧ i ∈ H} do
+      4 for {i|i ∈
+      5      W.remove(i); H.insert(i); // move to CPU
+929
+930     // Attention on GPU
+      6 oW ←  − FlashAttention(qt , KW , VW )
+931
+932
+        // Attention on CPU
+        // Search in vector database to retrieve most relevant KV
+933
+             vectors
+934
+      7 Ω ← − VectorSearch(qt );
+935   8 oΩ ← − AttentionCPU(Ω); // Combine partial attention outputs
+936   9 ot = γ1 · oW + γ2 · oΩ ; // Equation 4,5
+937
+938
+939
+       B.2   OVERALL E XECUTION F LOW
+940
+941    Algorithm 1 summarizes the above design of RetrievalAttention and elaborates the procedure in an
+942    algorithm. At the beginning of each token generation, RetrievalAttention predicts active KV vectors,
+943    moves them to GPU memory, and computes partial attention using the FlashAttention (Dao et al.,
+944    2022) kernel (#1 - #6). In parallel with GPU computation, RetrievalAttention leverages the specially
+945    designed vector database to find the most relevant KV vectors to compute attention on CPU (#7 - #8).
+946    Finally, RetrievalAttention combines the partial attention outputs on GPU and CPU using #4 and gets
+947    the approximated attention output (#9).
+948
+949    C     I MPLEMENTATION
+950
+951    RetrievalAttention builds one individual vector index for the KV cache in one attention head. Re-
+952    trievalAttention has implemented several optimizations to optimize the prompt prefill, accelerate the
+953    vector search, and reduce CPU memory usage.
+954
+955    Optimization for the Prefill Phase. During the prefill phase, full attention computation is required
+956    to generate the output vector for the next layer of the LLM. Simultaneously, we move the KV vectors
+957    to the CPU side for the ANNS index building. To accelerate the overall prefill process, we overlap
+958    the cache movement to the CPU with the full attention computation on the GPU in a pipeline manner.
+959    To minimize peak GPU memory usage during the prefill phase, attention computation is performed
+960    sequentially across multiple attention heads. This approach only slightly impacts the attention
+961    computation speed, as longer prompts can fully leverage GPU parallelism with FlashAttention.
+962    For simplicity, our current implementation does not integrate the KNN computation from Q to K into
+963    FlashAttention. However, the KNN computation can be fused into FlashAttention for acceleration
+964    because (1) FlashAttention inherently includes the step of calculating the inner product of queries and
+965    keys, and (2) the top-K algorithm only consumes registers that are redundant in the flash-attention
+966    kernel for modern GPUs. We can initialize a min-heap for each query in registers and update it with
+967    the matrix multiplication results as the thread block moves through key blocks. Heap operations are
+968
+       performed in CUDA cores and may take up to 2-3× the prefill latency, which is acceptable. The
+       detailed algorithm is shown in Algorithm ??.
+969
+970    Handling Newly Generated Tokens. In our current implementation, we do not update the index
+971    and, consequently, the nearest-keys set for prefilled queries during the decoding phase. Instead, we
+       maintain the newly generated tokens in the GPU memory as a static pattern and include all of them
+
+
+                                                         18
+       Under review as a conference paper at ICLR 2025
+
+
+972                                                                                        Llama-3-8B-Instruct-262k
+973                                                                           1.00
+                                                                                            Search on Prefill Tokens
+
+
+                                                         Average Recall@100
+974
+                                                                              0.98
+
+
+                                                            Over All Heads
+975
+976                                                                           0.96
+977                                                                           0.94
+978
+                                                                              0.92
+979
+980                                                                           0.90
+                                                                                     0   200   400    600   800   1000   1200
+981                                                                                        Index of Generated Token
+982
+983
+984    Figure 9: The Mahalanobis distance                   Figure 10: Index recalls remain at a high level
+985    from the newly generated queries (New                (≥0.95) in all attention heads when using 1200
+986    Q) and sampled prefill queries (Old Q)               newly generated queries to search in the indexes
+987    to the remaining prefill queries.                    built for prompt context.
+988
+989
+990    in the attention computation for subsequent generation steps. This design choice is based on the
+991    observation that newly generated tokens are typically much fewer in number compared to the long
+992
+       context.
+993    The maximum generation length of long-context benchmark Ruler and InfiniBench is 128 tokens.
+994    Existing studies (Bai et al., 2024; Zhao et al., 2024) have also demonstrated that although modern
+995    LLMs can handle extremely long contexts (e.g., 128K to 1M tokens), the maximum generation length
+996    usually does not exceed 2K tokens. Therefore, newly generated tokens can either remain in the
+997    GPU memory as static patterns or be offloaded to the CPU memory and efficiently retrieved using a
+998
+       brute-force KNN method. Since we do not update the original index, the index quality for searching
+       critical tokens within the prompt context remains unchanged as the decoding queries follow the same
+999
+       distribution as prefill queries. Figure 9 illustrates that the Mahalanobis distances from the newly
+1000
+       generated queries to the prefill queries are nearly identical to the distances among the prefill queries
+1001   themselves. This confirms that the newly generated queries remain within the distribution of prefill
+1002   queries. Furthermore, we employ a summary task, which generates 1,200 tokens based on a prompt
+1003   context of 128K tokens, to validate our design. Figure 10 demonstrates that the index provides robust
+1004   performance with high recall of top-k results in prefill key vectors when handling new queries in a
+1005   long generation.
+1006
+       Although we have adopted the above design choices, our ANNS can accept incremental inserts
+1007   without updating the nearest-keys of prefilled queries. Specifically, we can utilize the update strategy
+1008   from RoarGraph (Chen et al., 2024a) to achieve this. For each new key vector (v), we find the
+1009   closest prefilled query (q), get the previous nearest-key set (S), and use it to select neighbors for
+1010   v without modifying the pre-existing set. This insert strategy is shown to be highly efficient while
+1011   maintaining the indexing quality (Chen et al., 2024a). To exemplify this, we insert every key vector
+1012   of the generated token into the index in a summary task and test recall rates among all heads in
+1013   Llama-3-8B. Figure 11 presents the index of RetrievalAttention maintains its quality at high recall
+1014   regimes when continuing to insert newly generated key vectors into the index.
+1015   To validate the index works well on special cases with short input and relatively long generation,
+1016   we evaluate the index on code generation tasks from LongBench (Bai et al., 2023). The input
+1017   lengths for these tasks range from 151 to 719 tokens, with the model allowed to generate up to 2,000
+1018   tokens, incorporating incremental inserts into the index. This output length covers most scenarios
+1019   in existing benchmarks. We evaluate the recall rates of the index at each decoding step. As shown
+1020   in Figure 12, while recall rates exhibit a slight decline as decoding progresses, the index remains
+1021
+       robust, maintaining a recall rate of at least 0.95 in long-generation scenarios, where the output length
+       exceeds the input length by multiple times.
+1022
+1023
+1024   Multi-head Parallelism on the CPU side. To speed up the dynamic sparse attention computation
+1025   on the CPU, we exploit the multi-thread parallelism in vector databases by leveraging the multi-core
+       ability of modern CPU architecture. Specifically, since the computation of different attention heads
+
+
+                                                          19
+           Under review as a conference paper at ICLR 2025
+
+
+1026                                                                                              Llama-3-8B-Instruct-262k
+1027                                                                                 1.00
+                                                                                          Insert Every Newly Generated Key Vector
+
+
+                                                                Average Recall@100
+1028
+                                                                                     0.98
+
+
+                                                                   Over All Heads
+1029
+1030                                                                                 0.96
+1031                                                                                 0.94
+1032
+                                                                                     0.92
+1033
+1034                                                                                 0.90
+                                                                                             0         200        400        600       800    1000    1200
+1035                                                                                                      Index of Generated Token
+1036
+1037       Figure 11: Index recalls remain at a high level among all attention heads when inserting every newly
+1038       generated key vector into the index in a summary task that generates 1,200 tokens.
+1039
+1040                               Input Length=151, Output Length=2K
+                                                                                                         Llama-3-8B-Instruct-262k
+                                                                                       Input Length=300, Output Length=2K Input Length=451, Output Length=2K          Input Length=719, Output Length=2K
+                            1.00                                            1.00                                            1.00                               1.00
+1041
+       Average Recall@100
+
+
+                            0.98                                            0.98                                            0.98                               0.98
+          Over All Heads
+
+
+1042
+                            0.96                                            0.96                                            0.96                               0.96
+1043
+                            0.94                                            0.94                                            0.94                               0.94
+1044
+                            0.92                                            0.92                                            0.92                               0.92
+1045
+                            0.90                                            0.90                                            0.90                               0.90
+1046                               0      500    1000 1500 2000                        0      500    1000 1500 2000                0   500   1000 1500 2000           0      500    1000 1500 2000
+                                                                                                          Index of Generated Token
+1047
+1048       Figure 12: Index recalls on contexts in code generation tasks, with short prompt and long generation.
+1049
+1050
+1051      is independent, we launch multiple threads for parallel searching across different vector indexes to
+1052      reduce the overall latency on the CPU side. For grouped query attention (GQA) (Ainslie et al., 2023),
+1053      although multiple query heads could share the same key-value vectors, we observe that the query
+1054      vectors from different query heads in the same group exhibit different vector distributions. Therefore,
+1055      we build one vector index for each query head to leverage the specific query distribution of each head.
+1056
+1057       Minimize the CPU Memory Usage. To reduce CPU memory consumption, the indexes in the same
+1058       attention group share one copy of KV vectors by only storing the pointers to KV vectors in each index.
+1059       In the future, we plan to utilize scalar quantization to further compress the KV vectors, implementing
+1060       an 8-bit quantization in place of the original FP16 format. This compression is promising to reduce
+1061       memory usage while preserving computational efficiency. Importantly, our initial results demonstrate
+1062       that this quantization approach does not compromise the inference accuracy, maintaining performance
+1063       equivalent to the full-precision representation.
+1064
+1065
+1066
+           D                   A DDITIONAL R ELATED W ORK
+1067
+1068      Sparse Transformers. Since the quadratic complexity of attention has become the bottleneck of
+1069      LLM efficiency for long context applications, numerous works have studied to design sparse trans-
+1070      formers to reduce the computational and memory complexity of the self-attention mechanism. Some
+1071
+          works restrict the attention computation to predefined patterns, including sliding windows (Child
+          et al., 2019), dilated windows (Beltagy et al., 2020), or a mixture of different patterns (Zaheer et al.,
+1072
+          2020; Ainslie et al., 2020). Some approaches use cluster-based sparsity based on hash value (Kitaev
+1073
+          et al., 2020) or KNN algorithms (Bertsch et al., 2024; Mao et al., 2024). These solutions either
+1074      require pre-training a model from scratch or target limited scenarios like CPU-only, which do not
+1075      work for our target to out-of-box usage of LLMs on the GPU-CPU architecture. Although some
+1076      approaches (Xiao et al., 2024a; Ribar et al., 2024) exploit the dynamic sparse nature of LLMs, they
+1077      often use some estimation using low-rank hidden states or post-statistical approaches, which incurs
+1078      high overhead but with low accuracy. Moreover, all these approaches have to maintain full KV
+1079      vectors on GPU with only accelerated inference by reduced memory movement, which does not solve
+          the challenge of commodity GPUs with limited GPU memory.
+
+
+                                                                                                                     20
+       Under review as a conference paper at ICLR 2025
+
+
+1080
+       Additionally, some approaches accelerate the inference by employing dynamically sparse attention
+1081   patterns (Jiang et al., 2024), separating the prefill and decoding stages (Zhong et al., 2024; Qin et al.,
+1082   2024), and utilizing sequence parallelism (Jacobs et al., 2023; Liu et al., 2024a). These methods are
+1083   orthogonal to ours and can be in conjunction with our approach.
+1084
+1085
+1086
+1087
+       E           A DDITIONAL BASELINES
+1088
+1089
+       We compare RetrievalAttention with additional baselines InfiniGen and Quest on the RULER bench-
+1090
+       mark and show the results on Table 9. InfiniGen and Quest exhibit a noticeable drop in model
+1091
+       accuracy compared to full attention. In contrast, RetrievalAttention performs best and achieves nearly
+1092   the same accuracy as full attention across two benchmarks.
+1093
+1094
+                      Table 9: Performance (%) of different methods in 128K context length on RULER.
+1095
+1096              Methods          Act. Tokens    S1      S2       S3      M1      M2       M3     MQ     MV      VT     CW       FW    Q1     Q2     Avg.
+1097              FullAttention       128K       100.0   100.0    100.0    98.0    98.0     73.0   94.5   97.0   87.0     1.0    72.2   58.5   44.5   78.7
+        Llama-3
+
+
+1098              InfiniGen            2K         99.0    91.5     24.5    82.5    25.0     0.0    30.3   27.8   67.3     1.2    45.5   33.0   32.5   43.1
+                  Quest                2K        100.0   100.0     98.5    98.5    36.5     0.0    48.9   64.3   89.4     1.0    64.5   45.0   39.5   60.5
+1099              Ours              640 + 100    100.0   100.0    100.0    99.0    98.0     45.0   92.8   93.0   88.0     1.1    49.3   60.5   44.5   74.7
+1100
+1101
+1102
+1103
+1104   F          DYNAMIC R ETRIEVAL B UDGET A LLOCATION
+1105
+1106
+       We investigated the impact of adjusting the retrieval budget according to the sparsity degree across
+1107
+       layers, by adopting the budget allocation policy from PyramidIKV (Cai et al., 2024). Specifically, we
+1108   compare the performance of the original RetrievalAttention with and without the PyramidKV-based
+1109   budget allocation strategy on the InfiniteBench benchmark, as shown in RTable 2. Specifically, for
+1110   the original RetrievalAttention, we set a fixed budget of 2000 tokens for all heads in all layers. In
+1111   contrast, PyramidKV dynamically adjusts the retrieval size across different layers, allocating more in
+1112   lower layers and less in higher ones.
+1113
+       The results in Table 10 shows that PyramidKV allocation strategy achieves better performance
+1114   in Retr.KV tasks, though it slightly decreases performance in the En.QA task. On average, the
+1115   accuracy slightly surpasses that of the original RetrievalAttention. This indicates that dynamic budget
+1116   allocation is promising but may require task-specific allocation strategies.
+1117
+1118   Table 10: Performance (%) of RetrievalAttention and RetrievalAttention w/ PyramidKV in 128K
+1119   context length.
+1120
+1121                              Methods                   Retr.N        Retr.P    Retr.KV        Code.D        Math.F         En.QA    En.MC        Avg.
+1122                        Full Attention                     100.0      100.0           17.5       19.0         39.5           9.1      68.0        50.4
+1123                     RetrievalAttention                    100.0      100.0           14.5       18.5         40.0           8.7      67.5        49.9
+                  RetrievalAttention w/ PyramidKV              100.0      100.0           16.0       18.5         40.0           8.5      67.5        50.1
+1124
+1125
+1126
+1127
+1128
+1129   G           P ERFORMANCE ON THE LARGER MODEL
+1130
+1131   To demonstrate the generalizability of our methods on larger models, we evaluated our method on
+1132   Llama-3-70B-262k using a server with eight 40GB A100 GPUs by partitioning the model by layers
+1133   across GPUs. We choose the most complex task KV retrieval in ∞-Bench to stress test the efficiency
+       of RetrievalAttention and other baselines.
+
+
+                                                                                   21
+       Under review as a conference paper at ICLR 2025
+
+
+1134              Table 11: Performance (%) and decoding latency (s) in Llama-3-70B Model.
+1135
+1136                                    Full   StreamingLLM     Quest    Flat   RetrievalAttention
+1137                    Accuracy        35.0         0.0         13.0    24.0          23.5
+1138                 Decoding latency   248         0.14         1.36    5.68          1.62
+1139
+1140
+1141   The results in the Table 11 shows that RetrievalAttention achieves nearly the same task accuracy as the
+1142   exact KNN method Flat, and outperforms Quest by 80%. The decoding speed of RetrievalAttention
+1143   is 3.5× faster than Flat as it effectively reduces the vectors to scan.
+1144
+       H    T OP K K ERNEL I MPLEMENTATION D ETAILS
+1145
+1146
+       In practical computations, the TopK selection during the Q and K matrix multiplication can be
+1147
+       fused directly into the FlashAttention computation, thereby minimizing the overhead of building
+1148   indices. Specifically, during the FlashAttention operation, BitonicSort (Nassimi & Sahni, 1979) and
+1149   BitonicMerge (Johnson et al., 2019) algorithms are used within CUDA cores to efficiently retain
+1150   TopK information, while Tensor Cores are simultaneously utilized for matrix multiplication. This
+1151   design ensures that, on GPUs such as NVIDIA Hopper, the TopK retrieval process is fully hidden
+1152   within the FlashAttention computation through the parallel utilization of CUDA cores and Tensor
+1153   Cores (Shah et al., 2024), resulting in a highly efficient pipeline. Detailed steps are outlined in
+1154   Algorithm 2.
+1155
+1156
+1157
+1158
+1159
+1160
+1161
+1162
+1163
+1164
+1165
+1166
+1167
+1168
+1169
+1170
+1171
+1172
+1173
+1174
+1175
+1176
+1177
+1178
+1179
+1180
+1181
+1182
+1183
+1184
+1185
+1186
+1187
+
+
+
+                                                           22
+       Under review as a conference paper at ICLR 2025
+
+
+1188
+1189
+1190
+1191
+1192
+1193
+1194
+1195   Algorithm 2: Select Top-K key tokens for each query token, fused with Flash-Attention
+1196                                                                                                S
+         Shape: sequence length S, head dim dh , top K number T , block size B, block number N =   B
+1197
+         Input: Q, K, V ∈ RS×dh
+1198                                    S×T
+                      qK indices J ← (0)
+         Initialize top                     ∈ NS×T
+1199
+                         1
+1200     Scale τ ←      dh
+1201     # Thread-block-level parallelized
+1202     for i ← 1 to N do
+1203        Load Qchip ← Qi×B:(i+1)×B ∈ RB×dh into shared memory
+1204       # B sorted arries of size T with member format of (value, index)
+1205       Initialize A ← (−∞, 0)B×T ∈ (R, N)B×T in registers
+1206       Initialize Ochip ← (0)B×dh ∈ RB×dh in shared memory
+1207       Initialize m ← (− inf)B ∈ RB in registers
+1208       Initialize l ← (0)B ∈ RB in registers
+1209       # Loop through K, causal
+1210       for j ← 1 to i do
+1211          Load Kchip ← K j×B:(j+1)×B ∈ RB×dh into shared memory
+1212          Load Vchip ← V j×B:(j+1)×B ∈ RB×dh into shared memory
+1213          # Calculate QK T in tensor cores
+                           T
+1214          S ← τ Qchip Kchip
+1215
+              S ← mask(S)
+1216          # Top-K in CUDA cores
+1217          Aii                   ii
+                new ← BitonicSort(S )
+
+1218
+              A ← BitonicMerge(Aii , Aii
+                ii
+                                       new )
+
+1219          # Online softmax in CUDA cores
+1220          minew ← max(mi , rowmax(S)) ∈ RB
+              S ← S − minew
+1221
+              P ← exp(S)
+1222           i
+              lnew ← rowsum(S)
+1223          α ← exp(mi − minew )
+1224          li ← αli + lnew
+                           i
+
+1225
+             # Calculate P V in tensor cores
+1226         Ochip ← αOchip + P Vchip
+1227       end for
+1228       # Write top-K outputs, thread-level parallelized
+1229       for ii ← 1 to B do
+1230          Save J i×B+ii ← H ii .indices
+1231       end for
+1232       # Write flash-attention outputs
+1233       Ochip ← diag(li )−1 Ochip
+1234       Save O i×B:(i+1)×B ← Ochip
+         end for
+1235
+1236
+1237
+1238
+1239
+1240
+1241
+
+
+
+                                                              23

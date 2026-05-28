@@ -1,0 +1,1069 @@
+Under review as a conference paper at ICLR 2025
+
+
+000
+001
+      F LASH DP:  M EMORY-E FFICIENT  AND    H IGH -
+002   T HROUGHPUT DP-SGD T RAINING FOR L ARGE L AN -
+003
+004   GUAGE M ODELS
+005
+006
+       Anonymous authors
+007
+       Paper under double-blind review
+008
+009
+010
+011                                                A BSTRACT
+012
+013            As large language models (LLMs) increasingly underpin technological advance-
+014            ments, the privacy of their training data emerges as a critical concern. Differential
+015            Privacy (DP) serves as a rigorous mechanism to protect this data, yet its integration
+016            via Differentially Private Stochastic Gradient Descent (DP-SGD) introduces sub-
+017
+               stantial challenges, primarily due to the complexities of per-sample gradient clip-
+               ping. Current explicit methods, such as Opacus, necessitate extensive storage for
+018
+               per-sample gradients, significantly inflating memory requirements. Conversely,
+019
+               implicit methods like GhostClip reduce storage needs by recalculating gradients
+020            multiple times, which leads to inefficiencies due to redundant computations. This
+021            paper introduces FlashDP, an innovative cache-friendly method that consolidates
+022            necessary operations into a single task, calculating gradients only once in a fused
+023            manner. This approach not only diminishes memory movement by up to 50% but
+024            also cuts down redundant computations by 20%, compared to previous methods.
+025            Consequently, FlashDP does not increase memory demands and achieves a 90%
+026            throughput compared to the Non-DP method on a four-A100 system during the
+027            pre-training of the Llama-13B model, while maintaining parity with standard DP-
+028
+               SGD in terms of accuracy. These advancements establish FlashDP as a pivotal
+               development for efficient and privacy-preserving training of LLMs.
+029
+030
+031   1   I NTRODUCTION
+032
+033   The transformer architecture (Vaswani et al., 2017) has revolutionized fields like natural language
+034   processing (Gao et al., 2024; Xie et al., 2023), embodied AI (Song et al., 2023; Duan et al., 2022;
+035   Xu et al., 2024), and AI-generated content (AIGC) (Cao et al., 2023; Wu et al., 2023), with Large
+036
+      Language Models (LLMs) demonstrating exceptional abilities in text generation, complex query re-
+      sponses, and various language tasks due to training on massive datasets. These models, exemplified
+037
+      by ChatGPT, are applied across diverse areas, including healthcare, where they enhance diagnosis
+038
+      and drug discovery by analyzing medical data (Toma et al., 2023; Ali et al., 2023; Sheikhalishahi
+039   et al., 2019; Sallam, 2023; Biswas, 2023). However, the extensive capabilities of LLMs raise signif-
+040   icant privacy concerns, particularly as they can inadvertently expose or generate sensitive informa-
+041   tion, owing to their potential to memorize data from large training sets (Pang et al., 2024; Nasr et al.,
+042   2023; Carlini et al., 2023; Ippolito et al., 2022; McCoy et al., 2023; Tirumala et al., 2022; Zhang
+043   et al., 2023; Ashkboos et al., 2023).
+044
+      Differential Privacy (DP) ensures privacy by adding noise during data processing, such that any sin-
+045   gle data point’s influence on outcomes is minimal (Dwork, 2006). As the most commonly adopted
+046   methods for ensuring DP in deep learning models, Differentially Private Stochastic Gradient Descent
+047   (DP-SGD) based methods (Abadi et al., 2016) adapt traditional stochastic gradient descent by clip-
+048   ping gradients per sample and adding noise. Although DP-SGD’s application in LLMs is increasing,
+049   recent research (Li et al., 2022; Bu et al., 2023; Anil et al., 2022; Hoory et al., 2021) primarily tar-
+050   gets the fine-tuning phase, providing privacy only for fine-tuned data. While some studies (Lee &
+051   Kifer, 2021; Li et al., 2022; Bu et al., 2023) have applied DP-SGD to pre-training, they typically use
+052   shorter sequence lengths, not maximizing the benefits of longer sequences used in modern LLMs.
+053
+      This limitation arises from the high computational and memory demands of DP-SGD, especially
+      with long sequences typical in LLM pre-training.
+
+
+                                                         1
+      Under review as a conference paper at ICLR 2025
+
+
+054
+      Integrating DP into LLM training
+055   via DP-SGD/Adam poses significant
+056   challenges, particularly due to per-
+057   sample gradient clipping. This cru-
+058   cial privacy technique involves ad-
+059   justing each data sample’s gradients
+060   to limit their influence on model up-
+061   dates. While critical for maintain-
+062   ing strict privacy standards, this ap-
+063
+      proach requires computing and stor-
+      ing individual gradients, significantly
+064
+      raising computational and memory
+065
+      demands. Managing these gradients
+066   is especially taxing in LLMs, which
+067   are known for their large parameter Figure 1: Comparison of different training methods. (a)
+068   spaces. Each gradient must be care- Standard DP-SGD: Stores per-sample gradients G (red ex-
+069   fully clipped and aggregated before plicit cache), increasing memory usage (blue buffer). (b)
+070   updating model parameters, straining FlashDP: Optimizes gradient processing by consolidating
+071   computational resources, and pro- computations into a single pass, reducing redundancy and
+072   longing training times. These scala- memory use.
+073   bility issues are particularly acute in
+074
+      settings with limited hardware, creating significant barriers to efficiently training privacy-aware
+      LLMs (Li et al., 2022; Bu et al., 2023).
+075
+076   Current research on DP-SGD for training LLMs can be categorized into two classes: explicit meth-
+077   ods like Opacus (Yousefpour et al., 2021) stand out by directly storing per-sample gradients. This
+078   approach, while straightforward, significantly increases the memory footprint (Appendix Table 4),
+079   which becomes prohibitive for state-of-the-art LLMs characterized by billions of parameters (Tou-
+080
+      vron et al., 2023; Achiam et al., 2023). Such a substantial increase in memory requirements hampers
+      scalability and renders these methods impractical for deployment in large-scale model training envi-
+081
+      ronments. The direct storage of gradients, essential for ensuring the privacy guarantees of DP, thus
+082
+      poses a substantial barrier to the efficient implementation of DP in LLMs.
+083
+084   Conversely, implicit methods, exemplified by innovations such as GhostClip (Li et al., 2021), ad-
+085   dress the memory challenge by circumventing the need for persistent storage of per-sample gra-
+086
+      dients. These methods segment the DP-SGD process into multiple discrete computational tasks,
+      ostensibly to mitigate memory demands. However, this strategy necessitates the frequent recalcu-
+087
+      lation of per-sample gradients, which introduces a high degree of computational redundancy (Table
+088
+      4). This redundancy not only undermines training efficiency but also extends the duration of the
+089   training process significantly. For LLMs, which require substantial computational resources and
+090   extended training times, the inefficiencies introduced by such redundant computations become a
+091   critical bottleneck. These implicit methods, while innovative in reducing memory usage, thus strug-
+092   gle to deliver a practical solution for the privacy-preserving training of LLMs at scale.
+093
+      To effectively tackle the challenges presented by existing methods of integrating DP into the training
+094
+      of LLMs, we introduce FlashDP, a novel, cache-friendly implicit algorithm designed to streamline
+095   the DP-SGD process (Figure 1 (a)). FlashDP uniquely implements a unified computational strategy
+096   that performs the gradient operations required for DP-SGD in a single pass (Figure 1 (b)). This
+097   innovative approach not only eliminates the need for multiple recalculations of per-sample gradi-
+098   ents but also consolidates the entire process into one cohesive computational task. To be specific,
+099   FlashDP’s architecture, which consolidates the entire DP-SGD process into a single GPU kernel,
+100   eliminates redundant computations and optimizes data flow within the GPU. This integration re-
+101   sults in a streamlined workflow that efficiently manages memory and processing resources. Also,
+102   FlashDP reorganizes the GPU operations to maximize data throughput and minimize latency, ef-
+103
+      fectively enhancing the overall efficiency of the training process. These architectural improvements
+      significantly reduce the volume of memory transfers and computational redundancies, thereby opti-
+104
+      mizing both the speed and resource utilization during the training of LLMs with DP.
+105
+106   By re-designing the gradient computation workflow, FlashDP dramatically reduces the volume of
+107   memory transfers by 50% and decreases redundant computational tasks by 20% compared to pre-
+      vious implicit methods. This optimization is achieved through an advanced caching mechanism
+
+
+                                                        2
+      Under review as a conference paper at ICLR 2025
+
+
+108
+      that efficiently manages gradient data and computation within GPU memory, minimizing the data
+109   movement across the system. As a result, FlashDP significantly alleviates the memory overhead
+110   traditionally associated with DP-SGD, enhancing the model’s scalability and training speed.
+111
+112
+      The practical impact of these improvements is substantial. On a computational platform equipped
+      with four NVIDIA A100 GPUs, FlashDP achieves a remarkable 90% throughput compared to the
+113
+      non-DP method during the pre-training phase of the Llama-13B model, a state-of-the-art LLM
+114
+      known for its extensive data and computation demands. Crucially, this enhanced performance is
+115   attained without any degradation in the accuracy or dilution of the privacy guarantees that are fun-
+116   damental to DP-SGD. FlashDP thus not only meets but exceeds the operational requirements for
+117   effective and efficient privacy-preserving training of LLMs.
+118
+      Our contributions can be summarized as follows:
+119
+120         • Enhanced Throughput for Long Sequence LLM training with DP: We propose
+121           FlashDP, which effectively resolves the issue of low throughput in DP-SGD/Adam dur-
+122
+              ing the training of LLMs with long sequence lengths. By optimizing the computational
+              workflow and integrating more efficient handling of per-sample gradients, FlashDP sig-
+123
+              nificantly enhances the processing speed without compromising the model’s accuracy or
+124
+              privacy integrity.
+125
+126
+            • Innovative GPU I/O Optimization: Our study pioneers the exploration of DP-SGD from
+              the perspective of GPU input/output operations. FlashDP’s architecture, which consoli-
+127
+              dates the entire DP-SGD process into a single GPU kernel, eliminates redundant compu-
+128
+              tations and optimizes data flow within the GPU. This approach not only reduces the com-
+129           putational load but also minimizes the number of GPU memory accesses, setting a new
+130           standard for efficiency in DP implementations.
+131
+            • Experimental Validation of Efficiency and Scalability: In practical LLM models involv-
+132           ing Llama-13B, FlashDP matches the speed and memory usage of non-DP training meth-
+133           ods and achieves a significant 90% throughput compared with Non-DP methods. This
+134           performance is achieved on a computational platform equipped with four NVIDIA A100
+135           GPUs. Importantly, it accomplishes this without any degradation in the precision or the
+136           privacy guarantees typically observed in standard DP-SGD implementations. This capa-
+137           bility demonstrates FlashDP’s effectiveness in scaling DP applications to larger and more
+138           complex LLMs without the usual trade-offs.
+139
+140   2   R ELATED W ORK
+141   Improving Time and Memory Complexities of DP-SGD. The transition from standard stochas-
+142   tic gradient descent to DP-SGD introduces substantial modifications in memory and computational
+143   demands. In conventional settings, parameter updates are efficiently computed by aggregating gradi-
+144   ents across all samples within a batch. This approach is both memory-efficient and computationally
+145   straightforward. In contrast, DP-SGD mandates that each sample’s gradients be preserved, clipped,
+146   and subsequently aggregated to uphold privacy guarantees. Recent innovations in DP-SGD have
+147
+      primarily concentrated on ameliorating its computational and memory inefficiencies. TF-Privacy
+      vectorizes the loss to calculate per-sample gradients through backpropagation, which is efficient in
+148
+      terms of memory but slow in execution Abadi et al. (2015). Opacus Yousefpour et al. (2021) and
+149
+      Rochette et al. (2019) enhance the training efficiency by employing the outer product method Good-
+150   fellow (2015), albeit at the cost of increased memory usage needed to store per-sample gradients.
+151   This memory overhead is mitigated in FastGradClip Lee & Kifer (2020) by distributing the space
+152   complexity across two stages of backpropagation, effectively doubling the time complexity. Addi-
+153   tionally, ghost clipping techniques Goodfellow (2015), Li et al. (2021), Bu et al. (2022) allow for
+154   clipping per-sample gradients without full instantiation, optimizing both time and space, particularly
+155   when feature dimensions are constrained. Furthermore, Bu et al. (2023) introduces a ’book-keeping’
+156   (BK) method that achieves high throughput and memory efficiency while falling short in handling
+157   the long sequence lengths typical in LLM training.
+158   While these methodologies have made significant strides in mitigating the extensive computational
+159   and memory demands typically associated with managing per-sample gradients in DP-SGD, they
+160   have not addressed the optimization of DP training from the perspective of GPU architecture and
+161   memory access. Additionally, the approaches detailed thus far do not cater effectively to the training
+      of today’s long-sequence LLMs. FlashDP aims to enhance the efficiency and feasibility of training
+
+
+                                                        3
+      Under review as a conference paper at ICLR 2025
+
+
+162
+      LLMs with long sequences under the constraints of differential privacy, ensuring both high perfor-
+163   mance and adherence to privacy standards.
+164
+165   DP for Large Language Models. The field of privacy-preserving LLMs is characterized by the
+166
+      use or exclusion of DP and its extensions. He et al. (2022) evaluated the precision equivalence
+      of per-layer clipping with flat clipping on LLMs. Kerrigan et al. (2020) demonstrated that public
+167
+      pretraining could facilitate downstream DP fine-tuning, although they did not explore fine-tuning
+168
+      large pre-trained models using DP-SGD. Qu et al. (2021) explored the fine-tuning of BERT for
+169   language understanding tasks under local DP. Bommasani et al. (2021) suggested the potential for
+170   cost-effective private learning through fine-tuning large pre-trained language models. Anil et al.
+171   (2021) and Dupuy et al. (2022) extended these studies to BERT, pretraining and fine-tuning under
+172   global DP, respectively, with Anil et al. (2021) addressing datasets comprising hundreds of millions
+173   of examples, and Dupuy et al. (2022) reporting on datasets of utterances with relatively high ✏ values.
+174   Our research distinguishes itself by focusing on pre-training and fine-tuning large language models
+175   with high throughput and low memory usage.
+176
+177   3   U NDERSTANDING THE L IMITATIONS OF P REVIOUS M ETHODS
+178
+179
+180
+181
+182
+183
+184
+185
+186
+187
+188
+189
+190
+191
+      Figure 2: Comparison of different training methods. (a) Non-DP: Basic training without DP. (b)
+192
+      Explicit Method (e.g., Opacus, FastClip): Stores per-sample gradients G (red explicit cache), in-
+193   creasing memory usage. (c) Implicit Method (e.g., GhostClip, BK): Reduces memory by recalculat-
+194   ing gradients in fused manners (blue dotted box) but implicitly calculating the per-sample gradient
+195   twice, causing computational redundancy. (d) FlashDP: Optimizes gradient processing by consoli-
+196   dating computations into a single pass, reducing redundancy and memory use.
+197
+198   In this section, we introduce the previous non-DP, explicit, and implicate methods of DP-SGD from
+199   the GPU I/O perspective to see their weakness, which motivates our framework. Due to the space
+200   limit, please refer to Appendix A for the background on DP, Transformers, GPU architecture, and
+201   CUDA programming. As discussed in Section A.2, the linear operation is crucial in the architecture
+202   of LLMs, particularly within Multi-Head Attention (MHA) and Feedforward Network (FFN) mod-
+203   ules. Given its significance, we utilize the linear operation as an exemplar to elucidate the training
+204   workflow on GPUs, as shown in Figure 2. See Appendix B for details.
+205   In the standard non-private training workflow of a linear layer, the forward pass involves a matrix
+206   multiplication Y = XW T between the activation tensor X 2 RB⇥T ⇥P and the weight matrix
+207   W 2 RD⇥P , resulting in the output Y 2 RB⇥T ⇥D , where B, T , P , and D denote the batch size,
+208   sequence length, input feature dimension, and output feature dimension, respectively. The backward
+209   pass calculates
+               P P the output     gradient rY 2 RB⇥T ⇥D and the weight gradient rW 2 RD⇥P via
+210   rW = B T (rY ) X. Figure 2 (a) illustrates this process, showing that the activation tensor
+                             T
+
+211   X and weights W are stored in HBM for efficient access during computations, while intermediate
+212
+      operations utilize SRAM to enhance memory access time and throughput.
+213   The explicit DP-SGD workflow, as depicted in Figure 2 (b), categorizes the process into four stages
+214                                  explicitly managing per-sample gradients. Stage 1 involves comput-
+      to ensure privacy adherence by P
+215   ing per-sample gradients G = T rTY X using batched GEMM operations on SRAM to minimize
+      latency, with subsequent storage of the gradients back to HBM. Stage 2 requires reloading these gra-
+
+
+                                                        4
+      Under review as a conference paper at ICLR 2025
+
+
+216                                          pP P
+      dients to compute their norm kGk =              P G , then storing the results back in HBM. Stage
+                                                           2
+                                                  D
+217   3 includes loading the gradients and their norms for the per-layer clipping operations, ensuring that
+218   no gradient norm exceeds the predefined threshold C, with the clipped gradients G0 written back
+219   to HBM. Stage 4 focuses on adding Gaussian noise to the clipped gradients in SRAM for privacy
+220   preservation, followed by their aggregation for model updates, and storing the final noisy gradient
+221   rW back in HBM. This explicit handling of per-sample gradients not only increases memory usage
+222   but also complicates processing due to frequent memory swaps and disrupts efficient GPU utiliza-
+223   tion by breaking down kernel fusion strategies, becoming notably impractical for LLMs with their
+224   extensive parameter and gradient sizes, severely impacting training efficiency.
+225   The implicit DP-SGD workflow, illustrated in Figure 2 (c), employs a method such as GhostClip
+226   to recalculate gradients in a fused manner, thus circumventing the need for explicit storage of per-
+227   sample gradients. Stage 1 consolidates the first three stages of the explicit method into a single fused
+228   computational step, where the activation tensor X and output gradient tensor rY are loaded into
+229   SRAM. Per-sample gradient tensor G recalculations, norm calculations, and the per-layer clipping
+230   are integrated into one operation, minimizing latency and avoiding repeated data transfers to HBM.
+231
+      Stage 2 mirrors the explicit method’s final stage, where the recalculated and clipped gradients G0
+      undergo Gaussian noise addition in SRAM, followed by aggregation and storage in HBM for model
+232
+      updates. This approach reduces memory usage but increases computational load due to the redun-
+233
+      dancy of multiple gradient recalculations, which can significantly extend training times, particularly
+234   for LLMs with extensive sequence lengths, rendering the method less practical due to the increased
+235   time complexity proportional to T .
+236
+237
+      To address the previous limitations, the subsequent section will introduce FlashDP, a novel strategy
+      designed to address these inefficiencies by rethinking the execution pipeline of DP-SGD. Without
+238
+      delving into specifics here, FlashDP’s architecture will streamline the integration of per-sample gra-
+239
+      dient computation and clipping, potentially reducing the operational bottlenecks observed in existing
+240   methods.
+241
+242
+243   4   F LASH DP A LGORITHM D ESIGN
+244
+245
+246
+247
+248
+249
+250
+251
+252
+253
+254
+255
+256
+257
+258
+259   Figure 3: Illustration of FlashDP. It depicts the core algorithm design of FlashDP. Its features are
+260   integrated with on-chip per-sample gradient norm calculations. The workflow incorporates block-
+261   wise all-reduce and synchronization to facilitate efficient norm aggregation. SRAM (orange) and
+262
+      HBM (green) are optimally utilized to manage memory efficiently, addressing the kernel fusion
+      challenges and reducing computational redundancy inherent in traditional DP-SGD implementa-
+263
+      tions.
+264
+265
+266   4.1 A LGORITHMIC E NHANCEMENTS IN F LASH DP
+267   FlashDP introduces a suite of algorithmic enhancements designed to reconcile the computational
+268   demands and memory constraints associated with DP-SGD. At the heart of these enhancements is the
+269   Block-wise All-Reduce algorithm, which integrates several critical operations into a unified kernel
+      execution, thereby optimizing on-chip memory utilization and enhancing computational throughput.
+
+
+                                                         5
+      Under review as a conference paper at ICLR 2025
+
+
+270
+      Efficient Kernel Fusion through Block-wise All-Reduce. Central to FlashDP’s strategy is our
+271   proposed Hierarchical Reduction Architecture (HRA), which encompasses more than just reduction
+272   operations. HRA is a structured approach that manages the computation and synchronization of
+273   data across various stages, beginning with intra-block reduction of gradient norms within individual
+274   GPU blocks. This phase employs an HRA-based reduction strategy executed in shared memory,
+275   culminating in a single norm scaler per block. Such a design significantly reduces the data footprint
+276   necessary for subsequent inter-block communications, optimizing the efficiency of the all-reduce
+277   operation across the GPU grid.
+278   Following the compact intra-block reduction, FlashDP coordinates a global all-reduce operation
+279   across blocks, which computes a global gradient norm crucial for consistent gradient clipping across
+280   the entire mini-batch. Efficiently handled in HBM thanks to the minimized data size from earlier
+281   reductions, this step avoids the common memory bottlenecks typically associated with large-scale
+282   data operations in HBM, thus maintaining high computational throughput.
+283   Algorithm 1 Algorithm: FlashDP with Block-wise All-Reduce on GPUs
+284
+      Require: Input activation tensor X 2 RB⇥T ⇥P and output gradient tensor rY 2 RB⇥T ⇥D in
+285
+          GPU HBM
+286
+      Require: Clipping threshold C, noise scale
+287   Require: Block dimensions b, t, d, and p for batch size, sequence length, output features, and input
+288       features, respectively.
+289    1: Split block for output gradient tensor BrY 2 Rb⇥t⇥d , input activation tensor BX 2 Rb⇥t⇥p
+290       based on GPU on-chip SRAM size M .
+291    2: for each training backward iteration do
+292    3:      for each block input index ip = 1, 2, . . . , Pp in parallel do
+293    4:          for each block output feature id = 1, 2, . . . , Dd in parallel do
+294    5:              for each block batch size ib = 1, 2, . . . , b in parallel do
+                                                                    B
+295    6:                  Load output gradient block BrY and input activation block BX from HBM to
+296       SRAM.                                                             P
+297    7:                  Compute per-sample gradients block BG = T Br            T
+                                                                                     Y
+                                                                                       BX on-chip SRAM.
+298    8:
+          P P              Intra-block Reduce: Compute      per-sample   gradients  norm square block kBG k2 =
+                        2
+299          d    p BG on-chip SRAM.
+300    9:                  Inter-block Reduce: Offload all per-sample gradients norm square blocks kBG k2
+301       from SRAM to HBM, and perform block-wise all-reduce.
+302   10:                  Block-wise synchronization: Wait until all blocks finish the all-reduce operation
+                                                                                    0
+303       to get all-reduced per-sample gradients norm square blocks kBG k2 .
+                                         20
+304   11:                  Upload kBG k from HBM to SRAM.                                       ✓ p             ◆
+305                                                                                                    kBG k2 0
+306
+      12:                  Compute clipped per-sample gradients block BG = BG / max 1,
+                                                                                 0
+                                                                                                        C
+307       on-chip SRAM.
+308   13:                Add noise to clipped
+                                          P per-sample    gradients block and aggregate to compute pa-
+309       rameter gradient block BrW = b BG     0
+                                                  + N (0, 2 C 2 I) on-chip SRAM.
+310   14:                Offload parameter gradient block BrW from SRAM to HBM.
+311   15:            end for
+312
+      16:        end for
+      17:    end for
+313
+      18: end for
+314
+      19: Return entire parameter gradient rW .
+315
+316   The strategic implementation of HRA not only facilitates these reductions but also orchestrates syn-
+317   chronized updates and data consistency across the GPU architecture. By managing data flow from
+318   the point of loading through to final computation and storage, HRA ensures that the most intensive
+319   computations are confined to the faster, on-chip memory. This methodical approach leverages the
+320
+      GPU’s capabilities to facilitate high-performance differentially private training, minimizing memory
+      and bandwidth overhead.
+321
+322   The practical implementation and operational dynamics of the FlashDP approach are thoroughly
+323   illustrated in Algorithm 1 and visually depicted in Figure 3. FlashDP innovatively reduces the four
+      distinct stages typically involved in explicit DP-SGD into a single streamlined stage. This con-
+
+
+                                                          6
+      Under review as a conference paper at ICLR 2025
+
+
+324
+      solidation is achieved without adding any extra computational steps, thereby enhancing the overall
+325   efficiency of the process. Here is a detailed breakdown of this single streamlined stage:
+326
+327   Optimized Block Processing and Memory Management (Line 1-6). Initially, FlashDP partitions
+328
+      the input activation tensor X and the output gradient tensor rY into blocks based on the SRAM
+      capacity. This strategic partitioning is crucial for managing the limited on-chip memory more effec-
+329
+      tively and ensuring that data transfers between the HBM and SRAM are minimized.
+330
+331   Fused Computation of Gradients and Norms (Line 7-8). Within the GPU’s SRAM, FlashDP
+332   simultaneously computes the per-sample gradients block and their norms square (intra-block re-
+333   duce) for each block. This computation leverages the GPU’s powerful batched GEMM operations,
+334
+      enabling it to handle large data sets efficiently.
+335   Block-wise All-Reduce (Line 9-11). After computing the gradient norms, FlashDP performs a
+336   Block-wise All-Reduce operation in parallel to aggregate these norms across all blocks (inter-block
+337   reduce). This all-reduce operation is crucial for obtaining a global view of gradient norms square,
+338   which is necessary for consistent gradient clipping across the entire batch. This step is executed
+339   efficiently within the SRAM, reducing the latency and memory bandwidth requirements typically
+340
+      associated with inter-GPU communications.
+341   Gradient Clipping and Noise Addition in SRAM (Line 12-13). Following the gradient and norm
+342   calculations, clipping is performed directly on the chip. Each gradient is scaled according to the
+343   computed norms and a predefined clipping threshold C, ensuring compliance with DP standards.
+344   Immediately after clipping, Gaussian noise based on the noise scale and the clipping threshold is
+345   added to each gradient block.
+346   Efficient Parameter Aggregation (Line 14-19). The final step in the FlashDP algorithm involves
+347   aggregating the noisy, clipped gradients across all blocks and batches directly within SRAM. This
+348   aggregation is optimized to minimize memory accesses, ensuring that only the final gradient used
+349   for the model update is transferred back to HBM.
+350
+      4.2 A DAPTIVE K ERNEL I MPLEMENTATION
+351
+352
+      The implementation of the FlashDP algorithm leverages the robust and versatile capabilities of the
+      PyTorch framework Paszke et al. (2019), which is renowned for its intuitive handling of automatic
+353
+      differentiation and dynamic computational graphs. One of the critical features of our implemen-
+354
+      tation involves customizing PyTorch’s autograd functionality to accommodate the specific needs
+355   of differential privacy during the training of deep neural networks. To this end, operators that ne-
+356   cessitate trainable parameters are intricately defined by wrapping them within PyTorch’s autograd
+357   function.
+358
+      However, implementing the Block-wise All-Reduce algorithm has presented unique challenges, pri-
+359
+      marily due to the limitations of CUDA’s programming model in facilitating block-wise synchroniza-
+360
+      tion. Block-wise synchronization is essential in our algorithm; without it, clip operations might be
+361   executed prematurely, while the inter-block reduce operation is still incomplete, leading to numeri-
+362   cal inaccuracies in the computation of per-sample gradients’ norm squares. There are two primary
+363   methods to implement synchronization: 1. cooperative groups (CG) 1 and 2. adaptive kernel. We
+364   opted for the second method because the grid synchronization required by CG necessitates launching
+365   all blocks simultaneously, which is impractical for DP applications.
+366
+      To address this limitation, FlashDP’s implementation employs an adaptive approach. Instead of
+367   relying on a monolithic kernel to perform the entire Block-wise All-Reduce operation, the process is
+368   split across different kernels, which are executed iteratively over the batch dimension. This iterative
+369   approach allows for synchronization points between the execution of kernels, using the inherent
+370   block synchronization that occurs at kernel launch and completion.
+371
+      The execution flow in FlashDP is as follows: (1) Intra-block Reduction: Each block computes
+372
+      the norms of its gradients and performs an HRA-based reduction within the shared memory. This
+373   step employs a shuffle-reduce mechanism, optimizing intra-block operations by minimizing memory
+374   footprint and synchronization overhead. This results in a single norm value per block. (2) Inter-
+375   block Reduction: Each block transfers the outcome of its intra-block reduction to the HBM. This
+376   transfer is facilitated through atomic operations for several reasons. Firstly, the result of the intra-
+377
+         1
+             https://developer.nvidia.com/blog/cooperative-groups/
+
+
+                                                              7
+      Under review as a conference paper at ICLR 2025
+
+
+378
+      block reduction comprises only a single element, and each block elects only one thread to perform
+379   the atomic operation on this element. This approach minimizes potential bottlenecks, as the differing
+380   execution speeds across blocks prevent serious serialization issues. Secondly, atomic operations
+381   benefit from acceleration by the hardware instruction set, ensuring that these operations are executed
+382   swiftly and efficiently. (3) Inter-kernel Synchronization: After the completion of the inter-block
+383   reduction, FlashDP leverages the termination of the kernel as a natural synchronization point. At
+384   this juncture, all blocks have finished their individual reductions. (4) Iterative Kernel Launch: For
+385   each batch element, a new kernel is launched serially, maintaining synchronization across kernels.
+386   This approach involves broadcasting operations where source operands are dimensionally disparate,
+387
+      ensuring uniform data handling across computational units.
+388   This implementation strategy, while divergent from the ideal single-kernel solution, allows FlashDP
+389   to function effectively within the current constraints of CUDA. It underscores FlashDP’s adaptability
+390   and represents a practical solution to the block synchronization challenge, ensuring accurate gradient
+391   norm calculations essential for maintaining the model’s differential privacy. Our analysis on memory
+392   and access in Appendix C shows the utility of this implementation.
+393
+394
+      5      E XPERIMENTS
+395   Our experimental suite is methodically designed to assess the robustness and efficiency of FlashDP
+396   across a range of training paradigms and hardware configurations. We explore FlashDP’s perfor-
+397   mance in terms of memory efficiency and throughput under varying batch sizes, its adaptability to
+398   Automatic Mixed Precision (AMP) training (Appendix Section E.2), its consistency across different
+399   sequence lengths, and its scalability when employing Distributed Data Parallel (DDP) and Pipeline
+400
+      Parallel (PP) techniques.
+401
+      Table 1: Differential Batch-size Analysis. The table displays a multi-panel comparison of memory
+402
+      usage and throughput for four differential privacy methods—NonDP, Opacus, GhostClip, BK, and
+403
+      FlashDP—across different batch sizes B (1, 2, 4, and 8) when applied to GPT-2 models of varying
+404   sizes (small, medium, and large). Instances of ‘-’ in the table indicate scenarios where the corre-
+405   sponding method failed to execute due to memory constraints.
+406
+                                          Memory Usage (MB x1e4)                                    Throughput (tokens/sec x1e4)
+407         Model    B
+                         NonDP     Opacus     GhostClip      BK         FlashDP      NonDP     Opacus      GhostClip        BK       FlashDP
+408     GPT2-small        0.50   0.75(x1.50) 0.46(x0.92) 0.53(x1.06)   0.50(x1.00)    2.84   0.91(x0.32) 0.57(x0.20) 1.56(x0.54)    1.83(x0.64)
+       GPT2-medium   1    1.26   1.53(x1.21) 1.12(x0.89) 1.68(x1.33)   1.26(x1.00)    1.10   0.42(x0.38) 0.39(x0.35) 0.75(x0.68)    0.86(x0.78)
+409     GPT2-large        2.48   3.99(x1.61) 2.17(x0.88) 2.73(x1.18)   2.48(x1.00)    0.58   0.25(x0.43) 0.27(x0.46) 0.40(x0.69)    0.51(x0.89)
+        GPT2-small        0.87   1.30(x1.49) 0.79(x0.91) 1.01(x1.16)   0.87(x1.00)    3.22   1.68(x0.52) 0.92(x0.29) 1.91(x0.59)    2.32(x0.72)
+410    GPT2-medium   2    2.07   2.89(x1.39) 1.87(x0.90) 2.44(x1.18)   2.07(x1.00)    1.28   0.74(x0.58) 0.59(x0.46) 0.81(x0.63)    1.02(x0.80)
+        GPT2-large        3.91   4.79(x1.23) 3.53(x0.90) 4.81(x1.23)   3.91(x1.00)    0.68   0.38(x0.56) 0.38(x0.56) 0.45(x0.66)    0.59(x0.87)
+411     GPT2-small        1.53   2.07(x1.35) 1.44(x0.94) 1.68(x1.09)   1.53(x1.00)    3.60   2.42(x0.67) 1.42(x0.39) 2.24(x0.62)    2.59(x0.72)
+412    GPT2-medium   4    3.58   4.26(x1.19) 3.33(x0.93) 4.00(x1.12)   3.58(x1.00)    1.42   0.90(x0.63) 0.81(x0.57) 0.95(x0.67)    1.13(x0.80)
+        GPT2-large        6.60        -      6.15(x0.93) 6.60(x1.00)   6.60(x1.00)    0.76        -       0.50(x0.66) 0.53(x0.70)   0.64(x0.84)
+413     GPT2-small        2.86   3.44(x1.20) 2.72(x0.95) 2.86(x1.00)   2.86(x1.00)    3.80   2.64(x0.69) 1.92(x0.51) 2.40(x0.63)    2.72(x0.72)
+       GPT2-medium   8    6.60        -      6.24(x0.95) 6.60(x1.00)   6.60(x1.00)    1.52        -       0.99(x0.65) 1.03(x0.68)   1.19(x0.78)
+414     GPT2-large          -         -           -           -             -           -         -            -             -           -
+415
+416   5.1     E XPERIMENTAL S ETUP
+417
+      Our experiments utilize the Wikitext dataset Merity (2016) and are conducted on NVIDIA A100
+418
+      (80GB) GPUs using the PyTorch framework Paszke et al. (2019). We assess the performance of
+419   FlashDP across various configurations by comparing it with established explicit methods Opacus
+420   Yousefpour et al. (2021), and implicit method GhostClip Li et al. (2021) and BK Bu et al. (2023),
+421   under different training paradigms. The tested models include GPT-2 Radford et al. (2019) with a
+422   sequence length of 1024 and the TinyLlama Zhang et al. (2024) and Llama Touvron et al. (2023)
+423   models, both with a sequence length of 2048. Our evaluations mainly focus on memory usage (MB)
+424   and throughput (tokens/sec) to determine the efficiency. We also show the loss of the validation
+425   data to measure the utility of private pre-training. Unless specified otherwise, the settings for each
+426   experiment use GPT-2 models with a sequence length of 1024, and Llama models with a sequence
+427
+      length of 2048, employing the AdamW optimizer as the base. More experimental settings can be
+      found in Appendix D.
+428
+429   5.2     R ESULTS OF BATCH S IZE & M ICRO BATCH S IZE
+430
+431   Efficient batch processing is crucial in LLM training due to its high computational and memory
+      demands. By examining both batch and micro-batch sizes, we assess FlashDP’s ability to manage
+
+
+                                                                       8
+      Under review as a conference paper at ICLR 2025
+
+
+432
+      memory more effectively and maintain high throughput. This also tests the practicality of gradient
+433   accumulation (GA), which allows larger effective batch sizes by splitting them into smaller, manage-
+434   able micro-batches. The experiment results of different micro batch sizes can be seen in Appendix
+435   E.1.
+436
+      In Table 1, FlashDP was benchmarked against traditional DP-SGD methods like Opacus, GhostClip,
+437
+      and BK, as well as a non-DP (NonDP) configuration, demonstrating superior memory efficiency and
+438
+      throughput. FlashDP utilized approximately 38% less memory than Opacus and nearly matched the
+439   NonDP configuration while processing the GPT-2 large model at a batch size of 1. It achieved
+440   a throughput nearly double that of Opacus and only slightly lower than NonDP, showcasing its
+441   effective balance between privacy preservation and computational efficiency. Opacus exhibited the
+442   highest memory usage, which escalated with batch size, leading to failure at a batch size of 8.
+443   GhostClip, while more memory-efficient than Opacus, suffered from reduced throughput at higher
+444   batch sizes due to gradient re-computation. BK’s performance was intermediate, lacking distinct
+445   advantages. Overall, FlashDP not only maintained lower memory usage and higher throughput than
+446   the DP methods across all batch sizes but also approached the efficiency of NonDP configurations.
+447
+448
+449
+450
+451
+452
+453
+454
+455
+456
+457
+458                       (a) Memory Usage                             (b) Throughput
+459
+460   Figure 4: Memory and Throughput Comparison for TinyLlama with Varied Sequence Lengths
+461
+      Using Flash Attention. (a) Memory usage across sequence lengths of 1024, 2048, 4096, and 8192.
+      (b) Throughput measured in tokens per second across the same sequence lengths.
+462
+463   5.3 R ESULTS OF S EQUENCE L ENGTH
+464   In the training of LLMs, the ability to process long sequences of data is crucial for enhancing the
+465   model’s capability to understand and generate coherent, contextually rich text.
+466
+      Memory Usage Analysis. As illustrated in Figure 4 (a), there is a clear trend of increasing mem-
+467
+      ory usage with longer sequence lengths across all methods, which is expected due to the larger
+468
+      computational requirements. However, FlashDP always maintains the same GPU memory usage as
+469   NonDP, especially at the highest sequence length of 8192. This indicates that FlashDP’s method is
+470   particularly effective at managing the increased memory demands, thus facilitating the scalability of
+471   models trained with long sequences.
+472
+      Throughput Performance. Figure 4 (b) highlights throughput in terms of tokens per second at
+473
+      varying sequence lengths. FlashDP consistently maintains higher throughput compared to Opacus
+474
+      and BK across all sequence lengths, with its performance closely approaching that of the NonDP
+475   method. This efficiency in throughput underlines FlashDP’s capability to handle larger sequence
+476   lengths without significant compromises in processing speed, a critical factor for training usable and
+477   responsive LLMs.
+478
+      The experimental data clearly demonstrates FlashDP’s superior memory management and through-
+479
+      put efficiency across a range of sequence lengths. The ability of FlashDP to handle longer sequences
+480
+      with minimal increase in memory usage and only slight reductions in throughput is particularly im-
+481   pressive.
+482
+483   5.4 R ESULTS OF D ISTRIBUTED T RAINING
+484   Distributed Data Parallel (DDP) Li et al. (2020) and Pipeline Parallel (PP) Kim et al. (2020) are two
+485   advanced techniques crucial for scaling the training of LLMs efficiently across multiple GPUs or
+      nodes.
+
+
+                                                        9
+      Under review as a conference paper at ICLR 2025
+
+
+486
+487
+488
+489
+490
+491
+492
+493
+494
+495
+496
+                            (a) Memory Usage                         (b) Throughput
+497
+498   Figure 5: Memory and Throughput for Llama Models Using Pipeline Parallel Training. (a)
+499
+      Memory usage for Llama-3B, Llama-7B, and Llama-13B models. (b) Throughput in tokens per
+      second across these model sizes. A value of 0 indicates out of memory.
+500
+501
+502   Distributed Data Parallel (DDP). Figure 8 in Appendix illustrates the performance of different
+503   methods in a DDP setting across GPT-2 models of varying sizes. FlashDP showcases superior
+504   memory usage efficiency and higher throughput across all model sizes when compared to Opacus
+505   and BK. Notably, even as the model size increases, FlashDP maintains a competitive edge close to
+506   the NonDP benchmarks, highlighting its effective parameter distribution and gradient computation
+507   across multiple GPUs. This is crucial in scenarios where training speed and model scalability are
+508
+      priorities.
+509   Pipeline Parallel (PP). In the PP scenario depicted in Figure 5, FlashDP was tested with Llama
+510   models varying from 3 billion to 13 billion parameters. The results indicate that FlashDP not
+511
+      only scales efficiently with increasing model size but also demonstrates significant throughput im-
+      provements compared to Opacus and BK. Particularly, FlashDP’s ability to handle the largest model
+512
+      (Llama-13B) with minimal throughput degradation illustrates its robustness in managing extensive
+513
+      computational loads, characteristic of PP environments.
+514
+515   5.5     R ESULTS OF U TILITY
+516         Table 2: FlashDP Pretrain Precision validation on GPT2-small with different privacy ✏.
+517                                                      Validation loss
+                                        Method
+                                                  ✏ = 0.2 ✏ = 0.5 ✏ = 0.8
+518                                     DP-SGD    4.8082 4.8063 4.8061
+519                                     FlashDP   4.8082 4.8063 4.8061
+520   In our study, FlashDP is meticulously optimized for DP-SGD, focusing on enhancing GPU I/O and
+521   system-level efficiencies without altering the fundamental algorithmic components of DP-SGD. We
+522   conducted experiments on utility with GPT-2 small to support this, whose results are shown in Table
+523   2. From the table, we can easily see that FlashDP demonstrates an identical validation loss to that
+524   of standard DP-SGD across all privacy levels.
+525
+526
+      6      C ONCLUSION
+527   In this paper, we introduce FlashDP, a novel approach for integrating differentially private SGD
+528   (DP-SGD) into the training of large language models (LLMs) while enhancing memory efficiency
+529   and computational throughput. By optimizing GPU input/output operations, FlashDP significantly
+530   reduces the memory transaction overhead, allowing it to achieve near-non-private throughput levels
+531
+      while maintaining strict privacy standards. Central to FlashDP’s strategy is the Block-wise All-
+      Reduce algorithm, which integrates several critical operations into a unified kernel execution. To
+532
+      achieve this, we propose a Hierarchical Reduction Architecture (HRA), which encompasses more
+533
+      than just reduction operations. Moreover, we employ an adaptive kernel approach to implement
+534   HRA, which addresses the limitations of CUDA’s programming model in facilitating block syn-
+535   chronization. Our experiments demonstrate that FlashDP reduces memory usage to levels compara-
+536   ble with non-private methods and increases throughput, making the efficient training of substantial
+537   models like the Llama 13B feasible on modern hardware. The minimal interference in the training
+538   process and the maintenance of computational precision suggest that FlashDP could significantly
+539   advance the adoption of DP in sectors where privacy is crucial, making secure and efficient machine
+      learning more accessible for a wider range of applications.
+
+
+                                                       10
+      Under review as a conference paper at ICLR 2025
+
+
+540
+      R EFERENCES
+541
+542   Martı́n Abadi, Ashish Agarwal, Paul Barham, Eugene Brevdo, Zhifeng Chen, Craig Citro, Greg S.
+543    Corrado, Andy Davis, Jeffrey Dean, Matthieu Devin, Sanjay Ghemawat, Ian Goodfellow, Andrew
+544    Harp, Geoffrey Irving, Michael Isard, Yangqing Jia, Rafal Jozefowicz, Lukasz Kaiser, Manjunath
+545
+       Kudlur, Josh Levenberg, Dan Mané, Rajat Monga, Sherry Moore, Derek Murray, Chris Olah,
+       Mike Schuster, Jonathon Shlens, Benoit Steiner, Ilya Sutskever, Kunal Talwar, Paul Tucker, Vin-
+546
+       cent Vanhoucke, Vijay Vasudevan, Fernanda Viégas, Oriol Vinyals, Pete Warden, Martin Watten-
+547
+       berg, Martin Wicke, Yuan Yu, and Xiaoqiang Zheng. TensorFlow: Large-scale machine learning
+548    on heterogeneous systems, 2015. URL http://tensorflow.org/. Software available from
+549    tensorflow.org.
+550
+551   Martin Abadi, Andy Chu, Ian Goodfellow, H Brendan McMahan, Ilya Mironov, Kunal Talwar, and
+552
+       Li Zhang. Deep learning with differential privacy. In Proceedings of the 2016 ACM SIGSAC
+       conference on computer and communications security, pp. 308–318, 2016.
+553
+554   Josh Achiam, Steven Adler, Sandhini Agarwal, Lama Ahmad, Ilge Akkaya, Florencia Leoni Ale-
+555     man, Diogo Almeida, Janko Altenschmidt, Sam Altman, Shyamal Anadkat, et al. Gpt-4 technical
+556     report. arXiv preprint arXiv:2303.08774, 2023.
+557
+      Stephen R Ali, Thomas D Dobbs, Hayley A Hutchings, and Iain S Whitaker. Using chatgpt to write
+558
+        patient clinic letters. The Lancet Digital Health, 5(4):e179–e181, 2023.
+559
+560   Rohan Anil, Badih Ghazi, Vineet Gupta, Ravi Kumar, and Pasin Manurangsi. Large-scale differen-
+561     tially private bert. arXiv preprint arXiv:2108.01624, 2021.
+562
+      Rohan Anil, Badih Ghazi, Vineet Gupta, Ravi Kumar, and Pasin Manurangsi. Large-scale differen-
+563
+        tially private bert. In Findings of the Association for Computational Linguistics: EMNLP 2022,
+564     pp. 6481–6491, 2022.
+565
+566   Saleh Ashkboos, Ilia Markov, Elias Frantar, Tingxuan Zhong, Xincheng Wang, Jie Ren, Torsten
+567     Hoefler, and Dan Alistarh. Towards end-to-end 4-bit inference on generative large language mod-
+568
+        els. arXiv preprint arXiv:2310.09259, 2023.
+569   Som S Biswas. Role of chat gpt in public health. Annals of biomedical engineering, 51(5):868–869,
+570     2023.
+571
+572
+      Rishi Bommasani, Drew A Hudson, Ehsan Adeli, Russ Altman, Simran Arora, Sydney von Arx,
+        Michael S Bernstein, Jeannette Bohg, Antoine Bosselut, Emma Brunskill, et al. On the opportu-
+573
+        nities and risks of foundation models. arXiv preprint arXiv:2108.07258, 2021.
+574
+575   Zhiqi Bu, Jialin Mao, and Shiyun Xu. Scalable and efficient training of large convolutional neu-
+576     ral networks with differential privacy. Advances in Neural Information Processing Systems, 35:
+577     38305–38318, 2022.
+578
+      Zhiqi Bu, Yu-Xiang Wang, Sheng Zha, and George Karypis. Differentially private optimization on
+579     large model at small cost. In International Conference on Machine Learning, pp. 3192–3218.
+580     PMLR, 2023.
+581
+582   Yihan Cao, Siyu Li, Yixin Liu, Zhiling Yan, Yutong Dai, Philip S Yu, and Lichao Sun. A com-
+583     prehensive survey of ai-generated content (aigc): A history of generative ai from gan to chatgpt.
+584
+        arXiv preprint arXiv:2303.04226, 2023.
+585   Nicholas Carlini, Daphne Ippolito, Matthew Jagielski, Katherine Lee, Florian Tramer, and Chiyuan
+586     Zhang. Quantifying memorization across neural language models. In International Conference
+587     on Learning Representations, 2023.
+588
+      Tri Dao, Dan Fu, Stefano Ermon, Atri Rudra, and Christopher Ré. Flashattention: Fast and memory-
+589
+        efficient exact attention with io-awareness. Advances in Neural Information Processing Systems,
+590
+        35:16344–16359, 2022.
+591
+592   Jiafei Duan, Samson Yu, Hui Li Tan, Hongyuan Zhu, and Cheston Tan. A survey of embodied
+593      ai: From simulators to research tasks. IEEE Transactions on Emerging Topics in Computational
+         Intelligence, 6(2):230–244, 2022.
+
+
+                                                      11
+      Under review as a conference paper at ICLR 2025
+
+
+594
+      Christophe Dupuy, Radhika Arava, Rahul Gupta, and Anna Rumshisky. An efficient dp-sgd mecha-
+595     nism for large scale nlu models. In ICASSP 2022-2022 IEEE International Conference on Acous-
+596     tics, Speech and Signal Processing (ICASSP), pp. 4118–4122. IEEE, 2022.
+597
+598   Cynthia Dwork. Differential privacy. In International colloquium on automata, languages, and
+599     programming, pp. 1–12. Springer, 2006.
+600
+      Cynthia Dwork, Frank McSherry, Kobbi Nissim, and Adam Smith. Calibrating noise to sensitivity
+601     in private data analysis. In Theory of Cryptography: Third Theory of Cryptography Conference,
+602     TCC 2006, New York, NY, USA, March 4-7, 2006. Proceedings 3, pp. 265–284. Springer, 2006.
+603
+604   Mingqi Gao, Xinyu Hu, Jie Ruan, Xiao Pu, and Xiaojun Wan. Llm-based nlg evaluation: Current
+605    status and challenges. arXiv preprint arXiv:2402.01383, 2024.
+606
+      Ian Goodfellow. Efficient per-example gradient computations. arXiv preprint arXiv:1510.01799,
+607     2015.
+608
+609   Jiyan He, Xuechen Li, Da Yu, Huishuai Zhang, Janardhan Kulkarni, Yin Tat Lee, Arturs Backurs,
+610      Nenghai Yu, and Jiang Bian. Exploring the limits of differentially private deep learning with
+611      group-wise clipping. arXiv preprint arXiv:2212.01539, 2022.
+612
+      Shlomo Hoory, Amir Feder, Avichai Tendler, Sofia Erell, Alon Peled-Cohen, Itay Laish, Hootan
+613     Nakhost, Uri Stemmer, Ayelet Benjamini, Avinatan Hassidim, et al. Learning and evaluating a
+614     differentially private pre-trained language model. In Findings of the Association for Computa-
+615     tional Linguistics: EMNLP 2021, pp. 1178–1189, 2021.
+616
+617   Daphne Ippolito, Florian Tramèr, Milad Nasr, Chiyuan Zhang, Matthew Jagielski, Katherine Lee,
+618     Christopher A Choquette-Choo, and Nicholas Carlini. Preventing verbatim memorization in lan-
+619
+        guage models gives a false sense of privacy. arXiv preprint arXiv:2210.17546, 2022.
+620   Gavin Kerrigan, Dylan Slack, and Jens Tuyls. Differentially private language models benefit from
+621     public pre-training. arXiv preprint arXiv:2009.05886, 2020.
+622
+623   Chiheon Kim, Heungsub Lee, Myungryong Jeong, Woonhyuk Baek, Boogeon Yoon, Ildoo Kim,
+624     Sungbin Lim, and Sungwoong Kim. torchgpipe: On-the-fly pipeline parallelism for training giant
+625
+        models. arXiv preprint arXiv:2004.09910, 2020.
+626   Jaewoo Lee and Daniel Kifer. Scaling up differentially private deep learning with fast per-example
+627     gradient clipping. arXiv preprint arXiv:2009.03106, 2020.
+628
+629   Jaewoo Lee and Daniel Kifer. Scaling up differentially private deep learning with fast per-example
+630     gradient clipping. Proceedings on Privacy Enhancing Technologies, 2021.
+631
+      Shen Li, Yanli Zhao, Rohan Varma, Omkar Salpekar, Pieter Noordhuis, Teng Li, Adam Paszke, Jeff
+632     Smith, Brian Vaughan, Pritam Damania, et al. Pytorch distributed: Experiences on accelerating
+633     data parallel training. arXiv preprint arXiv:2006.15704, 2020.
+634
+635   Xuechen Li, Florian Tramer, Percy Liang, and Tatsunori Hashimoto. Large language models can be
+636     strong differentially private learners. arXiv preprint arXiv:2110.05679, 2021.
+637
+      Xuechen Li, Florian Tramer, Percy Liang, and Tatsunori Hashimoto. Large language models can be
+638     strong differentially private learners. In International Conference on Learning Representations,
+639     2022.
+640
+641   Anton Lozhkov, Loubna Ben Allal, Leandro von Werra, and Thomas Wolf. Fineweb-edu, May 2024.
+642     URL https://huggingface.co/datasets/HuggingFaceFW/fineweb-edu.
+643
+      R Thomas McCoy, Paul Smolensky, Tal Linzen, Jianfeng Gao, and Asli Celikyilmaz. How much
+644     do language models copy from their training data? evaluating linguistic novelty in text generation
+645     using raven. Transactions of the Association for Computational Linguistics, 11:652–670, 2023.
+646
+647   Stephen Merity. The wikitext long term dependency language modeling dataset. Salesforce Meta-
+        mind, 9, 2016.
+
+
+                                                      12
+      Under review as a conference paper at ICLR 2025
+
+
+648
+      Paulius Micikevicius, Sharan Narang, Jonah Alben, Gregory Diamos, Erich Elsen, David Garcia,
+649     Boris Ginsburg, Michael Houston, Oleksii Kuchaiev, Ganesh Venkatesh, et al. Mixed precision
+650     training. arXiv preprint arXiv:1710.03740, 2017.
+651
+652   Milad Nasr, Nicholas Carlini, Jonathan Hayase, Matthew Jagielski, A Feder Cooper, Daphne Ip-
+653    polito, Christopher A Choquette-Choo, Eric Wallace, Florian Tramèr, and Katherine Lee. Scalable
+654    extraction of training data from (production) language models. arXiv preprint arXiv:2311.17035,
+655
+       2023.
+656   Qi Pang, Jinhao Zhu, Helen Möllering, Wenting Zheng, and Thomas Schneider. Bolt: Privacy-
+657     preserving, accurate and efficient inference for transformers. In 2024 IEEE Symposium on Secu-
+658     rity and Privacy (SP), pp. 130–130. IEEE Computer Society, 2024.
+659
+660   Adam Paszke, Sam Gross, Francisco Massa, Adam Lerer, James Bradbury, Gregory Chanan, Trevor
+661     Killeen, Zeming Lin, Natalia Gimelshein, Luca Antiga, et al. Pytorch: An imperative style, high-
+662
+        performance deep learning library. Advances in neural information processing systems, 32, 2019.
+663
+      Chen Qu, Weize Kong, Liu Yang, Mingyang Zhang, Michael Bendersky, and Marc Najork. Privacy-
+664     adaptive bert for natural language understanding. arXiv preprint arXiv:2104.07504, 190, 2021.
+665
+666   Alec Radford, Jeffrey Wu, Rewon Child, David Luan, Dario Amodei, Ilya Sutskever, et al. Language
+667     models are unsupervised multitask learners. OpenAI blog, 1(8):9, 2019.
+668
+      Gaspar Rochette, Andre Manoel, and Eric W Tramel. Efficient per-example gradient computations
+669
+        in convolutional neural networks. arXiv preprint arXiv:1912.06015, 2019.
+670
+671   Malik Sallam. Chatgpt utility in healthcare education, research, and practice: systematic review on
+672    the promising perspectives and valid concerns. In Healthcare, volume 11, pp. 887. MDPI, 2023.
+673
+674   Seyedmostafa Sheikhalishahi, Riccardo Miotto, Joel T Dudley, Alberto Lavelli, Fabio Rinaldi, Venet
+675
+        Osmani, et al. Natural language processing of clinical notes on chronic diseases: systematic
+        review. JMIR medical informatics, 7(2):e12239, 2019.
+676
+677   Chan Hee Song, Jiaman Wu, Clayton Washington, Brian M Sadler, Wei-Lun Chao, and Yu Su.
+678     Llm-planner: Few-shot grounded planning for embodied agents with large language models. In
+679     Proceedings of the IEEE/CVF International Conference on Computer Vision, pp. 2998–3009,
+680     2023.
+681
+682
+      Kushal Tirumala, Aram Markosyan, Luke Zettlemoyer, and Armen Aghajanyan. Memorization
+        without overfitting: Analyzing the training dynamics of large language models. Advances in
+683
+        Neural Information Processing Systems, 35:38274–38290, 2022.
+684
+685   Augustin Toma, Patrick R Lawler, Jimmy Ba, Rahul G Krishnan, Barry B Rubin, and Bo Wang.
+686     Clinical camel: An open-source expert-level medical language model with dialogue-based knowl-
+687     edge encoding. arXiv preprint arXiv:2305.12031, 2023.
+688
+689
+      Hugo Touvron, Thibaut Lavril, Gautier Izacard, Xavier Martinet, Marie-Anne Lachaux, Timothée
+        Lacroix, Baptiste Rozière, Naman Goyal, Eric Hambro, Faisal Azhar, et al. Llama: Open and
+690
+        efficient foundation language models. arXiv preprint arXiv:2302.13971, 2023.
+691
+692   Ashish Vaswani, Noam Shazeer, Niki Parmar, Jakob Uszkoreit, Llion Jones, Aidan N Gomez,
+693     Łukasz Kaiser, and Illia Polosukhin. Attention is all you need. Advances in neural informa-
+694     tion processing systems, 30, 2017.
+695
+696
+      Jiayang Wu, Wensheng Gan, Zefeng Chen, Shicheng Wan, and Hong Lin. Ai-generated content
+         (aigc): A survey. arXiv preprint arXiv:2304.06632, 2023.
+697
+698   Yaqi Xie, Chen Yu, Tongyao Zhu, Jinbin Bai, Ze Gong, and Harold Soh. Translating natural lan-
+699     guage to planning goals with large-language models. arXiv preprint arXiv:2302.05128, 2023.
+700
+701   Zhiyuan Xu, Kun Wu, Junjie Wen, Jinming Li, Ning Liu, Zhengping Che, and Jian Tang. A survey
+        on robotics with foundation models: toward embodied ai. arXiv preprint arXiv:2402.02385, 2024.
+
+
+                                                      13
+      Under review as a conference paper at ICLR 2025
+
+
+702
+      Ashkan Yousefpour, Igor Shilov, Alexandre Sablayrolles, Davide Testuggine, Karthik Prasad, Mani
+703     Malek, John Nguyen, Sayan Ghosh, Akash Bharadwaj, Jessica Zhao, et al. Opacus: User-friendly
+704     differential privacy library in pytorch. arXiv preprint arXiv:2109.12298, 2021.
+705
+706   Chiyuan Zhang, Daphne Ippolito, Katherine Lee, Matthew Jagielski, Florian Tramèr, and Nicholas
+707     Carlini. Counterfactual memorization in neural language models. Advances in Neural Information
+708
+        Processing Systems, 36:39321–39362, 2023.
+709   Peiyuan Zhang, Guangtao Zeng, Tianduo Wang, and Wei Lu. Tinyllama: An open-source small
+710     language model. arXiv preprint arXiv:2401.02385, 2024.
+711
+712
+713
+714
+715
+716
+717
+718
+719
+720
+721
+722
+723
+724
+725
+726
+727
+728
+729
+730
+731
+732
+733
+734
+735
+736
+737
+738
+739
+740
+741
+742
+743
+744
+745
+746
+747
+748
+749
+750
+751
+752
+753
+754
+755
+
+
+
+                                                    14

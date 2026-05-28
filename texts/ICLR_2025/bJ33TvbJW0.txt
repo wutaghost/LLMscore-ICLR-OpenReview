@@ -1,0 +1,1543 @@
+Under review as a conference paper at ICLR 2025
+
+
+000
+001
+      S INK Q: ACCURATE KV C ACHE Q UANTIZATION WITH
+002   DYNAMIC S INK T RACKING
+003
+004
+005    Anonymous authors
+006    Paper under double-blind review
+007
+008
+009                                               A BSTRACT
+010
+011            The impressive capabilities of large language models (LLMs) come at the cost
+012            of substantial computational resources during deployment. While KV Cache can
+013            significantly reduce recomputation during inference, it also introduces additional
+014            memory overhead. KV Cache quantization presents a promising solution, strik-
+015            ing a good balance between memory usage and accuracy. Previous research has
+016
+               shown that the Keys are distributed by channel, while the Values are distributed by
+               token. Consequently, the common practice is to apply channel-wise quantization
+017
+               to the Keys and token-wise quantization to the Values. However, our further inves-
+018
+               tigation reveals that a small subset of unusual tokens exhibit unique characteristics
+019            that deviate from this pattern, which can substantially impact quantization accu-
+020            racy. Furthermore, these tokens often have higher attention scores, exacerbating
+021            their quantization errors. To address this, we develop a simple yet effective method
+022            to identify these tokens accurately during the decoding process and exclude them
+023            from quantization, significantly improving overall accuracy. Extensive experi-
+024            ments show that our method achieves significant accuracy improvements under
+025            2-bit quantization and can deliver a 6.4× reduction in memory usage and a 2.3×
+026            increase in throughput. Our code will be released upon acceptance.
+027
+028   1   I NTRODUCTION
+029
+030   Large language models (LLMs) have significantly impacted various industries due to their powerful
+031   capabilities (Achiam et al., 2023; Touvron et al., 2023a;b; Dubey et al., 2024; Jiang et al., 2023).
+032   However, their auto-regressive nature makes the generation process slow. While using KV Cache
+033   can reduce decoding complexity from O(n2 ) to O(n) by storing the Keys and the Values computed
+034   during inference, it introduces substantial memory overhead. This overhead scales with sequence
+035   length, batch size, and hidden dim, often creating a memory bottleneck and placing considerable
+036   pressure on resources during deployment. As a result, optimizing KV Cache management to enhance
+037   resource utilization and improve model throughput remains a critical challenge.
+038   KV Cache affects throughput in two primary ways. First, its memory usage limits the scalability of
+039   batch sizes, reducing parallelism during decoding and thus lowering throughput. Second, attention
+040   computation is delayed while waiting for the KV Cache to be transferred from memory to the com-
+041   putation unit. As the KV Cache size grows, the transmission time increases, decreasing throughput.
+042   Existing approaches mainly address this issue by optimizing hardware scheduling (Aminabadi et al.,
+043   2022; Dao et al., 2022; Sheng et al., 2023; Kwon et al., 2023) and reducing the size of the KV Cache
+044
+      (Liu et al., 2024b; Hooper et al., 2024; Kang et al., 2024; Zhang et al., 2023; Xiao et al., 2024). In
+      this paper, we focus on the latter approach—KV Cache compression.
+045
+046   One method to reduce the size of the KV Cache is to reduce the number of values that need to be
+047   stored. The shape of the KV Cache is [num layers, batch size, num heads, sequence length,
+048   head dim]. There are various compressing methods across each dimension, including layer-wise
+049   KV Cache sharing (Wu & Tu, 2024; Brandon et al., 2024; Zuhri et al., 2024; Mu et al., 2024), prefix
+050
+      sharing (Juravsky et al., 2024; Zhu et al., 2024), head-wise KV Cache sharing (Shazeer, 2019;
+      Ainslie et al., 2023), token eviction (Xiao et al., 2024; Zhang et al., 2023; Ge et al.), and low-rank
+051
+      projection (Wang et al., 2024; Yu et al., 2024; Chang et al., 2024; Liu et al., 2024a).
+052
+053   Another strategy for reducing the size of KV Cache is quantization. However, unlike weight quan-
+      tization, KV Cache quantization poses unique challenges due to the uneven distribution of the Keys
+
+
+                                                        1
+      Under review as a conference paper at ICLR 2025
+
+
+054
+      and Values (Kang et al., 2024). To enhance quantization accuracy, various methods have been
+055   proposed, including using low-rank matrices to approximate the error before and after quantiza-
+056   tion (Kang et al., 2024), smoothing Key distributions through specific mappings (Ashkboos et al.,
+057   2024; Chang et al., 2024), channel-wise Key and token-wise Value asymmetric quantization (Liu
+058   et al., 2024b; Hooper et al., 2024), non-uniform quantization (Hooper et al., 2024; Dettmers et al.,
+059   2022), mixed-precision quantization (Dong et al., 2024), and Block Floating Point (BFP) quantiza-
+060   tion (Trukhanov & Soloveychik, 2024). Among these methods, channel-wise Key and token-wise
+061   Value asymmetric quantization has garnered much attention for its high accuracy and tuning-free
+062   nature. This technique operates under the assumption that some channels of the Keys have huge
+063
+      magnitudes and that the distribution of the Keys within the same channel is relatively uniform.
+064   However, our further exploration reveals that a few unusual tokens deviate from this assumption.
+065   Moreover, we find that these tokens exhibit remarkably high attention scores—often referred to as
+066   attention sinks (Xiao et al., 2024). Notably, unlike previous studies, we find that these attention
+067   sinks can occur at any position within a sentence rather than being confined to the initial positions.
+068   Based on these observations, we propose Sink-aware KV Cache Quantization (SinkQ), a simple
+069
+      yet effective method that identifies these tokens and excludes them from the quantization process,
+      thereby improving quantization accuracy. With hardware-friendly implementation, SinkQ achieves
+070
+      significant accuracy improvements under 2-bit quantization, resulting in a 6.4× reduction in memory
+071
+      usage and a 2.3× increase in throughput.
+072
+073   Overall, our contributions are summarized as follows:
+074
+             • We investigate the outlier channels of the KV Cache and identify that some tokens deviate
+075
+               from the previous assumptions.
+076
+077
+             • We introduce Sink-aware KV Cache Quantization (SinkQ), a simple yet effective method to
+               dynamically identify and exclude these tokens during quantization, thus improving overall
+078
+               quantization accuracy.
+079
+080
+             • Our method achieves significant accuracy improvements under 2-bit quantization, yielding
+               a 6.4× reduction in memory usage and a 2.3× increase in throughput, thereby enhancing
+081
+               model efficiency.
+082
+083
+084   2   BACKGROUND
+085
+086   Implementation of KV Cache. Transformer-based (Vaswani, 2017) LLMs typically utilize KV
+087   cache to prevent the redundant calculation of the attention scores and accelerate auto-regressive
+088
+      decoding. The generation process of LLMs with KV cache is divided into the prefill phase and
+      the decoding phase (Patel et al., 2024). Given a prompt X = {x0 , x1 , . . . , xn−1 } and tensor X ∈
+089
+090
+      Rb×n×d after embedding, where b is the batch size, n is the length of the prompt, and d represents
+      the hidden size, we will briefly describe the calculation process of the attention block, and we omit
+091
+      the number of heads in the multi-head attention mechanism.
+092
+093   i) During the prefill phase, the Keys K<n and Values V<n are computed and cached by transforming
+094   X through the Key and Value weight matrices Wk , Wv ∈ Rd×d of each layer, which can be
+095   formulated as:
+096
+                                         K<n = XWk , V<n = XWv .
+097   ii) During the decoding phase, only the Keys and Values of the new token xn need to be calculated,
+098   which are then combined with the cached Keys and Values to compute the new attention scores and
+099   outputs. For the current input tensor Xn ∈ Rb×1×d , we update the KV cache as follows:
+100                                   K = K<n ∥Kn ,         V = V<n ∥Vn ,
+101
+      where Kn = Xn Wk and Vn = Xn Wv . We calculate the new attention output ATT as follows:
+102
+                                                                   Qn K ⊤
+
+103                                                                 √
+                             Qn = Xn Wq , ATT = Softmax                     V,                       (1)
+104                                                                   dk
+105                                                                      √
+      where Wq is the query weight matrix in the corresponding layer and dk is the normalization factor.
+106
+107   Necessity of compression. While KV cache reduces the computational complexity from O(n2 ) to
+      O(n), it introduces substantial GPU memory overhead, particularly with long sequence lengths and
+
+
+                                                        2
+      Under review as a conference paper at ICLR 2025
+
+
+108
+      large batch sizes. For example, in the case of LLaMA3-8B (Dubey et al., 2024), where the number
+109   of layers nlayers is 32, the number of heads h is 8, the head dimension d is 512, the input length l is
+110   8192, and the batch size b is 64, performing inference with fp16 precision (which uses 2 bytes per
+111   value) requires 4bhdlnlayers bytes to store the KV cache—equivalent to 256GB of memory. Thus,
+112   effectively compressing the KV cache is crucial to reducing GPU memory usage.
+113
+      Uniform Quantization. In this paper, we focus on compressing the KV cache by reducing the
+114
+      bit-width needed to represent cached tensors. A straightforward approach is Uniform Quantization
+115   (Jacob et al., 2018), which maps continuous numerical data to a discrete domain. Specifically, to
+116   quantize a high-precision matrix (e.g., float32) X to a matrix X ′ with b-bit precision, we first
+117   determine the quantization step size q. Each element Xi,j ∈ X can then be quantized to Q(Xi,j ) as
+118   follows:
+119                    Q(Xi,j ) = ⌊(Xi,j − Xmin )/q⌋, q = (Xmax − Xmin )/(2b − 1),                   (2)
+120   where ⌊·⌋ is the rounding function.
+121
+122
+      Group Quantization.          However, Uniform Quantization does not fully exploit the distribution
+      characteristics of the data, which can lead to significant quantization errors, especially when there
+123
+      are outliers. A more advanced technique is Group Quantization (Yao et al., 2022), which divides
+124
+      the matrix into multiple groups, expecting the data within each group to share similar distribution
+125   characteristics. Unlike Uniform Quantization, Group Quantization allows each group to have dif-
+126   ferent quantization parameters, such as step size. This flexibility enables the method to better adapt
+127   to the local characteristics of the data, thereby reducing quantization errors while maintaining a low
+128   bit-width. The channel-wise Key quantization and token-wise Value quantization proposed by KIVI
+129   (Liu et al., 2024b) is a type of Group Quantization.
+130
+131
+      3       M ETHOD
+132
+133   In this section, we propose Sink-Aware KV Cache Quantization (SinkQ). We start with a preliminary
+134   exploration of the Keys and Values before introducing our method.
+135
+136   3.1       E XPLORATION OF THE K EYS AND VALUES .
+137
+138   We conduct a series of preliminary experiments to gain a deeper understanding of the Keys and
+139   Values. For illustration, we take a sentence generated by LLaMA-2-7b-chat-hf 1 as an example.
+140   Table 5 in the Appendix presents the prompt and the generated context.
+141   Distribution of the Keys and Values. Figure 1a and Figure 1d display the magnitude of the Keys
+142   and Values from layer 10, head 17. Notably, some channels exhibit exceptionally large Keys, and
+143   within these channels, the distribution of the Keys appears relatively uniform. In contrast, the Values
+144   have no distinct characteristics. These observations are consistent with those reported in KIVI (Liu
+145   et al., 2024b).
+146
+      Distribution in outlier channels. We further investigate the distribution of these outlier channels.
+147   Figure 1b shows the Keys in an outlier channel from layer 10, head 17 (we plot the first 100 tokens).
+148   While the Keys generally exhibit a uniform distribution, a few tokens are notable exceptions. This
+149   pattern becomes clearer after sorting, as shown in Figure 1e, where some Keys have very small
+150   values while others are significantly larger. These exceptions can substantially increase Xmax −
+151   Xmin in Equation 2 during quantization, ultimately diminishing quantization accuracy.
+152
+      Identifying Outlier Tokens. Intuitively, tokens with very small magnitude of the Keys in outlier
+153   channels are also likely to have smaller magnitude overall. To test this hypothesis, we plot the Keys
+154   from an outlier channel and the magnitude of the Keys across all channels (we plot the first 300
+155   tokens). As shown in Figure 4 in the Appendix, the results confirm our assumption, suggesting that
+156   we can efficiently and accurately identify these outlier tokens with the magnitude of the Keys.
+157
+      Outlier Tokens & Attention scores. We further explore the attention scores of the outlier tokens
+158
+      and find that these tokens tend to have exceptionally high attention scores. To visualize this, we
+159   compare the overlap between the N tokens with the smallest magnitude of the Keys and the N
+160   tokens with the highest attention scores (we plot the first 300 tokens). Figure 1c presents our results.
+161
+          1
+              https://huggingface.co/meta-llama/Llama-2-7b-chat-hf
+
+
+                                                             3
+      Under review as a conference paper at ICLR 2025
+
+
+162
+                                             15.0                                                          100
+163
+                                        15   12.5                                                           90
+164
+                                        10   10.0                                                           80
+
+
+                                                                                          Overlap (%)
+165
+                                        5     7.5                                                           70
+166                                           5.0
+                                        0                                                                   60
+167                                           2.5                                                           50
+                                  100         0.0
+168    0
+
+
+
+                                  n
+                             50                                                                             40
+
+
+                              lum
+            200
+            Token400                          2.5
+
+
+                             Co
+169                                                 0   20   40           60   80   100                           0   50    100        150    200   250    300
+                     600 0                                        Index                                                                 N
+170
+                    (a)                                       (b)                                                                 (c)
+171
+172                                          15.0
+                                    2.0      12.5
+                                                                                                           5.00
+173                                 1.5                                                                    4.75
+                                             10.0                                                          4.50
+
+
+                                                                                          L1 Loss (×100)
+174                                1.0                                                                     4.25
+                                                                                                                                              largest
+                                              7.5                                                                                             random
+175                                0.5                                                                     4.00                               smallest
+                                              5.0
+                                   0.0                                                                     3.75
+                                                                                                                                              smallest+exclude
+176                                           2.5
+                                100                                                                        3.50
+177    0                                      0.0                                                          3.25
+                                  n
+
+
+                           50
+                             lum
+
+
+178         200
+            Token400                          2.5
+                             Co
+
+
+                                                    0   20   40         60     80   100                           0    10         20         30      40      50
+                     600 0                                   Sorted index                                                               N
+179
+180                 (d)                                       (e)                                                                 (f)
+181
+      Figure 1: Observations from preliminary experiments: (a) The Keys are distributed by channel
+182
+      and have some outlier channels. (d) The distribution of the Values does not exhibit any notable
+183   characteristics. (b) In certain outlier channels, a few tokens with low magnitude of Keys disrupt
+184   the originally uniform distribution within these channels. (e) Visualization of the sorted Keys in an
+185   outlier channel shows a rapid increase from a low value to very high values. (c) There is a significant
+186   overlap between the smallest N Keys and the largest N attention scores when N is small. (f) The
+187   L1 loss of attention output before and after quantization by retaining full-precision tokens based on
+188   different criteria. The best result is retaining full-precision tokens with the smallest magnitude of
+189   the Keys and excluding these tokens during quantization.
+190
+191
+192   When N is small, the overlap is initially high but quickly diminishes to a minimum before gradually
+193   increasing again. Notably, the tokens selected when N is small correspond to the outlier tokens,
+194   indicating that outlier tokens generally have high attention scores.
+195   Removing Outlier Tokens. From our analysis, outlier tokens significantly impact the effectiveness
+196   of quantization. These outlier tokens typically exhibit high attention scores, indicating that even
+197   minor quantization errors can result in considerable losses in attention output. By retaining these
+198   outlier tokens with full precision, we can greatly reduce the loss of attention output. To investigate
+199   this further, we retain different numbers of full-precision tokens based on different selection criteria
+200   and compare the L1 loss of attention outputs before and after quantization. The results (Figure 1f)
+201   reveal that retaining tokens with the largest keys yields the worst performance, while retaining those
+202
+      with the smallest Keys provides the best results, aligning with our previous findings. Furthermore,
+      outlier tokens contribute to an increase in Xmax − Xmin within outlier channels, thus affecting
+203
+      quantization accuracy. To address this issue, we exclude these outlier tokens during quantization,
+204
+      leading to even better results.
+205
+206
+207   3.2    SinkQ: S INK - AWARE KV C ACHE Q UANTIZATION
+208
+209   From these observations, we note that a few outlier tokens exhibit exceptionally high attention
+210   scores, consistent with the findings from StreamingLLM (Xiao et al., 2024). These tokens are
+211   referred to as attention sinks, and we will use this term later. Previous work suggesting that attention
+212
+      sinks occur only in the initial tokens; however, our observations reveal that they can appear at any
+      position within a sentence. Moreover, the distribution of the Keys of attention sinks differs signifi-
+213
+      cantly from that of other tokens, which can substantially impact overall quantization performance.
+214
+215   Based on the insights above, we propose Sink-aware KV Cache Quantization (SinkQ). Figure 2 il-
+      lustrates an overview of our method. SinkQ consists of two components: quantization and decoding.
+
+
+                                                                     4
+      Under review as a conference paper at ICLR 2025
+
+
+216                          (Fused matmul)                                         (Fused matmul)
+217                           K_Quant*N                                               V_Quant*N
+218
+                  Matmul                         Concat                    Matmul                       Add
+219       Query                 K_Sink                     Att score                    V_Sink                Att output
+220
+221                             K_Full                                                   V_Full
+222                                                        full-precision tensor
+223                                                        low-precision tensor
+224                                                        hidden states
+225                 K_Sink                                                                           V_Sink
+226
+227                              channel-wise                                       token-wise
+       K_Full                                    K_Quant               V_Quant                                V_Full
+228                               quantization                                      quantization
+229
+230   Figure 2: Overview of SinkQ. Top: Decoding stage. Multiply the Query by each type of the Keys
+231   and concatenate the results to obtain the attention scores. Multiply the attention scores by each type
+232   of the Values and sum the results to get the attention output. Bottom: Quantization stage. Before
+233
+      quantization, process the sinks first, then quantize the Keys by channel and the Values by token.
+234
+235
+      Quantization We define a fixed-size sink pool with a capacity of sink num to store the Keys
+236
+      and Values of the attention sinks. To fulfill group quantization, we quantize KV Cache every G
+237   steps, which means group size, a hyper-parameter in group quantization. When the group is full,
+238   tokens selected for quantization will obtain a position in the sink pool based on the rules described in
+239   Section 3.1. Once selected, the Keys and Values of these tokens are replaced with the mean values of
+240   all tokens to eliminate their impact on quantization. We adopt the quantization strategy from KIVI,
+241   applying channel-wise quantization for the Keys and token-wise quantization for the Values.
+242
+      Decoding We maintain three types of KV Cache: the quantized KV Cache, the full-precision KV
+243   Cache, and the KV Cache stored in the sink pool. First, the Query is multiplied by all three types
+244   of Keys, and we concatenate the results to produce the attention scores. Next, we multiply these
+245   scores by their corresponding Values from each type and sum them to generate the final attention
+246   output. To enhance decoding efficiency, we utilize a CUDA fused kernel to multiply full-precision
+247   and quantized matrices efficiently.
+248
+      Following KIVI, we have group tokens and recent tokens. We trigger a new quantization step when
+249   the full-precision KV Cache reaches a certain length (necessary for channel-wise key quantization).
+250   When the group is not full, we must keep these group tokens in full-precision. KIVI also maintain
+251   the local tokens in full-precision because these tokens are found important in many studies, we
+252   follow this operation and call these tokens recent tokens.
+253
+254
+255
+      4     E XPERIMENTS
+256
+      4.1     S ETTINGS
+257
+258   Baselines and Models. In this paper, we focus on tuning-free KV Cache quantization methods.
+259   To our knowledge, KIVI is currently the strongest tuning-free baseline with the best compression
+260   efficiency and accuracy. Therefore, to assess the effectiveness of our method, we compare SinkQ
+261   with KIVI (Liu et al., 2024b) and vanilla FP16 implementation using greedy decoding across two
+262   famous model families: LLaMA (Touvron et al., 2023b; Dubey et al., 2024) and Mistral (Jiang et al.,
+263   2023). Specifically, we select LLaMA2-7B-chat-hf, LLaMA2-13B-chat-hf, LLaMA3-8B-Instruct,
+264   and Mistral-7B-Instruct-v0.2. Additional experiment results on other baselines and models can be
+265   found in Appendix B.
+266   Tasks. We evaluate our methods on two benchmarks according to the length of input texts. For
+267   normal context length evaluation, we use arithmetic reasoning task Gsm8k (Cobbe et al., 2021),
+268   mainstream language and symbolic reasoning task BBH (Suzgun et al., 2023), and code completion
+269   task HumanEval (Chen et al., 2021) with different settings. For long context length evaluation, we
+      choose four types of tasks in LongBench (Bai et al., 2024) including Document QA (Qasper), Sum-
+
+
+                                                                 5
+      Under review as a conference paper at ICLR 2025
+
+
+270   Table 1: Results of the performance on GSM8K, BBH, and HumanEval (HE). Bold indicates the
+271   best results. We report accuracy for Gsm8k, BBH and Pass@k for HumanEval. Pass@k (p@k)
+272   refers to running each test question k times and calculating the average pass rate of the generated
+273   code. SinkQ outperforms KIVI across all tasks, achieving the best results.
+274
+275                    LLaMA2-7B-chat-hf LLaMA2-13B-chat-hf LLaMA3-8B-Instruct             Mistral-7B-Instruct
+276    Dataset
+277                    Fp16    KIVI    Ours    Fp16    KIVI    Ours   Fp16   KIVI   Ours   Fp16    KIVI   Ours
+278    Gsm8k (8)       21.99 16.30 21.38       36.54 28.51 36.09      74.91 63.15 72.55    42.91   37.38 41.17
+279
+       + CoT           21.30 17.51 18.20       37.00 31.77 36.92      76.72 66.79 75.06    42.99   37.45 41.39
+280
+281    + 0-CoT         24.11 21.61 22.59       32.60 29.19 31.31      40.64 37.54 42.68    40.18   33.81 37.98
+282    BBH (3)         33.34 32.48 33.36       37.61 36.20 37.43      45.77 44.19 45.60    42.10   40.29 42.02
+283
+       + CoT           40.21 34.00 35.17       47.38 41.02 44.37      68.18 47.38 60.31    51.33   36.42 41.93
+284
+285    + 0-CoT         35.00 33.30 34.25       35.86 33.57 34.80      51.37 44.19 48.89    41.74   37.83 40.19
+286    HE (p@1)        12.19 9.75      11.58   7.92    7.31   7.92    40.24 28.05 40.85    40 .24 32.92 35.36
+287    HE (p@10) 17.07 12.19 14.63             13.41 11.58 15.24      69.51 56.09 67.68    54.87   50.00 54.26
+288
+       Average         25.65 22.14 23.90       31.04 28.14 30.51      58.42 48.16 56.70    44.55   38.26 41.79
+289
+290
+291
+292   marization (GovReport, MultiNews), Few-shot Learning (TriviaQA, SamSum, TREC) and Code
+293   completion (LCC, RepoBench-P). We focus on downstream task performance rather than language
+294   modeling abilities such as perplexity (PPL).
+295   Details. We implement both KIVI and SinkQ under 2-bit quantization. For KIVI, the group size (G)
+296   and residual length (R) are set to 128. For SinkQ, we use G = 128, R = 32, and set sink num to 3.
+297   Notably, we set sink num to 0 for the first and second layers because we find that shallow layers
+298   have no attention sinks (Ablation in Section 4.4). Regarding the sinks that have been eliminated
+299   from the sink pool, we do not put these tokens back in their original positions, but still keep a full
+300   precision window to store these sinks for easier implementation. Our experiments find that a very
+301
+      small window can retain all the eliminated sinks, and we set it to 32. GSM8K and BBH are tested
+      under the LM Eval (Gao et al., 2024) framework. Humaneval follows the settings from InstructEval2 .
+302
+      Additionally, we use a CUDA fused kernel from (Dettmers et al., 2022) for efficient multiplication
+303
+      of full-precision and quantized matrices in both KIVI and SinkQ. All the experiments are conducted
+304   on NVIDIA A100 40G GPUs unless otherwise specified.
+305
+306
+      4.2      R ESULTS
+307
+308   4.2.1      N ORMAL CONTEXT LENGTH EVALUATION
+309
+310   Table 1 presents the results of the normal context length evaluation across different models and
+311   methods. For Gsm8k and BBH, we report accuracy in the setting of few-shot, few-shot CoT, and
+312   zero-shot CoT. For HumanEval, we report pass@1 and pass@10 in the zero-shot setting. The results
+313   illustrate that our method significantly outperforms KIVI across all settings. Notably, on BBH (3-
+314
+      CoT, LLaMA3-8B-Instruct), SinkQ achieves a 12.93% improvement over KIVI. Compared to FP16,
+      SinkQ incurs minor accuracy loss in most settings. The largest accuracy drop occurs on BBH (3-
+315
+      CoT, Mistral-7B-Instruct), likely due to the high complexity of the task and the long generation
+316
+      length required. Overall, SinkQ can achieve significant performance improvements over the best
+317   existing baseline.
+318
+319
+      4.2.2      L ONG CONTEXT LENGTH TASKS EVALUATION
+320
+321   The main results of long context length evaluation are in table 2. Our method outperforms KIVI
+322   in most settings, with only a tiny performance gap compared to the FP16 baseline. While KIVI
+323
+         2
+             https://github.com/declare-lab/instruct-eval
+
+
+                                                              6
+      Under review as a conference paper at ICLR 2025
+
+
+324   Table 2: Main results on LongBench. We report accuracy for TREC, Rouge-L for GovReport
+325   and SamSum, edit similarity (Levenshtein distance (Svyatkovskiy et al., 2020)) for LCC and Re-
+326   poBenchP, and F1 score for the other tasks. Bold indicates the best results for each setting. SinkQ
+327   demonstrates superior performance on average and exhibits nearly lossless compression accuracy.
+328
+329   Model                                               Qasper GovReport MultiNews TREC TriviaQA SamSum LCC RepoBench-P Avg
+330                                              Fp16     20.04              25.08            23.02       59.67        85.39                        39.28      59.59         48.04                45.01
+331   LLaMA2-7B-chat-hf                          KIVI     20.43              19.97            19.82       59.67        85.16                        37.70      58.73         47.24                43.59
+332
+                                                 Ours     19.95              21.56            20.81       59.67        85.00                        39.10      59.44         48.51                44.26
+333
+334                                              Fp16     17.42              25.65            23.35       64.00        86.52                        40.49      49.80         47.13                44.30
+
+335   LLaMA2-13B-chat-hf KIVI                             20.10              20.65            21.10       63.67        86.39                        39.51      49.10         43.95                43.06
+336                                              Ours     18.81              22.29            21.69       64.00        86.81                        40.35      51.14         47.71                44.10
+337                                              Fp16     37.54              31.04            25.58       69.67        89.85                        40.50      56.58         51.01                50.22
+338   LLaMA3-8B-Instruct KIVI                             34.88              28.43            24.78       69.33        89.57                        40.09      44.42         45.54                47.13
+339
+                                                 Ours     36.75              30.74            24.94       69.67        89.74                        40.39      52.37         48.82                49.18
+340
+                                                 Fp16     24.35              33.05            25.77       67.00        86.84                        40.95      57.24         49.84                48.13
+341
+      Mistral-7B-Instruct                        KIVI     24.20              30.98            25.10       66.33        85.40                        41.05      55.70         48.18                47.12
+342
+343                                              Ours     23.78              31.37            25.35       66.33        86.18                        41.25      55.89         48.32                47.31
+344
+345
+346   maintains good accuracy on most tasks, it occasionally experiences significant performance drops
+347   (e.g., LLaMA3-8B Instruct, LCC: 56.58% → 44.42%). However, SinkQ does not encounter this
+348   situation, which suggests that our method achieves higher quantization accuracy than KIVI.
+349
+350   4.3                           E FFICIENCY COMPARISON
+351
+                                                                                   70                                                        40                                            r=0.153
+352                       2500                                                                                                                      r=0.990                 r=0.199     r=0.154
+                                                                                   60                                                        35                           r=0.198
+      Throughput (Tokens/s)
+
+
+353                       2000                                                     50
+                                                                                                                                             30
+                                                                         Memory (GB)
+
+
+                                                                                                                                   Memory (GB)
+
+
+354                                                                                40
+                          1500                            FP16                                                    FP16                       25
+                                                                                   30                                                                                                 FP16
+355                                                       KIVI(G=32)                                              KIVI(G=32)                                                          KIVI(G=32)
+                          1000                            KIVI(G=128)              20                             KIVI(G=128)                20
+                                                                                                                                                                                      KIVI(G=128)
+356                                                       SinkQ(G=32)              10                             SinkQ(G=32)                15                                       SinkQ(G=32)
+                              500                         SinkQ(G=128)                                            SinkQ(G=128)                                                        SinkQ(G=128)
+357                                   50   100    150     200      250              00   50     100       150      200       250             10 0         25   50    75    100    125       150      175
+                                             Batch Size                                           Batch Size                                                    Sequence Length (K)
+358
+359
+                                    (a) System throughput                         (b) Memory Usage by batch size                                  (c) Memory Usage by length
+360
+      Figure 3: Experiments on throughput and memory: (a) Comparison of throughput (tokens/s) for
+361   different methods across different batch sizes on NVIDIA A800 80G. (b) Peak memory usage (in-
+362   cluding model weights and other components) at different batch sizes on NVIDIA A800 80G. (c)
+363   Peak memory usage (including model weights and other components) at different sequence lengths
+364   when batch size = 1 on NVIDIA A100 40G. SinkQ achieves a peak memory reduction of up to 6.4×
+365   and a throughput increase of 2.3×.
+366
+367   Additionally, to validate the memory reduction and throughput improvements achieved by SinkQ,
+368   we conduct three experiments: a throughput test, a memory test, and a longest sentence test. The
+369   throughput test measures the number of tokens generated per second as the batch size varies while
+370   keeping the input and output lengths fixed. The memory test tracks memory usage as the batch size
+371   changes, also with fixed input and output lengths. The longest sentence test assesses the memory
+372   required for inference as the output length increases infinitely (until out-of-memory), with a fixed
+373   batch size of 1 and an input length of 1. We use the LLaMA2-7B-chat-hf model for our experiments,
+374
+      and set the input length to 64 and the output length to 384 for both the throughput and memory tests.
+      Figure 3 illustrates the results.
+375
+376   Figure 3a shows that when the batch size is small, SinkQ performs slightly slower than the FP16
+377   baseline. However, as the batch size increases, SinkQ demonstrates a significant speed advantage.
+      Compared to KIVI, SinkQ is slightly slower at G = 32 but significantly faster at G = 128. This
+
+
+                                                                                                      7
+      Under review as a conference paper at ICLR 2025
+
+
+378   Table 3: Ablation study of SinkQ by combining possible group sizes G and residual lengths R. The
+379   settings in the main experiment are indicated with underlines.
+380
+381   G     R     Gsm8k(8) Gsm8k(8-CoT) G   R    Gsm8k(8) Gsm8k(8-CoT) G      R     Gsm8k(8) Gsm8k(8-CoT)
+382
+      32 0          70.05     73.16     64 0       68.92       72.63      128 0      70.96        73.54
+383
+      32 8          71.95     74.22     64 8       70.05       73.01      128 8      72.51        74.15
+384
+385   32 16         72.78     74.83     64 16      70.89       73.84      128 16     72.93        74.37
+386   32 32         72.78     74.53     64 32      72.40       75.06      128 32     72.55        75.06
+387   32 64         74.00     76.88     64 64      73.69       76.42      128 64     73.24        75.36
+388   32 128        73.77     77.33     64 128     74.68       76.42      128 128    73.24        76.65
+389
+390
+391
+      variation can be attributed to the difference in their handling of recent tokens and factors such as
+392
+      quantization timing and sequence length. From Figure 3b, it is evident that quantization can signif-
+393   icantly reduce memory usage compared to the FP16 baseline. While SinkQ requires slightly more
+394   memory than KIVI, this can also be attributed to differences in their management of recent tokens.
+395   Additionally, with larger group sizes, more full-precision tokens must be retained when the group is
+396   not full, leading to increased memory requirements. This phenomenon becomes more pronounced
+397   with large batch sizes and short sequence lengths. Figure 3c allows us to observe the compression
+398   ratio (the slope of each line) of the KV Cache more clearly. When the sequence length is sufficiently
+399   large, the influences of the group and recent tokens become negligible. Notably, when G = 32, the
+400   compression ratio is approximately 5.0 times; at G = 128, it reaches about 6.4 times.
+401
+402   4.4       A BLATION
+403
+404   Group size and residual length. Group size and residual length are critical hyperparameters in
+405
+      SinkQ. Theoretically, a larger group size allows more values to be quantized at each step, which
+      can reduce quantization accuracy due to the increased range of Xmax − Xmin . On the other hand,
+406
+      a larger group size decreases memory usage by requiring fewer quantization coefficients to be re-
+407
+      tained. Conversely, increasing the residual length requires more memory since a more full-precision
+408   KV Cache must be retained, but it also improves accuracy. Thus, selecting an appropriate group size
+409   and residual length is critical to balancing memory usage and accuracy.
+410
+411
+      We explore the impact of group size and residual length with group sizes of {32, 64, 128} and
+      residual lengths of {0, 8, 16, 32, 64, 128}. Table 3 reports the results for LLaMA3-8B-Instruct
+412
+      on Gsm8k 8-shot and 8-shot CoT under different configurations. When the group size is fixed,
+413
+      we observe a clear upward trend in accuracy as the residual length increases. However, when the
+414   residual length is fixed, the effect of group size shows no clear pattern, likely because the token
+415   distribution is relatively uniform, meaning that increasing group size has a limited impact. Since
+416   increasing the group size can improve the compression ratio (if not consider the group tokens), we
+417   tend to choose a larger group size. For our main experiments, we choose a group size of 128 and a
+418   residual length of 32 to balance performance and compression ratio.
+419
+      The number of sinks. We explore the effect of varying the number of sinks (sink num) from 0
+420   to 6, keeping all other settings unchanged. Table 4 presents the results for LLaMA3-8B-Instruct
+421   on Gsm8k (8-shot and 8-shot CoT). The results show that retaining even a single sink can signif-
+422   icantly improve performance, but further increases in sink num yield diminishing returns, even-
+423   tually plateauing performance. However, the increase in sink num may result in more memory
+424   overhead, leading to a decrease in compression ratio. Considering that a small sink num is already
+425   sufficient to significantly improve the accuracy, we set sink num = 3 for our main experiments,
+426   which is also consistent with our previous explorations.
+427   Sinks in shallow layers. We observe that there are no attention sinks in the shallow layers (see
+428   Figure 5 and Figure 6 in Appendix, the Keys shallow layers does not exhibit the characteristics
+429   discussed in Section 3.1.), suggesting that sink num should be set to 0 in these layers. To explore
+430   this further, we set sink num to 0 in consecutive shallow layers and evaluate the performance on
+431   Gsm8k (8-shot and 8-shot CoT) using LLaMA3-8B-Instruct. For example, “0 ∼ 2” means that
+      sink num is set to 0 for the first three layers of the model. Table 4 shows that the impact is minimal
+
+
+                                                           8
+      Under review as a conference paper at ICLR 2025
+
+
+432   Table 4: Ablation study of sink num. The settings in the main experiment are indicated with
+433   underlines. (left) Results on Gsm8k with different sink num. (right) Results on Gsm8k with
+434   sink num = 0 in shallow layers.
+435
+436            sink num Gsm8k(8) Gsm8k(8-CoT)                    Layers Gsm8k(8) Gsm8k(8-CoT)
+437
+                    0        62.09         68.31                  None      72.48        75.59
+438
+                    1        71.80         75.74                    0       72.78        75.44
+439
+440                 2        71.57         75.06                   0,1      72.55        75.06
+441                 3        72.55         75.06                  0∼2       71.49        74.68
+442                 4        72.25         75.97                  0∼3       71.80        73.64
+443                 5        72.18         75.74                  0∼4       70.96        74.53
+444
+                    6        72.18         75.89                  0∼5       69.60        74.00
+445
+446
+447
+448
+      in the shallowest layers but becomes more significant as we move deeper into the model. Based on
+      these results, we set sink num = 0 for the first two layers in all models for our main experiments.
+449
+450
+451   5    R ELATED WORK
+452
+453   Efficient Inference of LLMs. Large Language Models often have enormous parameters, leading
+454   to significant computational costs during inference. To address this, some researchers have em-
+455   ployed parameter pruning techniques to eliminate redundant or less important parameters, thereby
+456   compressing LLMs (Ma et al., 2023; Xia et al., 2024; Frantar & Alistarh, 2023). Other studies have
+457   focused on quantizing model weights, reducing their size and the number of arithmetic operations
+458   required for inference. For example, GPTQ (Frantar et al., 2022) uses second-order information to
+459
+      quantize models to 3 or 4-bit precision while maintaining accuracy. AWQ (Lin et al., 2024) preserves
+      critical weights based on the activation distribution, quantizing the remaining weights to lower bit
+460
+      precision. These methods can be combined with KV Cache compression to achieve a better memory
+461
+      usage and a higher throughput.
+462
+463   KV Cache Compression. KV Cache compression can significantly reduce the size of KV Cache
+464   with minimal accuracy loss. Liu et al. (2024b) find that some outlier channels in the Keys have
+465
+      very large magnitudes, resulting in a significant loss when quantifying Keys by token. They further
+      discover that Keys are distributed by channel, while Values are distributed by token. Based on these
+466
+      observations, they introduce KIVI, a tuning-free 2-bit quantization method that improve quantization
+467
+      accuracy by applying channel-wise quantization to the Key cache and token-wise quantization to
+468   the Value cache. Hooper et al. (2024) find that quantizing the Key cache before applying rotary
+469   positional embeddings reduces the negative impact of quantization. GEAR (Kang et al., 2024)
+470   compensates for compression-induced errors by combining low-rank and sparse matrices, achieving
+471   near-lossless results in 4-bit quantization, but it will bring additional calculations due to the low-rank
+472   matrix calculation. Additionally, evicting some tokens during inference helps reduce the excessive
+473   memory usage caused by storing KV Cache. Xiao et al. (2024) propose StreamingLLM, which
+474   retains the initial and final tokens of the input, leveraging the concept of the attention sink. Moreover,
+475   Zhang et al. (2023) consider that only a minority of tokens significantly influence the output and that
+476
+      these critical tokens are positively correlated with their frequency of occurrence. They propose H2O,
+      which retains recent tokens while dynamically evicting less important ones.
+477
+478
+479   6    C ONCLUSION
+480
+481   In this paper, we start from the assumptions of KIVI and further explore the distribution of the
+482   Keys in the outlier channels. We observe that several unusual tokens deviate from the assumptions
+483   of KIVI and exhibit exceptionally high attention scores. Quantizing these tokens has detrimental
+484   effects, as it increases the quantization errors of other tokens, and their high attention scores lead to
+485   more significant quantization errors reflected in the attention output. Building on these observations,
+      we propose Sink-Aware KV Cache quantization (SinkQ), which leverages the magnitude of the
+
+
+                                                          9
+      Under review as a conference paper at ICLR 2025
+
+
+486
+      Keys to dynamically track these tokens during decoding, excluding them from the quantization
+487   process while retaining their full-precision values. Extensive experiments show that our method
+488   achieves significant improvements in accuracy, along with substantial reductions in memory usage
+489   and increases in throughput.
+490
+491
+492
+      7   L IMITATIONS & F UTURE WORK
+493
+      Although SinkQ has achieved excellent results, there are still some limitations:
+494
+495          • Due to the presence of the group and recent tokens, we cannot ensure that all tokens are
+496            quantized at every moment. When the sequence length is very short and the batch size is
+497            very large, the compression ratio of SinkQ is reduced. In extreme cases, when the sequence
+498            length is shorter than the group size, SinkQ does not perform any compression.
+499          • SinkQ occasionally still incurs a little loss on specific datasets under 2-bit quantization.
+500            This may be related to the difficulty of the datasets and the required generation length.
+501            When the generation length is very long, SinkQ may face an unacceptable risk of loss due
+502            to error accumulation.
+503
+504   Additionally, there are still some points worth exploring:
+505
+             • Mitigating error accumulation: When the generation length is excessively long, KV Cache
+506
+               quantization may lead to unacceptable errors due to error accumulation. Developing tech-
+507
+               niques to alleviate this issue is a promising direction.
+508
+509
+             • Combining with other KV Cache compression techniques: KV Cache quantization is com-
+               patible with other compression methods. Combining it with other KV Cache compression
+510
+               techniques could achieve State-of-the-art results.
+511
+512
+513   R EFERENCES
+514
+      Josh Achiam, Steven Adler, Sandhini Agarwal, Lama Ahmad, Ilge Akkaya, Florencia Leoni Ale-
+515     man, Diogo Almeida, Janko Altenschmidt, Sam Altman, Shyamal Anadkat, et al. Gpt-4 technical
+516     report. arXiv preprint arXiv:2303.08774, 2023.
+517
+518   Joshua Ainslie, James Lee-Thorp, Michiel de Jong, Yury Zemlyanskiy, Federico Lebron, and Sumit
+519     Sanghai. Gqa: Training generalized multi-query transformer models from multi-head check-
+520
+        points. In Proceedings of the 2023 Conference on Empirical Methods in Natural Language Pro-
+        cessing, pp. 4895–4901, 2023.
+521
+522   Reza Yazdani Aminabadi, Samyam Rajbhandari, Ammar Ahmad Awan, Cheng Li, Du Li, Elton
+523     Zheng, Olatunji Ruwase, Shaden Smith, Minjia Zhang, Jeff Rasley, et al. Deepspeed-inference:
+524     enabling efficient inference of transformer models at unprecedented scale. In SC22: International
+525     Conference for High Performance Computing, Networking, Storage and Analysis, pp. 1–15. IEEE,
+526     2022.
+527
+      Saleh Ashkboos, Amirkeivan Mohtashami, Maximilian L Croci, Bo Li, Martin Jaggi, Dan Alistarh,
+528     Torsten Hoefler, and James Hensman. Quarot: Outlier-free 4-bit inference in rotated llms. arXiv
+529     preprint arXiv:2404.00456, 2024.
+530
+531   Yushi Bai, Xin Lv, Jiajie Zhang, Hongchang Lyu, Jiankai Tang, Zhidian Huang, Zhengxiao Du,
+532     Xiao Liu, Aohan Zeng, Lei Hou, Yuxiao Dong, Jie Tang, and Juanzi Li. Longbench: A
+533
+        bilingual, multitask benchmark for long context understanding. In Lun-Wei Ku, Andre Mar-
+        tins, and Vivek Srikumar (eds.), Proceedings of the 62nd Annual Meeting of the Association
+534
+        for Computational Linguistics (Volume 1: Long Papers), ACL 2024, Bangkok, Thailand, Au-
+535
+        gust 11-16, 2024, pp. 3119–3137. Association for Computational Linguistics, 2024. URL
+536     https://aclanthology.org/2024.acl-long.172.
+537
+538   William Brandon, Mayank Mishra, Aniruddha Nrusimha, Rameswar Panda, and Jonathan Ragan
+539    Kelly. Reducing transformer key-value cache size with cross-layer attention. arXiv preprint
+       arXiv:2405.12981, 2024.
+
+
+                                                       10
+      Under review as a conference paper at ICLR 2025
+
+
+540
+      Chi-Chih Chang, Wei-Cheng Lin, Chien-Yu Lin, Chong-Yan Chen, Yu-Fang Hu, Pei-Shuo Wang,
+541     Ning-Chi Huang, Luis Ceze, and Kai-Chiang Wu. Palu: Compressing kv-cache with low-rank
+542     projection. arXiv preprint arXiv:2407.21118, 2024.
+543
+544   Mark Chen, Jerry Tworek, Heewoo Jun, Qiming Yuan, Henrique Ponde de Oliveira Pinto, Jared
+545    Kaplan, Harri Edwards, Yuri Burda, Nicholas Joseph, Greg Brockman, Alex Ray, Raul Puri,
+546
+       Gretchen Krueger, Michael Petrov, Heidy Khlaaf, Girish Sastry, Pamela Mishkin, Brooke Chan,
+       Scott Gray, Nick Ryder, Mikhail Pavlov, Alethea Power, Lukasz Kaiser, Mohammad Bavarian,
+547
+       Clemens Winter, Philippe Tillet, Felipe Petroski Such, Dave Cummings, Matthias Plappert, Fo-
+548
+       tios Chantzis, Elizabeth Barnes, Ariel Herbert-Voss, William Hebgen Guss, Alex Nichol, Alex
+549    Paino, Nikolas Tezak, Jie Tang, Igor Babuschkin, Suchir Balaji, Shantanu Jain, William Saunders,
+550    Christopher Hesse, Andrew N. Carr, Jan Leike, Josh Achiam, Vedant Misra, Evan Morikawa, Alec
+551    Radford, Matthew Knight, Miles Brundage, Mira Murati, Katie Mayer, Peter Welinder, Bob Mc-
+552    Grew, Dario Amodei, Sam McCandlish, Ilya Sutskever, and Wojciech Zaremba. Evaluating large
+553    language models trained on code. 2021.
+554
+555
+      Karl Cobbe, Vineet Kosaraju, Mohammad Bavarian, Mark Chen, Heewoo Jun, Lukasz Kaiser,
+        Matthias Plappert, Jerry Tworek, Jacob Hilton, Reiichiro Nakano, Christopher Hesse, and John
+556
+        Schulman. Training verifiers to solve math word problems. arXiv preprint arXiv:2110.14168,
+557
+        2021.
+558
+559   Tri Dao, Dan Fu, Stefano Ermon, Atri Rudra, and Christopher Ré. Flashattention: Fast and memory-
+560     efficient exact attention with io-awareness. Advances in Neural Information Processing Systems,
+561     35:16344–16359, 2022.
+562
+      Tim Dettmers, Mike Lewis, Younes Belkada, and Luke Zettlemoyer. Gpt3. int8 (): 8-bit matrix
+563     multiplication for transformers at scale. Advances in Neural Information Processing Systems, 35:
+564     30318–30332, 2022.
+565
+566   Shichen Dong, Wen Cheng, Jiayu Qin, and Wei Wang. Qaq: Quality adaptive quantization for llm
+567     kv cache. arXiv preprint arXiv:2403.04643, 2024.
+568   Abhimanyu Dubey, Abhinav Jauhri, Abhinav Pandey, Abhishek Kadian, Ahmad Al-Dahle, Aiesha
+569     Letman, Akhil Mathur, Alan Schelten, Amy Yang, Angela Fan, et al. The llama 3 herd of models.
+570     arXiv preprint arXiv:2407.21783, 2024.
+571
+572   Elias Frantar and Dan Alistarh. Sparsegpt: Massive language models can be accurately pruned
+573     in one-shot. In Andreas Krause, Emma Brunskill, Kyunghyun Cho, Barbara Engelhardt, Sivan
+574
+        Sabato, and Jonathan Scarlett (eds.), International Conference on Machine Learning, ICML 2023,
+        23-29 July 2023, Honolulu, Hawaii, USA, volume 202 of Proceedings of Machine Learning
+575
+        Research, pp. 10323–10337. PMLR, 2023. URL https://proceedings.mlr.press/
+576
+        v202/frantar23a.html.
+577
+578   Elias Frantar, Saleh Ashkboos, Torsten Hoefler, and Dan Alistarh. GPTQ: accurate post-training
+579     quantization for generative pre-trained transformers. CoRR, abs/2210.17323, 2022. doi: 10.
+580     48550/ARXIV.2210.17323. URL https://doi.org/10.48550/arXiv.2210.17323.
+581
+      Leo Gao, Jonathan Tow, Baber Abbasi, Stella Biderman, Sid Black, Anthony DiPofi, Charles Fos-
+582     ter, Laurence Golding, Jeffrey Hsu, Alain Le Noac’h, Haonan Li, Kyle McDonell, Niklas Muen-
+583     nighoff, Chris Ociepa, Jason Phang, Laria Reynolds, Hailey Schoelkopf, Aviya Skowron, Lin-
+584     tang Sutawika, Eric Tang, Anish Thite, Ben Wang, Kevin Wang, and Andy Zou. A framework
+585     for few-shot language model evaluation, 07 2024. URL https://zenodo.org/records/
+586     12608602.
+587
+      Suyu Ge, Yunan Zhang, Liyuan Liu, Minjia Zhang, Jiawei Han, and Jianfeng Gao. Model tells you
+588
+        what to discard: Adaptive kv cache compression for llms. In The Twelfth International Conference
+589
+        on Learning Representations.
+590
+591   Coleman Hooper, Sehoon Kim, Hiva Mohammadzadeh, Michael W. Mahoney, Yakun Sophia Shao,
+592     Kurt Keutzer, and Amir Gholami. Kvquant: Towards 10 million context length LLM inference
+593     with KV cache quantization. CoRR, abs/2401.18079, 2024. doi: 10.48550/ARXIV.2401.18079.
+        URL https://doi.org/10.48550/arXiv.2401.18079.
+
+
+                                                     11
+      Under review as a conference paper at ICLR 2025
+
+
+594
+      Benoit Jacob, Skirmantas Kligys, Bo Chen, Menglong Zhu, Matthew Tang, Andrew G. Howard,
+595     Hartwig Adam, and Dmitry Kalenichenko. Quantization and training of neural networks for
+596     efficient integer-arithmetic-only inference. In 2018 IEEE Conference on Computer Vision and
+597     Pattern Recognition, CVPR 2018, Salt Lake City, UT, USA, June 18-22, 2018, pp. 2704–
+598     2713. Computer Vision Foundation / IEEE Computer Society, 2018. doi: 10.1109/CVPR.
+599     2018.00286. URL http://openaccess.thecvf.com/content_cvpr_2018/html/
+600     Jacob_Quantization_and_Training_CVPR_2018_paper.html.
+601
+      Albert Q. Jiang, Alexandre Sablayrolles, Arthur Mensch, Chris Bamford, Devendra Singh Chaplot,
+602
+        Diego de Las Casas, Florian Bressand, Gianna Lengyel, Guillaume Lample, Lucile Saulnier,
+603     Lélio Renard Lavaud, Marie-Anne Lachaux, Pierre Stock, Teven Le Scao, Thibaut Lavril, Thomas
+604     Wang, Timothée Lacroix, and William El Sayed. Mistral 7b. CoRR, abs/2310.06825, 2023.
+605     doi: 10.48550/ARXIV.2310.06825. URL https://doi.org/10.48550/arXiv.2310.
+606     06825.
+607
+608
+      Jordan Juravsky, Bradley Brown, Ryan Ehrlich, Daniel Y Fu, Christopher Ré, and Azalia
+        Mirhoseini. Hydragen: High-throughput llm inference with shared prefixes. arXiv preprint
+609
+        arXiv:2402.05099, 2024.
+610
+611   Hao Kang, Qingru Zhang, Souvik Kundu, Geonhwa Jeong, Zaoxing Liu, Tushar Krishna, and Tuo
+612     Zhao. GEAR: an efficient KV cache compression recipe for near-lossless generative inference
+613     of LLM. CoRR, abs/2403.05527, 2024. doi: 10.48550/ARXIV.2403.05527. URL https:
+614     //doi.org/10.48550/arXiv.2403.05527.
+615   Woosuk Kwon, Zhuohan Li, Siyuan Zhuang, Ying Sheng, Lianmin Zheng, Cody Hao Yu, Joseph
+616    Gonzalez, Hao Zhang, and Ion Stoica. Efficient memory management for large language model
+617    serving with pagedattention. In Proceedings of the 29th Symposium on Operating Systems Prin-
+618    ciples, pp. 611–626, 2023.
+619
+620
+      Ji Lin, Jiaming Tang, Haotian Tang, Shang Yang, Wei-Ming Chen, Wei-Chen Wang, Guangxuan
+         Xiao, Xingyu Dang, Chuang Gan, and Song Han. AWQ: activation-aware weight quantiza-
+621
+         tion for on-device LLM compression and acceleration. In Phillip B. Gibbons, Gennady Pekhi-
+622
+         menko, and Christopher De Sa (eds.), Proceedings of the Seventh Annual Conference on Ma-
+623      chine Learning and Systems, MLSys 2024, Santa Clara, CA, USA, May 13-16, 2024. mlsys.org,
+624      2024.      URL https://proceedings.mlsys.org/paper_files/paper/2024/
+625      hash/42a452cbafa9dd64e9ba4aa95cc1ef21-Abstract-Conference.html.
+626
+627   Aixin Liu, Bei Feng, Bin Wang, Bingxuan Wang, Bo Liu, Chenggang Zhao, Chengqi Dengr, Chong
+628
+        Ruan, Damai Dai, Daya Guo, et al. Deepseek-v2: A strong, economical, and efficient mixture-
+        of-experts language model. arXiv preprint arXiv:2405.04434, 2024a.
+629
+630   Zirui Liu, Jiayi Yuan, Hongye Jin, Shaochen Zhong, Zhaozhuo Xu, Vladimir Braverman, Beidi
+631     Chen, and Xia Hu. KIVI: A tuning-free asymmetric 2bit quantization for KV cache. In Forty-first
+632     International Conference on Machine Learning, ICML 2024, Vienna, Austria, July 21-27, 2024.
+633     OpenReview.net, 2024b. URL https://openreview.net/forum?id=L057s2Rq8O.
+634
+      Xinyin Ma, Gongfan Fang, and Xinchao Wang.     Llm-pruner: On the structural prun-
+635
+        ing of large language models.     In Alice Oh, Tristan Naumann, Amir Glober-
+636     son, Kate Saenko, Moritz Hardt, and Sergey Levine (eds.), Advances in Neural In-
+637     formation Processing Systems 36: Annual Conference on Neural Information Pro-
+638     cessing Systems 2023, NeurIPS 2023, New Orleans, LA, USA, December 10 - 16,
+639     2023, 2023. URL http://papers.nips.cc/paper_files/paper/2023/hash/
+640     44956951349095f74492a5471128a7e0-Abstract-Conference.html.
+641
+      Yongyu Mu, Yuzhang Wu, Yuchun Fan, Chenglong Wang, Hengyu Li, Qiaozhi He, Murun Yang,
+642
+        Tong Xiao, and Jingbo Zhu. Cross-layer attention sharing for large language models. arXiv
+643
+        preprint arXiv:2408.01890, 2024.
+644
+645   Pratyush Patel, Esha Choukse, Chaojie Zhang, Aashaka Shah, Íñigo Goiri, Saeed Maleki, and Ri-
+646     cardo Bianchini. Splitwise: Efficient generative llm inference using phase splitting. In 2024
+647     ACM/IEEE 51st Annual International Symposium on Computer Architecture (ISCA), pp. 118–
+        132. IEEE, 2024.
+
+
+                                                     12
+      Under review as a conference paper at ICLR 2025
+
+
+648
+      Noam Shazeer. Fast transformer decoding: One write-head is all you need.          arXiv preprint
+649     arXiv:1911.02150, 2019.
+650
+651   Ying Sheng, Lianmin Zheng, Binhang Yuan, Zhuohan Li, Max Ryabinin, Beidi Chen, Percy Liang,
+652     Christopher Ré, Ion Stoica, and Ce Zhang. Flexgen: High-throughput generative inference of
+653     large language models with a single gpu. In International Conference on Machine Learning, pp.
+654     31094–31116. PMLR, 2023.
+655
+656
+      Mirac Suzgun, Nathan Scales, Nathanael Schärli, Sebastian Gehrmann, Yi Tay, Hyung Won Chung,
+       Aakanksha Chowdhery, Quoc V. Le, Ed H. Chi, Denny Zhou, and Jason Wei. Challenging big-
+657
+       bench tasks and whether chain-of-thought can solve them. In Anna Rogers, Jordan L. Boyd-
+658
+       Graber, and Naoaki Okazaki (eds.), Findings of the Association for Computational Linguistics:
+659    ACL 2023, Toronto, Canada, July 9-14, 2023, pp. 13003–13051. Association for Computational
+660    Linguistics, 2023. doi: 10.18653/V1/2023.FINDINGS-ACL.824. URL https://doi.org/
+661    10.18653/v1/2023.findings-acl.824.
+662
+663   Alexey Svyatkovskiy, Shao Kun Deng, Shengyu Fu, and Neel Sundaresan. Intellicode compose:
+664     Code generation using transformer. In Proceedings of the 28th ACM joint meeting on European
+665     software engineering conference and symposium on the foundations of software engineering, pp.
+666
+        1433–1443, 2020.
+667
+      Hugo Touvron, Thibaut Lavril, Gautier Izacard, Xavier Martinet, Marie-Anne Lachaux, Timothée
+668
+        Lacroix, Baptiste Rozière, Naman Goyal, Eric Hambro, Faisal Azhar, et al. Llama: Open and
+669     efficient foundation language models. arXiv preprint arXiv:2302.13971, 2023a.
+670
+671   Hugo Touvron, Louis Martin, Kevin Stone, Peter Albert, Amjad Almahairi, Yasmine Babaei, Niko-
+672     lay Bashlykov, Soumya Batra, Prajjwal Bhargava, Shruti Bhosale, et al. Llama 2: Open founda-
+673     tion and fine-tuned chat models. arXiv preprint arXiv:2307.09288, 2023b.
+674
+675
+      Nikita Trukhanov and Ilya Soloveychik. Accurate block quantization in llms with outliers. arXiv
+        preprint arXiv:2403.20137, 2024.
+676
+677
+      A Vaswani. Attention is all you need. Advances in Neural Information Processing Systems, 2017.
+678
+679   Y Wang, D Ma, and D Cai. With greater text comes greater necessity: Inference-time training helps
+680     long text generation. arXiv preprint arXiv:2401.11504, 2024.
+681
+682   Haoyi Wu and Kewei Tu. Layer-condensed kv cache for efficient inference of large language models.
+683     arXiv preprint arXiv:2405.10637, 2024.
+684
+      Mengzhou Xia, Tianyu Gao, Zhiyuan Zeng, and Danqi Chen. Sheared llama: Accelerating language
+685
+       model pre-training via structured pruning. In The Twelfth International Conference on Learning
+686
+       Representations, ICLR 2024, Vienna, Austria, May 7-11, 2024. OpenReview.net, 2024. URL
+687    https://openreview.net/forum?id=09iOdaeOzp.
+688
+689   Guangxuan Xiao, Yuandong Tian, Beidi Chen, Song Han, and Mike Lewis. Efficient streaming
+690     language models with attention sinks. In The Twelfth International Conference on Learning
+691     Representations, ICLR 2024, Vienna, Austria, May 7-11, 2024. OpenReview.net, 2024. URL
+692     https://openreview.net/forum?id=NG7sS51zVF.
+693
+      Zhewei Yao, Reza Yazdani Aminabadi, Minjia Zhang, Xiaoxia Wu, Conglong Li, and Yuxiong
+694
+        He. Zeroquant: Efficient and affordable post-training quantization for large-scale transform-
+695
+        ers. In Sanmi Koyejo, S. Mohamed, A. Agarwal, Danielle Belgrave, K. Cho, and A. Oh (eds.),
+696     Advances in Neural Information Processing Systems 35: Annual Conference on Neural Informa-
+697     tion Processing Systems 2022, NeurIPS 2022, New Orleans, LA, USA, November 28 - December
+698     9, 2022, 2022. URL http://papers.nips.cc/paper_files/paper/2022/hash/
+699     adf7fa39d65e2983d724ff7da57f00ac-Abstract-Conference.html.
+700
+701   Hao Yu, Zelan Yang, Shen Li, Yong Li, and Jianxin Wu. Effectively compress kv heads for llm.
+        arXiv preprint arXiv:2406.07056, 2024.
+
+
+                                                     13
+      Under review as a conference paper at ICLR 2025
+
+
+702
+      Zhenyu Zhang, Ying Sheng, Tianyi Zhou, Tianlong Chen, Lianmin Zheng, Ruisi Cai, Zhao Song,
+703     Yuandong Tian, Christopher Ré, Clark W. Barrett, Zhangyang Wang, and Beidi Chen. H2O:
+704     heavy-hitter oracle for efficient generative inference of large language models. In Alice Oh,
+705     Tristan Naumann, Amir Globerson, Kate Saenko, Moritz Hardt, and Sergey Levine (eds.),
+706     Advances in Neural Information Processing Systems 36: Annual Conference on Neural In-
+707     formation Processing Systems 2023, NeurIPS 2023, New Orleans, LA, USA, December 10 -
+708     16, 2023, 2023. URL http://papers.nips.cc/paper_files/paper/2023/hash/
+709     6ceefa7b15572587b78ecfcebb2827f8-Abstract-Conference.html.
+710
+      Lei Zhu, Xinjiang Wang, Wayne Zhang, and Rynson WH Lau. Relayattention for efficient large
+711     language model serving with long system prompts. arXiv preprint arXiv:2402.14808, 2024.
+712
+713   Zayd Muhammad Kawakibi Zuhri, Muhammad Farid Adilazuarda, Ayu Purwarianti, and Al-
+714     ham Fikri Aji. Mlkv: Multi-layer key-value heads for memory efficient transformer decoding.
+715     arXiv preprint arXiv:2406.09297, 2024.
+716
+717
+718
+719
+720
+721
+722
+723
+724
+725
+726
+727
+728
+729
+730
+731
+732
+733
+734
+735
+736
+737
+738
+739
+740
+741
+742
+743
+744
+745
+746
+747
+748
+749
+750
+751
+752
+753
+754
+755
+
+
+
+                                                    14
+      Under review as a conference paper at ICLR 2025
+
+
+756
+      A    A DDITIONAL F IGURES AND TABLES .
+757
+758
+759
+          Input:
+                [INST]Which methods did Socrates employ to challenge the prevailing thoughts of his
+760
+          time?
+761
+                [/INST]
+762
+          Output:
+763             [INST]Which methods did Socrates employ to challenge the prevailing thoughts of his
+764       time?
+765             [/INST] Socrates employed several methods to challenge the prevailing thoughts of his
+766       time, including:
+767             1. Questioning: Socrates used questioning as a primary method to challenge the beliefs
+768       of others. He would ask probing questions to expose the contradictions and inconsistencies
+769       in their arguments, and to lead them to a deeper understanding of their own beliefs.
+770             2. Dialogue: Socrates believed in the power of dialogue to promote critical thinking and
+771
+          understanding. He would engage in conversations with others, using his questions and their
+          responses to challenge their beliefs and to encourage them to think more deeply about their
+772
+          ideas.
+773
+                3. Irony: Socrates often used irony to challenge the beliefs of others. By using irony,
+774       he could expose the flaws in their arguments and lead them to see things from a different
+775       perspective.
+776             4. Paradox: Socrates often used paradoxical statements to challenge the prevailing be-
+777       liefs of his time. By presenting seemingly contradictory statements, he could encourage his
+778       interlocutors to think more critically about their beliefs and to question their assumptions.
+779             5. Maieutics: Socrates believed in the power of midwifery, or maieutics, to bring forth
+780       new ideas and insights. He would use his questions and dialogue to help others discover new
+781       truths and to challenge their existing beliefs.
+782
+                6. Analogy: Socrates often used analogies to help others understand complex ideas and
+          to challenge their beliefs. By using comparisons and contrasts, he could help his interlocutors
+783
+          to see things from a different perspective and to develop a deeper understanding of the issues
+784
+          at hand.
+785             7. Refutation: Socrates was skilled at refuting the arguments of others by exposing their
+786       flaws and inconsistencies. He would use his questions and dialogue to challenge the beliefs
+787       of others and to lead them to a deeper understanding of the issues at hand.
+788             8. Affirmation: Socrates also used affirmation to challenge the prevailing thoughts of
+789       his time. By affirming the beliefs of others and building on them, he could encourage them
+790       to think more deeply about their ideas and to develop a more nuanced understanding of the
+791       issues at hand.
+792             9. Silence: Socrates believed that sometimes the best way to challenge the prevailing
+793
+          thoughts of his time was through silence. By remaining silent in the face of foolish or false
+          arguments, he could encourage others to think more critically about their beliefs and to ques-
+794
+          tion their assumptions.
+795
+                Overall, Socrates employed a wide range of methods to challenge the prevailing thoughts
+796       of his time, including questioning, dialogue, irony, paradox, maieutics, analogy, refutation,
+797       affirmation, and silence. Through these methods, he was able to encourage critical thinking
+798       and to promote a deeper understanding of the issues at hand.
+799
+800                          Table 5: Example generated by LLaMA-2-7B-chat-hf.
+801
+802
+803
+804
+805
+806
+807
+808
+809
+
+
+
+                                                        15
+      Under review as a conference paper at ICLR 2025
+
+
+810
+811
+      15.0
+812   12.5
+      10.0
+813    7.5
+814    5.0
+       2.5
+815    0.0
+       2.5
+816
+817    1.0
+       0.8
+818
+       0.6
+819    0.4
+820    0.2
+
+821    0.0         0                   50                   100                      150                     200                     250                  300
+                                                                                    Index
+822
+823           Figure 4: The Keys in an outlier channel (up) and the magnitude of the Keys overall (down).
+824
+825
+826
+827              Layer 0 key cache                   Layer 0 value cache                        Layer 10 key cache               Layer 10 value cache
+828
+829
+830                                         3                                                                              15                                2.0
+                                                                             0.4                                                                             1.5
+831                                         2                                                                              10
+                                                                                                                                                            1.0
+                                            1                                0.2                                           5                                0.5
+832
+                                            0                                0.0                                           0                                0.0
+833
+                                      100                                 100                                        100                                 100
+834          0                                   0                                          0                                    0
+                                       n
+
+
+                                                                                                                        n
+                                                                           n
+
+
+                                                                                                                                                          n
+                                 50                                  50                                         50                                  50
+                                  lum
+
+
+                                                                                                                   lum
+                                                                     lum
+
+
+                                                                                                                                                    lum
+                  200
+                  Token400                            200
+                                                      Token400                                   200
+                                                                                                 Token400                            200
+                                                                                                                                     Token400
+                                Co
+
+
+                                                                                                                   Co
+                                                                    Co
+
+
+                                                                                                                                                   Co
+835                        600 0                               600 0                                      600 0                               600 0
+836
+837              Layer 20 key cache              Layer 20 value cache                           Layer 31 key cache               Layer 31 value cache
+838
+839
+                                            15                                2.0
+840                                                                                                                         10                                  2
+                                            10                                1.5
+841                                         5                                1.0                                            5                                   1
+                                                                             0.5
+842                                         0                                0.0                                            0                                   0
+843                                   100                                 100                                        100                                 100
+             0                                   0                                          0                                    0                        n
+                                                                                                                        n
+                                    n
+
+
+                                                                           n
+
+
+                                 50                                  50                                         50                                  50
+                                                                                                                                                     lum
+                                                                                                                   lum
+                                 lum
+
+
+                                                                     lum
+
+
+844               200
+                  Token400                            200
+                                                      Token400                                   200
+                                                                                                 Token400                            200
+                                                                                                                                     Token400
+                                                                                                                                                    Co
+                                                                                                                   Co
+                                Co
+
+
+                                                                    Co
+
+
+845                        600 0                               600 0                                      600 0                               600 0
+846
+                       Figure 5: Magnitude of the keys and Values for Llama-2-7B-chat-hf in head 17.
+847
+848
+849
+850
+       1.0
+851    0.5
+       0.0
+852
+       0.5
+853    1.0
+       1.5
+854    2.0
+       2.5
+855
+       1.0
+856    0.5
+857    0.0
+       0.5
+858    1.0
+       1.5
+859    2.0
+       2.5
+860                0                   50                   100                      150                    200                      250                 300
+                                                                                    Index
+861
+862          Figure 6: The Keys in an outlier channel (up) and the sorted Keys in an outlier channel (down).
+863
+
+
+
+                                                                                16
+      Under review as a conference paper at ICLR 2025
+
+
+864
+865
+866
+867   B       A DDITIONAL EXPERIMENT RESULTS .
+868
+869   B.1     E XPERIMENTS ON LL A MA-2-70 B - CHAT- HF.
+870
+871
+872    70b-chat-hf Gsm8k(8) Gsm8k(8-cot) Gsm8k(0-cot) BBH(3) HE(p@1)                                     Avg
+873
+874
+       FP16                56.03            55.04               48.98         47.09        16.46         44.72
+875    KIVI                51.63            50.49               46.40         46.08        14.02         41.72
+876
+877    Ours                52.92            52.54               49.05         46.48        15.85         43.37
+878
+879                                Table 6: Experiments on LLaMA-2-70b-chat-hf
+880
+881
+      To validate the performance on larger models, we conducte some additional experiments on
+882
+      LLaMA-2-70b-chat-hf. Due to time and computational limitations, we only add experimental re-
+883   sults from a portion of the dataset on our main experiments. The experimental setup is completely
+884   consistent with the main experiment. The result shows that SinkQ can still achieve higher accuracy
+885   advantages on larger models based on KIVI.
+886
+887   B.2     C OMPARISON WITH TOKEN EVICTION METHODS .
+888
+889
+890    Llama2-7b-chat Qasper GovReport MultiNews TREC TriviaQA SamSum              LCC     Repobench-P    Avg
+891    FP16              20.04     25.08      23.02     59.67    85.39     39.28   59.59      48.04       45.01
+892
+       KIVI              20.43     19.97      19.82     59.67    85.16     37.7    58.73      47.24       43.59
+893
+894
+       SnapKV            18.96     18.73      19.64      59      84.84     38.22    60.5      50.08       43.75
+895    H2O               17.51     18.85      19.88      50      84.22     38.09   58.23      49.66       42.05
+896    Streaming         15.31     19.39      18.99      51      83.11     36.8    57.57      47.33       41.19
+897
+       Ours              19.95     21.56      20.81     59.67      85      39.1    59.44      48.51       44.26
+898
+899
+            Table 7: Experiments on three additional eviction-based methods on LLaMA-2-7b-chat-hf.
+900
+901
+902   We add some comparisons with the token eviction methods. The previous token eviction methods
+903   are mostly evaluated on LongBench, so we also conduct experiments on LongBench using LLaMA-
+904
+      2-7b-chat-hf. The input length of LongBench is relatively long, while the output length is relatively
+      short, which may be more conducive to the performance of the token eviction methods. The base-
+905
+      lines include StreamingLLM, H2O, and SnapKV. In order to maintain the simplicity and consistency
+906
+      of the settings for comparison, we only perform token eviction in the prefill stage, and retain all KV
+907   caches in the decode stage. In addition, we make some adjustments to H2O based on SnapKV’s
+908   strategy, selecting only the queries in the sliding window for attention score selection (which was
+909   later verified to be superior to H2O’s strategy). In order to maintain the overall compression ratio
+910   consistent with SinkQ, we choose to evict 84% of the tokens in the prefill stage, which have the
+911   closest compression ratio to SinkQ. For H2O, the number of recent tokens and heavy hitters is the
+912   same. For StreamingLLM, we do not adjust its position id during decoding phase. So, the process
+913   of token eviction is as follows:
+914
+915
+               • In the prefill stage, use queries in the sliding window to calculate the attention score with
+                 other tokens, and perform token eviction according to the strategies of StreamingLLM,
+916
+                 H2O, and SnapKV respectively.
+917
+               • During the decode phase, attention calculation is performed directly without token eviction.
+
+
+                                                         17
+      Under review as a conference paper at ICLR 2025
+
+
+918
+      Among these methods, SnapKV achieves the best results. But even under more favorable settings,
+919   the result is still slightly lower than SinkQ.
+920
+921
+922
+923   B.3     C OMPARISON WITH ADDITIONAL BASELINES .
+924
+925
+926
+       Llama2-7b-chat Gsm8k(8)        8-cot      0-cot   BBH(3)   3-cot   0-cot   HE(p@1) p@10       Avg
+927
+928    FP16                21.99          21.3   24.11   33.34    40.21 35.00       12.19   17.07    45.01
+929
+       KIVI                 16.3      17.51 21.61        32.48     34     33.30     9.75    12.19    43.59
+930
+931    Ours                19.86      19.33 22.52        33.33    34.43 33.74       11.58   14.63    43.75
+932    ZipCache            15.92      17.74 20.02        32.85    33.9    32.35     9.45    15.24    42.05
+933
+934
+                                    Table 8: Experiments on other baselines.
+935
+936
+937   We add ZipCache as our baseline, and in order to maintain consistent compression rates, we set
+938   20% of the tokens to 4-bit quantization and 80% to 2-bit quantization. The other hyper-parameters
+939   in ZipCache are the same. We conduct our experiments on GSM8K, BBH and HumanEval with
+940   LLaMA-2-7b-chat-hf. The results show that ZipCache is weaker than KIVI and SinkQ.
+941
+942
+943
+944   C     A DDITIONAL TIME ANALYSIS .
+945
+946
+947                                sink     qkv_linear    quant_matmul      other
+948
+949
+950                                                            18%
+951
+952
+953
+954                                                                13%
+955                                        55%
+956
+957
+                                                                 14%
+958
+959
+960
+961                    Figure 7: The time proportion of each part in the attention block.
+962
+963
+      We provide a more detailed analysis of the time cost. Firstly, we analyze the compression stage.
+964
+      In the compression stage, we calculate the magnitude of each token’s key, perform threshold com-
+965
+      parison, select the index, and quantify it. In the compress phase, the cost of the sink operation is
+966   relatively high compared to quantization, but the compress operation is only performed every G steps
+967   (128 in the main experiment), so this time cost can be almost negligible. In the attention calculation
+968   stage, we need to calculate the query, key and value in the sink pool and cover the attention score
+969   according to the sink index, which has a certain cost. We have drawn the main time overhead in
+970   Figure 9, and the sink operation accounts for about 18% of the time in the attention block. However,
+971   considering the pre-processing, post-processing and FFN calculation in the entire forward step, the
+      time proportion of sink operations is very small overall.
+
+
+                                                          18
+       Under review as a conference paper at ICLR 2025
+
+
+972
+       D    ACCUMULATIVE ATTENTION SCORE .
+973
+974
+       In order to more intuitively display the proportion of attention scores of attention sinks, we sort the
+975    accumulative attention scores and plot them on a graph. Due to the significant difference, we also
+976    plot the results after log2 mapping.
+977
+978
+979
+980
+981
+982
+983
+984
+985
+986
+987
+988
+989
+990
+991
+992
+993
+994
+995
+996
+997
+998
+999                                   Figure 8: Accumulated attention score.
+1000
+1001
+1002
+1003
+1004
+1005
+1006
+1007
+1008
+1009
+1010
+1011
+1012
+1013
+1014
+1015
+1016
+1017
+1018
+1019
+1020
+1021
+1022
+                                  Figure 9: Accumulated attention score (log2).
+1023
+1024
+1025
+
+
+
+                                                         19

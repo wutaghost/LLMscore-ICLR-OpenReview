@@ -1,0 +1,1660 @@
+Under review as a conference paper at ICLR 2025
+
+
+000
+001
+      M ODEL T ELLS YOU W HERE TO M ERGE :
+002   A DAPTIVE KV C ACHE M ERGING FOR LLM S                                                           ON
+003
+004   L ONG -C ONTEXT TASKS
+005
+006
+       Anonymous authors
+007
+       Paper under double-blind review
+008
+009
+010
+011                                               A BSTRACT
+012
+013            Serving LLM inference for long sequences poses significant challenge due to the
+014
+               enormous memory footprint from key-value (KV) cache. In this paper, we propose
+               a novel KV cache merging algorithm, KVMerger, to achieve adaptive KV cache
+015
+               compression for long sequence tasks without significant performance degradation.
+016
+               Our approach is inspired by the intriguing observation that key states exhibit high
+017            similarity at the token level within a single sequence. Based on the observation, we
+018            develop an effective merging set identification algorithm to identify suitable KV
+019            states for merging and a Gaussian kernel weighted merging algorithm to selec-
+020            tively merge all states within each merging set. Our merging set identification al-
+021            gorithm stimulates the second observation that KV cache sparsity, from similarity
+022            perspective, is independent of the dataset and remains persistent at the model level.
+023            We conduct extensive experiments to demonstrate the effectiveness of KVMerger
+024            for long-context tasks under constrained memory budgets, on Llama2-7B/13B-
+025
+               chat and Mistral-7B-instruct. Our results show that KVMerger achieves superior
+               performance across tasks compared to other KV cache compression techniques,
+026
+               including H2O and CaM on LongBench, ZeroScroll, and Needle-in-a-Haystack
+027
+               benchmarks, with both 50% and 35% KV cache budgets.
+028
+029
+030   1   I NTRODUCTION
+031
+032   Large Language Models (LLMs) have demonstrated exceptional performance across a variety of ap-
+033
+      plications, particularly excelling in long-context scenarios that are increasingly relevant in everyday
+      life. However, as LLMs process larger volumes of data over extended contexts, KV cache starts to
+034
+      pose a substantial obstacle to LLM’s performance and scalability. For example, a 175-billion pa-
+035
+      rameter GPT-3 model, with a batch size of 64 and a sequence length of 4,096 tokens (including both
+036   prefilled and generated tokens), necessitates approximately 1,208 GB of GPU memory (Liu et al.,
+037   2024), which exceeds the memory capacity of most advanced GPUs. Therefore, compressing KV
+038   cache while maintaining LLM accuracy, especially for long-context tasks, becomes quite essential.
+039
+      Current efforts for KV cache compression can be broadly categorized into three types: quantization,
+040
+      eviction, and merging, as illustrated in Figure 1. Quantization replaces floating point KV states
+041
+      (e.g., FP16) with low-bit values to decrease memory usage. Recent advancements, such as Coupled
+042   Quantization (Zhang et al., 2024b) and KIVI (Zirui Liu et al., 2023), have demonstrated that KV
+043   cache can be quantized to 1-bit or 2-bit precision while preserving performance. In contrast, KV
+044   cache eviction methods selectively remove unimportant states based on certain signals from the
+045   model, thereby reducing the memory footprint by limiting the number of key and value states in the
+046   KV cache (Xiao et al., 2024; Liu et al., 2023b; Zhang et al., 2023; Ge et al., 2024). While eviction-
+047   based methods have demonstrated promising results on short context tasks with simple perplexity
+048   metrics, a significant drawback of eviction methods is their potential to accidentally and permanently
+049   remove important tokens, leading to context damage and adversely affecting their effectiveness in
+050
+      long-context tasks that heavily rely on context information.
+051   Very recently, KV cache merging has emerged a complementary method of eviction (Zhang et al.).
+052   Unlike eviction-based methods, KV cache merging technique does not strictly remove key and value
+053   states. Instead, it involves merging states that are otherwise to be dropped by eviction method into
+      single token state. By amalgamating states rather than directly evicting them, this method ensures
+
+
+                                                        1
+      Under review as a conference paper at ICLR 2025
+
+
+054                          KV Cache                           KV Cache Eviction                      KVKV
+                                                                                                          Cache Merging
+                                                                                                            Cache Merging
+055                         Quantization                              Attention Score
+                                                           0.6 1.2 0.1 3.4 1.6 5.8 2.0 4.1
+056              K1    K2    K3   K4   K5   K6   K7   K8         K2   K3    K4    K5    K6   K7 K8   K1 2.0     K4 3.5
+                                                                                                            K3 6.9
+                                                                                                         K2 0.5        K6 4.2
+                                                                                                                   K5 1.0     K8
+                                                                                                                          K7 1.7
+                                                           K1                                        5.3
+057
+                      Quantization                              Retain Top-k                              Merging
+058
+059                                                                    K4    K6    K8
+                 K1    K2    K3   K4   K5   K6   K7   K8
+060
+061   Figure 1: Three categories of KV cache compression techniques: KV cache quantization (left), KV
+062   cache eviction (middle), and KV cache merging (right). For the illustration of KV cache eviction,
+063   we use aggregated attention scores as the eviction signal, and k is set to 3; for KV cache merging,
+064   we illustrate many-to-one merging. The key state in red represents the state which incorporates the
+065   information of other remaining states. Value states are processed in the same way as key states.
+066
+067   that essential information not captured by the attention scores is retained. It is noteworthy that,
+068   although token merging is well-established in computer vision (CV) (Zeng et al., 2022) (Bolya
+069   et al., 2023) (Kim et al., 2023) (Zhang et al., 2024a), the application of key and value states merging
+070   in LLMs has not been extensively explored due to several significant challenges. It is difficult to
+071
+      choose criteria for identifying sets of states to be merged without losing critical information, given
+      that LLM KV caches often have to serve long sequences with high dimensionality. Additionally,
+072
+      even after identifying the sets of states to be merged, it remains challenging to find the optimal
+073
+      merging policy, given that there are numerous algorithms for creating merged states. Effective
+074   merging techniques must strike a delicate balance between reducing memory usage and preserving
+075   the semantic integrity of the contexts.
+076
+077
+      To address the aforementioned challenges associated with KV cache merging, we propose an effec-
+      tive KV cache merging method for improving LLMs’ performance on long-context tasks. We start
+078
+      by introducing and analyzing an intriguing observation: key states exhibit high cosine similarity at
+079
+      the token level within a single sequence across different attention heads and model layers. our ob-
+080   servation also opens opportunities for effective merging of key and value states based on their cosine
+081   similarity. Subsequently, we formulate the KV cache merging as a constrained clustering problem,
+082   and propose an effective merging set identification method for KV cache merging. Based on that,
+083   we define KV cache sparsity from the perspective of states similarity. Our finding indicates that KV
+084   cache sparsity is independent of the dataset and remains persistent at the model level. Building on
+085   top of this, we propose a Gaussian kernel weighted merging function to merge states within each
+086   identified merging set. Our contributions can be summarized as follows:
+087   • As one of the pioneering researches concerning KV cache merging for LLMs, we developed
+088     KVMerger, an effective KV cache merging algorithm especially designed for long-context tasks,
+089     including merging set identification and Gaussian kernel weighted merging function.
+090
+      • We introduce an intriguing observation that key states share a high similarity at the token level
+091     within a single sequence, as an important complementary to the previous observations concerning
+092     high query states similarity (Dai et al., 2024) and intra-layer KV cache similarity (Liu et al., 2024).
+093     We also investigate the root cause of why such phenomenon appears.
+094
+      • We evaluate KVMerger on diverse long-context tasks including LongBench, ZeroScroll, and
+095
+        Needle-in-a-Haystack across various models under different KV cache budgets, and the results
+096     show comparable performance or much smaller performance gap compared to full cache budgets.
+097
+098   2   R ELATED W ORK
+099
+100
+      KV Cache Quantization. Quantization methods involve converting high-precision numerical val-
+101
+      ues of key and value states into lower-precision formats, thereby decreasing the storage requirements
+102   within the cache (Hooper et al., 2024; Sheng et al., 2023; Liu et al., 2023a; Zhang et al., 2024c).
+103   Due to the presence of outliers in key and value states, recent works such as KIVI (Zirui Liu et al.,
+104   2023) and Gear (Kang et al., 2024) employ fine-grained group-wise quantization, which quantize
+105   small channel groups within each token. MiKV (Yang et al., 2024) addresses the information loss
+106   introduced by KV cache eviction methods by preserving those KVs in lower precision rather than
+107   directly dropping them. ZipCache (He et al., 2024) proposes an efficient channel-separable quantiza-
+      tion scheme, disentangling the channel and token dimensions without excessive memory overhead.
+
+
+                                                                             2
+      Under review as a conference paper at ICLR 2025
+
+
+108
+      Different from quantization, this work studies compression of KV cache via states merging, which
+109   is complementary to quantization.
+110
+111   KV Cache Eviction. KV cache eviction methods focus on retaining those important key-value
+112
+      pairs and discard those unimportant ones permanently. One of the common selection policies of
+      key-value pairs is to exploit signals from the attention mechanism of LLMs. For example, H2O
+113
+      (Zhang et al., 2023), Scissorhands (Liu et al., 2023b), and RoCo (Ren & Zhu, 2024) compress
+114
+      KV cache by maintaining a small set of KV states whose corresponding tokens are determined by
+115   the ranking of attention scores. StreamingLLM (Xiao et al., 2024) finds that keeping the initial
+116   tokens, called attention sink, together with the recent window tokens is pivotal to maintain LLM’s
+117   performance. More recently, Ge et al. (2024) and Yu et al. (2024) find that attention sinks also occurs
+118   in the middle of the sentences, and Ge et al. (2024) introduces FastGen which can choose the most
+119   appropriate compression strategy for each heads with different attention distribution patterns.
+120
+      KV Cache Merging. Instead of permanently discarding key and value states, KV cache merging
+121   offers a promising direction for KV cache compression while maintaining the performance of LLMs.
+122   As the first work concerning cache merging, CaM (Zhang et al.) adaptively merges to-be-evicted
+123   value states into the remaining conserved value states, resulting in minimal output perturbation due
+124   to the merging operation. Recently, several concurrent work also propose to merge KV cache. For
+125   example, MiniCache (Liu et al., 2024) finds that KV states of some consecutive layers have high
+126   similarity and proposes an effective intra-layer KV cache merging and restoration algorithms to
+127   reduce memory usage by KV cache. Similarly, D2O Wan et al. (2024) selectively merges both value
+128   and key states to be evicted with those to be conserved using an Exponential Moving Average (EMA)
+129
+      threshold, and uses weighted merging based on cosine similarity. However, these methods rely
+      heavily on prior eviction strategies, defining effective KV cache merging algorithms remain open
+130
+      challenges. This paper is the first one that formally formulates the KV cache merging problem and
+131
+      conducts in-depth study of this problem via effective merging set identification policy and Gaussian
+132   weighted merging algorithm while exploiting the high similarities among key states.
+133
+134   3   P ROBLEM F ORMULATION
+135
+136   Formally, we study the performance impact of LLMs after compressing their KV cache. For a
+137   decoder only pre-trained LLM f with l layers, we denote key states and value states for each layer
+138   as K ∈ Rn×d and V ∈ Rn×d , respectively. Let Qt ∈ R1×d denote the query state at time step t.
+139
+      Then, the output Ot for each attention head at a certain layer of f can be formulated as:
+                                                                    Qt KT
+
+140                                Ot = At V, At = sof tmax          √                               (1)
+141                                                                    dk
+142   Our primary objective is to develop an efficient many-to-one merging algorithm M for KV cache,
+143
+      which generate merged key states and merged value states, respectively, such that the performance
+      of f with M remains similar or comparable to f with the original uncompressed KV cache.
+144
+145   Definition 3.1 (KV Cache Merging Problem, informal). Let Ot represent the original output of f ,
+146   and let Ot∗ represent the output after merging. M must satisfy the following optimization criterion:
+                                                         P
+147                                                         |Fl (I(K))|
+148                                       M = arg min l P               ,                               (2)
+                                                     I        l |K|
+149    subject to |Ot − Ot∗ | ≤ ϵ, where ϵ is an acceptable small positive value, ensuring the degradation
+150
+      in performance is negligible and within acceptable bounds. M also has the following properties:
+151
+      • |M (K) | / |K| ≤ 1, |M (V) |/ |V| ≤ 1
+152
+      • |M (K) | / |K| = |M (V) |/ |V| (make sure key and value states have the same compression ratio)
+153
+      The merging algorithm M consists of two parts: (i) a policy I that identifies sub KV cache sets, and
+154
+      (ii) a merging function F that maps the states in each merging set to a single state.
+155
+156   KV Cache Merging Sets Identification Policy I. We define the identification policy I as:
+157   • |K| = |Kc | + |Km |, |V| = |Vc | + |Vm |
+158   • |Kc | = |Vc |, |Km | = |Vm | (make sure key states and value states come in pair)
+159   where Kc and Km represent the subsets of key states to be conserved and merged, respectively, and
+160   Vc and Vm represent the subsets of value states to be conserved and merged, respectively. The above
+161   definition is a general formulation. For example, when |Kc | and |Vc | are zero, all key and value
+      states are merged, resulting in a full cache without any states eviction.
+
+
+                                                        3
+      Under review as a conference paper at ICLR 2025
+
+
+162
+163
+164
+165
+166
+167
+168
+169
+170   Figure 2: Visualization of the cosine similarity map of key states at the token-wise level produced
+171   by running the inference process on the Llama2-7b-chat model by randomly sampling data from the
+172   SynthWiki dataset. Observations include: (1) Key states share strong similarity within one sequence
+173
+      across different layers and heads; (2) The similarity between key states has the property of locality,
+      i.e., adjacent tokens exhibit higher similarity. More visualizations are shown in appendix A.2.
+174
+175
+176
+      KV Cache Merging Function F . We define the merging function F such that
+                            |K |         |K |
+177                F : {Si }i=1m → {s∗i }i=1m , where F (Si ) = s∗i , i = 1, 2, . . . , |Km |
+178   where Si represents each merging set, and s∗i is the merged new state for each merging set. |Km | is
+179   the total number of merging sets as previously defined.
+180
+181   4     O BSERVATIONS
+182
+183   In this section, we present two key observations illustrating that KV cache sparsity is universal for
+184   long-context tasks when viewed from the perspective of state similarity. These observations form
+185   the basis for our development of the adaptive KV cache merging algorithm KVMerger.
+186
+187   4.1   KV CACHE SIMILARITY
+188   Inspired by Dai et al. (2024), which reveals the phenomenon that query states share significant
+189   similarity at the token level in LLMs, we observe for the first time that key states also exhibit very
+190   high similarity at the token level within single sequence. We will first demonstrate the generalization
+191   of this token level similarity in key states and then analyze the potential reasons behind it.
+192   Observation: key states exhibit high, localized token-level similarity. We conduct the infer-
+193   ence process on the Llama2-7b-chat model by randomly sampling data from the SynthWiki dataset
+194   (Peysakhovich & Lerer, 2023) with average sequence length being about 4K. Then, we visualize the
+195   cosine similarity of key states at the token level within a sequence using the following equation:
+196                                                         ki kjT
+197
+                               similarity (ki , kj ) =                    , 1 ≤ i, j ≤ T,                   (3)
+                                                        ||ki || · ||kj ||
+198   where T is the total length of the sequence. ki represents the i-th key state, and kj represents the j-th
+199   key state. The results are shown in Figure 2. We observe that the similarity maps illustrate a clear
+200   oblique color segmentation. The closer it is to the diagonal, the more intense the color becomes,
+201   indicating that key states exhibit a strong localized similarity as query states do (Dai et al., 2024).
+202   Moreover, we observe from Figure 3(a) that the local similarity between one key state and the other
+203   consecutive key states shows different fluctuations for different attention heads. We also examine
+204   the cosine similarity of value states but do not observe the same property. One interesting question
+205
+      arises: why do such localized token similarity exhibit in key states, while value states do not?
+206   Analysis. A key difference between key states, query states, and value states is that Rotary Position
+207   Embedding (RoPE) (Su et al., 2023) is applied to the key and query states, but not to the value states.
+208   We hypothesize that this application of RoPE is the primary factor contributing to the observed
+209   differences in token-level similarity. Specifically, by rotating the embeddings in a multi-dimensional
+210   space, RoPE effectively captures the relative positions and order of tokens within a sequence. If we
+211
+      denote two adjacent input tokens as xm , xn ∈ Rd where m and n are two random integers, and
+      0 ≤ j ≤ (d − 1)/2. Then the position information of each token is incorporated by RoPE via the
+212
+      following equations:
+213                                                                                        −2j
+
+214                  km,[2j:2j+1] = Wk xm eimθj , kn,[2j:2j+1] = Wk xn einθj , θj = b d ,                 (4)
+215   where Wk is the matrix for key projection, and einθj is the rotary embedding component. b is called
+      as the rotary base, which is set to 10000 by default (Su et al., 2023). Then, we introduce two lemmas
+
+
+                                                         4
+      Under review as a conference paper at ICLR 2025
+
+
+216
+217
+218
+219
+220
+221
+222
+223
+224
+225   Figure 3: (a): The cosine similarity changes between the current token and its adjacent tokens
+226   across distinct attention heads and layers. We show the above changes for tokens with indices being
+227   2000, 3000, and 4000.(b) The layer-wise compression ratios obtained by our proposed merging
+228
+      set identification algorithm for different samples and different tasks. (c) The comparison of long-
+      context performance between H2O and average weighted merging with our proposed merging set
+229
+      identification algorithm. (d) The illustration of Gaussian kernel function with different values of σ.
+230
+231
+      that clearly show the conditions under which two token embeddings exhibit high cosine similarity
+232
+      after the application of the RoPE operation.
+233
+234   Lemma 4.1 (Informal). Consider two vectors km , kn ∈ R1×d . If their cosine similarity is 1, then
+                                                                           T                             T
+235   the cosine similarity of any 1 × 2 vectors, km,j = [km,2j , km,2j+1 ] and kn,j = [kn,2j , kn,2j+1 ] ,
+236   formed by the 2j-th and (2j + 1)-th elements of km and kn , 0 ≤ j ≤ (d − 1)/2, is also equal to 1.
+237
+      Lemma 4.2 (Informal). Consider integer j such that 0 ≤ j ≤ d−1   2 . Define the vectors km,j and
+238                                    T                             T                           ′
+      kn,j as km,j = [km,2j , km,2j+1 ] and kn,j = [kn,2j , kn,2j+1 ] , and define the vectors km,j and
+239    ′       ′                        ′
+240   kn,j as km,j = km,j /eimθj and kn,j = kn,j /einθj . If similarity (km,j , kn,j ) = 1, we have:
+                                                               ′   ′
+241                                                  ⟨km,j , kn,j ⟩
+242                                   cos (m − n) <   ′         ′     ≤ 1,
+                                                    ∥km,j ∥ · ∥kn,j ∥
+243            ′      ′                                    ′           ′          ′            ′
+      where ⟨km,j , kn,j ⟩ denotes the inner product of km,j and kn,j , and ∥km,j ∥ and ∥kn,j ∥ denote the
+244             ′           ′
+245   norms of km,j and kn,j , respectively.
+246   The complete proof of the above lemma is shown in appendix A.1. The conclusions of lemmas 3.1
+                                                                                                       ′
+247   and 3.2 are the necessary conditions of similarity(km,j , kn,j ) = 1. A cosine similarity of km,j and
+248    ′
+      kn,j falling beyond the range (cos (m − n), 1] will result in the failure of similarity(km,j , kn,j ) = 1.
+249
+      The analysis above clarifies why value states exhibit low similarity at the token level. Without the
+250   RoPE operation, value states are incapable of achieving rotation to comparable angles. The above
+251   analysis also indicates that merging highly similar key states is sensible.
+252
+253   4.2   P ERSISTENT KV CACHE SPARSITY
+254
+255
+      We have shown that key states within a sequence exhibit significant token-level similarity in LLMs.
+      Leveraging this, we apply a specialized greedy clustering algorithm to group consecutive key states
+256
+      with similarity values above a certain threshold, processing from the last to the first token. This
+257
+      yields a set of groups, each containing highly similar consecutive key states, forming a merging set.
+258   The number of this merging set corresponds to the number of key states after merging. Details of
+259   this set identification algorithm will be formally introduced in Section 5.1.
+260
+261
+      Observation: The KV cache sparsity for different samples are persistent at the model level.
+      Figure 3(a) shows that the similarity distributions of different tokens vary across distinct attention
+262
+      heads and layers. The size of each subset of key states is governed by the similarity threshold de-
+263
+      fined. Lowering the threshold results in the inclusion of a larger number of key states within a single
+264   merging set, thereby leading to varied compression ratios across all attention heads and layers. To
+265   investigate the actual compression ratio achieved by the previous set identification algorithm, we
+266   conduct inference processes on the Llama2-7b-chat model. This involves randomly sampling 200
+267   instances from the subset of LongBench (Bai et al., 2024) tasks and calculating the average com-
+268   pression ratio for each layer, as shown in Figure 3(b). We observe that the layer-wise compression
+269   ratios were highly consistent across different samples from the same task and even across different
+      tasks. This intriguing finding suggests that the kv cache sparsity, resulting from the high similarity
+
+
+                                                          5
+      Under review as a conference paper at ICLR 2025
+
+
+270
+271
+272
+273
+274
+275
+276
+277
+278
+279
+280
+281
+282   Figure 4: The whole framework of KVMerger is comprised of two major modules. The first module
+283   is to identify the merging set. The toy similarity map is used to illustrate this process, and the
+284   threshold for cosine similarity is set to 0.8. The second module is to merge key and value states
+285   within each identified merging set via Gaussian kernel weighted merging. The key state in red color
+286   represents the pivotal key state, where all the remaining key states should be weighted merged to
+287   that one. The values on key states represent the aggregated attention scores.
+288
+289
+      exhibited by key states, is independent of the dataset and remains persistent at the model level. The
+      same static KV cache sparsity property can be observed in other models as Appendix A.3 shown.
+290
+291   Insights The observed static KV cache sparsity suggests that it is possible to determine the layer-
+292   wise compression ratios by adjusting the cosine similarity threshold, making it convenient for us to
+293   control the total compression ratio for a certain model, thereby reducing the KV cache memory.
+294
+295   5     P ROPOSED A DAPTIVE KV M ERGING A LGORITHM
+296
+      In this section, we propose KVMerger, an adaptive KV merging algorithm, for LLMs based on the
+297   above observations. The whole pipeline of KVMerger is depicted in Figure 4. We first introduce the
+298   merging set identification algorithm in Section 5.1, which can be viewed as solving a constrained
+299   clustering problem. We propose a specialized greedy clustering algorithm to solve this. In Sec-
+300   tion 5.2, we delineate Gaussian kernel weighted merging, which is a many-to-one states merging
+301   algorithm without introducing significant information loss.
+302
+303
+      5.1   G REEDY P OLICY FOR M ERGING S ET I DENTIFICATION
+304   To solve the merging set identification problem described in Section 3, we regard it as a variant of
+305   clustering problem, which we define below:
+306   Definition 5.1 (Constrained Clustering Problem for KV Cache Merging, formal). Given the key
+307   states to be merged as Km = {k1 , k2 , . . . , kn } from a certain attention head at a certain layer of f ,
+308   where each kn ∈ R1×d , and a similarity function δ : Km × Km → Rn×n , and a cosine similarity
+309   threshold θ, partition Km into c merging sets {S1 , S2 , . . . , Sc } such that the intra-cluster similarity
+310   is maximized and the inter-cluster
+                                        similarity is minimized, which can be expressed       as:
+311                                        c
+                                           X      X                           c
+                                                                              X              X
+312                      max                               δ(ka , kb ) −                               δ(ka , kb )
+                      S1 ,S2 ,...,Sc
+313                                        i=1 ka ,kb ∈Si                   (i,j),i̸=j ka ∈Si ,kb ∈Sj
+314                                                                                                      Sc
+      • Each merging set Si should satisfy: Si ∩ Sj = ∅ for                        i ̸= j,    and          i=1 Si = Km ;
+315
+      • ∀Si , ∃j such that Si = {kj , kj+1 , · · · , kj+|Si |−1 }.
+316
+317   The similarity function, δ, we used here is cosine similarity based on the observation in Section
+318   4.1. In order to conserve the locality similarity property of key states, the merging set identification
+319   problem is a constrained clustering problem, meaning that all elements in one cluster are expected
+320
+      be consecutive, and we do not merge states with high similarity but far away from each other for
+      simplicity. Then, we propose a specialized greedy clustering algorithm to find all merging sets
+321
+      shown as Algorithm 1, which follows the above requirements.
+322
+323   KVMerger also retains the KV states whose corresponding aggregated attention scores fall within
+      the top-k range, including both attention sinks and heavy-hitters, which represent the most impor-
+
+
+                                                                     6
+      Under review as a conference paper at ICLR 2025
+
+
+324
+      tant and frequently accessed elements by LLMs. We assume that those key and value states are
+325   quite sensitive to merging and cannot participant in merging process to avoid information damage.
+326
+327   Algorithm 1 Merging Set Identification           Algorithm 2 Merging Policy
+328    1: procedure C LUSTER(Km , δ, θ)                 1: procedure M ERGE(Sc , A)
+329    2:    Initialize empty lists G and C, j = |Km | 2:     Compute aggregated attention score for
+330    3:    Add kj to C                                       each state in the merging set Sc :
+                                                                     P|Sc |
+331
+       4:    for i = j − 1 to 1 do                              ai = i=1     A [i, :]
+       5:        if δ(ki , kj ) > θ then                3:    Find pivotal state: p = argmax (ai )
+332
+       6:             Add ki to C                                                       i∈Sc
+333
+       7:        else                                   4:    for j = 1 to |Sc | do
+334    8:             Add C to G, j = i                 5:        gpj = G(kp , kj )
+335    9:             Initialize a new C with kj        6:    end for      P
+336   10:        end if                                 7:    wj = gP pj /    gpj
+337   11:    end for                                          kM =       wj k j
+338   12:    return G                                   8:    return kM
+339   13: end procedure                                 9: end procedure
+340
+341
+342   5.2    G AUSSIAN K ERNEL W EIGHTED M ERGING
+343
+344   Definition 5.2 (Weighted KV cache Merging, formal). Given identified merging sets of key states
+345   and value states as Sk = {ki , ki+1 , . . . , kp , . . . ki+n } and Sv = {vi , vi+1 , . . . , vp , . . . vi+n } , where
+346   kp and vp denote the pivotal key state and pivotal value state, respectively. Then, the weighted
+347
+      merging key states and value states can be defined as:
+                                             X                                       X
+348                       kp∗ = wp kp +                 wi ki , vp∗ = wp vp +                 wi vi                       (5)
+349                                           ki ∈Sk ,i̸=p                          vi ∈Sv ,i̸=p
+350   where wp and wi denote the weight assigned to the pivotal state and other states in the merging set.
+351   We define the weighted merging function for KV cache merging in Definition 5.2, which follows the
+352   many-to-one merging definitions from Wan et al. (2024). In terms of Definition 5.2, two principal
+353   design factors directly influence merging efficacy. The first factor is the selection of the pivotal state,
+354   to which all other states are merged. The second factor involves the assignment of weights to each
+355   state, with the pivot state having the largest weight to preserve the information.
+356   Selection for Pivotal State We follow previous token eviction methods that using aggregated atten-
+357   tion score to select pivotal token as it indicates the importance of tokens, which can be expressed as:
+358                                                                 |Sc |
+                                                                    X
+359                                   kp = argmax (ai ), ai =             A [i, :] ,                      (6)
+360                                                i∈Sc                    i=0
+361   where A is the attention map of the whole sequence. Note that the index of pivotal token for value
+362   states within each merging set is the same as key states.
+363   Gaussian Kernel Weights Initially, we use average weighted method to merge all states for each
+364   merging set. However, LLM’s performance is sub-optimal via this simple method as shown in Figure
+365   3(c). To reduce the influence of dissimilar or distant states, we utilize Gaussian kernel weighted
+366   merging, which is expressed as:
+                                                                        P|Sc |             2
+367                                            ||kp − ki ||2
+
+                                                                           i=0 ||kp − ki ||
+368                 gpi = G(kp , ki ) = exp −                  ,   σ =        √              .       (7)
+                                                   2σ 2                          2|Sc |
+369
+370   Gaussian kernel is able to assign greater weight to elements that are nearer to the pivotal state,
+371   offering a smooth and flexible weighting that reduces noise and outlier impact. This local weighting
+372   characteristic ensures that the merged result is significantly shaped by nearby states, maintaining
+373
+      local structure. Then, the merging weights for key states and value states can be formalized as:
+                                               gpi                    1
+374                                  wi = P|S |       , wp = P|S |          .                           (8)
+                                                c                     c
+375                                           j=0 gpj               j=0 gpj
+376   As demonstrated in Definition 5.2, the weight assigned to each ki and vi is directly governed by
+377   the squared l2 norm between the pivotal token and the remaining tokens. This indicates that if ki
+      is close to kp in the Euclidean space, more weight will be assigned to ki as Figure 3(d) illustrates.
+
+
+                                                                7
+      Under review as a conference paper at ICLR 2025
+
+
+378          Table 1: KVMerger for Llama2-7B/13B-chat and Mistral-7B-Instruct on LongBench datasets.
+379   models                     budget    method      2wikimqa gov report   narrativeqa   pr en multifieldqa en   trec    multi news   triviaqa   qasper   avg.
+380                              100%     Full Cache    31.45      26.99        18.74      8.00       36.60        64.00     26.26       83.09     21.83    35.22
+
+381       Llama2-7B-chat                    H2O         29.96      24.86        17.48      7.00       33.58        63.50     26.00       82.51     21.04    34.00
+                                  50%       CaM         30.69      24.46        17.08      6.50       33.98        63.50     24.66       82.17     20.00    33.67
+382
+                                          KVMerger      32.99      25.31        18.50      7.33       36.89        64.00     26.29       83.62     20.04    35.02
+383                                         H2O         30.57      24.48        17.85      7.00       32.17        63.00     25.37       80.89     20.04    33.49
+384                                         CaM         31.06      23.80        18.36      6.00       33.07        62.50     25.23       81.86     18.37    33.36
+                                  35%
+385                                       KVMerger      32.29      25.24        19.12      7.00       33.82        63.50     25.64       82.76     21.09    34.50
+386                              100%     Full Cache    13.21      27.59        14.42      15.25      27.44        68.50     26.69       87.42     17.15    33.07
+                                            H2O         13.39      26.20        15.01      15.50      26.40        68.00     25.35       84.73     17.10    32.40
+          Llama2-13B-chat
+
+
+387
+                                  50%       CaM         13.30      25.88        13.47      15.00      26.96        67.50     26.06       84.65     16.58    32.16
+388
+                                          KVMerger      13.46      26.63        14.4       16.00      27.29        68.50     26.12       87.48     17.22    33.01
+389                                         H2O         12.26      25.52        13.14      14.50      25.75        67.50     25.59       83.53     16.35    31.57
+390                               35%       CaM         13.43      25.37        13.58      12.50      25.70        67.50     25.04       84.95     16.34    31.60
+391                                       KVMerger      12.61      26.12        13.60      14.00      26.75        68.00     26.32       86.76     16.24    32.27
+                                 100%     Full Cache    31.47      26.55        21.96      25.00      39.50        61.00     26.44       83.89     30.12    38.44
+392
+          Mistral-7B-Instruct
+
+
+                                            H2O         29.21      19.91        17.65      8.00       25.50        53.00     19.95       74.55     21.51    29.92
+393
+                                  50%       CaM         29.57      22.67        19.43      12.00      28.95        58.00     20.17       81.82     21.87    32.72
+394                                       KVMerger      32.44      24.05        21.85      23.00      31.23        60.00     20.87       84.16     24.52    35.79
+395                                         H2O         12.30      5.16         3.64       0.62       11.95        37.50     18.99       17.08     14.05    13.48
+396                               35%       CaM         28.77      18.70        17.76      8.50       25.31        45.50     19.72       72.88     17.25    28.27
+397                                       KVMerger      30.77      20.99        23.58      23.50      28.10        60.5      19.94       83.82     24.13    35.04
+
+398
+399   Specifically, if σ approaches 0 and ||kp − ki ||2 is significantly different from 0, the weight assigned
+400   to ki tends towards 0. We empirically define σ as the mean value of gpi for all tokens within each
+401   merging set to avoid such situation. The complete merging policy is described by Algorithm 2.
+402
+403   6                         E XPERIMENT
+404
+405   6.1                       E XPERIMENTAL S ETTINGS
+406
+      Models and Tasks We evaluate KVMerger using three models: Llama2-7B/13B-chat (Touvron
+407   et al., 2023) and Mistral-7B-Instruct-v1.0(Jiang et al., 2023). Our evaluation focuses primarily on
+408   instruction-tuned models, as these are meticulously optimized for dialogue use cases and question-
+409   answering scenarios. The above three models are evaluated on two commonly used benchamrks
+410   for long-context scenario, that is, LongBench (Bai et al., 2024) and ZeroScrolls (Shaham et al.,
+411   2023). Specifically, we use nine datasets in LongBench: 2WikiMQA, gov report, NarrativeQA,
+412   passage retrieval en, MultifieldQA en, TREC, multi news, TriviaQA, qasper. We use seven datasets
+413   in ZeroScrolls: gov report, SummScreenFD, QMSum, SQuALITY, Qasper, NarrativeQA, Book-
+414   SumSort. Additionally, we also individually test our methods on RAG tasks with the Needle-in-a-
+415
+      Haystack test (Guerreiro et al., 2023). The performance of our method for LLMs on all the above
+      tasks are also compared with existing eviction method H2O and merging method CaM.
+416
+417   Implementation details We test KVMerger in two compression scenarios. The first one is 50%
+418   KV cache budget, where the proportion of recent tokens to be reserved is set to 0.17%, and the
+419   proportion of states not selected for the merging process in terms of aggregated attention scores is
+420   set to 0.12%. The remaining key states and value states participate in the merging process. The
+421
+      second compression scenario is 35% KV cache budget, where the proportion of recent tokens is set
+      to 0.08%, and the proportion of states not selected for the merging process is set to 0.02%. The
+422
+      cosine similarity threshold for both two scenarios is set to 0.75. We conducted our experiments on
+423
+      a cluster with A100 40GB GPUs and a cluster with A100 80GB GPUs. The evaluation process
+424   for LongBench and ZeroScrolls follows THUDM (2024) and Lab (2024). The implementation of
+425   Needle-in-a-Haystack test follows Kamradt.
+426
+427   6.2                       E XPERIMENTAL R ESULTS ON L ONG - CONTEXT TASKS
+428
+429   LongBench Results The evaluation results of nine selected LongBench datasets on Llama2-
+430   7B/13B-chat and Mistral-7B-Instruct-v1.0 are shown in Table 1. We compare the current KV cache
+431   compression methods, including H2O, CaM, with our proposed KV merging method KVMerger by
+      preserving both 50% and 35% of contexts in the KV cache. Our results demonstrate that KVMerger
+
+
+                                                                                           8
+      Under review as a conference paper at ICLR 2025
+
+
+432
+433
+434
+435
+436
+437
+438
+439
+440
+441
+442
+443
+444
+445
+446
+      Figure 5: The visualization of needle-in-a-haystack test on Llama2-7B-chat with different KV cache
+447
+      compression methods. The x-axis represents the length of contexts, and the y-axis represents the
+448
+      document depth where the needle is inserted.
+449
+450
+451   consistently outperforms the other KV cache compression techniques across nearly all selected
+452   datasets from LongBench. Notably, the performance gaps between our algorithm and the full KV
+453
+      cache scenario for both Llama2-7B/13B-chat and Mistral-7B-Instruct-v1.0 are significantly smaller
+      than the other KV compression methods. Another interesting finding is that the latest value states
+454
+      merging method, CaM, does not perform well on long-context tasks. This may be attributed to the
+455
+      information loss results from eviction of key states, despite the merging of value states.
+456
+457   Note that Mistral-7B-Instruct model leverages Grouped-Query-Attention (GQA) to optimize KV
+458   cache memory usage, where each key state corresponds to four query states. When applying H2O
+459
+      to each key state, rather than duplicating states, we use a single attention map. This attention map
+      is generated by averaging the values of four attention maps formed by the four query states, which
+460
+      determines the states to be evicted. For KVMerger, we also utilize the same attention map to select
+461
+      pivotal states, ensuring a fair comparison. Our results indicate a significant performance drop for
+462   Mistral-7B-Instruct-v1.0 when using H2O. Conversely, KVMerger demonstrates the smallest per-
+463   formance decline under both 35% and 50% KV cache budgets, highlighting its efficiency on GQA.
+464
+465
+      ZeroScrolls Results We also evaluate Llama2-7B-chat on ZeroScrolls datasets using different KV
+      cache compression techniques, which are shown as Table 6 in Appendix A.4. Table 6 demonstrates
+466
+      that our proposed KV cache merging method effectively restores the performance of the Llama2-7B-
+467
+      chat model across all selected ZeroScrolls datasets under both 35% and 50% cache budgets. This
+468   suggests that KVMerger not only mitigates performance degradation but also optimizes the model’s
+469   handling of extensive data sequences that approach the model’s maximum context window.
+470
+471
+      Needle In A Haystack Results We also conduct a detailed comparison of KVMerger with other
+      KV cache compression techniques on retrieval tasks using the needle-in-a-haystack test. This test
+472
+      involves placing a random fact in the middle of a long context window and assessing the model’s
+473
+      ability to retrieve this statement across varying document depths and context lengths. Specifically,
+474   we test Llama2-7B-chat on document depths ranging from 5% to 95% and context lengths ranging
+475   from 1000 to 4500 tokens under both 35% and 50% cache budgets. The corresponding results are il-
+476   lustrated as Figure 5. Our findings indicate that both CaM and our merging algorithm outperform the
+477   eviction method H2O. However, our proposed method achieves the highest retrieval performance,
+478   consistently delivering high scores across various context lengths and depth percentages.
+479
+      Memory Usage Analysis We analyze the inference memory consumption of KVMerger under full
+480   cache, 35%, and 50% KV cache budgets. Specifically, we use the Llama2-7B/13B-chat models
+481   with an input length of 3,900 and generate 1,024 tokens on a single A100 80GB GPU. During
+482   inference, we measure both the peak memory and KV cache memory usage, as presented in Table
+483   2. Our results show that KVMerger intuitively reduces KV cache memory consumption by up to
+484   60% under 35% KV cache budget. Additionally, it also decreases peak memory usage during the
+485   generation process. These findings demonstrate that KVMerger significantly reduces KV cache
+      memory without incurring any additional memory overhead.
+
+
+                                                       9
+      Under review as a conference paper at ICLR 2025
+
+
+
+                         Table 2: KV cache and peak memory usage for Llama2 Models
+486
+                                    Model             Scenario              KV Cache        Peak Memory
+487
+                                                     Full Cache              2.00 GB          18.83 GB
+488                        Llama2-7B-chat           KVMerger 50%             1.02 GB          17.90 GB
+489                                                 KVMerger 35%             0.65 GB          17.55 GB
+490                                                  Full Cache              3.13 GB          32.21 GB
+491                        Llama2-13B-chat          KVMerger 50%             1.56 GB          31.67 GB
+                                                    KVMerger 35%             1.22 GB          31.30 GB
+492
+493
+494   6.3   A BLATION S TUDY
+495
+496   Choice of Pivotal State in Gaussian Kernel Weighted Merging As mentioned in Section 5.2, the
+497   selection of pivotal state for each merging set is directly related to the performance of KVMerger.
+498   To show the significance of defining the pivotal state as our method, we compare it with randomly
+499   selecting pivotal state within each merging set by using Llama2-7B-chat model with 50% cache
+500
+      budget. The comparison is shown in Table 3, from which we can see that randomly selecting pivotal
+      states are detrimental to LLMs’ performance on long-context tasks.
+501
+502                  Table 3: KVMerger with different methods of pivotal states selection.
+503                 Pivotal State     2wikimqa     gov report    narrativeqa     pr en    multifieldqa en    avg.
+504                    Ours             32.99        25.31          18.50         7.33        36.89         24.20
+                      Random            30.01        24.07          17.72         6.50        33.30         22.12
+505
+506   Choice of Merging Policy We also compare our proposed Gaussian weighted merging algorithm
+507   with average weighted merging to illustrate the significance of Gaussian weighted merging. Specifi-
+508   cally, we evaluate LongBench tasks on Llama2-7B-chat model with average weighted merging with
+509   50% cache budget, and the results shown in Table 4. We can see that assigning all states with the
+510   same merging weights dramatically degrade the performance. One reasonable explanation is that
+511   average merging introduces information distortion by treating every states equally.
+512                                 Table 4: KVMerger with different merging policy.
+513                    σ            2wikimqa     gov report     narrativeqa     pr en     multifieldqa en    avg.
+514                 Gaussian          32.99        25.31           18.50         7.33          36.89        24.20
+                    average           27.04        24.96           17.50         6.34          33.37        21.84
+515
+516   Choice of σ in Gaussian Kernel Weights In section 5.2, we set σ as the mean of l2 distance between
+517   the pivotal state and all the remaining states within each merging set. To verify the effectiveness of
+518   the proposed σ computation method, we apply KVMerger on Llama2-7B-chat model with various
+519   σ values, and evaluation results are shown as Table 5. We can find that when σ is computed by
+520   using our method, KVMerger demonstrate the optimal results in terms of the overall performance
+521   compared with other σ values.
+522                  Table 5: KVMerger with different σ values under 50% cache budget.
+523                  σ       2wikimqa       gov report        narrativeqa      pr en     multifieldqa en     avg.
+524                  1         31.48          25.52              18.98          6.25         36.59          23.76
+525                  3         30.84          25.19              18.51          4.67          37.48         23.34
+526                 ours       32.99          25.31              18.50          7.33          36.89         24.20
+                     6         31.69          25.39              18.45          7.83          35.82         23.84
+527
+528
+529
+      7     C ONCLUSION
+530
+531
+      In this paper, we propose KVMerger, an adaptive KV cache merging method inspired by the ob-
+532
+      servation that key states exhibit high and persistent similarity within each sequence, allowing for
+533
+      layer-wise KV cache compression. We initially abstract the merging set identification problem as
+534   a constrained clustering problem and introduce a specialized greedy clustering algorithm to iden-
+535   tify merging sets based on cosine similarities between key states. Furthermore, we implement a
+536   Gaussian Kernel weighted merging method to merge key and value states within each merging set.
+537   Compared to other KV cache eviction and merging methods, our approach achieves superior re-
+538   sults on the LongBench and ZeroScrolls benchmark under the same cache budget. Additionally, our
+539   method effectively recovers the model’s long-context retrieval capabilities, as demonstrated by the
+      needle-in-a-haystack tests.
+
+
+                                                                  10
+      Under review as a conference paper at ICLR 2025
+
+
+540
+      R EFERENCES
+541
+542
+      Yushi Bai, Xin Lv, Jiajie Zhang, Hongchang Lyu, Jiankai Tang, Zhidian Huang, Zhengxiao Du, Xiao
+543
+        Liu, Aohan Zeng, Lei Hou, Yuxiao Dong, Jie Tang, and Juanzi Li. Longbench: A bilingual, mul-
+544     titask benchmark for long context understanding, 2024. URL https://arxiv.org/abs/
+545     2308.14508.
+546
+547   Daniel Bolya, Cheng-Yang Fu, Xiaoliang Dai, Peizhao Zhang, Christoph Feichtenhofer, and Judy
+548
+        Hoffman. Token merging: Your vit but faster, 2023. URL https://arxiv.org/abs/
+        2210.09461.
+549
+550   Jincheng Dai, Zhuowei Huang, Haiyun Jiang, Chen Chen, Deng Cai, Wei Bi, and Shuming Shi.
+551      Corm: Cache optimization with recent message for large language model inference, 2024. URL
+552      https://arxiv.org/abs/2404.15949.
+553
+      Suyu Ge, Yunan Zhang, Liyuan Liu, Minjia Zhang, Jiawei Han, and Jianfeng Gao. Model tells you
+554
+        what to discard: Adaptive kv cache compression for llms, 2024. URL https://arxiv.org/
+555
+        abs/2310.01801.
+556
+557   Nuno M. Guerreiro, Elena Voita, and André F. T. Martins. Looking for a needle in a haystack:
+558     A comprehensive study of hallucinations in neural machine translation, 2023. URL https:
+559     //arxiv.org/abs/2208.05309.
+560
+      Yefei He, Luoming Zhang, Weijia Wu, Jing Liu, Hong Zhou, and Bohan Zhuang. Zipcache:
+561     Accurate and efficient kv cache quantization with salient token identification, 2024. URL
+562     https://arxiv.org/abs/2405.14256.
+563
+564   Coleman Hooper, Sehoon Kim, Hiva Mohammadzadeh, Michael W. Mahoney, Yakun Sophia Shao,
+565     Kurt Keutzer, and Amir Gholami. Kvquant: Towards 10 million context length LLM inference
+566
+        with KV cache quantization. CoRR, abs/2401.18079, 2024.
+567   Albert Q. Jiang, Alexandre Sablayrolles, Arthur Mensch, Chris Bamford, Devendra Singh Chap-
+568     lot, Diego de las Casas, Florian Bressand, Gianna Lengyel, Guillaume Lample, Lucile Saulnier,
+569     Lélio Renard Lavaud, Marie-Anne Lachaux, Pierre Stock, Teven Le Scao, Thibaut Lavril,
+570     Thomas Wang, Timothée Lacroix, and William El Sayed. Mistral 7b, 2023. URL https:
+571     //arxiv.org/abs/2310.06825.
+572
+      George Kamradt. Llmtest: Needle in a haystack. https://github.com/gkamradt/
+573     LLMTest_NeedleInAHaystack. Accessed: 2024-07-08.
+574
+575   Hao Kang, Qingru Zhang, Souvik Kundu, Geonhwa Jeong, Zaoxing Liu, Tushar Krishna, and Tuo
+576     Zhao. Gear: An efficient kv cache compression recipe for near-lossless generative inference of
+577     llm, 2024. URL https://arxiv.org/abs/2403.05527.
+578   Minchul Kim, Shangqian Gao, Yen-Chang Hsu, Yilin Shen, and Hongxia Jin. Token fusion: Bridg-
+579    ing the gap between token pruning and token merging, 2023. URL https://arxiv.org/
+580    abs/2312.01026.
+581
+582   TAU NLP Lab. Zeroscrolls: Zero-shot summarization and reasoning language system. https:
+583
+        //github.com/tau-nlp/zero_scrolls, 2024. Accessed: 2024-07-02.
+584   Akide Liu, Jing Liu, Zizheng Pan, Yefei He, Gholamreza Haffari, and Bohan Zhuang. Minicache:
+585     Kv cache compression in depth dimension for large language models, 2024. URL https:
+586     //arxiv.org/abs/2405.14366.
+587
+588
+      Zechun Liu, Barlas Oguz, Changsheng Zhao, Ernie Chang, Pierre Stock, Yashar Mehdad, Yangyang
+        Shi, Raghuraman Krishnamoorthi, and Vikas Chandra. LLM-QAT: data-free quantization aware
+589
+        training for large language models. CoRR, abs/2305.17888, 2023a.
+590
+591   Zichang Liu, Aditya Desai, Fangshuo Liao, Weitao Wang, Victor Xie, Zhaozhuo Xu, Anastasios
+592     Kyrillidis, and Anshumali Shrivastava. Scissorhands: Exploiting the persistence of importance
+593     hypothesis for llm kv cache compression at test time, 2023b. URL https://arxiv.org/
+        abs/2305.17118.
+
+
+                                                    11
+      Under review as a conference paper at ICLR 2025
+
+
+594
+      Alexander Peysakhovich and Adam Lerer. Attention sorting combats recency bias in long context
+595     language models, 2023. URL https://arxiv.org/abs/2310.01427.
+596
+597   Siyu Ren and Kenny Q. Zhu. On the efficacy of eviction policy for key-value constrained generative
+598     language model inference, 2024. URL https://arxiv.org/abs/2402.06262.
+599
+      Uri Shaham, Maor Ivgi, Avia Efrat, Jonathan Berant, and Omer Levy. Zeroscrolls: A zero-shot
+600
+        benchmark for long text understanding, 2023. URL https://arxiv.org/abs/2305.
+601     14196.
+602
+603   Ying Sheng, Lianmin Zheng, Binhang Yuan, Zhuohan Li, Max Ryabinin, Beidi Chen, Percy Liang,
+604     Christopher Ré, Ion Stoica, and Ce Zhang. Flexgen: High-throughput generative inference of
+605     large language models with a single GPU. In International Conference on Machine Learning,
+606
+        ICML 2023, 23-29 July 2023, Honolulu, Hawaii, USA, volume 202 of Proceedings of Machine
+        Learning Research, pp. 31094–31116. PMLR, 2023.
+607
+608   Jianlin Su, Yu Lu, Shengfeng Pan, Ahmed Murtadha, Bo Wen, and Yunfeng Liu. Roformer: En-
+609      hanced transformer with rotary position embedding, 2023. URL https://arxiv.org/abs/
+610      2104.09864.
+611
+      THUDM. Longbench. https://github.com/THUDM/LongBench, 2024. Accessed: 2024-
+612
+        07-02.
+613
+614   Hugo Touvron, Louis Martin, Kevin Stone, Peter Albert, Amjad Almahairi, Yasmine Babaei, Niko-
+615     lay Bashlykov, Soumya Batra, Prajjwal Bhargava, Shruti Bhosale, et al. Llama 2: Open founda-
+616     tion and fine-tuned chat models. arXiv preprint arXiv:2307.09288, 2023.
+617
+      Zhongwei Wan, Xinjian Wu, Yu Zhang, Yi Xin, Chaofan Tao, Zhihong Zhu, Xin Wang, Siqi Luo,
+618
+        Jing Xiong, and Mi Zhang. D2o: Dynamic discriminative operations for efficient generative
+619
+        inference of large language models, 2024. URL https://arxiv.org/abs/2406.13035.
+620
+621   Guangxuan Xiao, Yuandong Tian, Beidi Chen, Song Han, and Mike Lewis. Efficient streaming lan-
+622     guage models with attention sinks, 2024. URL https://arxiv.org/abs/2309.17453.
+623
+      June Yong Yang, Byeongwook Kim, Jeongin Bae, Beomseok Kwon, Gunho Park, Eunho Yang,
+624
+        Se Jung Kwon, and Dongsoo Lee. No token left behind: Reliable kv cache compression via
+625     importance-aware mixed precision quantization, 2024. URL https://arxiv.org/abs/
+626     2402.18096.
+627
+628   Zhongzhi Yu, Zheng Wang, Yonggan Fu, Huihong Shi, Khalid Shaikh, and Yingyan Celine Lin. Un-
+629     veiling and harnessing hidden attention sinks: Enhancing large language models without training
+630
+        through attention calibration, 2024. URL https://arxiv.org/abs/2406.15765.
+631   Wang Zeng, Sheng Jin, Wentao Liu, Chen Qian, Ping Luo, Wanli Ouyang, and Xiaogang Wang. Not
+632    all tokens are equal: Human-centric visual analysis via token clustering transformer, 2022. URL
+633    https://arxiv.org/abs/2204.08680.
+634
+635   Liang Zhang, Anwen Hu, Haiyang Xu, Ming Yan, Yichen Xu, Qin Jin, Ji Zhang, and Fei Huang.
+636
+        Tinychart: Efficient chart understanding with visual token merging and program-of-thoughts
+        learning, 2024a. URL https://arxiv.org/abs/2404.16635.
+637
+638   Tianyi Zhang, Jonah Yi, Zhaozhuo Xu, and Anshumali Shrivastava. Kv cache is 1 bit per channel:
+639     Efficient large language model inference with coupled quantization, 2024b. URL https://
+640     arxiv.org/abs/2405.03917.
+641
+      Yuxin Zhang, Yuxuan Du, Gen Luo, Yunshan Zhong, Zhenyu Zhang, Shiwei Liu, and Rongrong Ji.
+642
+        Cam: Cache merging for memory-efficient llms inference. In Forty-first International Conference
+643
+        on Machine Learning.
+644
+645   Zhenyu Zhang, Ying Sheng, Tianyi Zhou, Tianlong Chen, Lianmin Zheng, Ruisi Cai, Zhao Song,
+646     Yuandong Tian, Christopher Ré, Clark Barrett, Zhangyang Wang, and Beidi Chen. H2 o: Heavy-
+647     hitter oracle for efficient generative inference of large language models, 2023. URL https:
+        //arxiv.org/abs/2306.14048.
+
+
+                                                     12
+      Under review as a conference paper at ICLR 2025
+
+
+648
+      Zhenyu Zhang, Shiwei Liu, Runjin Chen, Bhavya Kailkhura, Beidi Chen, and Atlas Wang. Q-hitter:
+649     A better token oracle for efficient llm inference via sparse-quantized kv cache. Proceedings of
+650     Machine Learning and Systems, 6:381–394, 2024c.
+651
+652   Zirui Liu, Jiayi Yuan, Hongye Jin, Shaochen Zhong, Zhaozhuo Xu, Vladimir Braverman, Beidi
+653     Chen, and Xia Hu. Kivi : Plug-and-play 2bit kv cache quantization with streaming asymmetric
+654
+        quantization. 2023. doi: 10.13140/RG.2.2.28167.37282. URL https://rgdoi.net/10.
+        13140/RG.2.2.28167.37282.
+655
+656
+657
+658
+659
+660
+661
+662
+663
+664
+665
+666
+667
+668
+669
+670
+671
+672
+673
+674
+675
+676
+677
+678
+679
+680
+681
+682
+683
+684
+685
+686
+687
+688
+689
+690
+691
+692
+693
+694
+695
+696
+697
+698
+699
+700
+701
+
+
+
+                                                     13
+      Under review as a conference paper at ICLR 2025
+
+
+702
+      A     A PPENDIX
+703
+704
+705   A.1    T HEORETICAL A NALYSIS
+706
+707   We present the formal and complete proofs of Lemma 4.1 and Lemma 4.2, which establish the
+708   cosine similarity condition for any two key state embeddings prior to the RoPE operation, given that
+709   their cosine similarity is equal to 1.
+710   Lemma 4.1 (Formal version of Lemma 4.1). Consider two vectors km , kn ∈ R1×d . If their
+711                                                                                                    T
+      cosine similarity is 1, then the cosine similarity of any 1 × 2 vectors, km,j = [km,j , km,2j+1 ] and
+712                            T
+      kn,j = [kn,2j , kn,2j+1 ] , formed by the 2j-th and (2j +1)-th elements of km and kn , 0 ≤ j ≤ d−1 2 ,
+713   is also equal to 1.
+714
+715
+      Proof. Since
+716
+                                              similarity (km , kn ) = 1,                                       (9)
+717
+      km and kn are collinear. Therefore,
+718
+                                                         km = αkn ,                                           (10)
+719
+      where α is a scalar. It means
+720
+                                                  km,2j = αkn,2j ,                                            (11)
+721                                             km,2j+1 = αkn,2j+1 .                                          (12)
+722   So,
+                                                          T                           T
+723                                   [km,2j , km,2j+1 ] = α [kn,2j , kn,2j+1 ] .                             (13)
+724   As a result,
+725                                          similarity (km,j , kn,j ) = 1                                    (14)
+726
+      Lemma 4.2 (Formal version of Lemma 4.2). Consider integer j such that 0 ≤ j ≤ d−1   2 . Define the
+727                                                      T                            T
+728   vectors km,j and kn,j as km,j = [km,2j , km,2j+1 ] and kn,j = [kn,2j , kn,2j+1 ] , and define the
+               ′        ′       ′                         ′
+729   vectors km,j and kn,j as km,j = km,j /eimθj and kn,j = kn,j /einθj . If similarity (km,j , kn,j ) =
+730   1, we have:
+                                                        ′     ′
+731                                                 ⟨km,j , kn,j ⟩
+                                    cos (m − n) <    ′          ′    ≤ 1,
+732                                                ∥km,j ∥ · ∥kn,j ∥
+733            ′      ′                                           ′           ′           ′       ′
+      where ⟨km,j , kn,j ⟩ denotes the inner product of km,j and kn,j , and ∥km,j ∥ and ∥kn,j ∥ denote the
+734             ′           ′
+      norms of km,j and kn,j , respectively.
+735
+736   Proof. Since j is an integer obeying 0 ≤ j ≤ d−1 2 , so
+737                                                     −2j
+738                                             −1 <          ≤ 0.                                            (15)
+                                                         d
+739   And b is set to be 10000 by default Su et al. (2023). Therefore,
+                                                        −2j
+740
+                                                 0 < b d ≤ 1,                                                 (16)
+741
+      which means
+742
+                                                   0 < θj ≤ 1.                                                (17)
+743
+744   Now, focus on the similarity between km,j and kn,j , and
+                                                         ′            ′
+745                               ⟨km,j , kn,j ⟩      ⟨km,j eimθj , kn,j einθj ⟩
+746                                                =   ′                ′          .                          (18)
+                                ∥km,j ∥ · ∥kn,j ∥    ∥km,j eimθj ∥ · ∥kn,j einθj ∥
+747
+      It is easy to derive that
+748                                              ′             ′
+                                            ∥km,j eimθj ∥ = ∥km,j ∥,                                          (19)
+749
+                                                     ′                    ′
+750                                         ∥kn,j einθj ∥ = ∥kn,j ∥,                                          (20)
+751   since the exponential terms do not change the vectors’ magnitude.
+752                                              ′            ′       ′           ′           ′       ′   ′
+      Then, substitute the complex forms of km,j and kn,j , km,j = km,2j + ikm,2j+1 and kn,j = kn,2j +
+753     ′                                  ′            ′
+754   ikn,2j+1 , respectively, back into ⟨km,j eimθj , kn,j einθj ⟩ and obtain
+                  ′            ′
+                                               ′          ′
+                                                                             ′  ′
+
+755           ⟨km,j eimθj , kn,j einθj ⟩ = ⟨ km,2j + ikm,2j+1 eimθj , kn,2j + ikn,2j+1 einθj ⟩.   (21)
+
+
+                                                              14
+      Under review as a conference paper at ICLR 2025
+
+
+756
+      From Euler equation, Equation 21 can be further expanded as
+757
+                         ′                         ′
+758                ⟨km,j eimθj , kn,j einθj ⟩
+759                  ′            ′                                                 ′                   ′
+760              =km,2j kn,2j cos (mθj ) cos (nθj ) + km,2j+1 kn,2j+1 sin (mθj ) sin (nθj )
+                              ′        ′                                                            ′                   ′
+761                 − km,2j kn,2j+1 cos (mθj ) sin (nθj ) − km,2j+1 kn,2j sin (mθj ) cos (nθj )
+762                           ′        ′                                                    ′                   ′
+
+763                 + km,2j kn,2j sin (mθj ) sin (nθj ) + km,2j+1 kn,2j+1 cos (mθj ) cos (nθj )
+                              ′        ′                                                            ′                   ′
+764                 + km,2j kn,2j+1 sin (mθj ) cos (nθj ) + km,2j+1 kn,2j cos (mθj ) sin (nθj )
+765                  ′            ′                                            ′                ′
+
+766              =km,2j kn,2j cos [(m − n)θj ] + km,2j+1 kn,2j+1 cos [(m − n)θj ]
+                              ′        ′                                                ′                   ′
+767                 + km,2j kn,2j+1 sin [(m − n)θj ] + km,2j+1 kn,2j sin [(m − n)θj ].                                          (22)
+768
+769   Substitute Equation 22 back into Equation 18, and
+770
+                                       ′               ′               ′       ′
+771       ⟨km,j , kn,j ⟩     km,2j kn,2j + km,2j+1 kn,2j+1
+772
+                           =           ′        ′          cos [(m − n)θj ]
+         ∥km,j ∥ · ∥kn,j ∥          ∥km,j ∥ · ∥kn,j ∥
+773                                            ′           ′               ′                ′
+
+774                                     km,2j kn,2j+1 − km,2j+1 kn,2j
+                                      +           ′        ′          sin [(m − n)θj ]
+775                                            ∥km,j ∥ · ∥kn,j ∥
+776                                            ′               ′                                                    ′       ′
+                                        km,j · kn,j                        km,j × kn,j
+777                               =     ′         ′     cos [(m − n)θj ] + ′          ′     sin [(m − n)θj ].                   (23)
+778
+                                      ∥km,j ∥ · ∥kn,j ∥                   ∥km,j ∥ · ∥kn,j ∥
+                                           ′                       ′
+779   Let ϕ be angle between km,j and kn,j , then Equation 23 can be rewrite as
+780
+781                           ⟨km,j , kn,j ⟩
+                                               = cos ϕ cos [(m − n)θj ] + sin ϕ sin [(m − n)θj ]
+782                          ∥km,j ∥ · ∥kn,j ∥
+783                                            = cos [ϕ − (m − n)θj ].                                                          (24)
+784
+785   Since the similarity between km,j and kn,j nearly equals 1 as we assumed, it can be obtained that
+786                                           ϕ = (m − n) θj .                                      (25)
+787   From Equation 17,
+788                                        0 <ϕ ≤ m − n, if m > n,                                  (26)
+789                                  m − n ≤ϕ < 0,             if m < n.                            (27)
+790   As a result,
+                                                         ′     ′
+791                                                   ⟨km,j , kn,j ⟩
+792                                 cos (m − n) <      ′         ′    ≤ 1.                          (28)
+                                                    ∥km,j ∥ · ∥kn,j ∥
+793
+794
+795
+796
+797
+798
+799
+800
+801
+802
+803
+804
+805
+806
+807
+808
+809
+
+
+
+                                                                                   15
+      Under review as a conference paper at ICLR 2025
+
+
+810
+      A.2   H IGH C OSINE S IMILARITY A MONG K EY S TATES
+811
+812                    Layer 0 Head 6            Layer 0 Head 14            Layer 0 Head 18            Layer 0 Head 24
+                                         1.00                       1.00                       1.00                       1.00
+813                                      0.75                       0.75                       0.75                       0.75
+                                         0.50                       0.50                       0.50                       0.50
+814                                      0.25                       0.25                       0.25                       0.25
+
+815                                      0.00                       0.00                       0.00                       0.00
+                                          0.25                       0.25                       0.25                       0.25
+816                                       0.50                       0.50                       0.50                       0.50
+                                          0.75                       0.75                       0.75                       0.75
+817                                       1.00                       1.00                       1.00                       1.00
+
+818                    Layer 4 Head 1             Layer 4 Head 8            Layer 4 Head 13            Layer 4 Head 24
+                                         1.00                       1.00                       1.00                       1.00
+819                                      0.75                       0.75                       0.75                       0.75
+                                         0.50                       0.50                       0.50                       0.50
+820                                      0.25                       0.25                       0.25                       0.25
+
+821                                      0.00                       0.00                       0.00                       0.00
+                                          0.25                       0.25                       0.25                       0.25
+822                                       0.50                       0.50                       0.50                       0.50
+                                          0.75                       0.75                       0.75                       0.75
+823                                       1.00                       1.00                       1.00                       1.00
+
+824
+                       Layer 8 Head 0    1.00
+                                                 Layer 8 Head 10    1.00
+                                                                            Layer 8 Head 19    1.00
+                                                                                                       Layer 8 Head 24    1.00
+825                                      0.75                       0.75                       0.75                       0.75
+                                         0.50                       0.50                       0.50                       0.50
+826                                      0.25                       0.25                       0.25                       0.25
+827                                      0.00                       0.00                       0.00                       0.00
+                                          0.25                       0.25                       0.25                       0.25
+828                                       0.50                       0.50                       0.50                       0.50
+                                          0.75                       0.75                       0.75                       0.75
+829                                       1.00                       1.00                       1.00                       1.00
+
+830
+                      Layer 12 Head 2    1.00
+                                                 Layer 12 Head 4    1.00
+                                                                            Layer 12 Head 6    1.00
+                                                                                                       Layer 12 Head 11   1.00
+831                                      0.75                       0.75                       0.75                       0.75
+                                         0.50                       0.50                       0.50                       0.50
+832                                      0.25                       0.25                       0.25                       0.25
+833                                      0.00                       0.00                       0.00                       0.00
+                                          0.25                       0.25                       0.25                       0.25
+834                                       0.50                       0.50                       0.50                       0.50
+                                          0.75                       0.75                       0.75                       0.75
+835                                       1.00                       1.00                       1.00                       1.00
+
+836
+                      Layer 16 Head 12   1.00
+                                                 Layer 16 Head 15   1.00
+                                                                            Layer 16 Head 21   1.00
+                                                                                                       Layer 16 Head 27   1.00
+837                                      0.75                       0.75                       0.75                       0.75
+                                         0.50                       0.50                       0.50                       0.50
+838
+                                         0.25                       0.25                       0.25                       0.25
+839                                      0.00                       0.00                       0.00                       0.00
+                                          0.25                       0.25                       0.25                       0.25
+840                                       0.50                       0.50                       0.50                       0.50
+                                          0.75                       0.75                       0.75                       0.75
+841                                       1.00                       1.00                       1.00                       1.00
+842
+                      Layer 20 Head 7    1.00
+                                                 Layer 20 Head 8    1.00
+                                                                            Layer 20 Head 18   1.00
+                                                                                                       Layer 20 Head 20   1.00
+843                                      0.75                       0.75                       0.75                       0.75
+                                         0.50                       0.50                       0.50                       0.50
+844
+                                         0.25                       0.25                       0.25                       0.25
+845                                      0.00                       0.00                       0.00                       0.00
+                                          0.25                       0.25                       0.25                       0.25
+846                                       0.50                       0.50                       0.50                       0.50
+                                          0.75                       0.75                       0.75                       0.75
+847
+                                          1.00                       1.00                       1.00                       1.00
+848
+                      Layer 24 Head 1    1.00
+                                                 Layer 24 Head 3    1.00
+                                                                            Layer 24 Head 16   1.00
+                                                                                                       Layer 24 Head 17   1.00
+849                                      0.75                       0.75                       0.75                       0.75
+                                         0.50                       0.50                       0.50                       0.50
+850
+                                         0.25                       0.25                       0.25                       0.25
+851                                      0.00                       0.00                       0.00                       0.00
+                                          0.25                       0.25                       0.25                       0.25
+852                                       0.50                       0.50                       0.50                       0.50
+                                          0.75                       0.75                       0.75                       0.75
+853
+                                          1.00                       1.00                       1.00                       1.00
+854
+                      Layer 28 Head 11   1.00
+                                                 Layer 28 Head 23   1.00
+                                                                            Layer 28 Head 27   1.00
+                                                                                                       Layer 28 Head 28   1.00
+855                                      0.75                       0.75                       0.75                       0.75
+                                         0.50                       0.50                       0.50                       0.50
+856
+                                         0.25                       0.25                       0.25                       0.25
+857                                      0.00                       0.00                       0.00                       0.00
+                                          0.25                       0.25                       0.25                       0.25
+858                                       0.50                       0.50                       0.50                       0.50
+                                          0.75                       0.75                       0.75                       0.75
+859
+                                          1.00                       1.00                       1.00                       1.00
+860
+861   Figure 6: Visualization on the cosine similarity map of key states across different layers and attention
+862   heads in Llama2-7B-chat model when processing the input sequence with a total of 3506 tokens.
+863
+
+
+
+                                                                       16
+      Under review as a conference paper at ICLR 2025
+
+
+864                   Layer 16 Head 24   1.00
+                                                 Layer 20 Head 29   1.00
+                                                                            Layer 24 Head 18   1.00
+                                                                                                       Layer 32 Head 23   1.00
+                                         0.75                       0.75                       0.75                       0.75
+865                                      0.50                       0.50                       0.50                       0.50
+
+866                                      0.25                       0.25                       0.25                       0.25
+                                         0.00                       0.00                       0.00                       0.00
+867                                       0.25                       0.25                       0.25                       0.25
+                                          0.50                       0.50                       0.50                       0.50
+868                                       0.75                       0.75                       0.75                       0.75
+
+869                                       1.00                       1.00                       1.00                       1.00
+
+
+870                   Layer 20 Head 16   1.00
+                                                  Layer 8 Head 1    1.00
+                                                                            Layer 32 Head 39   1.00
+                                                                                                       Layer 16 Head 21   1.00
+                                         0.75                       0.75                       0.75                       0.75
+871                                      0.50                       0.50                       0.50                       0.50
+
+872                                      0.25                       0.25                       0.25                       0.25
+                                         0.00                       0.00                       0.00                       0.00
+873                                       0.25                       0.25                       0.25                       0.25
+                                          0.50                       0.50                       0.50                       0.50
+874                                       0.75                       0.75                       0.75                       0.75
+
+875                                       1.00                       1.00                       1.00                       1.00
+
+
+876                   Layer 12 Head 27   1.00
+                                                 Layer 4 Head 13    1.00
+                                                                            Layer 0 Head 15    1.00
+                                                                                                       Layer 8 Head 28    1.00
+                                         0.75                       0.75                       0.75                       0.75
+877                                      0.50                       0.50                       0.50                       0.50
+878                                      0.25                       0.25                       0.25                       0.25
+                                         0.00                       0.00                       0.00                       0.00
+879                                       0.25                       0.25                       0.25                       0.25
+                                          0.50                       0.50                       0.50                       0.50
+880                                       0.75                       0.75                       0.75                       0.75
+
+881                                       1.00                       1.00                       1.00                       1.00
+
+
+882                   Layer 36 Head 35   1.00
+                                                 Layer 24 Head 36   1.00
+                                                                            Layer 36 Head 29   1.00
+                                                                                                       Layer 12 Head 10   1.00
+                                         0.75                       0.75                       0.75                       0.75
+883
+                                         0.50                       0.50                       0.50                       0.50
+884                                      0.25                       0.25                       0.25                       0.25
+                                         0.00                       0.00                       0.00                       0.00
+885                                       0.25                       0.25                       0.25                       0.25
+                                          0.50                       0.50                       0.50                       0.50
+886                                       0.75                       0.75                       0.75                       0.75
+887                                       1.00                       1.00                       1.00                       1.00
+
+
+888                   Layer 8 Head 34    1.00
+                                                 Layer 28 Head 24   1.00
+                                                                             Layer 4 Head 2    1.00
+                                                                                                       Layer 12 Head 38   1.00
+                                         0.75                       0.75                       0.75                       0.75
+889
+                                         0.50                       0.50                       0.50                       0.50
+890                                      0.25                       0.25                       0.25                       0.25
+                                         0.00                       0.00                       0.00                       0.00
+891                                       0.25                       0.25                       0.25                       0.25
+                                          0.50                       0.50                       0.50                       0.50
+892                                       0.75                       0.75                       0.75                       0.75
+893                                       1.00                       1.00                       1.00                       1.00
+
+
+894                   Layer 36 Head 3    1.00
+                                                 Layer 24 Head 2    1.00
+                                                                            Layer 28 Head 29   1.00
+                                                                                                        Layer 0 Head 6    1.00
+                                         0.75                       0.75                       0.75                       0.75
+895
+                                         0.50                       0.50                       0.50                       0.50
+896                                      0.25                       0.25                       0.25                       0.25
+                                         0.00                       0.00                       0.00                       0.00
+897                                       0.25                       0.25                       0.25                       0.25
+                                          0.50                       0.50                       0.50                       0.50
+898
+                                          0.75                       0.75                       0.75                       0.75
+899                                       1.00                       1.00                       1.00                       1.00
+
+
+900                    Layer 0 Head 1    1.00
+                                                 Layer 32 Head 15   1.00
+                                                                             Layer 4 Head 5    1.00
+                                                                                                       Layer 32 Head 13   1.00
+                                         0.75                       0.75                       0.75                       0.75
+901
+                                         0.50                       0.50                       0.50                       0.50
+902                                      0.25                       0.25                       0.25                       0.25
+                                         0.00                       0.00                       0.00                       0.00
+903                                       0.25                       0.25                       0.25                       0.25
+                                          0.50                       0.50                       0.50                       0.50
+904
+                                          0.75                       0.75                       0.75                       0.75
+905                                       1.00                       1.00                       1.00                       1.00
+
+906                   Layer 16 Head 22   1.00
+                                                 Layer 8 Head 38    1.00
+                                                                            Layer 20 Head 7    1.00
+                                                                                                       Layer 36 Head 10   1.00
+
+907                                      0.75                       0.75                       0.75                       0.75
+                                         0.50                       0.50                       0.50                       0.50
+908                                      0.25                       0.25                       0.25                       0.25
+                                         0.00                       0.00                       0.00                       0.00
+909                                       0.25                       0.25                       0.25                       0.25
+                                          0.50                       0.50                       0.50                       0.50
+910
+                                          0.75                       0.75                       0.75                       0.75
+911                                       1.00                       1.00                       1.00                       1.00
+
+912
+913   Figure 7: Visualization on the cosine similarity map of key states across different layers and attention
+914   heads in Llama2-13B-chat model when processing the input sequence with a total of 3776 tokens.
+915
+916
+917
+
+
+
+                                                                       17
+      Under review as a conference paper at ICLR 2025
+
+
+918                    Layer 0 Head 0   1.00
+                                                Layer 0 Head 2    1.00
+                                                                          Layer 0 Head 3    1.00
+                                                                                                    Layer 0 Head 5    1.00
+                                        0.75                      0.75                      0.75                      0.75
+919                                     0.50                      0.50                      0.50                      0.50
+
+920                                     0.25                      0.25                      0.25                      0.25
+                                        0.00                      0.00                      0.00                      0.00
+921                                      0.25                      0.25                      0.25                      0.25
+                                         0.50                      0.50                      0.50                      0.50
+922                                      0.75                      0.75                      0.75                      0.75
+
+923                                      1.00                      1.00                      1.00                      1.00
+
+
+924                    Layer 4 Head 2   1.00
+                                                Layer 4 Head 3    1.00
+                                                                          Layer 4 Head 5    1.00
+                                                                                                    Layer 4 Head 7    1.00
+                                        0.75                      0.75                      0.75                      0.75
+925                                     0.50                      0.50                      0.50                      0.50
+
+926                                     0.25                      0.25                      0.25                      0.25
+                                        0.00                      0.00                      0.00                      0.00
+927                                      0.25                      0.25                      0.25                      0.25
+                                         0.50                      0.50                      0.50                      0.50
+928                                      0.75                      0.75                      0.75                      0.75
+
+929                                      1.00                      1.00                      1.00                      1.00
+
+
+930                    Layer 8 Head 4   1.00
+                                                Layer 8 Head 5    1.00
+                                                                          Layer 8 Head 6    1.00
+                                                                                                    Layer 8 Head 7    1.00
+                                        0.75                      0.75                      0.75                      0.75
+931                                     0.50                      0.50                      0.50                      0.50
+932                                     0.25                      0.25                      0.25                      0.25
+                                        0.00                      0.00                      0.00                      0.00
+933                                      0.25                      0.25                      0.25                      0.25
+                                         0.50                      0.50                      0.50                      0.50
+934                                      0.75                      0.75                      0.75                      0.75
+
+935                                      1.00                      1.00                      1.00                      1.00
+
+
+936                   Layer 12 Head 0   1.00
+                                                Layer 12 Head 2   1.00
+                                                                          Layer 12 Head 4   1.00
+                                                                                                    Layer 12 Head 6   1.00
+                                        0.75                      0.75                      0.75                      0.75
+937
+                                        0.50                      0.50                      0.50                      0.50
+938                                     0.25                      0.25                      0.25                      0.25
+                                        0.00                      0.00                      0.00                      0.00
+939                                      0.25                      0.25                      0.25                      0.25
+                                         0.50                      0.50                      0.50                      0.50
+940                                      0.75                      0.75                      0.75                      0.75
+941                                      1.00                      1.00                      1.00                      1.00
+
+
+942                   Layer 16 Head 1   1.00
+                                                Layer 16 Head 3   1.00
+                                                                          Layer 16 Head 4   1.00
+                                                                                                    Layer 16 Head 5   1.00
+                                        0.75                      0.75                      0.75                      0.75
+943
+                                        0.50                      0.50                      0.50                      0.50
+944                                     0.25                      0.25                      0.25                      0.25
+                                        0.00                      0.00                      0.00                      0.00
+945                                      0.25                      0.25                      0.25                      0.25
+                                         0.50                      0.50                      0.50                      0.50
+946                                      0.75                      0.75                      0.75                      0.75
+947                                      1.00                      1.00                      1.00                      1.00
+
+
+948                   Layer 20 Head 0   1.00
+                                                Layer 20 Head 1   1.00
+                                                                          Layer 20 Head 2   1.00
+                                                                                                    Layer 20 Head 4   1.00
+                                        0.75                      0.75                      0.75                      0.75
+949
+                                        0.50                      0.50                      0.50                      0.50
+950                                     0.25                      0.25                      0.25                      0.25
+                                        0.00                      0.00                      0.00                      0.00
+951                                      0.25                      0.25                      0.25                      0.25
+                                         0.50                      0.50                      0.50                      0.50
+952
+                                         0.75                      0.75                      0.75                      0.75
+953                                      1.00                      1.00                      1.00                      1.00
+
+
+954                   Layer 24 Head 0   1.00
+                                                Layer 24 Head 2   1.00
+                                                                          Layer 24 Head 4   1.00
+                                                                                                    Layer 24 Head 6   1.00
+                                        0.75                      0.75                      0.75                      0.75
+955
+                                        0.50                      0.50                      0.50                      0.50
+956                                     0.25                      0.25                      0.25                      0.25
+                                        0.00                      0.00                      0.00                      0.00
+957                                      0.25                      0.25                      0.25                      0.25
+                                         0.50                      0.50                      0.50                      0.50
+958
+                                         0.75                      0.75                      0.75                      0.75
+959                                      1.00                      1.00                      1.00                      1.00
+
+960                   Layer 28 Head 1   1.00
+                                                Layer 28 Head 4   1.00
+                                                                          Layer 28 Head 5   1.00
+                                                                                                    Layer 28 Head 6   1.00
+
+961                                     0.75                      0.75                      0.75                      0.75
+                                        0.50                      0.50                      0.50                      0.50
+962                                     0.25                      0.25                      0.25                      0.25
+                                        0.00                      0.00                      0.00                      0.00
+963                                      0.25                      0.25                      0.25                      0.25
+                                         0.50                      0.50                      0.50                      0.50
+964
+                                         0.75                      0.75                      0.75                      0.75
+965                                      1.00                      1.00                      1.00                      1.00
+
+966
+967   Figure 8: Visualization on the cosine similarity map of key states across different layers and attention
+968   heads in Mistral-7B-Instruct model when processing the input sequence with a total of 5001 tokens.
+969
+970
+971
+
+
+
+                                                                     18
+       Under review as a conference paper at ICLR 2025
+
+
+972
+       A.3    S TATIC KV C ACHE S PARSITY
+973
+974    In section 4.2, we observe that the KV cache sparsity, resulting from the high similarity exhibited
+975    by key states, is independent of the dataset and remains persistent at the model level. To further
+976    illustrate this property, we also visualize the layer-wise compression ratios of Llama2-13B-chat and
+977    Mistral-7B-Instruct obtained by our proposed merging set identification algorithm for some selected
+978    tasks from LongBench, which is shown in Figure 9. We can observe that the static KV cache sparsity
+979    property also holds true for these models, making it convenient for us to set the memory budget for
+980
+       inference without significant adjustment.
+981
+982
+                                                    Llama2-13B-chat                                          Mistral-7B-Instruct
+                                           60
+983                                                                                                 50
+                       Compression Ratio (%)
+
+
+                                                                                Compression Ratio (%)
+984                                        55
+                                                                                                    45
+985                                        50
+986
+                                           45                                                       40
+987
+988                                        40                                                       35
+                                                                  NarrativeQA                                        NarrativeQA
+989                                        35                     GovReport                         30               GovReport
+990
+                                           30                     TriviaQA                                           TriviaQA
+991                                                               2WikiMQA                          25               2WikiMQA
+992                                             0   10       20        30    40                          0      10         20         30
+993                                                      Layer Index                                            Layer Index
+994
+995    Figure 9: The layer-wise compression ratios of Llama2-13B-chat and Mistral-7B-Instruct obtained
+996    by our proposed merging set identification algorithm for different samples and different tasks.
+997
+998
+999    A.4    Z ERO S CROLLS B ENCHMARK R ESULTS
+1000
+1001
+       We provide the evaluation results of Llama2-7B-chat model on ZeroScrolls Benchmark with
+       KVMerger. From Table 6, we can spot that KVMerger achieves excellent performance compared
+1002
+       to H2O and CaM methods under the same KV cache budget scenarios, with some results even better
+1003
+       than the condition under full cache. This emphasize that KVMerger can effectively maintain the
+1004   long-context processing ability of LLMs with compressed KV cache.
+1005
+1006                           Table 6: KVMerger for Llama2-7B-chat on selected ZeroScrolls datasets
+1007    cache budget          Method    gov report          SummScreenFD    QMSum SQuALITY                     Qasper   NarrativeQA   BookSumSort    avg.
+1008       100%              Full Cache   17.40                 14.10        15.20  19.50                       22.50      15.40          3.00      15.30
+                                H2O       15.40                 13.20        14.30  18.30                       20.50      15.00          3.80      14.36
+1009         50%               CaM        15.60                 13.10        13.70  18.50                       20.10      15.30          3.40      14.24
+1010                         KVMerger     17.70                 13.80        15.10  19.10                       22.50      15.20          3.10      15.21
+                                H2O       14.80                 11.60        14.20  17.80                       17.70      14.70          3.60      13.49
+1011         35%               CaM        15.30                 11.70        13.90  18.30                       17.10      14.50          3.30      13.44
+1012                         KVMerger     16.60                 13.80        15.40  18.60                       20.40      15.40          3.70      14.84
+
+1013
+1014
+1015
+1016
+1017
+1018
+1019
+1020
+1021
+1022
+1023
+1024
+1025
+
+
+
+                                                                                19
