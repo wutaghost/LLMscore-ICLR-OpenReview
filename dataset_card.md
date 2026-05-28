@@ -188,12 +188,3 @@ This curated package is released under CC-BY-4.0. Original OpenReview content sh
 ## Acknowledgement
 
 We thank Huazhong University of Science and Technology for supporting this work and the preparation of this dataset release.
-
-## Citation
-
-If you use this dataset, please cite the associated paper using the official ICML bibliographic entry for:
-
-- *Position: Peer Review Should Be Calibrated via LLM Scoring*
-- Zijin Chen, Lesui Yu, Xiaofei Liao, Hai Jin, and Qinbin Li
-
-To avoid distributing a non-official or incorrectly formatted citation, this dataset card does not include a hand-written BibTeX entry. Please use the final citation record released with the official ICML proceedings.
