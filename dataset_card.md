@@ -6,7 +6,7 @@ task_categories:
 language:
 - en
 - zh
-pretty_name: LLMscore-ICLR-OpenReview-Link
+pretty_name: LLMscore-ICLR-OpenReview
 size_categories:
 - 100K<n<1M
 tags:
@@ -17,11 +17,11 @@ tags:
 - openreview
 ---
 
-# LLMscore-ICLR-OpenReview-Link
+# LLMscore-ICLR-OpenReview
 
 ## Dataset Description
 
-`LLMscore-ICLR-OpenReview-Link` is the released original dataset for the paper
+`LLMscore-ICLR-OpenReview` is the released original dataset for the paper
 *Position: Peer Review Should Be Calibrated via LLM Scoring* by Zijin Chen,
 Lesui Yu, Xiaofei Liao, Hai Jin, and Qinbin Li, accepted to the ICML 2026
 Position Track.

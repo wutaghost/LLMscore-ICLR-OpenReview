@@ -1,4 +1,4 @@
-# LLMscore-ICLR-OpenReview-Link
+# LLMscore-ICLR-OpenReview
 
 This dataset is the released original dataset for the paper *Position: Peer
 Review Should Be Calibrated via LLM Scoring* by Zijin Chen, Lesui Yu, Xiaofei
