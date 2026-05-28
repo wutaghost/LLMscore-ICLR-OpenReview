@@ -153,7 +153,6 @@ Paper text was extracted from the corresponding public OpenReview PDFs using `pd
 - Extracted paper text is stored only as individual `.txt` files under `texts/ICLR_*`, not embedded in combined JSONL files.
 - Key-like tokens matching common API-key patterns in extracted paper text are replaced with `[REDACTED_API_KEY]` or related redacted placeholders before release.
 - The current redaction report records 54 replacements across 42 files; see `metadata/redaction_report.json`.
-- The release safety scan reports no PDFs, no `.env`/log/cache paths, no API-key/password patterns, and no local absolute source paths; see `metadata/safety_scan.txt`.
 
 ## Intended Uses
 
