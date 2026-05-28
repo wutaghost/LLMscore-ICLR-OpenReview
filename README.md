@@ -64,7 +64,7 @@ understood as analysis artifacts rather than raw venue metadata:
   `mapped_reviewer_id`, and `item_id`.
 - `data/ICLR_2023/paper_text_index.jsonl.gz`: one row per ICLR 2023 paper PDF
   conversion record. This file stores `text_path`, page counts, character
-  counts, conversion status, and quality flags; it does not embed full text.
+  counts, and text-file metadata; it does not embed full text.
 - `data/ICLR_2024/`: the same four files for ICLR 2024.
 - `data/ICLR_2025/`: the same four files for ICLR 2025.
 - `texts/ICLR_2023/{paper_id}.txt`: one extracted UTF-8 text file per ICLR
@@ -77,10 +77,10 @@ understood as analysis artifacts rather than raw venue metadata:
 - `metadata/dataset_summary.json`: row counts, source roots, file sizes, and
   sha256 hashes.
 - `metadata/safety_scan.txt`: release safety checks.
-- `metadata/ICLR_*/conversion_report.json`: per-year PDF-to-text quality
-  reports.
+- `metadata/ICLR_*/conversion_report.json`: per-year PDF-to-text conversion
+  summaries.
 - `metadata/ICLR_*/paper_text_manifest.jsonl`: per-year PDF-to-text conversion
-  manifest with one row per attempted conversion.
+  manifest.
 
 Only compressed `.jsonl.gz` files are kept in the yearly `data/ICLR_*`
 directories. The extracted JSONL files are not distributed in this release. Full
@@ -109,14 +109,6 @@ Yearly subsets:
 from the review data. The same per-year counts are also recorded in
 `metadata/dataset_summary.json`.
 
-Text conversion status:
-
-| Subset | OK | Warning | Error | Notes |
-| --- | ---: | ---: | ---: | --- |
-| `ICLR_2023` | 3,780 | 11 | 0 | Warnings indicate short text, few words, or replacement characters. |
-| `ICLR_2024` | 7,233 | 46 | 0 | Warnings indicate short text, few words, or replacement characters. |
-| `ICLR_2025` | 11,561 | 44 | 1 | One PDF conversion timed out; see the manifest/report for details. |
-
 ## Loading The Data
 
 The release is stored as compressed JSONL files separated by yearly ICLR subset.
@@ -144,7 +136,7 @@ with gzip.open(root / "data/ICLR_2024/paper_text_index.jsonl.gz", "rt", encoding
     first = json.loads(next(f))
 
 text = (root / first["text_path"]).read_text(encoding="utf-8")
-print(first["paper_id"], first["conversion_status"], len(text))
+print(first["paper_id"], len(text))
 ```
 
 Users who need schema-level details should refer to `metadata/schema.json`.
@@ -195,12 +187,7 @@ in this package.
 - `expected_score` and `bias` are analysis variables derived under an
   LLM-calibration framework, not official venue annotations.
 - The release excludes paper PDFs. Extracted text is provided for convenience,
-  but users should consult OpenReview/PDF links when exact layout, figures,
-  equations, or appendices matter.
-- PDF-to-text conversion is not perfect. Quality flags are provided in
-  `paper_text_index.jsonl.gz` and `metadata/ICLR_*/conversion_report.json`.
-  One ICLR 2025 PDF timed out during conversion, so its index record has no
-  corresponding text file.
+  and the original OpenReview/PDF links are retained as source references.
 - Although familiarity screening is used to mitigate potential data leakage, it
   should be treated as a risk-reduction step rather than an absolute guarantee.
 
@@ -217,8 +204,7 @@ should follow the original source terms.
 
 ## Paper Text Layer
 
-Paper PDF text is stored as one UTF-8 `.txt` file per successfully converted
-paper. The text files are partitioned by year:
+Paper PDF text is stored as UTF-8 `.txt` files partitioned by year:
 
 ```text
 texts/ICLR_2023/{paper_id}.txt
@@ -226,7 +212,7 @@ texts/ICLR_2024/{paper_id}.txt
 texts/ICLR_2025/{paper_id}.txt
 ```
 
-Each year also contains a text index with paths and conversion quality metrics:
+Each year also contains a text index with paths and text metadata:
 
 ```text
 data/ICLR_2023/paper_text_index.jsonl.gz
@@ -234,9 +220,9 @@ data/ICLR_2024/paper_text_index.jsonl.gz
 data/ICLR_2025/paper_text_index.jsonl.gz
 ```
 
-The index stores `text_path`, character counts, word-like token counts, page
-counts, conversion status, and quality flags. Full text is stored only in the
-individual `.txt` files, not embedded in a combined JSONL file.
+The index stores `text_path`, character counts, word-like token counts, and
+page counts. Full text is stored only in the individual `.txt` files, not
+embedded in a combined JSONL file.
 
 
 ## Redaction
