@@ -1,3 +1,22 @@
+---
+license: cc-by-4.0
+task_categories:
+- text-classification
+- text-generation
+language:
+- en
+- zh
+pretty_name: LLMscore-ICLR-OpenReview
+size_categories:
+- 100K<n<1M
+tags:
+- peer-review
+- scientific-text
+- llm-scoring
+- meta-evaluation
+- openreview
+---
+
 # LLMscore-ICLR-OpenReview
 
 [![GitHub](https://img.shields.io/badge/GitHub-wutaghost%2FLLMscore--ICLR--OpenReview-blue?logo=github)](https://github.com/wutaghost/LLMscore-ICLR-OpenReview)
