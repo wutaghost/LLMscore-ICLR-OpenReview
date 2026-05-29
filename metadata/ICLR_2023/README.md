@@ -5,8 +5,8 @@ It has not been merged into the released dataset.
 
 ## Files
 
-- `data/ICLR_2023/paper_text_index.jsonl.gz`: one row per paper, pointing to its txt file.
-- `texts/ICLR_2023/*.txt`: one UTF-8 text file per converted PDF for inspection.
+- `data/ICLR_2023/paper_text_index.jsonl.gz`: one row per paper, pointing to an archive member.
+- `texts/ICLR_2023.tar.gz`: one yearly archive containing the converted UTF-8 `.txt` members.
 - `metadata/ICLR_2023/paper_text_manifest.jsonl`: conversion metadata and quality flags.
 - `metadata/ICLR_2023/conversion_report.json`: aggregate quality report.
 

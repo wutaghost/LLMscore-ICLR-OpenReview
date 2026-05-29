@@ -1,8 +1,5 @@
 # LLMscore-ICLR-OpenReview
 
-[![GitHub](https://img.shields.io/badge/GitHub-wutaghost%2FLLMscore--ICLR--OpenReview-blue?logo=github)](https://github.com/wutaghost/LLMscore-ICLR-OpenReview)
-[![Hugging Face](https://img.shields.io/badge/🤗%20Hugging%20Face-Wutaghost%2FLLMscore--ICLR--OpenReview-orange)](https://huggingface.co/datasets/Wutaghost/LLMscore-ICLR-OpenReview)
-
 This dataset is the released original dataset for the paper *Position: Peer
 Review Should Be Calibrated via LLM Scoring* by Zijin Chen, Lesui Yu, Xiaofei
 Liao, Hai Jin, and Qinbin Li. The paper has been accepted to the ICML 2026
@@ -21,7 +18,7 @@ paper text.
 
 The package intentionally does not include paper PDFs. Use `openreview_url` and
 `pdf_url` to access the original OpenReview pages and PDFs. Extracted paper text
-is stored as one UTF-8 `.txt` file per paper under `texts/ICLR_*`.
+is stored in yearly `tar.gz` bundles, with one UTF-8 `.txt` member per paper.
 
 ## Release Scope
 
@@ -70,13 +67,12 @@ understood as analysis artifacts rather than raw venue metadata:
   counts, and text-file metadata; it does not embed full text.
 - `data/ICLR_2024/`: the same four files for ICLR 2024.
 - `data/ICLR_2025/`: the same four files for ICLR 2025.
-- `texts/ICLR_2023/{paper_id}.txt`: one extracted UTF-8 text file per ICLR
-  2023 paper PDF.
-- `texts/ICLR_2024/{paper_id}.txt`: one extracted UTF-8 text file per ICLR
-  2024 paper PDF.
-- `texts/ICLR_2025_1/{paper_id}.txt` and
-  `texts/ICLR_2025_2/{paper_id}.txt`: extracted UTF-8 text files for ICLR
-  2025 paper PDFs, split into two directories for repository hosting.
+- `texts/ICLR_2023.tar.gz`: archive containing one extracted UTF-8 `.txt`
+  member per ICLR 2023 paper PDF.
+- `texts/ICLR_2024.tar.gz`: archive containing one extracted UTF-8 `.txt`
+  member per ICLR 2024 paper PDF.
+- `texts/ICLR_2025.tar.gz`: archive containing one extracted UTF-8 `.txt`
+  member per ICLR 2025 paper PDF.
 - `metadata/schema.json`: field definitions.
 - `metadata/dataset_summary.json`: row counts, source roots, file sizes, and
   sha256 hashes.
@@ -88,10 +84,8 @@ understood as analysis artifacts rather than raw venue metadata:
 
 Only compressed `.jsonl.gz` files are kept in the yearly `data/ICLR_*`
 directories. The extracted JSONL files are not distributed in this release. Full
-paper text is distributed only as individual `.txt` files under `texts/ICLR_*`;
-the ICLR 2025 text layer is split across `texts/ICLR_2025_1/` and
-`texts/ICLR_2025_2/` to keep hosted directories within platform file-count
-limits.
+paper text is distributed only through the three yearly `tar.gz` bundles under
+`texts/`.
 
 ## Basic Statistics
 
@@ -130,19 +124,22 @@ with gzip.open("data/ICLR_2024/papers.jsonl.gz", "rt", encoding="utf-8") as f:
     papers = [json.loads(line) for line in f]
 ```
 
-To load paper text, read the yearly text index and then open the referenced
-individual text file:
+To load paper text, read the yearly text index, split the `archive::member`
+locator stored in `text_path`, and then open the referenced archive member:
 
 ```python
-from pathlib import Path
 import gzip
 import json
+import tarfile
+from pathlib import Path
 
 root = Path(".")
 with gzip.open(root / "data/ICLR_2024/paper_text_index.jsonl.gz", "rt", encoding="utf-8") as f:
     first = json.loads(next(f))
 
-text = (root / first["text_path"]).read_text(encoding="utf-8")
+archive_rel, member = first["text_path"].split("::", 1)
+with tarfile.open(root / archive_rel, "r:gz") as tar:
+    text = tar.extractfile(member).read().decode("utf-8")
 print(first["paper_id"], len(text))
 ```
 
@@ -211,16 +208,16 @@ should follow the original source terms.
 
 ## Paper Text Layer
 
-Paper PDF text is stored as UTF-8 `.txt` files partitioned by year:
+Paper PDF text is stored as UTF-8 `.txt` members inside yearly archives:
 
 ```text
-texts/ICLR_2023/{paper_id}.txt
-texts/ICLR_2024/{paper_id}.txt
-texts/ICLR_2025_1/{paper_id}.txt
-texts/ICLR_2025_2/{paper_id}.txt
+texts/ICLR_2023.tar.gz::ICLR_2023/{paper_id}.txt
+texts/ICLR_2024.tar.gz::ICLR_2024/{paper_id}.txt
+texts/ICLR_2025.tar.gz::ICLR_2025/{paper_id}.txt
 ```
 
-Each year also contains a text index with paths and text metadata:
+Each year also contains a text index with archive-member locators and text
+metadata:
 
 ```text
 data/ICLR_2023/paper_text_index.jsonl.gz
@@ -228,14 +225,15 @@ data/ICLR_2024/paper_text_index.jsonl.gz
 data/ICLR_2025/paper_text_index.jsonl.gz
 ```
 
-The index stores `text_path`, character counts, word-like token counts, and
-page counts. Full text is stored only in the individual `.txt` files, not
-embedded in a combined JSONL file.
+The index stores `text_path` in `archive::member` form, plus character counts,
+word-like token counts, and page counts. Full text is stored only in the
+archive members, not embedded in a combined JSONL file.
 
 
 ## Redaction
 
 Key-like tokens matching common API-key patterns in extracted PDF text are
-replaced with `[REDACTED_API_KEY]` or redacted placeholders before release. The
-current redaction report records 54 replacements across 42 files. See
-`metadata/redaction_report.json` for details.
+replaced with `[REDACTED_API_KEY]` or redacted placeholders before release.
+The text-layer release also redacts URL strings and absolute path patterns as
+`[REDACTED_URL]` and `[REDACTED_PATH]` before bundling. See
+`metadata/redaction_report.json` for the aggregate counts and affected files.

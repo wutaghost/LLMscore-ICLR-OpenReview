@@ -25,7 +25,7 @@ tags:
 
 The dataset is constructed for peer review analysis. It contains OpenReview-linked paper metadata, review records, anonymized rationale items, extracted paper text, LLM-derived anchor scores, and residual-based bias measurements for ICLR 2023, 2024, and 2025.
 
-The release does not redistribute paper PDFs. Paper-level records retain `openreview_url` and `pdf_url` fields so users can refer to the original public OpenReview source. Extracted paper text is distributed separately as UTF-8 `.txt` files under `texts/ICLR_2023`, `texts/ICLR_2024`, `texts/ICLR_2025_1`, and `texts/ICLR_2025_2`; the JSONL index files store paths and conversion metadata rather than embedding full paper text.
+The release does not redistribute paper PDFs. Paper-level records retain `openreview_url` and `pdf_url` fields so users can refer to the original public OpenReview source. Extracted paper text is distributed separately as UTF-8 `.txt` members inside `texts/ICLR_2023.tar.gz`, `texts/ICLR_2024.tar.gz`, and `texts/ICLR_2025.tar.gz`; the JSONL index files store archive-member locators and conversion metadata rather than embedding full paper text.
 
 ## What The Dataset Captures
 
@@ -61,9 +61,9 @@ The release stores each conference year in a separate directory to keep the year
 - `data/ICLR_2023/paper_text_index.jsonl.gz`: one row per ICLR 2023 paper-text conversion record;
 - `data/ICLR_2024/`: the same four files for ICLR 2024;
 - `data/ICLR_2025/`: the same four files for ICLR 2025;
-- `texts/ICLR_2023/{paper_id}.txt`: one extracted UTF-8 text file per converted ICLR 2023 paper PDF;
-- `texts/ICLR_2024/{paper_id}.txt`: one extracted UTF-8 text file per converted ICLR 2024 paper PDF;
-- `texts/ICLR_2025_1/{paper_id}.txt` and `texts/ICLR_2025_2/{paper_id}.txt`: extracted UTF-8 text files for converted ICLR 2025 paper PDFs.
+- `texts/ICLR_2023.tar.gz`: archive containing one extracted UTF-8 `.txt` member per converted ICLR 2023 paper PDF;
+- `texts/ICLR_2024.tar.gz`: archive containing one extracted UTF-8 `.txt` member per converted ICLR 2024 paper PDF;
+- `texts/ICLR_2025.tar.gz`: archive containing one extracted UTF-8 `.txt` member per converted ICLR 2025 paper PDF.
 
 The rows are deterministically sorted:
 
@@ -136,7 +136,7 @@ Yearly subsets:
 ### `paper_text_index.jsonl.gz`
 
 - `paper_id`: linked paper identifier.
-- `text_path`: relative path to the extracted UTF-8 `.txt` file when available.
+- `text_path`: `archive::member` locator for the extracted UTF-8 `.txt` content when available.
 - `char_count`, `word_like_count`, and page-count fields: conversion metadata for the extracted text.
 - conversion status and quality flags when available.
 
@@ -150,9 +150,9 @@ Paper text was extracted from the corresponding public OpenReview PDFs using `pd
 
 - Reviewer identifiers are anonymized within each paper.
 - No paper PDFs are redistributed.
-- Extracted paper text is stored only as individual `.txt` files under `texts/ICLR_*`, not embedded in combined JSONL files.
+- Extracted paper text is stored only as archive members inside `texts/*.tar.gz`, not embedded in combined JSONL files.
 - Key-like tokens matching common API-key patterns in extracted paper text are replaced with `[REDACTED_API_KEY]` or related redacted placeholders before release.
-- The current redaction report records 54 replacements across 42 files; see `metadata/redaction_report.json`.
+- URL strings and absolute path patterns in extracted paper text are additionally redacted as `[REDACTED_URL]` and `[REDACTED_PATH]`; see `metadata/redaction_report.json`.
 
 ## Intended Uses
 

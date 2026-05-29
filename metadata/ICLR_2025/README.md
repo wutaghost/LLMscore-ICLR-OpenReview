@@ -5,8 +5,8 @@ LLMscore-ICLR-OpenReview release.
 
 ## Files
 
-- `data/ICLR_2025/paper_text_index.jsonl.gz`: one row per paper, pointing to its txt file.
-- `texts/ICLR_2025_1/*.txt` and `texts/ICLR_2025_2/*.txt`: UTF-8 text files for converted PDFs.
+- `data/ICLR_2025/paper_text_index.jsonl.gz`: one row per paper, pointing to an archive member.
+- `texts/ICLR_2025.tar.gz`: one yearly archive containing the converted UTF-8 `.txt` members.
 - `metadata/ICLR_2025/paper_text_manifest.jsonl`: conversion metadata and quality flags.
 - `metadata/ICLR_2025/conversion_report.json`: aggregate quality report.
 
@@ -18,4 +18,4 @@ Command: `pdftotext -layout -enc UTF-8 -nopgbrk`.
 
 - text index rows: 11606
 - text files: 11605
-- text directories: `texts/ICLR_2025_1/`, `texts/ICLR_2025_2/`
+- text bundle: `texts/ICLR_2025.tar.gz`
