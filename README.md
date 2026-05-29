@@ -1,5 +1,8 @@
 # LLMscore-ICLR-OpenReview
 
+[![GitHub](https://img.shields.io/badge/GitHub-wutaghost%2FLLMscore--ICLR--OpenReview-blue?logo=github)](https://github.com/wutaghost/LLMscore-ICLR-OpenReview)
+[![Hugging Face](https://img.shields.io/badge/🤗%20Hugging%20Face-Wutaghost%2FLLMscore--ICLR--OpenReview-orange)](https://huggingface.co/datasets/Wutaghost/LLMscore-ICLR-OpenReview)
+
 This dataset is the released original dataset for the paper *Position: Peer
 Review Should Be Calibrated via LLM Scoring* by Zijin Chen, Lesui Yu, Xiaofei
 Liao, Hai Jin, and Qinbin Li. The paper has been accepted to the ICML 2026
